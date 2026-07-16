@@ -24,9 +24,9 @@ async function makeTemp(): Promise<string> {
 	return dir;
 }
 
-async function writeInfo(lockDir: string, info: { pid: number; timestamp: number }): Promise<void> {
+async function writeInfo(lockDir: string, info: { pid: number; timestamp: number; start_time?: string }): Promise<void> {
 	await fs.mkdir(lockDir, { recursive: true });
-	await fs.writeFile(path.join(lockDir, "info"), JSON.stringify(info), "utf8");
+	await fs.writeFile(path.join(lockDir, "info"), JSON.stringify({ ...info, start_time: info.start_time ?? "test-start" }), "utf8");
 }
 
 function ctxWith(spoolDir: string, probe: GcPidProbe): GcContext {

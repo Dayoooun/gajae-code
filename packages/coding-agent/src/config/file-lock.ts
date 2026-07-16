@@ -14,8 +14,65 @@ const DEFAULT_OPTIONS: Required<FileLockOptions> = {
 	retryDelayMs: 100,
 };
 
-interface LockInfo {
+interface LockInfo extends FileLockOwnerToken {
+	start_time: string;
+}
+
+/**
+ * Returns the OS-provided process start timestamp for PID-reuse detection.
+ * `ps` is available on the supported Unix hosts (macOS and Linux), unlike
+ * Linux's `/proc/<pid>/stat` pseudo-file.
+ */
+export function processStartTime(pid: number): string | null {
+	try {
+		const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
+		if (result.exitCode !== 0) return null;
+		const startTime = new TextDecoder().decode(result.stdout).trim();
+		return startTime || null;
+	} catch {
+		return null;
+	}
+}
+
+function ownerIsAlive(owner: FileLockOwnerToken): boolean {
+	if (ownerLiveness(owner.pid) !== "alive") return false;
+	const currentStartTime = processStartTime(owner.pid);
+	return currentStartTime === null || currentStartTime === owner.start_time;
+}
+
+function writeLockInfo(lockPath: string): Promise<LockInfo> {
+	const info: LockInfo = { pid: process.pid, start_time: processStartTime(process.pid) ?? "unknown", timestamp: Date.now() };
+	return Bun.write(`${lockPath}/info`, JSON.stringify(info)).then(() => info);
+}
+
+async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
+	try {
+		const content = await fs.readFile(`${lockPath}/info`, "utf-8");
+		const info = JSON.parse(content) as Partial<LockInfo>;
+		if (
+			typeof info.pid !== "number" ||
+			typeof info.timestamp !== "number" ||
+			typeof info.start_time !== "string" ||
+			!info.start_time
+		) {
+			return null;
+		}
+		return info as LockInfo;
+	} catch {
+		return null;
+	}
+}
+
+/** @internal */
+export async function readFileLockInfoForGc(lockDir: string): Promise<FileLockOwnerToken | null> {
+	return await readLockInfo(lockDir);
+}
+
+/** Owner identity stamped into a `<file>.lock/info` record. */
+export interface FileLockOwnerToken {
 	pid: number;
+	start_time?: string;
+
 	timestamp: number;
 }
 
@@ -23,35 +80,7 @@ function getLockPath(filePath: string): string {
 	return `${filePath}.lock`;
 }
 
-async function writeLockInfo(lockPath: string): Promise<LockInfo> {
-	const info: LockInfo = { pid: process.pid, timestamp: Date.now() };
-	await Bun.write(`${lockPath}/info`, JSON.stringify(info));
-	return info;
-}
 
-async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
-	try {
-		const content = await fs.readFile(`${lockPath}/info`, "utf-8");
-		return JSON.parse(content) as LockInfo;
-	} catch {
-		return null;
-	}
-}
-
-/** @internal */
-export async function readFileLockInfoForGc(lockDir: string): Promise<{ pid: number; timestamp: number } | null> {
-	const info = await readLockInfo(lockDir);
-	if (!info) return null;
-	if (!Number.isFinite(info.pid) || info.pid <= 0) return null;
-	if (!Number.isFinite(info.timestamp)) return null;
-	return info;
-}
-
-/** Owner identity stamped into a `<file>.lock/info` record. */
-export interface FileLockOwnerToken {
-	pid: number;
-	timestamp: number;
-}
 
 /** Outcome of a guarded lock-dir removal attempt (`removeFileLockDirForGc`). */
 export type FileLockGcRemoval = "removed" | "owner_changed" | "missing";
@@ -91,7 +120,12 @@ export async function removeFileLockDirForGc(
 ): Promise<FileLockGcRemoval> {
 	const current = await readLockInfo(lockDir);
 	if (!current) return "missing";
-	if (current.pid !== expected.pid || current.timestamp !== expected.timestamp) {
+	if (
+		current.pid !== expected.pid ||
+		(expected.start_time !== undefined && current.start_time !== expected.start_time) ||
+		current.timestamp !== expected.timestamp
+	) {
+
 		return "owner_changed";
 	}
 	await fs.rm(lockDir, { recursive: true, force: true });
@@ -143,10 +177,9 @@ async function staleLockSnapshot(lockPath: string, staleMs: number): Promise<Loc
 	// Never reap a live owner by elapsed time: a long legitimate critical section must
 	// not have its lock stolen (#652). Reclaim a dead owner immediately. Only when owner
 	// liveness is indeterminate do we fall back to the staleMs elapsed-time heuristic.
-	const liveness = ownerLiveness(info.pid);
-	if (liveness === "alive") return { stale: false };
-	if (liveness === "dead" || Date.now() - info.timestamp > staleMs) {
-		return { stale: true, owner: { pid: info.pid, timestamp: info.timestamp } };
+	if (ownerIsAlive(info)) return { stale: false };
+	if (ownerLiveness(info.pid) === "dead" || Date.now() - info.timestamp > staleMs) {
+		return { stale: true, owner: info };
 	}
 	return { stale: false };
 }
