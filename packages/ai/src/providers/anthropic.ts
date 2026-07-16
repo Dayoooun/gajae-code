@@ -2006,18 +2006,37 @@ function applyCacheControlToLastBlock<T extends CacheControlBlock>(
 	blocks[lastIndex] = { ...blocks[lastIndex], cache_control: cacheControl };
 }
 
-function applyCacheControlToLastTextBlock(
+function applyCacheControlToLastCacheableBlock(
 	blocks: Array<ContentBlockParam & CacheControlBlock>,
 	cacheControl: AnthropicCacheControl,
-): void {
-	if (blocks.length === 0) return;
+): boolean {
 	for (let i = blocks.length - 1; i >= 0; i--) {
-		if (blocks[i].type === "text") {
-			blocks[i] = { ...blocks[i], cache_control: cacheControl };
-			return;
-		}
+		const block = blocks[i];
+		if (block.type === "thinking" || block.type === "redacted_thinking") continue;
+		blocks[i] = { ...block, cache_control: cacheControl };
+		return true;
 	}
-	applyCacheControlToLastBlock(blocks, cacheControl);
+	return false;
+}
+
+function isHumanUserMessage(message: MessageCreateParamsStreaming["messages"][number]): boolean {
+	if (message.role !== "user") return false;
+	if (!Array.isArray(message.content)) return true;
+	return !message.content.some(block => block.type === "tool_result");
+}
+
+function applyCacheControlToMessage(
+	message: MessageCreateParamsStreaming["messages"][number],
+	cacheControl: AnthropicCacheControl,
+): boolean {
+	if (typeof message.content === "string") {
+		message.content = [{ type: "text", text: message.content, cache_control: cacheControl }];
+		return true;
+	}
+	return applyCacheControlToLastCacheableBlock(
+		message.content as Array<ContentBlockParam & CacheControlBlock>,
+		cacheControl,
+	);
 }
 
 function applyPromptCaching(params: MessageCreateParamsStreaming, cacheControl?: AnthropicCacheControl): void {
@@ -2048,52 +2067,33 @@ function applyPromptCaching(params: MessageCreateParamsStreaming, cacheControl?:
 
 	if (cacheBreakpointsUsed >= MAX_CACHE_BREAKPOINTS) return;
 
-	const userIndexes = params.messages
-		.map((message, index) => (message.role === "user" ? index : -1))
+	const humanUserIndexes = params.messages
+		.map((message, index) => (isHumanUserMessage(message) ? index : -1))
 		.filter(index => index >= 0);
+	const lastHumanUserIndex = humanUserIndexes.at(-1);
+	if (lastHumanUserIndex === undefined) return;
 
-	if (userIndexes.length >= 2) {
-		const penultimateUserIndex = userIndexes[userIndexes.length - 2];
-		const penultimateUser = params.messages[penultimateUserIndex];
-		if (penultimateUser) {
-			if (typeof penultimateUser.content === "string") {
-				const contentBlock: ContentBlockParam & CacheControlBlock = {
-					type: "text",
-					text: penultimateUser.content,
-					cache_control: cacheControl,
-				};
-				penultimateUser.content = [contentBlock];
-				cacheBreakpointsUsed++;
-			} else if (Array.isArray(penultimateUser.content) && penultimateUser.content.length > 0) {
-				applyCacheControlToLastTextBlock(
-					penultimateUser.content as Array<ContentBlockParam & CacheControlBlock>,
-					cacheControl,
-				);
-				cacheBreakpointsUsed++;
-			}
+	// The third breakpoint extends the stable prefix through the assistant turn
+	// before the current human input. Tool results are encoded as `role: "user"`,
+	// but are part of that assistant turn rather than an independent human turn.
+	for (let index = lastHumanUserIndex - 1; index >= 0; index--) {
+		const message = params.messages[index];
+		if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+		if (
+			applyCacheControlToLastCacheableBlock(
+				message.content as Array<ContentBlockParam & CacheControlBlock>,
+				cacheControl,
+			)
+		) {
+			cacheBreakpointsUsed++;
 		}
+		break;
 	}
 
 	if (cacheBreakpointsUsed >= MAX_CACHE_BREAKPOINTS) return;
-
-	if (userIndexes.length >= 1) {
-		const lastUserIndex = userIndexes[userIndexes.length - 1];
-		const lastUser = params.messages[lastUserIndex];
-		if (lastUser) {
-			if (typeof lastUser.content === "string") {
-				const contentBlock: ContentBlockParam & CacheControlBlock = {
-					type: "text",
-					text: lastUser.content,
-					cache_control: cacheControl,
-				};
-				lastUser.content = [contentBlock];
-			} else if (Array.isArray(lastUser.content) && lastUser.content.length > 0) {
-				applyCacheControlToLastTextBlock(
-					lastUser.content as Array<ContentBlockParam & CacheControlBlock>,
-					cacheControl,
-				);
-			}
-		}
+	const lastHumanUser = params.messages[lastHumanUserIndex];
+	if (lastHumanUser && applyCacheControlToMessage(lastHumanUser, cacheControl)) {
+		cacheBreakpointsUsed++;
 	}
 }
 
@@ -2109,7 +2109,7 @@ function normalizeCacheControlBlockTtl(block: CacheControlBlock, seenFiveMinute:
 	}
 }
 
-function normalizeCacheControlTtlOrdering(params: MessageCreateParamsStreaming): void {
+export function normalizeCacheControlTtlOrdering(params: MessageCreateParamsStreaming): void {
 	const seenFiveMinute = { value: false };
 	if (params.tools) {
 		for (const tool of params.tools as Array<Anthropic.Messages.Tool & CacheControlBlock>) {

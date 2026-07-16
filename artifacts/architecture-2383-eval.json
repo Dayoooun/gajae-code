@@ -1,0 +1,42 @@
+{
+  "issue": 2383,
+  "status": "pass",
+  "evaluatedAt": "2026-07-16",
+  "evidenceType": "deterministic-simulated-three-turn-integration",
+  "documentation": {
+    "url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
+    "retrievedAt": "2026-07-16",
+    "findings": [
+      "Explicit cache breakpoints have a 20-block lookback window.",
+      "Up to four explicit block-level breakpoints are supported.",
+      "Cache prefixes are ordered tools, system, then messages.",
+      "The cache usage field is cache_read_input_tokens."
+    ]
+  },
+  "trace": {
+    "turns": [
+      "human",
+      "assistant-tool-use",
+      "tool-result",
+      "human",
+      "assistant",
+      "human"
+    ],
+    "stablePrefixTokens": 1536
+  },
+  "placements": {
+    "before": {
+      "anchors": ["tools", "system", "tool-result", "human"],
+      "cache_read_input_tokens": 1024
+    },
+    "twoAnchors": {
+      "anchors": ["system", "human"],
+      "cache_read_input_tokens": 1024
+    },
+    "after": {
+      "anchors": ["tools", "system", "assistant-turn", "human"],
+      "cache_read_input_tokens": 1536
+    }
+  },
+  "decision": "Ship the four-anchor placement: it is the only evaluated placement that moves the third anchor to the previous assistant-turn boundary and its simulated cache_read_input_tokens does not regress versus the current placement."
+}
