@@ -83,6 +83,7 @@ import type {
 	TextContent,
 	ToolCall,
 	ToolChoice,
+	ToolResultMessage,
 	TransportFailureFacts,
 	Usage,
 	UsageReport,
@@ -337,6 +338,7 @@ import {
 	type CompactionSummaryMessage,
 	type CustomMessage,
 	convertToLlm,
+	createPreAdmissionArtifactSpillPreview,
 	type FileMentionMessage,
 	type PythonExecutionMessage,
 	readPendingDisplayTag,
@@ -2603,12 +2605,47 @@ export class AgentSession {
 	// Track last assistant message for auto-compaction check
 	#lastAssistantMessage: AssistantMessage | undefined = undefined;
 
+	/** Spill an oversized result before persistence and the next provider request. */
+	async #spillOversizedToolResultBeforeAdmission(message: ToolResultMessage): Promise<void> {
+		if (!this.settings.get("tools.preAdmissionArtifactSpill")) return;
+
+		const textParts = message.content.flatMap(block => (block.type === "text" ? [block.text] : []));
+		if (textParts.length === 0) return;
+		const fullText = textParts.join("\n");
+		const contextWindow = this.model?.contextWindow;
+		const thresholdTokens = Math.min(
+			8_000,
+			contextWindow && contextWindow > 0 ? Math.floor(contextWindow * 0.05) : 8_000,
+		);
+		if (thresholdTokens <= 0 || estimateTextTokensHeuristic(fullText) <= thresholdTokens) return;
+
+		try {
+			const artifact = await this.sessionManager.allocateArtifactPath("tool-result");
+			if (!artifact.id || !artifact.path) return;
+			await Bun.write(artifact.path, fullText);
+			const digest = crypto.createHash("sha256").update(fullText).digest("hex");
+			const preview = createPreAdmissionArtifactSpillPreview(fullText, artifact.id, digest);
+			message.content = [
+				...message.content.filter((block): block is ImageContent => block.type === "image"),
+				{ type: "text", text: preview },
+			];
+		} catch (error) {
+			logger.warn("Failed to spill oversized tool result before context admission", {
+				toolName: message.toolName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	#handleAgentEvent = async (event: AgentEvent): Promise<void> => {
 		// Record a successful final yield before any asynchronous extension work so a
 		// concurrently delivered agent_end cannot start post-turn maintenance first.
 		if (event.type === "tool_execution_end" && event.toolName === "yield" && !event.isError) {
 			this.#lastSuccessfulYieldToolCallId = event.toolCallId;
+		}
+		if (event.type === "message_end" && event.message.role === "toolResult") {
+			await this.#spillOversizedToolResultBeforeAdmission(event.message);
 		}
 
 		// Agent listeners run synchronously, but this handler yields while emitting
