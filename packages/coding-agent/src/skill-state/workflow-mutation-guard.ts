@@ -52,7 +52,8 @@ type ToolWithEditMode = AgentTool & {
 	customWireName?: unknown;
 };
 
-export interface DeepInterviewMutationGuardInput {
+export interface WorkflowMutationGuardInput {
+
 	cwd: string;
 	sessionId?: string;
 	threadId?: string;
@@ -60,6 +61,8 @@ export interface DeepInterviewMutationGuardInput {
 	args: unknown;
 	forceOverride?: boolean;
 	enforceWorkflowState?: boolean;
+	guardContext?: WorkflowGuardContext;
+
 }
 
 interface ExtractedTargets {
@@ -67,13 +70,21 @@ interface ExtractedTargets {
 	unknown: boolean;
 }
 
-export interface DeepInterviewMutationDecision {
+export interface WorkflowMutationDecision {
+
 	blocked: boolean;
 	message?: string;
 	targets: string[];
 	reason?: string;
 	command?: string;
 }
+
+export interface WorkflowGuardContext {
+	sessionId: string | null;
+	activeState: Awaited<ReturnType<typeof readVisibleSkillActiveState>>;
+	modeStates: ReadonlyMap<string, ModeState | null>;
+}
+
 
 interface ModeState {
 	active?: boolean;
@@ -126,9 +137,23 @@ async function readValidatedModeState(filePath: string): Promise<ModeState | nul
 	}
 	return state;
 }
-async function readVisibleModeState(cwd: string, skill: string, sessionId: string): Promise<ModeState | null> {
-	return await readValidatedModeState(modeStatePath(cwd, skill, sessionId));
+
+export async function readWorkflowGuardContext(
+	cwd: string,
+	options: { sessionId?: string; threadId?: string } = {},
+): Promise<WorkflowGuardContext> {
+	const sessionId = await resolveBoundarySessionId(cwd, options.sessionId);
+	if (!sessionId) return { sessionId: null, activeState: null, modeStates: new Map() };
+	const activeState = await readVisibleSkillActiveState(cwd, sessionId, { tier: "security" });
+	const skills = activeState ? [...new Set(listActiveSkills(activeState).map(entry => entry.skill))] : [];
+	const modeStates = new Map(
+		await Promise.all(
+			skills.map(async skill => [skill, await readValidatedModeState(modeStatePath(cwd, skill, sessionId))] as const),
+		),
+	);
+	return { sessionId, activeState, modeStates };
 }
+
 
 /**
  * Phases that genuinely finish a workflow skill. Mirrors the Stop hook's
@@ -219,10 +244,13 @@ async function getActivePlanningSkill(
 	cwd: string,
 	sessionId?: string,
 	threadId?: string,
+	context?: WorkflowGuardContext,
 ): Promise<ActivePlanningSkill | null> {
-	const resolvedSessionId = await resolveBoundarySessionId(cwd, sessionId);
+	const guardContext = context ?? (await readWorkflowGuardContext(cwd, { sessionId, threadId }));
+	const resolvedSessionId = guardContext.sessionId;
 	if (!resolvedSessionId) return null;
-	const skillState = await readVisibleSkillActiveState(cwd, resolvedSessionId, { tier: "security" });
+	const skillState = guardContext.activeState;
+
 	if (!skillState) return null;
 	const activeEntries = listActiveSkills(skillState).filter(entry =>
 		entryMatchesContext(entry, resolvedSessionId, threadId),
@@ -230,7 +258,8 @@ async function getActivePlanningSkill(
 	if (activeEntries.length === 0) return null;
 	const current = resolveCurrentWorkflowEntry(activeEntries, safeString(skillState.skill).trim());
 	if (!isPlanningSkill(current.skill)) return null;
-	const modeState = await readVisibleModeState(cwd, current.skill, resolvedSessionId);
+	const modeState = guardContext.modeStates.get(current.skill) ?? null;
+
 	if (!modeState) return null;
 	if (modeState.active !== true) return null;
 	if (!modeStateMatchesContext(modeState, resolvedSessionId, threadId)) return null;
@@ -558,23 +587,27 @@ async function planningBlockedTargets(cwd: string, targets: ExtractedTargets): P
 	}
 	return blocked;
 }
-export async function assertDeepInterviewMutationRawPathsAllowed(input: {
+export async function assertWorkflowMutationRawPathsAllowed(input: {
+
 	cwd: string;
 	sessionId?: string;
 	threadId?: string;
 	rawPaths: string[];
 	forceOverride?: boolean;
+	guardContext?: WorkflowGuardContext;
+
 }): Promise<void> {
 	const targets: ExtractedTargets = { paths: input.rawPaths, unknown: input.rawPaths.length === 0 };
-	// Always-on `.gjc/**` runtime-owned block, in parity with getDeepInterviewMutationDecision
-	// and ahead of forceOverride: a deferred ast_edit apply must not reach `.gjc/**` either.
+	// Always-on `.gjc/**` runtime-owned block, ahead of forceOverride.
+	// A deferred ast_edit apply must not reach `.gjc/**` either.
 	if (hasBlockedGjcTarget(input.cwd, targets)) {
 		const stateSkill = firstBlockedWorkflowStateSkill(input.cwd, targets);
 		const command = stateSkill ? sanctionedWorkflowStateCommand(stateSkill) : "gjc <workflow-command>";
 		throw new ToolError(`${WORKFLOW_STATE_MUTATION_BLOCK_MESSAGE}\nUse: ${command}`);
 	}
 	if (input.forceOverride) return;
-	const planning = await getActivePlanningSkill(input.cwd, input.sessionId, input.threadId);
+	const planning = await getActivePlanningSkill(input.cwd, input.sessionId, input.threadId, input.guardContext);
+
 	if (!planning) return;
 	const message = planningPhaseBlockMessage(planning.skill);
 	if (input.rawPaths.length === 0) throw new ToolError(message);
@@ -582,9 +615,11 @@ export async function assertDeepInterviewMutationRawPathsAllowed(input: {
 	if (blocked.length > 0) throw new ToolError(message);
 }
 
-export async function getDeepInterviewMutationDecision(
-	input: DeepInterviewMutationGuardInput,
-): Promise<DeepInterviewMutationDecision> {
+export async function getWorkflowMutationDecision(
+
+	input: WorkflowMutationGuardInput,
+
+): Promise<WorkflowMutationDecision> {
 	if (!BLOCKED_TOOL_NAMES.has(input.tool.name)) return { blocked: false, targets: [] };
 	const targets = extractTargets(input.tool, input.args);
 	if (input.tool.name !== "bash" && input.enforceWorkflowState !== false && hasBlockedGjcTarget(input.cwd, targets)) {
@@ -598,7 +633,7 @@ export async function getDeepInterviewMutationDecision(
 			command,
 		};
 	}
-	const planning = await getActivePlanningSkill(input.cwd, input.sessionId, input.threadId);
+	const planning = await getActivePlanningSkill(input.cwd, input.sessionId, input.threadId, input.guardContext);
 	if (!planning) {
 		return { blocked: false, targets: [] };
 	}
@@ -627,17 +662,7 @@ export async function getDeepInterviewMutationDecision(
 	};
 }
 
-export async function assertDeepInterviewMutationAllowed(input: DeepInterviewMutationGuardInput): Promise<void> {
-	const decision = await getDeepInterviewMutationDecision(input);
+export async function assertWorkflowMutationAllowed(input: WorkflowMutationGuardInput): Promise<void> {
+	const decision = await getWorkflowMutationDecision(input);
 	if (decision.blocked) throw new ToolError(decision.message ?? DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE);
 }
-
-/*
- * Generic cross-workflow names for this planning-phase mutation guard. The guard
- * now governs deep-interview, ralplan, and ultragoal goal-planning, so new
- * callers SHOULD use these names; the `*DeepInterview*` exports above remain as
- * compatibility aliases (and are still what the test-suite imports).
- */
-export const getWorkflowMutationDecision = getDeepInterviewMutationDecision;
-export const assertWorkflowMutationAllowed = assertDeepInterviewMutationAllowed;
-export const assertWorkflowMutationRawPathsAllowed = assertDeepInterviewMutationRawPathsAllowed;

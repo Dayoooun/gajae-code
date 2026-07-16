@@ -20,6 +20,7 @@ import {
 	type SkillActiveState,
 	syncSkillActiveState,
 } from "../skill-state/active-state";
+import { readWorkflowGuardContext } from "../skill-state/workflow-mutation-guard";
 import { initialPhaseForSkill } from "../skill-state/initial-phase";
 
 // Re-export for existing callers and tests that imported it from this module.
@@ -747,8 +748,11 @@ function buildHandoffForceAskMessage(skill: GjcWorkflowSkill, phase: string, sta
 }
 
 export async function buildSkillStopOutput(input: StopHookInput): Promise<Record<string, unknown> | null> {
-	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
-	const skillState = await readVisibleSkillActiveState(input.cwd, resolvedSessionId, input.stateDir);
+	const guardContext = await readWorkflowGuardContext(input.cwd, { sessionId: input.sessionId, threadId: input.threadId });
+	const resolvedSessionId = guardContext.sessionId;
+	if (!resolvedSessionId) return null;
+	const skillState = guardContext.activeState;
+
 	const activeEntries = listActiveSkills(skillState)
 		.filter(isWorkflowActiveEntry)
 		.filter(entry =>
@@ -757,11 +761,7 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 	if (!skillState || activeEntries.length === 0) return null;
 
 	for (const entry of activeEntries) {
-		const modeState = await readValidatedJsonFile<ModeState>(
-			modeStatePath(input.cwd, entry.skill, resolvedSessionId),
-			"mode-state",
-			ModeStateSchema,
-		);
+		const modeState = guardContext.modeStates.get(entry.skill) ?? null;
 		const handoffRequired = isHandoffRequiredSkill(entry.skill);
 		if (!modeState && handoffRequired) {
 			const phase = String(entry.phase ?? skillState.phase ?? "active");
