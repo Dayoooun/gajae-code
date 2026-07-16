@@ -795,6 +795,7 @@ async function writeJsonAtomic(
 		fromPhase?: string;
 		toPhase?: string;
 		owner?: WorkflowStateMutationOwner;
+		lockHeld?: boolean;
 	},
 ): Promise<{ warning?: string; stamped: Record<string, unknown>; revision: number }> {
 	const warning = options?.skill
@@ -824,7 +825,7 @@ async function writeJsonAtomic(
 			toPhase: options?.toPhase,
 			forced: options?.force ?? false,
 		},
-		lockHeld: true,
+		lockHeld: options?.lockHeld ?? false,
 	});
 	// `writeResult.stamped` and `.revision` are computed inside the writer lock, so they are
 	// the envelope/revision this write actually owns. Never post-lock re-read here: a concurrent
@@ -1153,7 +1154,7 @@ export async function reconcileWorkflowSkillState(options: {
 	if (!validation.valid) throw new StateCommandError(2, validation.error ?? `invalid ${mode} state envelope`);
 
 	if (existingRead.kind === "corrupt") await fs.rm(filePath, { force: true });
-	await writeGuardedWorkflowEnvelopeAtomic(filePath, merged, {
+	const writeResult = await writeGuardedWorkflowEnvelopeAtomic(filePath, merged, {
 		cwd,
 		policy: "source",
 		receipt: {
@@ -1181,8 +1182,7 @@ export async function reconcileWorkflowSkillState(options: {
 			toPhase: trimmedPhase,
 		},
 	});
-	const persisted = (await readJsonFile(filePath)) ?? {};
-	const sourceRevision = options.sourceRevision ?? existingStateRevision(persisted);
+	const sourceRevision = options.sourceRevision ?? writeResult.revision;
 
 	// Reconciliation drives the active-state/HUD update directly (not via the
 	// best-effort syncWorkflowSkillState wrapper) so a failed HUD/active-state write
@@ -1403,6 +1403,7 @@ return await withWorkflowStateLock(filePath, async () => {
 		force: forced,
 		fromPhase,
 		toPhase,
+		lockHeld: true,
 	});
 	const stampedReceipt = isPlainObject(stamped.receipt) ? stamped.receipt : {};
 
@@ -1491,6 +1492,7 @@ return await withWorkflowStateLock(filePath, async () => {
 		force: forced,
 		fromPhase: typeof existing.current_phase === "string" ? existing.current_phase : undefined,
 		toPhase: "complete",
+		lockHeld: true,
 	});
 	const stampedReceipt = isPlainObject(stamped.receipt) ? stamped.receipt : {};
 

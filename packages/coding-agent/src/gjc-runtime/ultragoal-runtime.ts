@@ -2098,6 +2098,7 @@ export {
 	validateReplayExemptFallback,
 	waitForReplayProcessWithTimeout,
 };
+export type { ReplayProcessHandle } from "./ultragoal-evidence";
 
 async function validateArtifactRefs(cwd: string, executorQa: JsonObject): Promise<Map<string, JsonObject>> {
 	void cwd;

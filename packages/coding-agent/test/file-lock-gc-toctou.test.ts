@@ -102,6 +102,19 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		expect(await fs.exists(lockDir)).toBe(false);
 	});
 
+	test("preserves a live old-format holder without start_time", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		await fs.mkdir(lockDir, { recursive: true });
+		await fs.writeFile(path.join(lockDir, "info"), JSON.stringify({ pid: process.pid, timestamp: Date.now() - 10_000 }));
+
+		await expect(withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 })).rejects.toThrow(
+			"Failed to acquire lock",
+		);
+		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
 	test("release refuses to remove a lock that no longer has this owner token", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");

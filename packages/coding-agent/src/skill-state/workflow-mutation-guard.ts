@@ -190,7 +190,7 @@ function isPlanningSkill(skill: string): skill is "deep-interview" | "ralplan" |
 function isBlockingPlanningPhase(skill: "deep-interview" | "ralplan" | "ultragoal", phase: string): boolean {
 	const normalized = phase.trim().toLowerCase();
 	if (skill === "ultragoal") return normalized === "goal-planning";
-	return !getSkillManifest("ralplan").stopReleasingPhases.includes(normalized);
+	return !getSkillManifest(skill).stopReleasingPhases.includes(normalized);
 }
 
 interface ActivePlanningSkill {

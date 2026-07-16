@@ -554,13 +554,13 @@ function isHandoffRequiredSkill(skill: GjcWorkflowSkill): boolean {
  * mode-state preserves the historical fail-open behavior so a broken state file
  * cannot lock a session.
  */
-function modeStateReleasesStop(state: ModeState | null, handoffRequired: boolean): boolean {
+function modeStateReleasesStop(state: ModeState | null, handoffRequired: boolean, skill: GjcWorkflowSkill): boolean {
 	if (!state) return !handoffRequired;
 	if (state.active !== true) return true;
 	const phase = String(state.current_phase ?? "")
 		.trim()
 		.toLowerCase();
-	if (getSkillManifest("ralplan").stopReleasingPhases.includes(phase)) return true;
+	if (getSkillManifest(skill).stopReleasingPhases.includes(phase)) return true;
 	if (!handoffRequired && phase === "handoff") return true;
 	return false;
 }
@@ -784,7 +784,7 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 				systemMessage: rescueMessage,
 			};
 		}
-		if (modeStateReleasesStop(modeState, handoffRequired)) {
+		if (modeStateReleasesStop(modeState, handoffRequired, entry.skill)) {
 			// A mode-state that claims it releases the Stop block must agree with
 			// authoritative durable state. If a stale/incoherent mode-state would
 			// release while the plan/ledger still shows pending work, block instead

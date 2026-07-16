@@ -15,9 +15,7 @@ const DEFAULT_OPTIONS: Required<FileLockOptions> = {
 	retryDelayMs: 100,
 };
 
-interface LockInfo extends FileLockOwnerToken {
-	start_time: string;
-}
+type LockInfo = FileLockOwnerToken;
 
 /**
  * Returns the OS-provided process start timestamp for PID-reuse detection.
@@ -35,14 +33,31 @@ export function processStartTime(pid: number): string | null {
 	}
 }
 
-function ownerIsAlive(owner: FileLockOwnerToken): boolean {
+let ownProcessStartTime: string | undefined;
+
+function currentProcessStartTime(): string {
+	return (ownProcessStartTime ??= processStartTime(process.pid) ?? "unknown");
+}
+
+function cachedProcessStartTime(owner: FileLockOwnerToken, cache?: Map<string, string | null>): string | null {
+	if (!cache) return processStartTime(owner.pid);
+	const key = `${owner.pid}:${owner.start_time ?? ""}`;
+	const cached = cache.get(key);
+	if (cached !== undefined || cache.has(key)) return cached ?? null;
+	const startTime = processStartTime(owner.pid);
+	cache.set(key, startTime);
+	return startTime;
+}
+
+function ownerIsAlive(owner: FileLockOwnerToken, startTimeCache?: Map<string, string | null>): boolean {
 	if (ownerLiveness(owner.pid) !== "alive") return false;
-	const currentStartTime = processStartTime(owner.pid);
+	if (!owner.start_time) return true;
+	const currentStartTime = cachedProcessStartTime(owner, startTimeCache);
 	return currentStartTime === null || currentStartTime === owner.start_time;
 }
 
 function writeLockInfo(lockPath: string): Promise<LockInfo> {
-	const info: LockInfo = { pid: process.pid, start_time: processStartTime(process.pid) ?? "unknown", timestamp: Date.now() };
+	const info: LockInfo = { pid: process.pid, start_time: currentProcessStartTime(), timestamp: Date.now() };
 	return Bun.write(`${lockPath}/info`, JSON.stringify(info)).then(() => info);
 }
 
@@ -53,8 +68,7 @@ async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
 		if (
 			typeof info.pid !== "number" ||
 			typeof info.timestamp !== "number" ||
-			typeof info.start_time !== "string" ||
-			!info.start_time
+			(info.start_time !== undefined && (typeof info.start_time !== "string" || !info.start_time))
 		) {
 			return null;
 		}
@@ -162,7 +176,11 @@ function sameStatToken(a: LockDirStatToken, b: LockDirStatToken): boolean {
 	return a.dev === b.dev && a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
 }
 
-async function staleLockSnapshot(lockPath: string, staleMs: number): Promise<LockStaleSnapshot> {
+async function staleLockSnapshot(
+	lockPath: string,
+	staleMs: number,
+	startTimeCache?: Map<string, string | null>,
+): Promise<LockStaleSnapshot> {
 	const info = await readLockInfo(lockPath);
 	if (!info) {
 		try {
@@ -178,7 +196,7 @@ async function staleLockSnapshot(lockPath: string, staleMs: number): Promise<Loc
 	// Never reap a live owner by elapsed time: a long legitimate critical section must
 	// not have its lock stolen (#652). Reclaim a dead owner immediately. Only when owner
 	// liveness is indeterminate do we fall back to the staleMs elapsed-time heuristic.
-	if (ownerIsAlive(info)) return { stale: false };
+	if (ownerIsAlive(info, startTimeCache)) return { stale: false };
 	if (ownerLiveness(info.pid) === "dead" || Date.now() - info.timestamp > staleMs) {
 		return { stale: true, owner: info };
 	}
@@ -227,14 +245,14 @@ async function releaseLock(lockPath: string, owner: FileLockOwnerToken): Promise
 async function acquireLock(filePath: string, options: FileLockOptions = {}): Promise<() => Promise<void>> {
 	const opts = { ...DEFAULT_OPTIONS, ...options };
 	const lockPath = getLockPath(filePath);
-
+	const contentionStartTimes = new Map<string, string | null>();
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		const owner = await tryAcquireLock(lockPath);
 		if (owner) {
 			return () => releaseLock(lockPath, owner);
 		}
 
-		const stale = await staleLockSnapshot(lockPath, opts.staleMs);
+		const stale = await staleLockSnapshot(lockPath, opts.staleMs, contentionStartTimes);
 		if (await removeStaleLockForAcquire(lockPath, stale)) {
 			continue;
 		}
