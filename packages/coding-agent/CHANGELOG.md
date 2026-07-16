@@ -120,6 +120,9 @@
 ### Fixed
 - Published the Windows Bun workflow-gate durability fix that tolerates unsupported `EPERM` directory `fsync` failures after an already-committed atomic rename; the 0.11.0 package changelog described the fix, but the released artifact did not contain it (#2316).
 
+### Fixed
+- Decoupled the Telegram daemon's operational generation from its notification protocol version and bumped it to generation 4, so upgrades from v0.10.2 replace generation-3 owners through a durable provisional/ready/retired, owner-fenced readiness handoff instead of silently attaching. Discord and Slack now persist a separate process generation and replace physically live but incompatible owners; focused rolling-upgrade regressions and a narrow per-family lifecycle generation guard enforce the contract (#2278).
+
 ## [0.11.0] - 2026-07-15
 
 ### Fixed
