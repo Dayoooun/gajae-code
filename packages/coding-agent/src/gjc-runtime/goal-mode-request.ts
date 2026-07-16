@@ -191,7 +191,7 @@ export async function writeCurrentSessionGoalModeState(input: {
 	const entries = fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session");
 	if (fileEntries.length === 0) return { status: "unavailable", reason: "empty_session_file" };
 
-	const requestedProvenance = input.provenance ?? { source: "ultragoal", runId: "legacy", goalId: "aggregate" };
+	const requestedProvenance = input.provenance;
 	const context = buildSessionContext(entries);
 	const existingGoal = goalFromModeData(context.modeData);
 	if (
@@ -247,7 +247,7 @@ export async function consumePendingGoalModeRequest(
 	// (do not delete it) so its rightful owner can still pick it up. Legacy/unscoped
 	// requests (no sessionId) remain consumable by any session in this cwd.
 	const ownerSessionId = typeof candidate.sessionId === "string" ? candidate.sessionId.trim() : "";
-	if (ownerSessionId && ownerSessionId !== (currentSessionId?.trim() ?? "")) {
+	if (ownerSessionId && ownerSessionId !== session.gjcSessionId) {
 		return null;
 	}
 	await removeFileAudited(filePath, {

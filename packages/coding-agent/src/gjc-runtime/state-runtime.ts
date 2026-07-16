@@ -1098,11 +1098,20 @@ export async function reconcileWorkflowSkillState(options: {
 	payload: Record<string, unknown>;
 	sourceRevision?: number;
 }): Promise<{ stateFile: string }> {
-	const { cwd, mode, threadId, turnId, active, payload } = options;
-	const { gjcSessionId: sessionId } = resolveGjcSessionForWrite(cwd, {
+	const { gjcSessionId: sessionId } = resolveGjcSessionForWrite(options.cwd, {
 		payloadSessionId: options.sessionId,
 		envSessionId: process.env.GJC_SESSION_ID,
 	});
+	return withWorkflowStateLock(path.relative(options.cwd, activeStateFile(options.cwd, sessionId)), async () =>
+		reconcileWorkflowSkillStateUnlocked(options, sessionId),
+	);
+}
+
+async function reconcileWorkflowSkillStateUnlocked(
+	options: Parameters<typeof reconcileWorkflowSkillState>[0],
+	sessionId: string,
+): Promise<{ stateFile: string }> {
+	const { cwd, mode, threadId, turnId, active, payload } = options;
 	const filePath = modeStateFile(cwd, mode, sessionId);
 	const existingRead = await readExistingStateForMutation(filePath);
 	const existingPayload = existingRead.kind === "valid" ? existingRead.value : {};
@@ -1562,7 +1571,7 @@ async function handleClear(
  * the phase remains in `skill-active-state.json` until a chain call (or
  * explicit `clear`) demotes it.
  */
-async function handleHandoff(
+async function handleHandoffUnlocked(
 	args: readonly string[],
 	cwd: string,
 	positionalSkill: string | undefined,
@@ -1879,6 +1888,17 @@ async function handleHandoff(
 			},
 		}),
 	};
+}
+
+async function handleHandoff(
+	args: readonly string[],
+	cwd: string,
+	positionalSkill: string | undefined,
+): Promise<StateCommandResult> {
+	const selectors = await resolveSelectors(args, cwd, positionalSkill, "handoff");
+	return withWorkflowStateLock(path.relative(cwd, activeStateFile(cwd, selectors.gjcSessionId)), async () =>
+		handleHandoffUnlocked(args, cwd, positionalSkill),
+	);
 }
 
 async function handleContract(

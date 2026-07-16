@@ -598,27 +598,37 @@ function parseCliReplayRecord(
 	};
 }
 
-function validateCliReplayInvariants(invariants: JsonObject[], stdout: string, fieldName: string): void {
+function isMeaningfulCliReplayInvariant(invariant: JsonObject, stdout: string, fieldName: string): boolean {
+	const type = requiredStringField(invariant, "type", fieldName);
+	const value = requiredStringField(invariant, "value", fieldName);
+	if (type === "substring") return value.trim().length > 0 && stdout.includes(value);
+	if (type === "regex") {
+		const flags = invariant.flags === undefined ? "" : requiredStringField(invariant, "flags", fieldName);
+		if (!/^[im]*$/.test(flags)) throw new Error(`qualityGate ${fieldName}.flags may only contain i and m`);
+		const expression = new RegExp(value, flags);
+		return !expression.test("") && !expression.test("gjc-replay-random-nonce-7f3a9c") && expression.test(stdout);
+	}
+	if (type === "not_substring") return false;
+	throw new Error(`qualityGate ${fieldName}.type must be substring, regex, or not_substring`);
+}
+
+function validateCliReplayInvariants(invariants: JsonObject[], stdout: string, fieldName: string): boolean {
+	let meaningfulPositiveInvariant = false;
 	for (const [index, invariant] of invariants.entries()) {
 		const invariantField = `${fieldName}.invariants[${index}]`;
 		const type = requiredStringField(invariant, "type", invariantField);
 		const value = requiredStringField(invariant, "value", invariantField);
-		if (value === "") throw new Error(`qualityGate ${invariantField}.value must not be empty`);
-		if (type === "substring" && !stdout.includes(value))
-			throw new Error(`qualityGate ${invariantField} substring invariant did not match stdout`);
-		else if (type === "not_substring" && stdout.includes(value))
-			throw new Error(`qualityGate ${invariantField} not_substring invariant matched stdout`);
-		else if (type === "regex") {
-			const flags = invariant.flags === undefined ? "" : requiredStringField(invariant, "flags", invariantField);
-			if (!/^[im]*$/.test(flags)) throw new Error(`qualityGate ${invariantField}.flags may only contain i and m`);
-			if (value === ".*" || value === "^.*$")
-				throw new Error(`qualityGate ${invariantField} regex invariant must not match every stdout value`);
-			if (!new RegExp(value, flags).test(stdout))
-				throw new Error(`qualityGate ${invariantField} regex invariant did not match stdout`);
-		} else if (type !== "substring" && type !== "not_substring") {
-			throw new Error(`qualityGate ${invariantField}.type must be substring, regex, or not_substring`);
+		if (type === "not_substring") {
+			if (stdout.includes(value))
+				throw new Error(`qualityGate ${invariantField} not_substring invariant matched stdout`);
+			continue;
 		}
+		if (!isMeaningfulCliReplayInvariant(invariant, stdout, invariantField)) {
+			throw new Error(`qualityGate ${invariantField} must be a meaningful positive invariant that matches stdout`);
+		}
+		meaningfulPositiveInvariant = true;
 	}
+	return meaningfulPositiveInvariant;
 }
 
 async function collectCliReplayOutput(
@@ -762,10 +772,12 @@ export async function validateCliReplay(
 		}
 		const actualStdout = normalizeCliReplayOutput(stdout.text, cwd);
 		const recordedStdout = normalizeCliReplayOutput(replay.recordedStdout, cwd);
-		if (replay.invariants.length > 0) {
-			validateCliReplayInvariants(replay.invariants, actualStdout, fieldName);
-		} else if (actualStdout !== recordedStdout) {
-			throw new Error(`qualityGate ${fieldName} CLI replay stdout did not match recordedStdout after normalization`);
+		if (!replay.invariants.length || !validateCliReplayInvariants(replay.invariants, actualStdout, fieldName)) {
+			if (actualStdout !== recordedStdout) {
+				throw new Error(
+					`qualityGate ${fieldName} CLI replay stdout did not match recordedStdout after normalization`,
+				);
+			}
 		}
 		return true;
 	} catch (error) {
