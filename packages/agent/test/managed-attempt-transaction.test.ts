@@ -1,8 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import type { ManagedAttemptOutcome } from "@gajae-code/agent-core";
 import { Agent } from "@gajae-code/agent-core";
-import { sanitizedDetachedClone } from "@gajae-code/agent-core/agent-loop";
-import type { AssistantMessage } from "@gajae-code/ai";
+import { agentLoopContinue, sanitizedDetachedClone } from "@gajae-code/agent-core/agent-loop";
+import type { AgentContext, AgentEvent, AgentLoopConfig } from "@gajae-code/agent-core/types";
+import type { AssistantMessage, Message } from "@gajae-code/ai";
+
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 
@@ -54,6 +56,80 @@ describe("managed attempt transaction", () => {
 		expect(assistantBatch.slice(-3)).toEqual(["message_end", "turn_end", "agent_end"]);
 		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(1);
 		expectManagedRunStart(events);
+	});
+
+	it("commits a detached accepted message when a managed partial is not structured-cloneable", async () => {
+		const mock = createMockModel();
+		let liveMessage: AssistantMessage | undefined;
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			void (async () => {
+				const partial = assistantMessage(mock.model);
+				liveMessage = partial;
+				(partial as unknown as Record<string, unknown>).probe = () => {};
+				stream.push({ type: "start", partial });
+				await Bun.sleep(0);
+				partial.content.push({ type: "text", text: "accepted" });
+				stream.push({ type: "text_start", contentIndex: 0, partial });
+				await Bun.sleep(0);
+				stream.push({ type: "done", reason: "stop", message: partial });
+			})();
+			return stream;
+		};
+		const context: AgentContext = {
+			systemPrompt: ["test"],
+			messages: [{ role: "user", content: "run", timestamp: Date.now() }],
+			tools: [],
+		};
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: messages =>
+				messages.filter(
+					message => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+				) as Message[],
+			fallbackManaged: true,
+		};
+		const stream = agentLoopContinue(context, config, undefined, streamFn);
+		const events: AgentEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+		const messageUpdate = events.find(
+			(event): event is Extract<AgentEvent, { type: "message_update" }> => event.type === "message_update",
+		);
+		const messageEnd = events.find(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+		const turnEnd = events.find(
+			(event): event is Extract<AgentEvent, { type: "turn_end" }> => event.type === "turn_end",
+		);
+		const agentEnd = events.find(
+			(event): event is Extract<AgentEvent, { type: "agent_end" }> => event.type === "agent_end",
+		);
+		const committed = context.messages.at(-1) as AssistantMessage;
+
+		expect(messageUpdate).toBeDefined();
+		expect(messageEnd).toBeDefined();
+		expect(turnEnd).toBeDefined();
+		expect(agentEnd).toBeDefined();
+		expect(result).toHaveLength(1);
+		const accepted = turnEnd!.message;
+		expect(accepted).toBe(committed);
+		expect(agentEnd!.messages[0]).toBe(accepted);
+		expect(result[0]).toBe(accepted);
+		expect(messageUpdate!.message).toEqual(accepted);
+		expect(messageEnd!.message).toEqual(accepted);
+		for (const message of [messageUpdate!.message, messageEnd!.message, accepted, agentEnd!.messages[0], result[0]]) {
+			expect(() => structuredClone(message)).not.toThrow();
+			expect(() => JSON.stringify(message)).not.toThrow();
+			expect(message).toMatchObject({ role: "assistant", content: [{ type: "text", text: "accepted" }] });
+		}
+
+		(liveMessage!.content[0] as { type: "text"; text: string }).text = "mutated after commit";
+		(liveMessage as unknown as Record<string, unknown>).probe = () => "mutated";
+		for (const message of [messageUpdate!.message, messageEnd!.message, accepted, agentEnd!.messages[0], result[0]]) {
+			expect((message as AssistantMessage).content[0]).toEqual({ type: "text", text: "accepted" });
+		}
 	});
 
 	it("replays mutating provider partials as event-time snapshots with callbacks first", async () => {
@@ -159,7 +235,9 @@ describe("managed attempt transaction", () => {
 	it("discards retryable managed failures before any assistant lifecycle escapes", async () => {
 		const mock = createMockModel();
 		const streamFn = async () => {
-			throw Object.assign(new Error("rate limit exceeded"), { status: 429 });
+			throw Object.assign(new Error("rate limit exceeded"), {
+				transportFailure: { kind: "transport", status: 429 },
+			});
 		};
 		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
@@ -194,6 +272,36 @@ describe("managed attempt transaction", () => {
 		expect(events).not.toContain("turn_end");
 		expect(events).not.toContain("agent_end");
 		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(0);
+	});
+
+	it("does not authorize managed fallback from raw status or hostile transport wrappers", async () => {
+		const mock = createMockModel();
+		const localFailure = Object.assign(new Error("local status only"), { status: 429 });
+		Object.defineProperty(localFailure, "transportFailure", {
+			get() {
+				throw new Error("hostile transport getter");
+			},
+		});
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: async () => {
+				throw localFailure;
+			},
+		});
+		let outcomeCalls = 0;
+
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: () => {
+				outcomeCalls += 1;
+				return { type: "retry", continuation: () => {} };
+			},
+		} as any);
+		await agent.waitForIdle();
+
+		expect(outcomeCalls).toBe(0);
+		expect(agent.state.error).toContain("local status only");
+		expect(agent.state.messages.find(message => message.role === "assistant")).toBeDefined();
 	});
 
 	it("stages a non-cloneable provider failure without masking it as a DataCloneError", async () => {
@@ -693,7 +801,10 @@ describe("managed attempt transaction", () => {
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
 			streamFn: (...args) => {
 				calls += 1;
-				if (calls === 2) throw Object.assign(new Error("limited"), { status: 429 });
+				if (calls === 2)
+					throw Object.assign(new Error("limited"), {
+						transportFailure: { kind: "transport", status: 429 },
+					});
 				return mock.stream(...args);
 			},
 		});
@@ -1002,7 +1113,9 @@ it("emits an exhaustion diagnostic lifecycle once before terminal completion", a
 	const agent = new Agent({
 		initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
 		streamFn: async () => {
-			throw Object.assign(new Error("overloaded"), { status: 503 });
+			throw Object.assign(new Error("overloaded"), {
+				transportFailure: { kind: "transport", status: 503 },
+			});
 		},
 	});
 	const events: string[] = [];

@@ -110,13 +110,19 @@ function isEmptyResponseOverflow(message: AssistantMessage): boolean {
 	return isContextOverflow(message);
 }
 
-/** Managed fallback owns retry policy; only typed transport facts may discard an attempt. */
-function managedTransportFailure(failure: unknown) {
-	if (failure && typeof failure === "object" && "transportFailure" in failure) {
-		const facts = (failure as { transportFailure?: unknown }).transportFailure;
-		if (facts && typeof facts === "object") return transportFailureFacts(facts);
+/** Managed fallback owns retry policy; only attached typed transport facts may discard an attempt. */
+function managedProperty(value: unknown, key: string): unknown {
+	if (!value || typeof value !== "object") return undefined;
+	try {
+		return Reflect.get(value, key);
+	} catch {
+		return undefined;
 	}
-	return transportFailureFacts(failure);
+}
+
+function managedTransportFailure(failure: unknown) {
+	const facts = managedProperty(failure, "transportFailure");
+	return facts && typeof facts === "object" ? transportFailureFacts(facts) : undefined;
 }
 
 function managedRetryableFailure(failure: unknown): boolean {
@@ -172,15 +178,17 @@ function managedFailureOutcome(message: AssistantMessage): ManagedAttemptOutcome
 }
 
 function managedFailureMessage(error: unknown, config: AgentLoopConfig): AssistantMessage {
-	const details = error as { message?: unknown; errorStatus?: unknown; status?: unknown };
-	const status =
-		typeof details.errorStatus === "number"
-			? details.errorStatus
-			: typeof details.status === "number"
-				? details.status
-				: undefined;
-	const transportFailure =
-		managedTransportFailure(error) ?? (status === undefined ? undefined : { kind: "transport" as const, status });
+	const errorMessage = managedProperty(error, "message");
+	const transportFailure = managedTransportFailure(error);
+	let fallbackMessage = "Managed fallback attempt failed";
+	if (typeof errorMessage === "string") fallbackMessage = errorMessage;
+	else {
+		try {
+			fallbackMessage = String(error);
+		} catch {
+			// Keep the stable local message for hostile wrappers.
+		}
+	}
 	return {
 		role: "assistant",
 		content: [],
@@ -196,8 +204,7 @@ function managedFailureMessage(error: unknown, config: AgentLoopConfig): Assista
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason: "error",
-		errorMessage: typeof details.message === "string" ? details.message : String(error),
-		errorStatus: status,
+		errorMessage: fallbackMessage,
 		...(transportFailure ? { transportFailure } : {}),
 		timestamp: Date.now(),
 	};
@@ -1221,6 +1228,7 @@ async function runLoopBody(
 					continue;
 				}
 			}
+
 			newMessages.push(message);
 			modelHasResponded = true;
 			let steeringMessagesFromExecution: AgentMessage[] | undefined;
@@ -1254,6 +1262,14 @@ async function runLoopBody(
 				await config.onManagedAttemptOutcome?.({ type: "run_terminal", reason: "cancelled" });
 				stream.end(newMessages);
 				return;
+			}
+			if (attemptTransaction) {
+				message = managedAttemptSnapshot(message);
+				const index = currentContext.messages.length - 1;
+				if (index >= 0 && currentContext.messages[index]?.role === "assistant") {
+					currentContext.messages[index] = message;
+				}
+				newMessages[newMessages.length - 1] = message;
 			}
 
 			// One provider invocation is committed before any tool can run.

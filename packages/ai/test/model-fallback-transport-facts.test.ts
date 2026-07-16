@@ -136,32 +136,90 @@ describe("fallback transport facts", () => {
 		expect(transportFailureFacts(headerOnly)).toEqual(headerOnly!);
 	});
 
-	it("survives hostile header objects: single enumeration, headers omitted on failure", () => {
-		// Record getters are read at most once (single enumeration).
-		const hostile: Record<string, string> = {};
+	it("survives hostile outer wrappers without masking provider facts", () => {
+		for (const property of ["status", "response", "providerCode", "code", "error", "type", "headers"]) {
+			const hostile: Record<string, unknown> = {
+				status: 429,
+				code: "rate_limit_error",
+				headers: { "retry-after": "2" },
+			};
+			Object.defineProperty(hostile, property, {
+				configurable: true,
+				get() {
+					throw new Error(`${property} accessor failed`);
+				},
+			});
+			expect(() => transportFailureFacts(hostile)).not.toThrow();
+			const trigger = classifyFallbackTrigger(transportFailureFacts(hostile));
+			expect(trigger.class).toBe("rate_limit");
+			expect(trigger.retryAfterMs).toBe(property === "headers" ? undefined : 2000);
+		}
+
+		const liveProxy = new Proxy(
+			{ status: 429, code: "rate_limit_error", headers: { "retry-after": "2" } },
+			{
+				get(target, property, receiver) {
+					if (property === "headers") throw new Error("headers trap failed");
+					return Reflect.get(target, property, receiver);
+				},
+			},
+		);
+		expect(transportFailureFacts(liveProxy)).toMatchObject({
+			kind: "transport",
+			status: 429,
+			providerCode: "rate_limit_error",
+		});
+
+		const { proxy, revoke } = Proxy.revocable({}, {});
+		revoke();
+		expect(() => transportFailureFacts(proxy, { status: 503 })).not.toThrow();
+		expect(transportFailureFacts(proxy, { status: 503 })).toMatchObject({ kind: "transport", status: 503 });
+	});
+
+	it("omits unsafe header values while retaining finite transport facts", () => {
+		const accessorHeaders: Record<string, string> = {};
 		let reads = 0;
-		Object.defineProperty(hostile, "retry-after", {
+		Object.defineProperty(accessorHeaders, "retry-after", {
 			enumerable: true,
 			get() {
 				reads += 1;
-				if (reads > 1) throw new Error("boom");
-				return "2";
+				throw new Error("getter must not be read");
 			},
 		});
-		expect(transportFailureFacts({ status: 429, headers: hostile })?.headers).toEqual({ "retry-after": "2" });
-		expect(reads).toBe(1);
+		const accessorFacts = transportFailureFacts({ status: 429, headers: accessorHeaders });
+		expect(accessorFacts).toMatchObject({ kind: "transport", status: 429 });
+		expect(accessorFacts?.headers).toBeUndefined();
+		expect(reads).toBe(0);
 
-		// An always-throwing getter omits headers but preserves status facts.
-		const alwaysThrow: Record<string, string> = {};
-		Object.defineProperty(alwaysThrow, "retry-after", {
-			enumerable: true,
-			get() {
-				throw new Error("boom");
+		const throwingHeaders = new Headers();
+		Object.defineProperty(throwingHeaders, "get", {
+			value: () => {
+				throw new Error("get failed");
 			},
 		});
-		const survived = transportFailureFacts({ status: 429, headers: alwaysThrow });
-		expect(survived).toMatchObject({ kind: "transport", status: 429 });
-		expect(survived?.headers).toBeUndefined();
+		const throwingFacts = transportFailureFacts({ status: 503, code: "rate_limit_error", headers: throwingHeaders });
+		expect(throwingFacts).toMatchObject({ kind: "transport", status: 503, providerCode: "rate_limit_error" });
+		expect(throwingFacts?.headers).toBeUndefined();
+
+		const nonStringHeaders = new Headers();
+		Object.defineProperty(nonStringHeaders, "get", { value: () => new String("2") });
+		const nonStringFacts = transportFailureFacts({ status: 429, headers: nonStringHeaders });
+		expect(nonStringFacts).toMatchObject({ kind: "transport", status: 429 });
+		expect(nonStringFacts?.headers).toBeUndefined();
+	});
+
+	it("round-trips normalized facts through JSON and structuredClone without changing classification", () => {
+		const facts = transportFailureFacts({
+			status: 429,
+			code: "insufficient_quota",
+			headers: new Headers({ "retry-after-ms": "125", "x-request-id": "secret" }),
+		});
+		const jsonRoundTrip = JSON.parse(JSON.stringify(facts));
+		const cloneRoundTrip = structuredClone(facts);
+		expect(jsonRoundTrip).toEqual(facts);
+		expect(cloneRoundTrip).toEqual(facts);
+		expect(classifyFallbackTrigger(jsonRoundTrip)).toEqual({ class: "quota", retryAfterMs: 125 });
+		expect(classifyFallbackTrigger(cloneRoundTrip)).toEqual({ class: "quota", retryAfterMs: 125 });
 	});
 
 	it("does not attach transport facts to non-transport provider errors", () => {

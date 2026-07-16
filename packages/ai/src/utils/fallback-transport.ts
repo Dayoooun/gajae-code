@@ -71,7 +71,28 @@ export interface FallbackTriggerInput {
 }
 
 function isTransportHeaders(value: unknown): value is TransportHeaders {
-	return value instanceof Headers || (!!value && typeof value === "object");
+	try {
+		return value instanceof Headers || (!!value && typeof value === "object");
+	} catch {
+		return false;
+	}
+}
+
+function propertyOf(value: unknown, name: string): unknown {
+	if (!value || typeof value !== "object") return undefined;
+	try {
+		return Reflect.get(value, name);
+	} catch {
+		return undefined;
+	}
+}
+
+function finiteStatus(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+	return typeof value === "string" ? value : undefined;
 }
 
 /** Retry-signal headers retained on transport facts; everything else is dropped. */
@@ -84,10 +105,10 @@ const RETAINED_TRANSPORT_HEADER_SET: ReadonlySet<string> = new Set(RETAINED_TRAN
  * record, so facts stay structured-cloneable and JSON-serializable and never
  * persist arbitrary response headers into session files.
  *
- * Exception-safe by contract: header inspection runs in a single enumeration
- * inside a catch (record getters are read at most once), and any failure
- * omits headers instead of throwing — status/providerCode facts extracted by
- * the caller must survive a hostile headers object.
+ * Exception-safe by contract: inspection uses only `Headers.get()` results
+ * that are primitive strings or own data-descriptor record entries. Any
+ * failure omits headers instead of throwing — status/providerCode facts
+ * extracted by the caller must survive a hostile headers object.
  */
 function retainedHeaderRecord(headers: TransportHeaders | undefined): Record<string, string> | undefined {
 	if (headers === undefined) return undefined;
@@ -96,18 +117,19 @@ function retainedHeaderRecord(headers: TransportHeaders | undefined): Record<str
 		if (headers instanceof Headers) {
 			for (const name of RETAINED_TRANSPORT_HEADERS) {
 				const value = headers.get(name);
-				if (value === null) continue;
+				if (typeof value !== "string") continue;
 				record ??= {};
 				record[name] = value;
 			}
 			return record;
 		}
-		for (const [key, value] of Object.entries(headers)) {
-			if (typeof value !== "string") continue;
+		for (const key of Object.keys(headers)) {
+			const descriptor = Object.getOwnPropertyDescriptor(headers, key);
+			if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "string") continue;
 			const name = key.toLowerCase();
 			if (!RETAINED_TRANSPORT_HEADER_SET.has(name)) continue;
 			record ??= {};
-			record[name] = value;
+			record[name] = descriptor.value;
 		}
 		return record;
 	} catch {
@@ -122,29 +144,28 @@ export function transportFailureFacts(
 ): TransportFailureFacts | undefined {
 	if (!error || typeof error !== "object") return undefined;
 	const value = error as FallbackTriggerInput & { kind?: unknown; type?: unknown };
+	const response = propertyOf(value, "response");
+	const nestedError = propertyOf(value, "error");
 	const status =
-		typeof value.status === "number"
-			? value.status
-			: typeof value.response?.status === "number"
-				? value.response.status
-				: capturedResponse?.status;
+		finiteStatus(propertyOf(value, "status")) ??
+		finiteStatus(propertyOf(response, "status")) ??
+		finiteStatus(propertyOf(capturedResponse, "status"));
 	const providerCode =
-		typeof value.providerCode === "string"
-			? value.providerCode
-			: typeof value.code === "string"
-				? value.code
-				: typeof value.error?.code === "string"
-					? value.error.code
-					: typeof value.type === "string"
-						? value.type
-						: typeof value.error?.type === "string"
-							? value.error.type
-							: undefined;
-	const rawHeaders = isTransportHeaders(value.headers)
-		? value.headers
-		: isTransportHeaders(value.response?.headers)
-			? value.response.headers
-			: capturedResponse?.headers;
+		stringValue(propertyOf(value, "providerCode")) ??
+		stringValue(propertyOf(value, "code")) ??
+		stringValue(propertyOf(nestedError, "code")) ??
+		stringValue(propertyOf(value, "type")) ??
+		stringValue(propertyOf(nestedError, "type"));
+	const errorHeaders = propertyOf(value, "headers");
+	const responseHeaders = propertyOf(response, "headers");
+	const capturedHeaders = propertyOf(capturedResponse, "headers");
+	const rawHeaders = isTransportHeaders(errorHeaders)
+		? errorHeaders
+		: isTransportHeaders(responseHeaders)
+			? responseHeaders
+			: isTransportHeaders(capturedHeaders)
+				? capturedHeaders
+				: undefined;
 	// Normalize BEFORE the existence gate so normalization is idempotent:
 	// facts built from an error whose headers carry no retained retry signal
 	// must not exist on the first pass and then vanish when re-normalized
