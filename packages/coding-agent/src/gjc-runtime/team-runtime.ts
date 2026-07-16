@@ -15,7 +15,6 @@ import {
 	appendJsonl as appendJsonlAudited,
 	appendText,
 	createJsonNoClobber,
-	deleteIfOwned,
 	removeFileAudited,
 	writeJsonAtomic,
 	writeReport,
@@ -23,10 +22,24 @@ import {
 } from "./state-writer";
 import { deliverTeamMailboxMessage } from "./team-notify";
 import type {
+	GjcTeamApiClaimResult,
 	GjcTeamMailboxDeliveryTransport,
 	GjcTeamNotification,
 	GjcTeamNotificationDeliveryState,
 	GjcTeamPaneAttemptResult,
+	GjcTeamTask,
+	GjcTeamTaskClaim,
+	GjcTeamTaskMetadataInput,
+	GjcTeamTaskStatus,
+} from "./team-store";
+import {
+	GjcTeamTaskStore,
+	getGjcTeamTaskCompletionEvidenceFailure,
+	isGjcTeamTaskCompletionVerified,
+	normalizeGjcTeamTask as normalizeTask,
+	readGjcTeamTasksFromDir as readTasks,
+	taskMetadataFromInput,
+	writeGjcTeamTaskToDir as writeTask,
 } from "./team-store";
 import {
 	buildGjcTmuxExactOptionTarget,
@@ -39,6 +52,7 @@ import {
 } from "./tmux-common";
 
 export type {
+	GjcTeamApiClaimResult,
 	GjcTeamMailboxDeliveryInput,
 	GjcTeamMailboxDeliveryResult,
 	GjcTeamMailboxDeliveryTransport,
@@ -46,20 +60,11 @@ export type {
 	GjcTeamNotification,
 	GjcTeamNotificationDeliveryState,
 	GjcTeamPaneAttemptResult,
+	GjcTeamTask,
+	GjcTeamTaskClaim,
+	GjcTeamTaskMetadataInput,
+	GjcTeamTaskStatus,
 } from "./team-store";
-
-export type GjcTeamPhase = "starting" | "running" | "awaiting_integration" | "complete" | "failed" | "cancelled";
-export type GjcTeamTaskStatus = "pending" | "blocked" | "in_progress" | "completed" | "failed";
-export type GjcWorkerStatusState = "idle" | "working" | "blocked" | "done" | "failed" | "draining" | "unknown";
-export type GjcTeamWorkerLifecycleState =
-	| "starting"
-	| "ready"
-	| "working"
-	| "draining"
-	| "stopped"
-	| "failed"
-	| "unknown";
-export type GjcTeamShutdownMode = "graceful" | "force" | "abort";
 
 export const GJC_TEAM_DEFAULT_WORKERS = 3;
 export const GJC_TEAM_MAX_WORKERS = 20;
@@ -93,58 +98,7 @@ export interface GjcTeamWorker {
 	worktree_base_ref?: string;
 	team_state_root?: string;
 }
-
-export interface GjcTeamTaskClaim {
-	owner: string;
-	token: string;
-	leased_until: string;
-}
-export type GjcTeamTaskCompletionEvidenceKind = "command" | "inspection" | "artifact";
-export type GjcTeamTaskCompletionEvidenceStatus = "passed" | "failed" | "not_run" | "verified" | "rejected";
-
-export interface GjcTeamTaskCompletionEvidenceItem {
-	kind: GjcTeamTaskCompletionEvidenceKind;
-	status: GjcTeamTaskCompletionEvidenceStatus;
-	summary: string;
-	command?: string;
-	artifact?: string;
-	location?: string;
-	output?: string;
-}
-
-export interface GjcTeamTaskCompletionEvidence {
-	summary: string;
-	items: GjcTeamTaskCompletionEvidenceItem[];
-	files?: string[];
-	notes?: string;
-	recorded_by: string;
-	recorded_at: string;
-}
-
-export interface GjcTeamTask {
-	id: string;
-	subject: string;
-	description: string;
-	title: string;
-	objective: string;
-	status: GjcTeamTaskStatus;
-	assignee?: string;
-	owner?: string;
-	result?: string;
-	completion_evidence?: GjcTeamTaskCompletionEvidence;
-	error?: string;
-	blocked_by?: string[];
-	depends_on?: string[];
-	lane?: string;
-	required_role?: string;
-	allowed_roles?: string[];
-	version: number;
-	claim?: GjcTeamTaskClaim;
-	created_at: string;
-	updated_at: string;
-	completed_at?: string;
-}
-
+export type GjcTeamPhase = "starting" | "running" | "awaiting_integration" | "complete" | "failed" | "cancelled";
 export type GjcTeamWorktreeMode =
 	| { enabled: false }
 	| { enabled: true; detached: true; name: null }
@@ -254,13 +208,6 @@ export interface GjcTeamStartOptions {
 	mailboxDeliveryTransport?: GjcTeamMailboxDeliveryTransport;
 }
 
-export interface GjcTeamApiClaimResult {
-	ok: boolean;
-	task?: GjcTeamTask;
-	worker_id?: string;
-	claim_token?: string;
-	reason?: string;
-}
 export type GjcTeamLivenessRecoveryReason =
 	| "claim_expired"
 	| "stale_heartbeat"
@@ -604,9 +551,6 @@ function powershellQuote(value: string): string {
 function safePathSegment(kind: string, value: string): string {
 	assertSafeId(kind, value);
 	return value;
-}
-function taskPath(dir: string, taskId: string): string {
-	return path.join(dir, "tasks", `${safePathSegment("task_id", taskId)}.json`);
 }
 function mailboxPath(dir: string, worker: string): string {
 	return path.join(dir, "mailbox", `${safePathSegment("worker_id", worker)}.json`);
@@ -1250,6 +1194,9 @@ function isPastTimestamp(value: string | undefined): boolean {
 	return Number.isFinite(timestamp) && timestamp <= Date.now();
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value != null;
+}
 function readClaimRecord(value: unknown): GjcTeamTaskClaim | undefined {
 	if (!isRecord(value)) return undefined;
 	const owner = typeof value.owner === "string" ? value.owner : "";
@@ -1365,56 +1312,6 @@ export async function recoverGjcTeamStaleClaims(
 	const config = await readConfig(dir);
 	return reconcileGjcTeamStaleClaims(teamName, dir, config, env);
 }
-function normalizeOptionalTaskString(value: unknown): string | undefined {
-	if (typeof value !== "string") return undefined;
-	const trimmed = value.trim();
-	return trimmed || undefined;
-}
-
-function normalizeOptionalTaskStringArray(value: unknown): string[] | undefined {
-	if (!Array.isArray(value)) return undefined;
-	const items = Array.from(
-		new Set(value.map(item => (typeof item === "string" ? item.trim() : "")).filter(item => item.length > 0)),
-	).sort();
-	return items.length > 0 ? items : undefined;
-}
-type GjcTeamTaskMetadataInput = Partial<
-	Pick<GjcTeamTask, "owner" | "lane" | "required_role" | "allowed_roles" | "depends_on" | "blocked_by">
->;
-
-function taskMetadataFromInput(input: Record<string, unknown>, includeOwner = false): GjcTeamTaskMetadataInput {
-	const metadata: GjcTeamTaskMetadataInput = {};
-	const owner = normalizeOptionalTaskString(input.owner);
-	const lane = normalizeOptionalTaskString(input.lane);
-	const requiredRole = normalizeOptionalTaskString(input.required_role ?? input.requiredRole);
-	const allowedRoles = normalizeOptionalTaskStringArray(input.allowed_roles ?? input.allowedRoles);
-	const dependsOn = normalizeOptionalTaskStringArray(input.depends_on ?? input.dependsOn);
-	const blockedBy = normalizeOptionalTaskStringArray(input.blocked_by ?? input.blockedBy);
-	if (includeOwner && owner) metadata.owner = owner;
-	if (lane) metadata.lane = lane;
-	if (requiredRole) metadata.required_role = requiredRole;
-	if (allowedRoles) metadata.allowed_roles = allowedRoles;
-	if (dependsOn) metadata.depends_on = dependsOn;
-	if (blockedBy) metadata.blocked_by = blockedBy;
-	return metadata;
-}
-
-function normalizeTask(raw: GjcTeamTask): GjcTeamTask {
-	const status = raw.status === ("complete" as GjcTeamTaskStatus) ? "completed" : raw.status;
-	return {
-		...raw,
-		status,
-		subject: raw.subject ?? raw.title,
-		description: raw.description ?? raw.objective,
-		title: raw.title ?? raw.subject,
-		objective: raw.objective ?? raw.description,
-		version: raw.version ?? 1,
-		lane: normalizeOptionalTaskString(raw.lane),
-		required_role: normalizeOptionalTaskString(raw.required_role),
-		allowed_roles: normalizeOptionalTaskStringArray(raw.allowed_roles),
-	};
-}
-
 const GJC_TEAM_INTEGRATION_ATTENTION_STATUSES = new Set<GjcTeamIntegrationStatus>([
 	"integration_failed",
 	"merge_conflict",
@@ -1457,218 +1354,6 @@ async function resolveGjcTeamSnapshotPhase(
 	if (storedPhase !== "running") return storedPhase;
 	if (tasks.length === 0 || !tasks.every(isGjcTeamTaskCompletionVerified)) return storedPhase;
 	return (await hasPendingGjcTeamIntegration(dir, config, monitor)) ? "awaiting_integration" : storedPhase;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value != null;
-}
-const GJC_TEAM_COMPLETION_EVIDENCE_SUMMARY_MAX = 4_000;
-const GJC_TEAM_COMPLETION_EVIDENCE_OUTPUT_MAX = 8_000;
-const GJC_TEAM_COMMAND_EVIDENCE_STATUSES = new Set<GjcTeamTaskCompletionEvidenceStatus>([
-	"passed",
-	"failed",
-	"not_run",
-]);
-const GJC_TEAM_VERIFICATION_EVIDENCE_STATUSES = new Set<GjcTeamTaskCompletionEvidenceStatus>(["verified", "rejected"]);
-
-function completionEvidenceError(taskId: string, field: string): Error {
-	return new Error(`invalid_completion_evidence:${taskId}:${field}`);
-}
-
-function trimRequiredCompletionEvidenceString(
-	taskId: string,
-	field: string,
-	value: unknown,
-	maxLength = GJC_TEAM_COMPLETION_EVIDENCE_SUMMARY_MAX,
-): string {
-	if (typeof value !== "string") throw completionEvidenceError(taskId, field);
-	const trimmed = value.trim();
-	if (!trimmed || trimmed.length > maxLength) throw completionEvidenceError(taskId, field);
-	return trimmed;
-}
-
-function trimOptionalCompletionEvidenceString(
-	taskId: string,
-	field: string,
-	value: unknown,
-	maxLength = GJC_TEAM_COMPLETION_EVIDENCE_OUTPUT_MAX,
-): string | undefined {
-	if (value == null) return undefined;
-	if (typeof value !== "string") throw completionEvidenceError(taskId, field);
-	const trimmed = value.trim();
-	if (!trimmed) return undefined;
-	if (trimmed.length > maxLength) throw completionEvidenceError(taskId, field);
-	return trimmed;
-}
-
-function normalizeGjcTeamCompletionEvidenceStatus(
-	taskId: string,
-	kind: GjcTeamTaskCompletionEvidenceKind,
-	value: unknown,
-): GjcTeamTaskCompletionEvidenceStatus {
-	const status = trimRequiredCompletionEvidenceString(taskId, "items.status", value);
-	const allowed = kind === "command" ? GJC_TEAM_COMMAND_EVIDENCE_STATUSES : GJC_TEAM_VERIFICATION_EVIDENCE_STATUSES;
-	if (!allowed.has(status as GjcTeamTaskCompletionEvidenceStatus))
-		throw completionEvidenceError(taskId, "items.status");
-	return status as GjcTeamTaskCompletionEvidenceStatus;
-}
-
-function normalizeGjcTeamCompletionEvidenceItem(taskId: string, value: unknown): GjcTeamTaskCompletionEvidenceItem {
-	if (!isRecord(value) || Array.isArray(value)) throw completionEvidenceError(taskId, "items");
-	const kind = trimRequiredCompletionEvidenceString(taskId, "items.kind", value.kind);
-	if (kind !== "command" && kind !== "inspection" && kind !== "artifact")
-		throw completionEvidenceError(taskId, "items.kind");
-	const status = normalizeGjcTeamCompletionEvidenceStatus(taskId, kind, value.status);
-	const item: GjcTeamTaskCompletionEvidenceItem = {
-		kind,
-		status,
-		summary: trimRequiredCompletionEvidenceString(taskId, "items.summary", value.summary),
-	};
-	const command = trimOptionalCompletionEvidenceString(taskId, "items.command", value.command);
-	const artifact = trimOptionalCompletionEvidenceString(taskId, "items.artifact", value.artifact);
-	const location = trimOptionalCompletionEvidenceString(taskId, "items.location", value.location);
-	const output = trimOptionalCompletionEvidenceString(taskId, "items.output", value.output);
-	if (kind === "command" && !command) throw completionEvidenceError(taskId, "items.command");
-	if (command) item.command = command;
-	if (artifact) item.artifact = artifact;
-	if (location) item.location = location;
-	if (output) item.output = output;
-	return item;
-}
-
-function normalizeGjcTeamCompletionEvidenceFiles(taskId: string, value: unknown): string[] | undefined {
-	if (value == null) return undefined;
-	if (!Array.isArray(value)) throw completionEvidenceError(taskId, "files");
-	const files = new Set<string>();
-	for (const entry of value) {
-		if (typeof entry !== "string") throw completionEvidenceError(taskId, "files");
-		const filePath = entry.trim().replace(/\\/g, "/");
-		if (!filePath || filePath.includes("\0") || path.isAbsolute(filePath) || filePath.split("/").includes("..")) {
-			throw completionEvidenceError(taskId, "files");
-		}
-		files.add(filePath);
-	}
-	return files.size > 0 ? [...files].sort() : undefined;
-}
-
-function isGjcTeamCompletionEvidenceItemVerified(item: GjcTeamTaskCompletionEvidenceItem): boolean {
-	return (
-		(item.kind === "command" && item.status === "passed") ||
-		((item.kind === "inspection" || item.kind === "artifact") && item.status === "verified")
-	);
-}
-
-function normalizeGjcTeamTaskCompletionEvidence(
-	taskId: string,
-	owner: string,
-	input: unknown,
-	recordedAt = now(),
-): GjcTeamTaskCompletionEvidence {
-	if (!isRecord(input) || Array.isArray(input)) throw new Error(`completion_evidence_required:${taskId}`);
-	const itemsValue = input.items;
-	if (!Array.isArray(itemsValue) || itemsValue.length === 0) throw completionEvidenceError(taskId, "items");
-	const items = itemsValue.map(item => normalizeGjcTeamCompletionEvidenceItem(taskId, item));
-	if (!items.some(isGjcTeamCompletionEvidenceItemVerified))
-		throw new Error(`completion_evidence_no_verified_item:${taskId}`);
-	const evidence: GjcTeamTaskCompletionEvidence = {
-		summary: trimRequiredCompletionEvidenceString(taskId, "summary", input.summary),
-		items,
-		recorded_by: owner,
-		recorded_at: recordedAt,
-	};
-	const files = normalizeGjcTeamCompletionEvidenceFiles(taskId, input.files);
-	const notes = trimOptionalCompletionEvidenceString(taskId, "notes", input.notes);
-	if (files) evidence.files = files;
-	if (notes) evidence.notes = notes;
-	return evidence;
-}
-
-function getGjcTeamTaskCompletionEvidenceFailure(task: GjcTeamTask): string | null {
-	if (task.status !== "completed") return `task_not_completed:${task.id}`;
-	const evidence = task.completion_evidence;
-	if (!isRecord(evidence) || Array.isArray(evidence)) return `completion_evidence_required:${task.id}`;
-	if (typeof evidence.recorded_by !== "string" || evidence.recorded_by.trim().length === 0)
-		return `invalid_completion_evidence:${task.id}:recorded_by`;
-	if (typeof evidence.recorded_at !== "string" || evidence.recorded_at.trim().length === 0)
-		return `invalid_completion_evidence:${task.id}:recorded_at`;
-	try {
-		normalizeGjcTeamTaskCompletionEvidence(task.id, evidence.recorded_by.trim(), evidence, evidence.recorded_at);
-		return null;
-	} catch (error) {
-		return error instanceof Error ? error.message : `invalid_completion_evidence:${task.id}:unknown`;
-	}
-}
-
-function isGjcTeamTaskCompletionVerified(task: GjcTeamTask): boolean {
-	return getGjcTeamTaskCompletionEvidenceFailure(task) == null;
-}
-function roleValuesForWorker(worker: GjcTeamWorker): Set<string> {
-	return new Set([worker.role, worker.agent_type].map(value => value.trim()).filter(value => value.length > 0));
-}
-
-function getGjcTeamTaskClaimEligibilityReason(
-	task: GjcTeamTask,
-	worker: GjcTeamWorker,
-	tasks: GjcTeamTask[],
-): string | null {
-	if (task.status !== "pending") return `task_not_pending:${task.id}`;
-	if (task.owner && task.owner !== worker.id) return `task_owner_mismatch:${task.id}:${task.owner}`;
-	if (task.assignee && task.assignee !== worker.id) return `task_assignee_mismatch:${task.id}:${task.assignee}`;
-
-	const workerRoles = roleValuesForWorker(worker);
-	if (task.required_role && !workerRoles.has(task.required_role))
-		return `task_role_mismatch:${task.id}:${task.required_role}`;
-	if (task.allowed_roles?.length && !task.allowed_roles.some(role => workerRoles.has(role)))
-		return `task_role_mismatch:${task.id}:${task.allowed_roles.join(",")}`;
-
-	if (task.blocked_by?.length) return `task_blocked:${task.id}:${task.blocked_by.join(",")}`;
-	for (const dependencyId of task.depends_on ?? []) {
-		const dependency = tasks.find(candidate => candidate.id === dependencyId);
-		if (!dependency || !isGjcTeamTaskCompletionVerified(dependency))
-			return `task_dependency_incomplete:${task.id}:${dependencyId}`;
-	}
-
-	return null;
-}
-
-async function getActiveClaimReason(dir: string, task: GjcTeamTask): Promise<string | null> {
-	const claimPath = path.join(dir, "claims", `${task.id}.json`);
-	const diskClaim = readClaimRecord(await readJsonFile<unknown>(claimPath));
-	const claim = task.claim ?? diskClaim;
-	if (!claim || isPastTimestamp(claim.leased_until)) return null;
-	return `task_already_claimed:${task.id}`;
-}
-function isGjcTeamTaskRecord(value: unknown): value is GjcTeamTask {
-	return (
-		isRecord(value) &&
-		typeof value.id === "string" &&
-		typeof value.status === "string" &&
-		(isGjcTeamTaskStatus(value.status) || value.status === "complete") &&
-		(typeof value.subject === "string" || typeof value.title === "string") &&
-		(typeof value.description === "string" || typeof value.objective === "string")
-	);
-}
-function isGjcTeamTaskFile(entry: { isFile(): boolean; name: string }): boolean {
-	return entry.isFile() && entry.name.endsWith(".json") && !entry.name.endsWith(".evidence.json");
-}
-
-async function readTasks(dir: string): Promise<GjcTeamTask[]> {
-	try {
-		const entries = await fs.readdir(path.join(dir, "tasks"), { withFileTypes: true });
-		const tasks = await Promise.all(
-			entries.filter(isGjcTeamTaskFile).map(entry => readJsonFile<unknown>(path.join(dir, "tasks", entry.name))),
-		);
-		return tasks
-			.filter(isGjcTeamTaskRecord)
-			.map(normalizeTask)
-			.sort((a, b) => a.id.localeCompare(b.id));
-	} catch (error) {
-		if (isEnoent(error)) return [];
-		throw error;
-	}
-}
-async function writeTask(dir: string, task: GjcTeamTask): Promise<void> {
-	await writeJsonFile(taskPath(dir, task.id), normalizeTask(task));
 }
 
 async function findTeamDir(
@@ -3530,12 +3215,16 @@ export async function shutdownGjcTeam(
 	return readGjcTeamSnapshot(config.team_name, cwd, env);
 }
 
+function taskStore(dir: string): GjcTeamTaskStore {
+	return new GjcTeamTaskStore(dir, event => appendEvent(dir, event));
+}
+
 export async function listGjcTeamTasks(
 	teamName: string,
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamTask[]> {
-	return readTasks(await findTeamDir(teamName, cwd, env));
+	return taskStore(await findTeamDir(teamName, cwd, env)).list();
 }
 export async function readGjcTeamTask(
 	teamName: string,
@@ -3543,9 +3232,7 @@ export async function readGjcTeamTask(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamTask> {
-	const task = (await listGjcTeamTasks(teamName, cwd, env)).find(candidate => candidate.id === taskId);
-	if (!task) throw new Error(`task_not_found:${taskId}`);
-	return task;
+	return taskStore(await findTeamDir(teamName, cwd, env)).read(taskId);
 }
 export async function createGjcTeamTask(
 	teamName: string,
@@ -3558,29 +3245,9 @@ export async function createGjcTeamTask(
 	const dir = await findTeamDir(teamName, cwd, env);
 	const config = await readConfig(dir);
 	if (taskOptions.owner) assertKnownWorker(config, taskOptions.owner);
-	const tasks = await readTasks(dir);
-	const next = tasks.length + 1;
-	const task: GjcTeamTask = {
-		id: `task-${next}`,
-		subject,
-		description,
-		title: subject,
-		objective: description,
-		status: "pending",
-		...(taskOptions.owner ? { owner: taskOptions.owner } : {}),
-		...(taskOptions.lane ? { lane: taskOptions.lane } : {}),
-		...(taskOptions.required_role ? { required_role: taskOptions.required_role } : {}),
-		...(taskOptions.allowed_roles ? { allowed_roles: taskOptions.allowed_roles } : {}),
-		...(taskOptions.depends_on ? { depends_on: taskOptions.depends_on } : {}),
-		...(taskOptions.blocked_by ? { blocked_by: taskOptions.blocked_by } : {}),
-		version: 1,
-		created_at: now(),
-		updated_at: now(),
-	};
-	await writeTask(dir, task);
+	const task = await taskStore(dir).create(subject, description, taskOptions);
 	config.updated_at = now();
 	await writeJsonFile(path.join(dir, "config.json"), config);
-	await appendEvent(dir, { type: "task_created", task_id: task.id, message: subject });
 	return task;
 }
 export async function updateGjcTeamTask(
@@ -3595,19 +3262,7 @@ export async function updateGjcTeamTask(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamTask> {
-	const dir = await findTeamDir(teamName, cwd, env);
-	const task = await readGjcTeamTask(teamName, taskId, cwd, env);
-	const updated = normalizeTask({
-		...task,
-		...updates,
-		title: updates.subject ?? task.title,
-		objective: updates.description ?? task.objective,
-		version: task.version + 1,
-		updated_at: now(),
-	});
-	await writeTask(dir, updated);
-	await appendEvent(dir, { type: "task_updated", task_id: taskId, message: updated.subject });
-	return updated;
+	return taskStore(await findTeamDir(teamName, cwd, env)).update(taskId, updates);
 }
 export async function claimGjcTeamTask(
 	teamName: string,
@@ -3618,67 +3273,11 @@ export async function claimGjcTeamTask(
 ): Promise<GjcTeamApiClaimResult> {
 	const dir = await findTeamDir(teamName, cwd, env);
 	const config = await readConfig(dir);
-	const teamWorker = findKnownWorker(config, workerId);
-	const livenessRecovery = await reconcileGjcTeamStaleClaims(teamName, dir, config, env);
-	const staleWorkerReasons = livenessRecovery.stale_workers[workerId];
-	if (staleWorkerReasons?.length)
-		return { ok: false, reason: `worker_not_live:${workerId}:${staleWorkerReasons.join(",")}` };
-	const tasks = await readTasks(dir);
-	const task = taskId
-		? tasks.find(candidate => candidate.id === taskId)
-		: tasks.find(candidate => getGjcTeamTaskClaimEligibilityReason(candidate, teamWorker, tasks) == null);
-	if (!task) return { ok: false, reason: taskId ? `task_not_found:${taskId}` : "no_pending_task" };
-	const eligibilityReason = getGjcTeamTaskClaimEligibilityReason(task, teamWorker, tasks);
-	if (eligibilityReason) return { ok: false, reason: eligibilityReason };
-	const activeClaimReason = await getActiveClaimReason(dir, task);
-	if (activeClaimReason) return { ok: false, reason: activeClaimReason };
-	const token = randomUUID();
-	const claim: GjcTeamTaskClaim = {
-		owner: workerId,
-		token,
-		leased_until: new Date(Date.now() + 30 * 60_000).toISOString(),
-	};
-	const claimPath = path.join(dir, "claims", `${task.id}.json`);
-	const created = await writeJsonFileNoClobber(claimPath, claim);
-	if (!created) return { ok: false, reason: `task_already_claimed:${task.id}` };
-	const current = await readGjcTeamTask(teamName, task.id, cwd, env);
-	const currentEligibilityReason = getGjcTeamTaskClaimEligibilityReason(current, teamWorker, await readTasks(dir));
-	if (currentEligibilityReason) {
-		await fs.rm(claimPath, { force: true });
-		return { ok: false, reason: currentEligibilityReason };
-	}
-	if (current.status !== "pending") {
-		await deleteIfOwned(claimPath, {
-			...stateWriterOptions(claimPath, "prune", "rollback"),
-			predicate: current => (current as GjcTeamTaskClaim).token === token,
-		});
-		return { ok: false, reason: `task_not_pending:${task.id}` };
-	}
-	const updated: GjcTeamTask = {
-		...current,
-		status: "in_progress",
-		assignee: workerId,
-		owner: workerId,
-		claim,
-		version: current.version + 1,
-		updated_at: now(),
-	};
-	try {
-		await writeTask(dir, updated);
-	} catch (error) {
-		await deleteIfOwned(claimPath, {
-			...stateWriterOptions(claimPath, "prune", "rollback"),
-			predicate: current => (current as GjcTeamTaskClaim).token === token,
-		});
-		throw error;
-	}
-	await appendEvent(dir, {
-		type: "task_claimed",
-		task_id: updated.id,
-		worker: workerId,
-		message: "Worker claimed task",
-	});
-	return { ok: true, task: updated, worker_id: workerId, claim_token: token };
+	const worker = findKnownWorker(config, workerId);
+	const recovered = await reconcileGjcTeamStaleClaims(teamName, dir, config, env);
+	const reasons = recovered.stale_workers[workerId];
+	if (reasons?.length) return { ok: false, reason: `worker_not_live:${workerId}:${reasons.join(",")}` };
+	return taskStore(dir).claim(worker, taskId);
 }
 export async function transitionGjcTeamTaskStatus(
 	teamName: string,
@@ -3691,51 +3290,8 @@ export async function transitionGjcTeamTaskStatus(
 	completionEvidenceInput?: unknown,
 ): Promise<GjcTeamTask> {
 	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	const task = await readGjcTeamTask(teamName, taskId, cwd, env);
-	if (workerId) assertKnownWorker(config, workerId);
-	if (status === "pending") throw new Error(`invalid_task_transition:${taskId}:pending_requires_release`);
-	if (task.status === "completed" || task.status === "failed") throw new Error(`task_terminal:${taskId}`);
-	if (!task.claim) throw new Error(`claim_token_required:${taskId}`);
-	if (!claimToken) throw new Error(`claim_token_required:${taskId}`);
-	if (task.claim.token !== claimToken) throw new Error(`claim_token_mismatch:${taskId}`);
-	if (workerId && task.claim.owner !== workerId) throw new Error(`claim_owner_mismatch:${taskId}`);
-	const terminal = status === "completed" || status === "failed";
-	const transitionedAt = now();
-	const completionEvidence =
-		status === "completed"
-			? normalizeGjcTeamTaskCompletionEvidence(taskId, task.claim.owner, completionEvidenceInput, transitionedAt)
-			: undefined;
-	const updated: GjcTeamTask = {
-		...task,
-		status,
-		claim: terminal ? undefined : task.claim,
-		version: task.version + 1,
-		updated_at: transitionedAt,
-		...(terminal ? { completed_at: transitionedAt } : {}),
-		...(completionEvidence ? { completion_evidence: completionEvidence } : {}),
-	};
-	await writeTask(dir, updated);
-	if (terminal) {
-		const claimPath = path.join(dir, "claims", `${taskId}.json`);
-		await removeFileAudited(claimPath, stateWriterOptions(claimPath, "prune", "terminal"));
-	}
-	const eventData: Record<string, unknown> = { status };
-	if (completionEvidence) {
-		eventData.completion_evidence = {
-			recorded_by: completionEvidence.recorded_by,
-			item_count: completionEvidence.items.length,
-			verified_item_count: completionEvidence.items.filter(isGjcTeamCompletionEvidenceItemVerified).length,
-			files_count: completionEvidence.files?.length ?? 0,
-		};
-	}
-	await appendEvent(dir, {
-		type: "task_transitioned",
-		task_id: taskId,
-		message: "Task status changed",
-		data: eventData,
-	});
-	return updated;
+	if (workerId) assertKnownWorker(await readConfig(dir), workerId);
+	return taskStore(dir).transition(taskId, status, claimToken, workerId, completionEvidenceInput);
 }
 export async function transitionGjcTeamTask(
 	teamName: string,
@@ -3765,31 +3321,7 @@ export async function releaseGjcTeamTaskClaim(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamTask> {
-	const dir = await findTeamDir(teamName, cwd, env);
-	const task = await readGjcTeamTask(teamName, taskId, cwd, env);
-	if (!task.claim || task.claim.token !== claimToken || task.claim.owner !== workerId)
-		throw new Error(`claim_token_mismatch:${taskId}`);
-	const updated: GjcTeamTask = {
-		...task,
-		status: "pending",
-		assignee: undefined,
-		claim: undefined,
-		version: task.version + 1,
-		updated_at: now(),
-	};
-	await writeTask(dir, updated);
-	const claimPath = path.join(dir, "claims", `${taskId}.json`);
-	await deleteIfOwned(claimPath, {
-		...stateWriterOptions(claimPath, "prune", "release"),
-		predicate: current => (current as GjcTeamTaskClaim).token === claimToken,
-	});
-	await appendEvent(dir, {
-		type: "task_claim_released",
-		task_id: taskId,
-		worker: workerId,
-		message: "Task claim released",
-	});
-	return updated;
+	return taskStore(await findTeamDir(teamName, cwd, env)).release(taskId, claimToken, workerId);
 }
 
 function emptyNotificationSummary(): GjcTeamNotificationSummary {
