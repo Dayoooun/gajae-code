@@ -5,6 +5,8 @@ import { syncSkillActiveState } from "../skill-state/active-state";
 import { buildRalplanHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
+import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
+import { getSkillManifest } from "./workflow-manifest";
 import {
 	formatRalplanStagePresence,
 	parseRalplanIndexLine,
@@ -19,6 +21,7 @@ import { runNativeStateCommand } from "./state-runtime";
 import {
 	appendJsonlIdempotent,
 	readExistingStateForMutation,
+	withWorkflowStateLock,
 	writeArtifact,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
@@ -55,7 +58,6 @@ type RalplanStage = (typeof KNOWN_STAGES)[number];
 const KNOWN_ARCHITECT_KINDS = new Set(["openai-code"]);
 const KNOWN_CRITIC_KINDS = new Set(["openai-code"]);
 
-const PATH_COMPONENT_RE = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/;
 
 const SUBAGENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 
@@ -68,12 +70,9 @@ const KNOWN_FALLBACK_REASONS = new Set([
 	"missing_record",
 ]);
 
-class RalplanCommandError extends Error {
-	constructor(
-		public readonly exitStatus: number,
-		message: string,
-	) {
-		super(message);
+class RalplanCommandError extends CommandError {
+	constructor(exitStatus: number, message: string) {
+		super(exitStatus, message);
 		this.name = "RalplanCommandError";
 	}
 }
@@ -95,15 +94,6 @@ const VALUE_FLAGS = new Set([
 	"--fallback-receipt-path",
 ]);
 
-function flagValue(args: readonly string[], flag: string): string | undefined {
-	const index = args.indexOf(flag);
-	if (index < 0) return undefined;
-	return args[index + 1];
-}
-
-function hasFlag(args: readonly string[], flag: string): boolean {
-	return args.includes(flag);
-}
 
 export function isRalplanArtifactWriteInvocation(args: readonly string[]): boolean {
 	return hasFlag(args, "--write");
@@ -113,11 +103,6 @@ function isRalplanDoctorInvocation(args: readonly string[]): boolean {
 	return args[0] === "doctor";
 }
 
-function assertSafePathComponent(value: string, label: string): void {
-	if (!PATH_COMPONENT_RE.test(value) || value.includes("..")) {
-		throw new RalplanCommandError(2, `invalid path component for --${label}: ${value}`);
-	}
-}
 
 function assertKnownStage(stage: string): asserts stage is RalplanStage {
 	if (!(KNOWN_STAGES as readonly string[]).includes(stage)) {
@@ -204,26 +189,17 @@ async function readActiveRunId(cwd: string, sessionId: string): Promise<string |
  * undo Stop semantics. Every other phase advances to track the stage just
  * persisted so run-state stays coherent with the active ralplan stage.
  */
-const PHASE_LOCK = new Set([
-	"final",
-	"handoff",
-	"complete",
-	"completed",
-	"failed",
-	"cancelled",
-	"canceled",
-	"inactive",
-]);
 
 /** Phase that keeps run-state coherent with the stage just written, preserving locked phases. */
 function advanceCurrentPhase(existingPhase: unknown, stage: RalplanStage): string {
 	const current = typeof existingPhase === "string" ? existingPhase.trim() : "";
-	if (current && PHASE_LOCK.has(current)) return current;
+	if (current && getSkillManifest("ralplan").phaseLock.includes(current)) return current;
 	return stage;
 }
 
 async function persistActiveRunId(cwd: string, sessionId: string, runId: string, stage: RalplanStage): Promise<void> {
 	const statePath = ralplanStatePath(cwd, sessionId);
+return await withWorkflowStateLock(statePath, async () => {
 	const existingRead = await readExistingStateForMutation(statePath);
 	if (existingRead.kind === "corrupt") {
 		throw new RalplanCommandError(
@@ -242,7 +218,7 @@ async function persistActiveRunId(cwd: string, sessionId: string, runId: string,
 		existing.run_id === runId &&
 		existing.version === WORKFLOW_STATE_VERSION &&
 		existing.current_phase === nextPhase &&
-		(existing.active === true || PHASE_LOCK.has(nextPhase))
+		(existing.active === true || getSkillManifest("ralplan").phaseLock.includes(nextPhase))
 	) {
 		return;
 	}
@@ -259,7 +235,8 @@ async function persistActiveRunId(cwd: string, sessionId: string, runId: string,
 		receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan persist-run-id", sessionId },
 		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
 	});
-}
+	});
+});
 
 /* --------------------------- planner run-state --------------------------- */
 
@@ -382,6 +359,7 @@ function plannerStatePayload(update: PlannerStateUpdate): Record<string, unknown
  */
 async function applyPlannerStateUpdate(cwd: string, sessionId: string, update: PlannerStateUpdate): Promise<void> {
 	const statePath = ralplanStatePath(cwd, sessionId);
+return await withWorkflowStateLock(statePath, async () => {
 	const existingRead = await readExistingStateForMutation(statePath);
 	if (existingRead.kind === "corrupt") {
 		throw new RalplanCommandError(
@@ -401,7 +379,8 @@ async function applyPlannerStateUpdate(cwd: string, sessionId: string, update: P
 		receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan planner-state", sessionId },
 		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
 	});
-}
+	});
+});
 
 async function resolveArtifactArgs(args: readonly string[], cwd: string): Promise<ResolvedArtifactArgs> {
 	const stage = flagValue(args, "--stage");
@@ -916,7 +895,7 @@ export async function runNativeRalplanCommand(args: string[], cwd = process.cwd(
 		if (isRalplanArtifactWriteInvocation(args)) return await handleArtifactWrite(args, cwd);
 		return await handleConsensusHandoff(args, cwd);
 	} catch (error) {
-		if (error instanceof RalplanCommandError) return { status: error.exitStatus, stderr: `${error.message}\n` };
+		if (error instanceof CommandError) return { status: error.exitStatus, stderr: `${error.message}\n` };
 		return { status: 1, stderr: `${error instanceof Error ? error.message : String(error)}\n` };
 	}
 }

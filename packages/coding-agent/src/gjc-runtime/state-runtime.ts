@@ -26,6 +26,7 @@ import {
 	type WorkflowStateReceipt,
 } from "../skill-state/workflow-state-contract";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
+import { assertSafePathComponent, CommandError, flagValue, hasFlag, isPlainObject } from "./workflow-cli-common";
 import { applyAmbiguityFloorToEnvelope } from "./deep-interview-ambiguity";
 import { mergeDeepInterviewEnvelope, normalizeDeepInterviewEnvelope } from "./deep-interview-state";
 import { activeSnapshotPath, auditPath, modeStatePath, sessionStateDir } from "./session-layout";
@@ -61,6 +62,7 @@ import {
 	softDelete,
 	updateWorkflowTransactionJournal,
 	type WorkflowEnvelopeIntegrityMismatch,
+	withWorkflowStateLock,
 	writeGuardedWorkflowEnvelopeAtomic,
 } from "./state-writer";
 import { getSkillManifest, isKnownWorkflowState, isValidTransition, typedArgsFor } from "./workflow-manifest";
@@ -80,28 +82,13 @@ export interface StateCommandResult {
 }
 
 const SKILL_ACTIVE_STATE_FILE = "skill-active-state.json";
-const TERMINAL_CLEAR_PHASES = new Set(["complete", "completed", "cancelled", "canceled", "failed"]);
-const PATH_COMPONENT_RE = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/;
 const KNOWN_MODES: readonly string[] = CANONICAL_GJC_WORKFLOW_SKILLS;
 
-class StateCommandError extends Error {
-	constructor(
-		public readonly exitStatus: number,
-		message: string,
-	) {
-		super(message);
+class StateCommandError extends CommandError {
+	constructor(exitStatus: number, message: string) {
+		super(exitStatus, message);
 		this.name = "StateCommandError";
 	}
-}
-
-function flagValue(args: readonly string[], flag: string): string | undefined {
-	const index = args.indexOf(flag);
-	if (index < 0) return undefined;
-	return args[index + 1];
-}
-
-function hasFlag(args: readonly string[], flag: string): boolean {
-	return args.includes(flag);
 }
 
 const GRAPH_FORMATS = new Set(["ascii", "mermaid", "dot"]);
@@ -237,11 +224,6 @@ function parsePositionalArgs(args: readonly string[]): ParsedInvocation {
 	return { action: "read" };
 }
 
-function assertSafePathComponent(value: string, label: string): void {
-	if (!PATH_COMPONENT_RE.test(value) || value.includes("..")) {
-		throw new StateCommandError(2, `invalid path component for --${label}: ${value}`);
-	}
-}
 function isKnownMode(mode: string): mode is CanonicalGjcWorkflowSkill {
 	return KNOWN_MODES.includes(mode);
 }
@@ -391,7 +373,9 @@ async function describeStaleClearState(
 	existing: Record<string, unknown>,
 ): Promise<string | undefined> {
 	const phase = typeof existing.current_phase === "string" ? existing.current_phase.trim() : undefined;
-	if (phase && TERMINAL_CLEAR_PHASES.has(phase)) return `mode-state is already terminal (${phase})`;
+	if (phase && getSkillManifest(mode).stopReleasingPhases.includes(phase) && phase !== "inactive") {
+		return `mode-state is already terminal (${phase})`;
+	}
 	const activePhase = await readActivePhaseForSkill(cwd, sessionId, mode);
 	if (activePhase && phase && activePhase !== phase) {
 		return `active-state phase ${activePhase} differs from mode-state phase ${phase}`;
@@ -504,22 +488,12 @@ function phaseFromActiveValue(value: unknown): string | undefined {
 	return phase || undefined;
 }
 
-const RALPLAN_CANONICAL_PHASE_OVERRIDES = new Set([
-	"final",
-	"handoff",
-	"complete",
-	"completed",
-	"failed",
-	"cancelled",
-	"canceled",
-	"inactive",
-]);
 
 function modeStatePhase(value: unknown): string | undefined {
 	if (!isPlainObject(value) || typeof value.current_phase !== "string") return undefined;
 	const phase = value.current_phase.trim();
 	if (!phase) return undefined;
-	if (value.active === false && !RALPLAN_CANONICAL_PHASE_OVERRIDES.has(phase)) return undefined;
+	if (value.active === false && !getSkillManifest("ralplan").canonicalOverrides.includes(phase)) return undefined;
 	return phase;
 }
 
@@ -938,9 +912,6 @@ async function readAuditWindow(
 	return { entries: selected.reverse(), limit, ...(since ? { since } : {}), truncated: matched > limit };
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
 
 /**
  * Shallow-merge `source` into `target`, with the convention that a `source` key whose value is
@@ -1332,6 +1303,7 @@ async function handleWrite(
 
 	const filePath = modeStateFile(cwd, mode, sessionId);
 	const forced = hasFlag(args, "--force");
+return await withWorkflowStateLock(filePath, async () => {
 	const existingRead = await readExistingStateForMutation(filePath);
 	if (existingRead.kind === "corrupt" && !forced) {
 		throw new StateCommandError(
@@ -1458,6 +1430,7 @@ async function handleWrite(
 		}),
 		...(outOfBandWarning ? { stderr: `${outOfBandWarning}\n` } : {}),
 	};
+});
 }
 
 async function handleClear(
@@ -1476,6 +1449,7 @@ async function handleClear(
 
 	const filePath = modeStateFile(cwd, mode, sessionId);
 	const forced = hasFlag(args, "--force");
+return await withWorkflowStateLock(filePath, async () => {
 	const existingRead = await readExistingStateForMutation(filePath);
 	if (existingRead.kind === "corrupt" && !forced) {
 		throw new StateCommandError(
@@ -1544,6 +1518,7 @@ async function handleClear(
 		}),
 		...(outOfBandWarning ? { stderr: `${outOfBandWarning}\n` } : {}),
 	};
+});
 }
 
 /**
@@ -2253,7 +2228,7 @@ export async function runNativeStateCommand(args: string[], cwd = process.cwd())
 				return { status: 2, stderr: `Unknown gjc state command: ${parsed.action}\n` };
 		}
 	} catch (error) {
-		if (error instanceof StateCommandError) return { status: error.exitStatus, stderr: `${error.message}\n` };
+		if (error instanceof CommandError) return { status: error.exitStatus, stderr: `${error.message}\n` };
 		if (error instanceof SessionResolutionError) return { status: 2, stderr: `${error.message}\n` };
 		return { status: 1, stderr: `${error instanceof Error ? error.message : String(error)}\n` };
 	}
