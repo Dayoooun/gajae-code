@@ -26,9 +26,8 @@ import {
 	Spacer,
 	Text,
 	TUI,
-	visibleWidth,
 } from "@gajae-code/tui";
-import { APP_NAME, adjustHsv, getProjectDir, hsvToRgb, isEnoent, logger, postmortem, prompt } from "@gajae-code/utils";
+import { APP_NAME, adjustHsv, getProjectDir, isEnoent, logger, postmortem, prompt } from "@gajae-code/utils";
 import chalk from "chalk";
 import { AsyncJobManager } from "../async";
 import { type AppKeybinding, KeybindingsManager } from "../config/keybindings";
@@ -68,7 +67,7 @@ import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import { getRecentSessions } from "../session/session-manager";
 import { formatDuration } from "../slash-commands/helpers/format";
-import { STTController, type SttState } from "../stt";
+import { SttModeController } from "./controllers/stt-controller";
 import type { LspStartupServerInfo } from "../tools";
 import { normalizeLocalScheme } from "../tools/path-utils";
 import { type ResolveToolDetails, runResolveInvocation } from "../tools/resolve";
@@ -106,6 +105,7 @@ import { CommandController } from "./controllers/command-controller";
 import { EventController } from "./controllers/event-controller";
 import { ExtensionUiController } from "./controllers/extension-ui-controller";
 import { InputController } from "./controllers/input-controller";
+import { ModeGate } from "./controllers/mode-gate";
 import { SelectorController } from "./controllers/selector-controller";
 import { SSHCommandController } from "./controllers/ssh-command-controller";
 import { TodoCommandController } from "./controllers/todo-command-controller";
@@ -423,11 +423,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	readonly #inputController: InputController;
 	readonly #selectorController: SelectorController;
 	readonly #uiHelpers: UiHelpers;
-	#sttController: STTController | undefined;
-	#voiceAnimationInterval: NodeJS.Timeout | undefined;
-	#voiceHue = 0;
-	#voicePreviousShowHardwareCursor: boolean | null = null;
-	#voicePreviousUseTerminalCursor: boolean | null = null;
+	readonly #modeGate = new ModeGate();
+	#sttController: SttModeController | undefined;
 	#resizeHandler?: () => void;
 	#observerRegistry: SessionObserverRegistry;
 	#jobsObserver?: JobsObserver;
@@ -1435,6 +1432,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			const restored = await this.session.goalRuntime.onThreadResumed();
 			this.goalModeEnabled = restored?.enabled === true;
 			this.goalModePaused = restored?.enabled !== true && restored?.goal.status === "paused";
+			if (this.goalModeEnabled || this.goalModePaused) this.#modeGate.enter("goal");
 			// Keep `goal` armed on resumed threads; it is part of the default active tool set.
 			if (restored?.goal) {
 				const previousTools = this.session.getActiveToolNames();
@@ -1466,6 +1464,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		} else if (sessionContext.mode === "plan_paused") {
 			this.planModePaused = true;
 			this.#planModeHasEntered = true;
+			this.#modeGate.enter("plan");
 			this.#updatePlanModeStatus();
 		}
 	}
@@ -1474,7 +1473,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.planModeEnabled) {
 			return;
 		}
-		if (this.goalModeEnabled || this.goalModePaused) {
+		if (!this.#modeGate.enter("plan")) {
 			this.showWarning("Exit goal mode first.");
 			return;
 		}
@@ -1602,6 +1601,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#planModePreviousModelState = undefined;
 		this.#updatePlanModeStatus();
 		const paused = options?.paused ?? false;
+		if (!paused) this.#modeGate.exit("plan");
 		this.sessionManager.appendModeChange(paused ? "plan_paused" : "none");
 		if (!options?.silent) {
 			this.showStatus(paused ? "Plan mode paused." : "Plan mode disabled.");
@@ -1612,7 +1612,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.goalModeEnabled) {
 			return;
 		}
-		if (this.planModeEnabled || this.planModePaused) {
+		if (!this.#modeGate.enter("goal")) {
 			this.showWarning("Exit plan mode first.");
 			return;
 		}
@@ -1669,6 +1669,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#goalModePreviousTools = undefined;
 		this.#goalContinuationTurnInFlight = false;
 		this.#cancelGoalContinuation();
+		if (!this.goalModePaused) this.#modeGate.exit("goal");
 		this.#updateGoalModeStatus();
 		if (!options?.silent) {
 			if (options?.reason === "completed") {
@@ -2189,12 +2190,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.#welcomeComponent?.dispose();
 		this.#welcomeComponent = undefined;
-		this.#cleanupMicAnimation();
-		this.#cancelGoalContinuation();
 		if (this.#sttController) {
-			this.#sttController.dispose();
+			this.#sttController.dispose(this);
 			this.#sttController = undefined;
 		}
+		this.#cancelGoalContinuation();
 		this.#extensionUiController.clearExtensionTerminalInputListeners();
 		this.#extensionUiController.clearHookWidgets();
 		for (const unsubscribe of this.#eventBusUnsubscribers) {
@@ -2632,75 +2632,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showWarning("Speech-to-text is disabled. Enable it in settings: stt.enabled");
 			return;
 		}
-		if (!this.#sttController) {
-			this.#sttController = new STTController();
-		}
-		await this.#sttController.toggle(this.editor, {
-			showWarning: (msg: string) => this.showWarning(msg),
-			showStatus: (msg: string) => this.showStatus(msg),
-			onStateChange: (state: SttState) => {
-				if (state === "recording") {
-					this.#voicePreviousShowHardwareCursor = this.ui.getShowHardwareCursor();
-					this.#voicePreviousUseTerminalCursor = this.editor.getUseTerminalCursor();
-					this.ui.setShowHardwareCursor(false);
-					this.editor.setUseTerminalCursor(false);
-					this.#startMicAnimation();
-				} else if (state === "transcribing") {
-					this.#stopMicAnimation();
-					this.#setMicCursor({ r: 200, g: 200, b: 200 });
-				} else {
-					this.#cleanupMicAnimation();
-				}
-				this.updateEditorChrome();
-				this.ui.requestRender();
-			},
-		});
-	}
-
-	#setMicCursor(color: { r: number; g: number; b: number }): void {
-		this.editor.cursorOverride = `\x1b[38;2;${color.r};${color.g};${color.b}m${theme.icon.mic}\x1b[0m`;
-		// Theme symbols can be wide (for example, 🎤), so measure the rendered override.
-		this.editor.cursorOverrideWidth = visibleWidth(this.editor.cursorOverride);
-	}
-
-	#updateMicIcon(): void {
-		const { r, g, b } = hsvToRgb({ h: this.#voiceHue, s: 0.9, v: 1.0 });
-		this.#setMicCursor({ r, g, b });
-	}
-
-	#startMicAnimation(): void {
-		if (this.#voiceAnimationInterval) return;
-		this.#voiceHue = 0;
-		this.#updateMicIcon();
-		this.#voiceAnimationInterval = setInterval(() => {
-			this.#voiceHue = (this.#voiceHue + 8) % 360;
-			this.#updateMicIcon();
-			this.ui.requestRender();
-		}, 60);
-	}
-
-	#stopMicAnimation(): void {
-		if (this.#voiceAnimationInterval) {
-			clearInterval(this.#voiceAnimationInterval);
-			this.#voiceAnimationInterval = undefined;
-		}
-	}
-
-	#cleanupMicAnimation(): void {
-		if (this.#voiceAnimationInterval) {
-			clearInterval(this.#voiceAnimationInterval);
-			this.#voiceAnimationInterval = undefined;
-		}
-		this.editor.cursorOverride = undefined;
-		this.editor.cursorOverrideWidth = undefined;
-		if (this.#voicePreviousShowHardwareCursor !== null) {
-			this.ui.setShowHardwareCursor(this.#voicePreviousShowHardwareCursor);
-			this.#voicePreviousShowHardwareCursor = null;
-		}
-		if (this.#voicePreviousUseTerminalCursor !== null) {
-			this.editor.setUseTerminalCursor(this.#voicePreviousUseTerminalCursor);
-			this.#voicePreviousUseTerminalCursor = null;
-		}
+		this.#sttController ??= new SttModeController();
+		await this.#sttController.toggle(this);
 	}
 
 	showDebugSelector(): void {
