@@ -333,6 +333,10 @@ import {
 } from "./contribution-prep";
 import { pruneStaleFileMentions } from "./file-mention-pruning";
 import {
+	pruneSupersededMaintenanceReminders,
+	pruneSupersededVolatileProjectContext,
+} from "./volatile-context-pruning";
+import {
 	type BashExecutionMessage,
 	type CompactionSummaryMessage,
 	type CustomMessage,
@@ -2245,8 +2249,13 @@ export class AgentSession {
 				return undefined;
 			}
 			if (message.role === "toolResult") {
-				recordSkip("tool-result-role");
-				return undefined;
+				const text = Array.isArray(message.content)
+					? message.content.filter(block => block.type === "text").map(block => block.text).join("\n")
+					: String(message.content ?? "");
+				const tool = (message as unknown as { toolName?: string }).toolName ?? "tool";
+				const target = (message.details as { path?: unknown } | undefined)?.path;
+				const digest = `[tool result: ${tool}${typeof target === "string" ? ` ${target}` : ""}]\n${text.split("\n").slice(0, 12).join("\n")}`;
+				return { role: "user", content: [{ type: "text", text: digest }] } as Message;
 			}
 			if (message.role !== "user" && message.role !== "assistant") {
 				recordSkip("unsupported-role");
@@ -8827,14 +8836,23 @@ export class AgentSession {
 
 	async #pruneToolOutputs(signal?: AbortSignal): Promise<{ prunedCount: number; tokensSaved: number } | undefined> {
 		const branchEntries = this.sessionManager.getBranch();
-		const result = pruneToolOutputs(branchEntries, DEFAULT_PRUNE_CONFIG);
+		const result = pruneToolOutputs(branchEntries, DEFAULT_PRUNE_CONFIG, { relaxedMinimum: 0 });
 		const argumentResult = pruneAssistantToolArguments(branchEntries, DEFAULT_PRUNE_CONFIG);
 		const fileMentionResult = pruneStaleFileMentions(branchEntries, p =>
 			resolveReadPath(p, this.sessionManager.getCwd()),
 		);
+		const volatileContextResult = pruneSupersededVolatileProjectContext(branchEntries);
+		const reminderResult = pruneSupersededMaintenanceReminders(branchEntries);
 		const tokensSaved =
-			result.tokensSaved + argumentResult.argumentTokensSaved + Math.round(fileMentionResult.bytesSaved / 4);
-		const prunedCount = result.prunedCount + argumentResult.argumentPrunedCount + fileMentionResult.changed.length;
+			result.tokensSaved +
+			argumentResult.argumentTokensSaved +
+			Math.round((fileMentionResult.bytesSaved + volatileContextResult.bytesSaved + reminderResult.bytesSaved) / 4);
+		const prunedCount =
+			result.prunedCount +
+			argumentResult.argumentPrunedCount +
+			fileMentionResult.changed.length +
+			volatileContextResult.changed.length +
+			reminderResult.changed.length;
 		if (prunedCount === 0 || signal?.aborted) {
 			return undefined;
 		}
@@ -8843,6 +8861,7 @@ export class AgentSession {
 		// the pruning mutations must be written back into the canonical store.
 		const combined = [...result.prunedEntries, ...argumentResult.prunedEntries, ...fileMentionResult.changed];
 		this.sessionManager.applyEntryMessageUpdates(combined);
+		this.sessionManager.applyCustomMessageEntryUpdates([...volatileContextResult.changed, ...reminderResult.changed]);
 		await this.sessionManager.rewriteEntries();
 		const sessionContext = this.buildDisplaySessionContext();
 		this.agent.replaceMessages(sessionContext.messages);
@@ -8938,6 +8957,7 @@ export class AgentSession {
 			const compactionSettings = this.settings.getGroup("compaction");
 			const pathEntries = this.sessionManager.getBranch();
 			const preparation = prepareCompaction(pathEntries, compactionSettings, {
+				contextWindow: this.model.contextWindow,
 				tokenCorrectionRatio: this.#computeCompactionTokenCorrectionRatio(),
 			});
 			if (!preparation) {
@@ -9391,9 +9411,13 @@ export class AgentSession {
 		// sanctioned maintenance boundary, i.e. when the un-pruned context already
 		// crosses the compaction threshold. Pruning may then avert full compaction.
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) return;
-		const pruneResult = await this.#pruneToolOutputs();
-		if (pruneResult) {
-			contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
+		const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG);
+		if (
+			pruneEstimate.tokensSaved > 0 &&
+			!shouldCompact(Math.max(0, contextTokens - pruneEstimate.tokensSaved), contextWindow, compactionSettings, autoCompactionOutputReserveTokens)
+		) {
+			const pruneResult = await this.#pruneToolOutputs();
+			if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
 		if (shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
 			// Try promotion first — if a larger model is available, switch instead of compacting
@@ -9483,14 +9507,18 @@ export class AgentSession {
 			// 1) Prune stale tool outputs first — cheaper than compaction, may avert it,
 			//    and (like all history rewrites) resets the codex provider session /
 			//    prompt-cache epoch via #closeCodexProviderSessionsForHistoryRewrite.
-			if (isAborted()) return "aborted";
-			const pruneResult = await this.#pruneToolOutputs(maintenanceSignal);
-			if (isAborted()) return "aborted";
-			if (pruneResult) {
-				contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
+			const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG);
+			let pruneResult: { prunedCount: number; tokensSaved: number } | undefined;
+			if (
+				pruneEstimate.tokensSaved > 0 &&
+				!shouldCompact(Math.max(0, contextTokens - pruneEstimate.tokensSaved), contextWindow, compactionSettings, autoCompactionOutputReserveTokens)
+			) {
+				pruneResult = await this.#pruneToolOutputs(maintenanceSignal);
+				if (isAborted()) return "aborted";
+				if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 			}
 			if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
-				return pruneResult && pruneResult.prunedCount > 0 ? "pruned" : "not-needed";
+				return pruneResult?.prunedCount ? "pruned" : "not-needed";
 			}
 
 			// 2) Try context promotion (switch to a larger-window model) before compacting.
@@ -9653,9 +9681,13 @@ export class AgentSession {
 			return;
 		}
 
-		const pruneResult = await this.#pruneToolOutputs();
-		if (pruneResult) {
-			contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
+		const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG);
+		if (
+			pruneEstimate.tokensSaved > 0 &&
+			!shouldCompact(Math.max(0, contextTokens - pruneEstimate.tokensSaved), contextWindow, compactionSettings, autoCompactionOutputReserveTokens)
+		) {
+			const pruneResult = await this.#pruneToolOutputs();
+			if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
 		if (shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
 			await this.#runAutoCompaction("threshold", false, false, {
@@ -10679,6 +10711,7 @@ export class AgentSession {
 			// it would grow it, so recovery cannot re-overflow the provider window.
 			const overflowRatio = this.#computeCompactionTokenCorrectionRatio();
 			const preparation = prepareCompaction(pathEntries, compactionSettings, {
+				contextWindow: this.model?.contextWindow,
 				tokenCorrectionRatio: overflowRatio !== undefined ? Math.max(1, overflowRatio) : undefined,
 			});
 			if (autoCompactionSignal.aborted) return await emitAborted();
@@ -13387,7 +13420,7 @@ export class AgentSession {
 	} {
 		return this.#estimateContextTokensWith(
 			message => this.#estimateMessageDisplayTokens(message),
-			false,
+			boundaryTs,
 			boundaryTs,
 			anchor,
 		);
@@ -13478,7 +13511,9 @@ export class AgentSession {
 		const num = actual - imgAdjust;
 		const den = heuristic - imgAdjust;
 		if (!(num > 0) || !(den > 0)) return undefined;
-		return num / den;
+		const observedRatio = num / den;
+		this.#compactionDeltaInflation = Math.min(1.3, Math.max(1, observedRatio));
+		return observedRatio;
 	}
 
 	#estimateContextTokensForCompaction(pendingMessages: readonly AgentMessage[]): {
@@ -13487,7 +13522,6 @@ export class AgentSession {
 	} {
 		const estimate = this.#estimateContextTokensWith(
 			message => this.#estimateMessageCompactionDeltaTokens(message),
-			true,
 		);
 		return {
 			tokens: estimate.tokens + this.#estimateMessagesCompactionDeltaTokens(pendingMessages),
@@ -13497,7 +13531,6 @@ export class AgentSession {
 
 	#estimateContextTokensWith(
 		estimateMessage: (message: AgentMessage) => number,
-		inflateFixed = false,
 		boundaryTs?: number,
 		knownAnchor?: { index: number; usage: Usage } | undefined,
 	): {
@@ -13515,7 +13548,7 @@ export class AgentSession {
 		if (!anchor) {
 			// No usage data - estimate the full provider request.
 			const fixedTokens = computeNonMessageTokens(this);
-			let estimated = inflateFixed ? Math.ceil(fixedTokens * this.#compactionDeltaInflation) : fixedTokens;
+			let estimated = fixedTokens;
 			for (const message of messages) {
 				estimated += estimateMessage(message);
 			}
@@ -13549,11 +13582,17 @@ export class AgentSession {
 		return tokens;
 	}
 
+	#displayTokenCache = new WeakMap<AgentMessage, { fingerprint: string; tokens: number }>();
+
 	#estimateMessageDisplayTokens(message: AgentMessage): number {
+		const fingerprint = JSON.stringify(message);
+		const cached = this.#displayTokenCache.get(message);
+		if (cached?.fingerprint === fingerprint) return cached.tokens;
 		let tokens = 0;
 		for (const llmMessage of convertToLlm([message])) {
 			tokens += estimateMessageTokensHeuristic(llmMessage);
 		}
+		this.#displayTokenCache.set(message, { fingerprint, tokens });
 		return tokens;
 	}
 
