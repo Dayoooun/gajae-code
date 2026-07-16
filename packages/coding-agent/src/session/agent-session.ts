@@ -6616,7 +6616,7 @@ export class AgentSession {
 			}
 
 			const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
-			const hindsightRecall = this.getHindsightSessionState()?.getRecallSnippet();
+			const hindsightRecall = this.getHindsightSessionState()?.getRecallSnippetForInjection();
 			if (hindsightRecall) {
 				messages.push({
 					role: "custom",
@@ -8846,9 +8846,12 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
-	async #pruneToolOutputs(signal?: AbortSignal): Promise<{ prunedCount: number; tokensSaved: number } | undefined> {
+	async #pruneToolOutputs(
+		signal?: AbortSignal,
+		overThreshold = false,
+	): Promise<{ prunedCount: number; tokensSaved: number } | undefined> {
 		const branchEntries = this.sessionManager.getBranch();
-		const result = pruneToolOutputs(branchEntries, DEFAULT_PRUNE_CONFIG, { relaxedMinimum: 0 });
+		const result = pruneToolOutputs(branchEntries, DEFAULT_PRUNE_CONFIG, overThreshold ? { relaxedMinimum: 0 } : undefined);
 		const argumentResult = pruneAssistantToolArguments(branchEntries, DEFAULT_PRUNE_CONFIG);
 		const fileMentionResult = pruneStaleFileMentions(branchEntries, p =>
 			resolveReadPath(p, this.sessionManager.getCwd()),
@@ -9428,7 +9431,7 @@ export class AgentSession {
 			pruneEstimate.tokensSaved > 0 &&
 			!shouldCompact(Math.max(0, contextTokens - pruneEstimate.tokensSaved), contextWindow, compactionSettings, autoCompactionOutputReserveTokens)
 		) {
-			const pruneResult = await this.#pruneToolOutputs();
+			const pruneResult = await this.#pruneToolOutputs(undefined, true);
 			if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
 		if (shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
@@ -9525,7 +9528,7 @@ export class AgentSession {
 				pruneEstimate.tokensSaved > 0 &&
 				!shouldCompact(Math.max(0, contextTokens - pruneEstimate.tokensSaved), contextWindow, compactionSettings, autoCompactionOutputReserveTokens)
 			) {
-				pruneResult = await this.#pruneToolOutputs(maintenanceSignal);
+				pruneResult = await this.#pruneToolOutputs(maintenanceSignal, true);
 				if (isAborted()) return "aborted";
 				if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 			}
@@ -9698,7 +9701,7 @@ export class AgentSession {
 			pruneEstimate.tokensSaved > 0 &&
 			!shouldCompact(Math.max(0, contextTokens - pruneEstimate.tokensSaved), contextWindow, compactionSettings, autoCompactionOutputReserveTokens)
 		) {
-			const pruneResult = await this.#pruneToolOutputs();
+			const pruneResult = await this.#pruneToolOutputs(undefined, true);
 			if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
 		if (shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
@@ -13432,7 +13435,6 @@ export class AgentSession {
 	} {
 		return this.#estimateContextTokensWith(
 			message => this.#estimateMessageDisplayTokens(message),
-			boundaryTs,
 			boundaryTs,
 			anchor,
 		);

@@ -292,15 +292,16 @@ function strictlyContainsReadRange(container: ReadLineRange, contained: ReadLine
 	);
 }
 
-function readSupersedesRead(later: ToolCall, earlier: ToolCall): boolean {
-	const laterPath = toolCallPath(later);
-	const earlierPath = toolCallPath(earlier);
-	if (!laterPath || !earlierPath || readBasePath(laterPath) !== readBasePath(earlierPath)) return false;
-	const laterRanges = readLineRanges(laterPath);
-	const earlierRanges = readLineRanges(earlierPath);
+function readSupersedesRead(
+	later: ToolCall,
+	earlier: ToolCall,
+	lineRangesByCall: ReadonlyMap<ToolCall, ReadLineRange[]>,
+): boolean {
+	const laterRanges = lineRangesByCall.get(later);
+	const earlierRanges = lineRangesByCall.get(earlier);
 	return (
-		laterRanges.length === 1 &&
-		earlierRanges.length === 1 &&
+		laterRanges?.length === 1 &&
+		earlierRanges?.length === 1 &&
 		strictlyContainsReadRange(laterRanges[0], earlierRanges[0])
 	);
 }
@@ -321,7 +322,7 @@ function normalizedIdempotentBashCommand(call: ToolCall): string | undefined {
 	if (typeof command !== "string") return undefined;
 	const normalized = command.trim().replace(/\s+/g, " ");
 	if (/[;&|]/.test(normalized) || !IDEMPOTENT_BASH_COMMAND.test(normalized)) return undefined;
-	return normalized;
+	return JSON.stringify([normalized, typeof call.arguments.cwd === "string" ? call.arguments.cwd : undefined]);
 }
 
 function toolTargetKey(call: ToolCall): string | undefined {
@@ -423,8 +424,9 @@ function buildStalenessIndex(entries: SessionEntry[]): StalenessIndex {
 		}
 	}
 
+	type ResultMeta = { key?: string; call: ToolCall; message: ToolResultMessage };
 	const lastResultIndexByKey = new Map<string, number>();
-	const resultMeta = new Map<number, { key?: string; call: ToolCall; message: ToolResultMessage }>();
+	const resultMeta = new Map<number, ResultMeta>();
 	const lastEditIndexByPath = new Map<string, number>();
 
 	for (let i = 0; i < entries.length; i++) {
@@ -490,12 +492,27 @@ function buildStalenessIndex(entries: SessionEntry[]): StalenessIndex {
 		}
 	}
 
+	const readsByBasePath = new Map<string, Array<[number, ResultMeta]>>();
+	const lineRangesByCall = new Map<ToolCall, ReadLineRange[]>();
 	for (const [index, meta] of resultMeta) {
 		if (meta.call.name !== "read") continue;
-		for (const [laterIndex, laterMeta] of resultMeta) {
-			if (laterIndex > index && laterMeta.call.name === "read" && readSupersedesRead(laterMeta.call, meta.call)) {
-				staleResultIndices.add(index);
-				break;
+		const path = toolCallPath(meta.call);
+		if (!path) continue;
+		lineRangesByCall.set(meta.call, readLineRanges(path));
+		const basePath = readBasePath(path);
+		const group = readsByBasePath.get(basePath);
+		if (group) group.push([index, meta]);
+		else readsByBasePath.set(basePath, [[index, meta]]);
+	}
+	for (const reads of readsByBasePath.values()) {
+		if (reads.length < 2) continue;
+		for (let earlier = 0; earlier < reads.length - 1; earlier++) {
+			const [index, meta] = reads[earlier];
+			for (let later = earlier + 1; later < reads.length; later++) {
+				if (readSupersedesRead(reads[later][1].call, meta.call, lineRangesByCall)) {
+					staleResultIndices.add(index);
+					break;
+				}
 			}
 		}
 	}

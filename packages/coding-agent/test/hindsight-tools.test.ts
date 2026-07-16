@@ -121,6 +121,28 @@ describe("Hindsight tool factories", () => {
 	});
 });
 
+describe("Hindsight recall injection", () => {
+	beforeEach(() => {
+		resetSettingsForTest();
+		registeredState = undefined;
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		registeredState = undefined;
+	});
+
+	it("injects an unchanged recall snippet only once", () => {
+		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+		registerState(client);
+		registeredState!.lastRecallSnippet = "<memories>fact</memories>";
+		expect(registeredState!.getRecallSnippetForInjection()).toBe("<memories>fact</memories>");
+		expect(registeredState!.getRecallSnippetForInjection()).toBeUndefined();
+		registeredState!.lastRecallSnippet = "<memories>updated fact</memories>";
+		expect(registeredState!.getRecallSnippetForInjection()).toBe("<memories>updated fact</memories>");
+	});
+});
+
 describe("retain.execute", () => {
 	beforeEach(() => {
 		resetSettingsForTest();

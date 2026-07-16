@@ -454,9 +454,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 			throw new Error("Expected custom message to convert to an LLM message");
 		}
 
-		// The 110-token usage anchor is retained. #2342 calibrates message deltas
-		// without inflating fixed conversion overhead: 1,509 total tokens.
-		expect(usage.tokens).toBe(1509);
+		// The 110-token usage anchor is retained, followed by the 1,500-token custom
+		// message delta: 110 + 1,500 = 1,610.
+		expect(usage.tokens).toBe(1610);
 	});
 
 	it("skips error/aborted assistants when anchoring context estimates", () => {
@@ -500,10 +500,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 		if (!llmAborted) {
 			throw new Error("Expected aborted message to convert to an LLM message");
 		}
-		// The 540-token successful usage anchor is retained. #2342 estimates the
-		// aborted trailing message at 214 tokens without inflating fixed overhead:
-		// 540 + 214 = 754.
-		expect(usage.tokens).toBe(754);
+		// The 540-token successful usage anchor is retained, followed by the
+		// aborted trailing message's 750-token display estimate: 540 + 750 = 1,290.
+		expect(usage.tokens).toBe(1290);
 	});
 
 	it("excludes the anchor assistant's own output from the token-correction denominator", async () => {
@@ -547,6 +546,35 @@ describe("AgentSession auto-compaction queue resume", () => {
 		// raw ratio would be ~0.13 and clamp to 0.5.
 		expect(ratio).toBeGreaterThan(1);
 		expect(ratio).toBeLessThanOrEqual(2);
+	});
+
+	it("keeps context usage available after compaction with a usage anchor", async () => {
+		vi.useRealTimers();
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "anchored response" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 100,
+				output: 10,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 110,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		sessionManager.appendMessage({ role: "user", content: "u".repeat(4_000), timestamp: Date.now() });
+		sessionManager.appendMessage(assistant);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		await session.compact();
+
+		const usage = session.getContextUsage();
+		expect(usage?.tokens).toBeGreaterThanOrEqual(110);
 	});
 
 	it("runs pre-prompt handoff maintenance before sending the oversized prompt", async () => {

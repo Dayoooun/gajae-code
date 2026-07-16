@@ -1156,7 +1156,7 @@ export function prepareCompaction(
 	// case so an otherwise-valid manual/idle/overflow compaction can still reduce
 	// history; normal threshold compaction is already well above the scaled window.
 	const historyTokens = pathEntries.slice(boundaryStart, boundaryEnd).reduce(
-		(tokens, entry) => tokens + (entry.type === "message" ? estimateEntryTokens(entry) : 0),
+		(tokens, entry) => tokens + estimateEntryTokens(entry),
 		0,
 	);
 	const effectiveKeepRecentTokens =

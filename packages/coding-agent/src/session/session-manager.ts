@@ -4866,6 +4866,9 @@ export class SessionManager {
 			if (canonical?.type !== "custom_message") continue;
 			canonical.content = updated.content;
 			canonical.details = updated.details;
+			// Pruning replaces content permanently; retaining a cold-spill marker would
+			// rehydrate the superseded payload on the next materialization.
+			canonical.evictedContent = undefined;
 		}
 		this.#needsFullRewriteOnNextPersist = true;
 		this.#bumpEntryRevision();

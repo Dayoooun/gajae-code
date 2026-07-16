@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { logger } from "@gajae-code/utils";
 import type { AgentSession } from "../session/agent-session";
 import { type BankScope, ensureBankMission } from "./bank";
@@ -201,6 +203,7 @@ export class HindsightSessionState {
 	lastRetainedTurn: number;
 	hasRecalledForFirstTurn: boolean;
 	lastRecallSnippet?: string;
+	lastInjectedRecallSnippetHash?: string;
 	/** Cached `<mental_models>` block injected into developer instructions. */
 	mentalModelsSnippet?: string;
 	/** When the cached snippet was last refreshed; gates the agent_end re-list. */
@@ -243,11 +246,22 @@ export class HindsightSessionState {
 		this.lastRetainedTurn = 0;
 		this.hasRecalledForFirstTurn = false;
 		this.lastRecallSnippet = undefined;
+		this.lastInjectedRecallSnippetHash = undefined;
 	}
 
 	/** Return the current recall payload, resolving subagent aliases to their primary state. */
 	getRecallSnippet(): string | undefined {
 		return this.aliasOf ? this.aliasOf.getRecallSnippet() : this.lastRecallSnippet;
+	}
+	/** Return the recall payload once per distinct content value for transcript injection. */
+	getRecallSnippetForInjection(): string | undefined {
+		if (this.aliasOf) return this.aliasOf.getRecallSnippetForInjection();
+		const snippet = this.lastRecallSnippet;
+		if (!snippet) return undefined;
+		const hash = createHash("sha256").update(snippet).digest("hex");
+		if (hash === this.lastInjectedRecallSnippetHash) return undefined;
+		this.lastInjectedRecallSnippetHash = hash;
+		return snippet;
 	}
 
 	enqueueRetain(content: string, context?: string): void {
@@ -302,6 +316,7 @@ export class HindsightSessionState {
 		await ensureBankMission(this.client, this.bankId, this.config, this.missionsSet);
 		await this.client.retain(this.bankId, transcript, {
 			documentId,
+			updateMode: "append",
 			context: this.config.retainContext,
 			metadata: { session_id: this.sessionId },
 			tags: this.retainTags,

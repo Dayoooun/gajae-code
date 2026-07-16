@@ -205,6 +205,8 @@ describe("hindsightBackend.start", () => {
 		expect(secondTranscript).toContain("second user message");
 		expect(secondTranscript).not.toContain("first user message");
 		expect(secondOptions?.documentId).toBe(firstOptions?.documentId);
+		expect(firstOptions?.updateMode).toBe("append");
+		expect(secondOptions?.updateMode).toBe("append");
 	});
 
 	it("skips transcript extraction and upload when the full-session delta is empty", async () => {

@@ -124,6 +124,15 @@ describe("staleness supersession ordering", () => {
 		expect(ids).not.toContain(latest.id);
 	});
 
+	it("does not supersede idempotent bash commands run from different directories", () => {
+		const entries: SessionEntry[] = [];
+		const first = pair(entries, "c1", "bash", { command: "bun test packages/agent", cwd: "/repo-a" });
+		const second = pair(entries, "c2", "bash", { command: "bun test packages/agent", cwd: "/repo-b" });
+		const ids = prunedIds(entries, { ...EAGER, protectTokens: 1_000_000 });
+		expect(ids).not.toContain(first.id);
+		expect(ids).not.toContain(second.id);
+	});
+
 	it("does not supersede non-allowlisted bash commands", () => {
 		const entries: SessionEntry[] = [];
 		const oldest = pair(entries, "c1", "bash", { command: "git log --oneline" });
