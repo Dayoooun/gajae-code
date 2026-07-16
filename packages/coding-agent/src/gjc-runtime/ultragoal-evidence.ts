@@ -320,7 +320,7 @@ function structuralArtifactKind(row: JsonObject): "screenshot" | "automation" | 
 	return null;
 }
 
-async function validateStructuralArtifact(
+export async function validateStructuralArtifact(
 	cwd: string,
 	row: JsonObject,
 	fieldName: string,
@@ -519,7 +519,7 @@ function normalizeCliReplayOutput(value: string, cwd: string): string {
 	return lines.join("\n");
 }
 
-async function readCliReplayRecord(cwd: string, row: JsonObject, fieldName: string): Promise<JsonObject | null> {
+export async function readCliReplayRecord(cwd: string, row: JsonObject, fieldName: string): Promise<JsonObject | null> {
 	const inline = qualityGateObject(row.replay) ?? (row.kind === "cli-replay" ? row : null);
 	if (inline) return inline;
 	if (!evidenceKindMatches(normalizedEvidenceKind(row), ["cli-replay", "command-replay"])) return null;
@@ -707,7 +707,7 @@ export async function validateReplayExemptFallback(
 		);
 	return true;
 }
-async function validateCliReplay(
+export async function validateCliReplay(
 	cwd: string,
 	row: JsonObject,
 	fieldName: string,
@@ -772,7 +772,7 @@ async function hasLiveProofPresence(
 	return false;
 }
 
-async function validateLiveSurfaceProofPresence(
+export async function validateLiveSurfaceProofPresence(
 	cwd: string,
 	family: SurfaceFamily,
 	artifactIds: string[],
@@ -789,7 +789,7 @@ async function validateLiveSurfaceProofPresence(
 		`qualityGate ${artifactIds.map(id => `executorQa.artifactRefs.${id}`).join(", ")} must reference a live proof artifact, structural capture, or CLI replay; inlineEvidence and typed verifiedReceipt do not prove live surfaces`,
 	);
 }
-async function validateSurfaceStructuralRequirement(
+export async function validateSurfaceStructuralRequirement(
 	cwd: string,
 	family: SurfaceFamily,
 	artifactIds: string[],
@@ -824,7 +824,7 @@ async function validateSurfaceStructuralRequirement(
 	}
 }
 
-async function validateArtifactProof(
+export async function validateArtifactProof(
 	cwd: string,
 	row: JsonObject,
 	fieldName: string,

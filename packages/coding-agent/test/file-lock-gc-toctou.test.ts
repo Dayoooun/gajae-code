@@ -106,7 +106,7 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
 		const lockDir = `${lockedFile}.lock`;
-		const replacement = { pid: LIVE_PID, timestamp: Date.now() + 1_000 };
+		const replacement = { pid: LIVE_PID, start_time: "test-start", timestamp: Date.now() + 1_000 };
 
 		await withFileLock(lockedFile, async () => {
 			await writeInfo(lockDir, replacement);
@@ -196,7 +196,7 @@ describe("fileLocksGcAdapter.prune TOCTOU (#606)", () => {
 		const racingProbe: GcPidProbe = pid => {
 			if (pid === DEAD_PID && !reclaimed) {
 				reclaimed = true;
-				writeFileSync(path.join(lockDir, "info"), JSON.stringify({ pid: LIVE_PID, timestamp: 2000 }));
+				writeFileSync(path.join(lockDir, "info"), JSON.stringify({ pid: LIVE_PID, start_time: "test-start", timestamp: 2000 }));
 			}
 			return pid === DEAD_PID ? { status: "dead" } : { status: "keep", reason: "alive" };
 		};

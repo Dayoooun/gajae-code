@@ -824,6 +824,7 @@ async function writeJsonAtomic(
 			toPhase: options?.toPhase,
 			forced: options?.force ?? false,
 		},
+		lockHeld: true,
 	});
 	// `writeResult.stamped` and `.revision` are computed inside the writer lock, so they are
 	// the envelope/revision this write actually owns. Never post-lock re-read here: a concurrent
@@ -1430,7 +1431,7 @@ return await withWorkflowStateLock(filePath, async () => {
 		}),
 		...(outOfBandWarning ? { stderr: `${outOfBandWarning}\n` } : {}),
 	};
-});
+}, { cwd });
 }
 
 async function handleClear(
@@ -1518,7 +1519,7 @@ return await withWorkflowStateLock(filePath, async () => {
 		}),
 		...(outOfBandWarning ? { stderr: `${outOfBandWarning}\n` } : {}),
 	};
-});
+}, { cwd });
 }
 
 /**

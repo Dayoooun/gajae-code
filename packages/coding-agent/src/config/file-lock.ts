@@ -1,5 +1,6 @@
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils/fs-error";
 
 export interface FileLockOptions {
@@ -204,6 +205,7 @@ async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSn
 }
 
 async function tryAcquireLock(lockPath: string): Promise<LockInfo | null> {
+	await fs.mkdir(path.dirname(lockPath), { recursive: true });
 	try {
 		await fs.mkdir(lockPath);
 		return await writeLockInfo(lockPath);

@@ -235,8 +235,8 @@ return await withWorkflowStateLock(statePath, async () => {
 		receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan persist-run-id", sessionId },
 		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
 	});
-	});
-});
+	}, { cwd });
+}
 
 /* --------------------------- planner run-state --------------------------- */
 
@@ -379,8 +379,8 @@ return await withWorkflowStateLock(statePath, async () => {
 		receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan planner-state", sessionId },
 		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
 	});
-	});
-});
+	}, { cwd });
+}
 
 async function resolveArtifactArgs(args: readonly string[], cwd: string): Promise<ResolvedArtifactArgs> {
 	const stage = flagValue(args, "--stage");

@@ -1812,7 +1812,7 @@ const MANDATORY_COMPUTER_CASE_IDS = [
 ] as const;
 const TOOLS_INDEX_PATH = "packages/coding-agent/src/tools/index.ts";
 
-function normalizeRepoPath(value: string): string {
+export function normalizeRepoPath(value: string): string {
 	return value.replaceAll("\\\\", "/").replace(/^\.\//, "");
 }
 
@@ -2079,6 +2079,7 @@ export async function readArtifactBytes(cwd: string, row: JsonObject, fieldName:
 }
 
 import {
+	readCliReplayRecord,
 	validateArtifactProof,
 	validateCliReplay,
 	validateLiveSurfaceProofPresence,
@@ -3603,9 +3604,9 @@ async function readOptionalExecutorQa(cwd: string, value: string | undefined): P
 	return structured as JsonObject;
 }
 
-import { computeCheckpointChangeSet, resolveGitBase } from "./ultragoal-change-set";
+import { computeCheckpointChangeSet, parseGitNameStatus, parseUnifiedDiffPaths, resolveGitBase, spawnText } from "./ultragoal-change-set";
 
-export { computeCheckpointChangeSet, resolveGitBase };
+export { computeCheckpointChangeSet, parseGitNameStatus, parseUnifiedDiffPaths, resolveGitBase, spawnText };
 
 function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | undefined {
 	const kind = nonEmptyString(source.kind);

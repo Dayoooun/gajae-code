@@ -1,10 +1,10 @@
 import {
-	categorizeComputerChangePath, isSettingsSchemaPath, nonEmptyString,
+	categorizeComputerChangePath, isSettingsSchemaPath, nonEmptyString, normalizeRepoPath,
 	type UltragoalChangeCategory, type UltragoalChangeSet, type UltragoalChangeSetPath,
 	type UltragoalChangeStatus,
 } from "./ultragoal-runtime";
 
-async function spawnText(
+export async function spawnText(
 	command: string[],
 	options: { cwd: string; timeoutMs?: number },
 ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
@@ -111,7 +111,7 @@ function mergeChangeSetPaths(groups: UltragoalChangeSetPath[][]): UltragoalChang
 	return [...byKey.values()];
 }
 
-async function computeCheckpointChangeSet(cwd: string): Promise<UltragoalChangeSet | undefined> {
+export async function computeCheckpointChangeSet(cwd: string): Promise<UltragoalChangeSet | undefined> {
 	const ciChangedPaths = ciDevChangedPathRows();
 	const inGit = await spawnText(["git", "rev-parse", "--is-inside-work-tree"], { cwd, timeoutMs: 3000 });
 	if (!inGit.ok || inGit.stdout.trim() !== "true") {
@@ -149,7 +149,7 @@ async function computeCheckpointChangeSet(cwd: string): Promise<UltragoalChangeS
 	};
 }
 
-function parseUnifiedDiffPaths(diff: string): UltragoalChangeSetPath[] {
+export function parseUnifiedDiffPaths(diff: string): UltragoalChangeSetPath[] {
 	const paths: UltragoalChangeSetPath[] = [];
 	for (const line of diff.split("\n")) {
 		if (!line.startsWith("diff --git ")) continue;

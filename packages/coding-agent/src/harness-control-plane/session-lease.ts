@@ -54,7 +54,7 @@ async function writeLeaseAtomic(file: string, lease: SessionLease): Promise<void
 	await fs.rename(tmp, file);
 }
 function leaseMutationLockPath(root: string, sessionId: string): string {
-	return `${sessionPaths(root, sessionId).lease}.lock`;
+	return sessionPaths(root, sessionId).lease;
 }
 
 function isOwnedUnixEndpointPath(root: string, sessionId: string, endpointPath: string, fallbackPath: string): boolean {
@@ -68,6 +68,7 @@ function isOwnedUnixEndpointPath(root: string, sessionId: string, endpointPath: 
 }
 async function withLeaseMutationLock<T>(root: string, sessionId: string, fn: () => Promise<T>): Promise<T> {
 	const lockPath = leaseMutationLockPath(root, sessionId);
+	await fs.mkdir(path.dirname(lockPath), { recursive: true });
 	try {
 		return await withFileLock(lockPath, fn, {
 			staleMs: 30_000,
