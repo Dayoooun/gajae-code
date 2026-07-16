@@ -150,7 +150,9 @@ function matchesGoalModeRequest(existingGoal: Goal, objective: string, provenanc
 	if (existingProvenance?.source === "ultragoal" && provenance?.source === "ultragoal") {
 		return existingProvenance.runId === provenance.runId && existingProvenance.goalId === provenance.goalId;
 	}
-	return existingProvenance === undefined && (provenance === undefined || existingGoal.objective === objective);
+	// Legacy goals predate provenance. Preserve their historical existing-goal
+	// behavior unless both sides prove that this is a different durable plan.
+	return existingProvenance === undefined || provenance === undefined;
 }
 
 function createGoalModeState(objective: string, provenance: Goal["provenance"]): GoalModeState {

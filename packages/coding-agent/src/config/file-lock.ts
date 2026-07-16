@@ -34,11 +34,6 @@ export function processStartTime(pid: number): string | null {
 }
 
 let ownProcessStartTime: string | undefined;
-const heldLockPaths = new Set<string>();
-
-function isCurrentProcessOwner(owner: FileLockOwnerToken): boolean {
-	return owner.pid === process.pid && (!owner.start_time || owner.start_time === currentProcessStartTime());
-}
 
 function currentProcessStartTime(): string {
 	return (ownProcessStartTime ??= processStartTime(process.pid) ?? "unknown");
@@ -250,23 +245,11 @@ async function releaseLock(lockPath: string, owner: FileLockOwnerToken): Promise
 async function acquireLock(filePath: string, options: FileLockOptions = {}): Promise<() => Promise<void>> {
 	const opts = { ...DEFAULT_OPTIONS, ...options };
 	const lockPath = getLockPath(filePath);
-	if (heldLockPaths.has(lockPath)) throw new Error(`File lock reentry for ${filePath}`);
 	const contentionStartTimes = new Map<string, string | null>();
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		const owner = await tryAcquireLock(lockPath);
-		if (owner) {
-			heldLockPaths.add(lockPath);
-			return async () => {
-				try {
-					await releaseLock(lockPath, owner);
-				} finally {
-					heldLockPaths.delete(lockPath);
-				}
-			};
-		}
+		if (owner) return () => releaseLock(lockPath, owner);
 
-		const currentOwner = await readLockInfo(lockPath);
-		if (currentOwner && isCurrentProcessOwner(currentOwner)) throw new Error(`File lock reentry for ${filePath}`);
 		const stale = await staleLockSnapshot(lockPath, opts.staleMs, contentionStartTimes);
 		if (await removeStaleLockForAcquire(lockPath, stale)) continue;
 		await Bun.sleep(opts.retryDelayMs);

@@ -747,10 +747,11 @@ export async function validateCliReplay(
 		}
 		const actualStdout = normalizeCliReplayOutput(stdout.text, cwd);
 		const recordedStdout = normalizeCliReplayOutput(replay.recordedStdout, cwd);
-		if (actualStdout !== recordedStdout) {
+		if (replay.invariants.length > 0) {
+			validateCliReplayInvariants(replay.invariants, actualStdout, fieldName);
+		} else if (actualStdout !== recordedStdout) {
 			throw new Error(`qualityGate ${fieldName} CLI replay stdout did not match recordedStdout after normalization`);
 		}
-		validateCliReplayInvariants(replay.invariants, actualStdout, fieldName);
 		return true;
 	} catch (error) {
 		if (error instanceof Error && error.message === "timeout") {

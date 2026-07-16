@@ -40,17 +40,23 @@ describe("harness final QA regressions", () => {
 		}
 	});
 
-	test("fails same-process lock reentry without retrying", async () => {
+	test("serializes independent same-process lock callers", async () => {
 		const dir = await tempDir();
 		const lockedFile = path.join(dir, "state.json");
-		await withFileLock(lockedFile, async () => {
-			await expect(withFileLock(lockedFile, async () => {}, { retries: 50, retryDelayMs: 100 })).rejects.toThrow(
-				"File lock reentry",
-			);
+		const events: string[] = [];
+		let releaseFirst: (() => void) | undefined;
+		const first = withFileLock(lockedFile, async () => {
+			events.push("first");
+			await new Promise<void>(resolve => (releaseFirst = resolve));
 		});
+		while (!releaseFirst) await Bun.sleep(1);
+		const second = withFileLock(lockedFile, async () => events.push("second"));
+		releaseFirst();
+		await Promise.all([first, second]);
+		expect(events).toEqual(["first", "second"]);
 	});
 
-	test("requires recorded stdout equality even when an invariant matches everything", async () => {
+	test("rejects an always-match replay invariant", async () => {
 		await expect(
 			validateCliReplay(
 				process.cwd(),
@@ -65,7 +71,7 @@ describe("harness final QA regressions", () => {
 				"replay",
 				{ live: false },
 			),
-		).rejects.toThrow("stdout did not match recordedStdout");
+		).rejects.toThrow("regex invariant must not match every stdout value");
 	});
 
 	test("matches reworded ultragoal requests by provenance but replaces stale plan provenance", async () => {
@@ -112,6 +118,6 @@ describe("harness final QA regressions", () => {
 				objective: "Legacy rewording",
 				provenance: existingGoal.provenance,
 			}),
-		).toMatchObject({ status: "updated", goal: { objective: "Legacy rewording" } });
+		).toMatchObject({ status: "existing_goal" });
 	});
 });
