@@ -64,7 +64,7 @@ export const hindsightBackend: MemoryBackend = {
 					aliasOf: parent,
 				}),
 			);
-			previous?.dispose();
+			await previous?.dispose();
 			return;
 		}
 
@@ -94,7 +94,7 @@ export const hindsightBackend: MemoryBackend = {
 		// Cleanup any stale state for this session (defensive — prevents leaks
 		// when a session is reused without going through dispose).
 		const previous = session.setHindsightSessionState(state);
-		previous?.dispose();
+		await previous?.dispose();
 		state.attachSessionListeners();
 
 		// Kick off mental-model bootstrap. Resolves asynchronously; the first
@@ -138,7 +138,7 @@ export const hindsightBackend: MemoryBackend = {
 		const state = session?.getHindsightSessionState();
 		if (state) await state.flushRetainQueue();
 		const previous = session?.setHindsightSessionState(undefined);
-		previous?.dispose();
+		await previous?.dispose();
 		logger.warn(
 			"Hindsight memory is server-side; only the local recall cache was cleared. " +
 				"Delete the Hindsight bank from the UI to wipe upstream state.",

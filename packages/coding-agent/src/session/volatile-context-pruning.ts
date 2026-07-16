@@ -4,13 +4,11 @@ const SUPERSEDED_VOLATILE_CONTEXT_NOTICE = "[superseded volatile context pruned]
 
 /**
  * Custom messages whose producer maintains one current singleton state:
- * - goal-continuation: only the newest queued goal continuation remains actionable.
  * - todo-write-error-reminder: a later todo-write failure replaces the prior warning.
  * - resolve-reminder: only the currently pending resolve preview can be applied.
  * - eager-todo-prelude: the newest todo prelude reflects the current task state.
  */
 const SUPERSEDED_SINGLETON_REMINDER_TYPES = new Set([
-	"goal-continuation",
 	"todo-write-error-reminder",
 	"resolve-reminder",
 	"eager-todo-prelude",

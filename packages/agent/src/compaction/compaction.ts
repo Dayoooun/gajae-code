@@ -509,7 +509,8 @@ function collectMessageFragments(message: AgentMessage): { fragments: string[]; 
 	}
 
 	switch (message.role) {
-		case "user": {
+		case "user":
+		case "custom": {
 			const content = (message as { content: string | Array<{ type: string; text?: string }> }).content;
 			if (typeof content === "string") {
 				fragments.push(content);
@@ -709,8 +710,6 @@ export function findCutPoint(
 
 	for (let i = endIndex - 1; i >= startIndex; i--) {
 		const entry = entries[i];
-		if (entry.type !== "message") continue;
-
 		// Estimate this message's size
 		const messageTokens = estimateEntryTokens(entry);
 		accumulatedTokens += messageTokens;

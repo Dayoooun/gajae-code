@@ -675,6 +675,13 @@ function collectToolOutputPruneCandidates(
 	return { candidates, tokensSaved };
 }
 
+function minimumSavings(config: PruneConfig, options: PruneToolOutputsOptions = {}): number {
+	const relaxedMinimum = options.relaxedMinimum;
+	return typeof relaxedMinimum === "number" && Number.isFinite(relaxedMinimum)
+		? Math.min(config.minimumSavings, Math.max(0, relaxedMinimum))
+		: config.minimumSavings;
+}
+
 /**
  * Estimate the token savings {@link pruneToolOutputs} would achieve, without
  * mutating any entry. Returns 0 savings when below the configured minimum so the
@@ -683,9 +690,10 @@ function collectToolOutputPruneCandidates(
 export function estimateToolOutputPruneSavings(
 	entries: SessionEntry[],
 	config: PruneConfig = DEFAULT_PRUNE_CONFIG,
+	options: PruneToolOutputsOptions = {},
 ): { prunableCount: number; tokensSaved: number } {
 	const { candidates, tokensSaved } = collectToolOutputPruneCandidates(entries, config);
-	if (tokensSaved < config.minimumSavings || candidates.length === 0) {
+	if (tokensSaved < minimumSavings(config, options) || candidates.length === 0) {
 		return { prunableCount: 0, tokensSaved: 0 };
 	}
 	return { prunableCount: candidates.length, tokensSaved };
@@ -720,13 +728,9 @@ export function pruneToolOutputs(
 	options: PruneToolOutputsOptions = {},
 ): PruneResult {
 	const { candidates, tokensSaved } = collectToolOutputPruneCandidates(entries, config);
-	const relaxedMinimum = options.relaxedMinimum;
-	const minimumSavings =
-		typeof relaxedMinimum === "number" && Number.isFinite(relaxedMinimum)
-			? Math.min(config.minimumSavings, Math.max(0, relaxedMinimum))
-			: config.minimumSavings;
+	const minimum = minimumSavings(config, options);
 
-	if (tokensSaved < minimumSavings || candidates.length === 0) {
+	if (tokensSaved < minimum || candidates.length === 0) {
 		return { prunedCount: 0, tokensSaved: 0, prunedEntries: [] };
 	}
 

@@ -40,6 +40,16 @@ describe("maintenance custom-message pruning", () => {
 		expect(entries[2]?.content).toBe("new");
 	});
 
+	it("preserves queued goal continuations because consumed state is not provable", () => {
+		const entries = [
+			custom("one", "goal-continuation", "continue first"),
+			custom("two", "goal-continuation", "continue second"),
+		];
+		const result = pruneSupersededMaintenanceReminders(entries);
+		expect(result.changed).toEqual([]);
+		expect(entries.map(entry => entry.content)).toEqual(["continue first", "continue second"]);
+	});
+
 	it("does not rehydrate superseded content from a cold-spill marker", () => {
 		const manager = SessionManager.create("/tmp", "/tmp");
 		const id = manager.appendCustomMessageEntry("volatile-project-context", "old tree", false);

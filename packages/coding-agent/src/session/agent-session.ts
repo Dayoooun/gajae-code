@@ -4446,7 +4446,7 @@ export class AgentSession {
 		this.#closeAllProviderSessions("dispose");
 		const hindsightState = this.setHindsightSessionState(undefined);
 		await hindsightState?.flushRetainQueue();
-		hindsightState?.dispose();
+		await hindsightState?.dispose();
 		if (this.#unsubscribeAppendOnly) {
 			this.#unsubscribeAppendOnly();
 			this.#unsubscribeAppendOnly = undefined;
@@ -9430,7 +9430,9 @@ export class AgentSession {
 		// sanctioned maintenance boundary, i.e. when the un-pruned context already
 		// crosses the compaction threshold. Pruning may then avert full compaction.
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) return;
-		const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG);
+		const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG, {
+			relaxedMinimum: 0,
+		});
 		if (
 			pruneEstimate.tokensSaved > 0 &&
 			!shouldCompact(
@@ -9531,7 +9533,9 @@ export class AgentSession {
 			// 1) Prune stale tool outputs first — cheaper than compaction, may avert it,
 			//    and (like all history rewrites) resets the codex provider session /
 			//    prompt-cache epoch via #closeCodexProviderSessionsForHistoryRewrite.
-			const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG);
+			const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG, {
+				relaxedMinimum: 0,
+			});
 			let pruneResult: { prunedCount: number; tokensSaved: number } | undefined;
 			if (
 				pruneEstimate.tokensSaved > 0 &&
@@ -9710,7 +9714,9 @@ export class AgentSession {
 			return;
 		}
 
-		const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG);
+		const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG, {
+			relaxedMinimum: 0,
+		});
 		if (
 			pruneEstimate.tokensSaved > 0 &&
 			!shouldCompact(

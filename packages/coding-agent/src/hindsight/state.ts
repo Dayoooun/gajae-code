@@ -106,33 +106,31 @@ export class HindsightRetainQueue {
 			this.#timer = undefined;
 		}
 
-		if (this.#flushing) {
-			// Coalesce: wait for the in-flight flush, then drain anything that
-			// landed after it started so we don't strand items.
-			await this.#flushing;
-			if (this.#items.length > 0) await this.flush();
-			return;
-		}
-
+		if (this.#flushing) return this.#flushing;
 		if (this.#items.length === 0) return;
 
-		const items = this.#items.splice(0);
-		const flushPromise = this.#doFlush(items);
-		this.#flushing = flushPromise;
+		this.#flushing = this.#flushLoop();
 		try {
-			await flushPromise;
+			await this.#flushing;
 		} finally {
 			this.#flushing = undefined;
 		}
 	}
 
-	dispose(): void {
+	async #flushLoop(): Promise<void> {
+		while (this.#items.length > 0) {
+			const items = this.#items.splice(0);
+			await this.#doFlush(items);
+		}
+	}
+
+	async dispose(): Promise<void> {
 		this.#closed = true;
 		if (this.#timer) {
 			clearTimeout(this.#timer);
 			this.#timer = undefined;
 		}
-		this.#items = [];
+		await this.flush();
 	}
 
 	async #doFlush(items: PendingRetainItem[]): Promise<void> {
@@ -499,10 +497,10 @@ export class HindsightSessionState {
 		});
 	}
 
-	dispose(): void {
+	async dispose(): Promise<void> {
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
-		this.retainQueue.dispose();
+		await this.retainQueue.dispose();
 	}
 
 	async #refreshBaseSystemPromptAfter(reason: "MM load" | "MM reload" | "MM TTL reload"): Promise<void> {

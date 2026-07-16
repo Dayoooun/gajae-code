@@ -224,6 +224,43 @@ describe("retain.execute", () => {
 		expect(message).toContain("1 memory");
 	});
 
+	it("drains a retain queued during an in-flight flush before it resolves", async () => {
+		const settings = Settings.isolated({ "memory.backend": "hindsight" });
+		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+		const { promise, resolve } = Promise.withResolvers<Awaited<ReturnType<HindsightApi["retainBatch"]>>>();
+		const retainBatchSpy = vi
+			.spyOn(HindsightApi.prototype, "retainBatch")
+			.mockImplementationOnce(async () => await promise)
+			.mockResolvedValue({} as never);
+		registerState(client, settings);
+
+		registeredState!.enqueueRetain("first");
+		const flush = registeredState!.flushRetainQueue();
+		while (retainBatchSpy.mock.calls.length === 0) await Promise.resolve();
+		registeredState!.enqueueRetain("trailing");
+		resolve({} as never);
+		await flush;
+
+		expect(retainBatchSpy).toHaveBeenCalledTimes(2);
+		expect(retainBatchSpy.mock.calls.map(([, items]) => items.map(item => item.content))).toEqual([
+			["first"],
+			["trailing"],
+		]);
+	});
+
+	it("flushes pending retains during disposal and rejects later enqueues", async () => {
+		const settings = Settings.isolated({ "memory.backend": "hindsight" });
+		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+		const retainBatchSpy = vi.spyOn(HindsightApi.prototype, "retainBatch").mockResolvedValue({} as never);
+		registerState(client, settings);
+
+		registeredState!.enqueueRetain("retain before disposal");
+		await registeredState!.dispose();
+
+		expect(retainBatchSpy).toHaveBeenCalledTimes(1);
+		expect(() => registeredState!.enqueueRetain("after disposal")).toThrow(/closed/i);
+	});
+
 	it("throws when no per-session state is registered", async () => {
 		const settings = Settings.isolated({ "memory.backend": "hindsight" });
 		const tool = HindsightRetainTool.createIf(makeSession(settings))!;

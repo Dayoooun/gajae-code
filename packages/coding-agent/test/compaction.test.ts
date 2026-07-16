@@ -6,6 +6,7 @@ import {
 	calculateContextTokens,
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
+	estimateEntryTokens,
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
@@ -959,6 +960,24 @@ describe("findCutPoint", () => {
 		expect(result.firstKeptEntryIndex).toBe(3);
 		expect(result.isSplitTurn).toBe(true);
 		expect(result.turnStartIndex).toBe(2);
+	});
+	it("counts custom-message content when retaining the recent context window", () => {
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("old turn")),
+			{
+				type: "custom_message",
+				id: "custom-context",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				customType: "goal-context",
+				content: "x".repeat(400),
+				display: false,
+			},
+			createMessageEntry(createUserMessage("new turn")),
+		];
+
+		expect(estimateEntryTokens(entries[1]!)).toBeGreaterThanOrEqual(100);
+		expect(findCutPoint(entries, 0, entries.length, 100).firstKeptEntryIndex).toBe(1);
 	});
 });
 
