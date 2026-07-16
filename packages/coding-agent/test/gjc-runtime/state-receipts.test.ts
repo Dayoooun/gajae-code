@@ -82,6 +82,9 @@ describe("G5 gjc state receipts", () => {
 			expectCliChecksum(writePayload);
 			const statePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
 			expectValidReceipt(await readJson(statePath), "ralplan");
+			const receipt = (await readJson(statePath)).receipt as Record<string, unknown>;
+			expect(await fs.stat(String(receipt.storage_path))).toBeDefined();
+			expect(await fs.stat(String(receipt.state_path))).toBeDefined();
 			expectAuditEntry(findAuditEntry(await readAuditEntries(cwd), "write"), "write");
 
 			const clear = await runNativeStateCommand(["clear", "--mode", "ralplan"], cwd);
