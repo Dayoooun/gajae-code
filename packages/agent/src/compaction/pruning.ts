@@ -267,6 +267,44 @@ function readBasePath(path: string): string {
 	return base;
 }
 
+type ReadLineRange = { start: number; end: number };
+
+/** Parse trailing numeric read selectors; mode selectors do not select lines. */
+function readLineRanges(path: string): ReadLineRange[] {
+	let target = path;
+	while (/:(?:raw|conflicts)$/.test(target)) target = target.replace(/:(?:raw|conflicts)$/, "");
+	const match = target.match(/:(\d+(?:[-+]\d+)?(?:,\d+(?:[-+]\d+)?)*)$/);
+	if (!match) return [];
+	return match[1].split(",").flatMap(part => {
+		const range = part.match(/^(\d+)(?:([-+])(\d+))?$/);
+		if (!range) return [];
+		const start = Number(range[1]);
+		const end = range[2] === "+" ? start + Number(range[3]) - 1 : Number(range[3] ?? Number.POSITIVE_INFINITY);
+		return start > 0 && end >= start ? [{ start, end }] : [];
+	});
+}
+
+function strictlyContainsReadRange(container: ReadLineRange, contained: ReadLineRange): boolean {
+	return (
+		container.start <= contained.start &&
+		container.end >= contained.end &&
+		(container.start < contained.start || container.end > contained.end)
+	);
+}
+
+function readSupersedesRead(later: ToolCall, earlier: ToolCall): boolean {
+	const laterPath = toolCallPath(later);
+	const earlierPath = toolCallPath(earlier);
+	if (!laterPath || !earlierPath || readBasePath(laterPath) !== readBasePath(earlierPath)) return false;
+	const laterRanges = readLineRanges(laterPath);
+	const earlierRanges = readLineRanges(earlierPath);
+	return (
+		laterRanges.length === 1 &&
+		earlierRanges.length === 1 &&
+		strictlyContainsReadRange(laterRanges[0], earlierRanges[0])
+	);
+}
+
 /**
  * Stable identity for "the same logical lookup": same tool re-targeting the
  * same subject. A later result with the same key supersedes earlier ones.
@@ -275,9 +313,22 @@ function readBasePath(path: string): string {
  * (`skip`) and result-shaping flags (`i`, `gitignore`): a later page or a
  * differently-shaped search complements earlier output, it does not replace it.
  */
+const IDEMPOTENT_BASH_COMMAND = /^(?:(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?(?:test|build)\b|git\s+status\b|cargo\s+build\b|(?:make|just)\s+build\b)/;
+
+function normalizedIdempotentBashCommand(call: ToolCall): string | undefined {
+	if (call.name !== "bash") return undefined;
+	const command = call.arguments.command;
+	if (typeof command !== "string") return undefined;
+	const normalized = command.trim().replace(/\s+/g, " ");
+	if (/[;&|]/.test(normalized) || !IDEMPOTENT_BASH_COMMAND.test(normalized)) return undefined;
+	return normalized;
+}
+
 function toolTargetKey(call: ToolCall): string | undefined {
 	const path = toolCallPath(call);
 	if (path !== undefined) return JSON.stringify([call.name, "path", path]);
+	const command = normalizedIdempotentBashCommand(call);
+	if (command !== undefined) return JSON.stringify([call.name, "command", command]);
 	const pattern = call.arguments.pattern;
 	if (typeof pattern === "string" && pattern.length > 0) {
 		const paths = call.arguments.paths;
@@ -435,6 +486,16 @@ function buildStalenessIndex(entries: SessionEntry[]): StalenessIndex {
 					staleResultIndices.add(index);
 					break;
 				}
+			}
+		}
+	}
+
+	for (const [index, meta] of resultMeta) {
+		if (meta.call.name !== "read") continue;
+		for (const [laterIndex, laterMeta] of resultMeta) {
+			if (laterIndex > index && laterMeta.call.name === "read" && readSupersedesRead(laterMeta.call, meta.call)) {
+				staleResultIndices.add(index);
+				break;
 			}
 		}
 	}
@@ -630,10 +691,24 @@ export function shouldRunMaintenancePrune(args: {
 	return args.estimatedSavings > args.cacheEpochResetCost;
 }
 
-export function pruneToolOutputs(entries: SessionEntry[], config: PruneConfig = DEFAULT_PRUNE_CONFIG): PruneResult {
-	const { candidates, tokensSaved } = collectToolOutputPruneCandidates(entries, config);
+export interface PruneToolOutputsOptions {
+	/** Lower the usual minimum only when the caller is already over its compaction threshold. */
+	relaxedMinimum?: number;
+}
 
-	if (tokensSaved < config.minimumSavings || candidates.length === 0) {
+export function pruneToolOutputs(
+	entries: SessionEntry[],
+	config: PruneConfig = DEFAULT_PRUNE_CONFIG,
+	options: PruneToolOutputsOptions = {},
+): PruneResult {
+	const { candidates, tokensSaved } = collectToolOutputPruneCandidates(entries, config);
+	const relaxedMinimum = options.relaxedMinimum;
+	const minimumSavings =
+		typeof relaxedMinimum === "number" && Number.isFinite(relaxedMinimum)
+			? Math.min(config.minimumSavings, Math.max(0, relaxedMinimum))
+			: config.minimumSavings;
+
+	if (tokensSaved < minimumSavings || candidates.length === 0) {
 		return { prunedCount: 0, tokensSaved: 0, prunedEntries: [] };
 	}
 
