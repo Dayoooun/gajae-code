@@ -454,10 +454,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 			throw new Error("Expected custom message to convert to an LLM message");
 		}
 
-		// Anchor = total context tokens of the last successful assistant
-		// (input 100 + output 10): the next request replays that assistant's
-		// own output, so prompt-only anchoring would undercount it.
-		expect(usage.tokens).toBe(110 + estimateMessageTokensHeuristic(llmCustomMessage));
+		// The 110-token usage anchor is retained. #2342 calibrates message deltas
+		// without inflating fixed conversion overhead: 1,509 total tokens.
+		expect(usage.tokens).toBe(1509);
 	});
 
 	it("skips error/aborted assistants when anchoring context estimates", () => {
@@ -501,10 +500,10 @@ describe("AgentSession auto-compaction queue resume", () => {
 		if (!llmAborted) {
 			throw new Error("Expected aborted message to convert to an LLM message");
 		}
-		// The aborted turn's partial usage must not anchor the estimate; it is
-		// charged heuristically as trailing context after the last successful
-		// anchor (total 540).
-		expect(usage.tokens).toBe(540 + estimateMessageTokensHeuristic(llmAborted));
+		// The 540-token successful usage anchor is retained. #2342 estimates the
+		// aborted trailing message at 214 tokens without inflating fixed overhead:
+		// 540 + 214 = 754.
+		expect(usage.tokens).toBe(754);
 	});
 
 	it("excludes the anchor assistant's own output from the token-correction denominator", async () => {
