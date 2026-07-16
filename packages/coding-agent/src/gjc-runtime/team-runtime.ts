@@ -21,6 +21,13 @@ import {
 	writeReport,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
+import { deliverTeamMailboxMessage } from "./team-notify";
+import type {
+	GjcTeamMailboxDeliveryTransport,
+	GjcTeamNotification,
+	GjcTeamNotificationDeliveryState,
+	GjcTeamPaneAttemptResult,
+} from "./team-store";
 import {
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxUntaggedSessionHint,
@@ -30,13 +37,7 @@ import {
 	resolveGjcTmuxBinary,
 	resolveGjcTmuxCommand,
 } from "./tmux-common";
-import { deliverTeamMailboxMessage } from "./team-notify";
-import type {
-	GjcTeamMailboxDeliveryTransport,
-	GjcTeamNotification,
-	GjcTeamNotificationDeliveryState,
-	GjcTeamPaneAttemptResult,
-} from "./team-store";
+
 export type {
 	GjcTeamMailboxDeliveryInput,
 	GjcTeamMailboxDeliveryResult,
