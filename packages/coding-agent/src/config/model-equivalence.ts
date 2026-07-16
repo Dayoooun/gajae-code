@@ -104,6 +104,11 @@ export function formatCanonicalVariantSelector(model: Model<Api>): string {
 	return `${model.provider}/${model.id}`;
 }
 
+/** Compare provider variants on the common capability axis used by resolution. */
+export function compareModelVariantRank(left: Model<Api>, right: Model<Api>): number {
+	return Number(!left.input.includes("image")) - Number(!right.input.includes("image"));
+}
+
 function buildOverrideMap(overrides: Record<string, string> | undefined): Map<string, string> {
 	const result = new Map<string, string>();
 	if (!overrides) {

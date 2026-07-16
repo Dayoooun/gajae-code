@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Effort, type Model, type OpenAICompat, type ThinkingConfig, writeModelCache } from "@gajae-code/ai";
 import { kNoAuth, MODEL_ROLE_IDS, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { resolveModelFromString } from "@gajae-code/coding-agent/config/model-resolver";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { addApiCompatibleProvider } from "@gajae-code/coding-agent/setup/provider-onboarding";
@@ -648,6 +649,26 @@ describe("ModelRegistry", () => {
 
 			expect(resolved?.input.includes("image")).toBe(true);
 			expect(resolved?.provider).toBe("anthropic");
+		});
+		test("ranks bare and canonical references to the same variant", async () => {
+			await Settings.init({
+				inMemory: true,
+				overrides: { modelProviderOrder: ["demo", "anthropic"] },
+			});
+			writeRawModelsJson({
+				demo: providerConfig("https://demo.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const candidates = registry.getAll();
+			const canonical = registry.resolveCanonicalModel("claude-sonnet-4-5", {
+				availableOnly: false,
+				candidates,
+			});
+			const bare = resolveModelFromString("claude-sonnet-4-5", candidates, undefined, registry);
+
+			expect(canonical).toBeDefined();
+			expect(bare).toBeDefined();
+			expect(`${bare!.provider}/${bare!.id}`).toBe(`${canonical!.provider}/${canonical!.id}`);
 		});
 	});
 

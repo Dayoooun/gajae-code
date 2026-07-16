@@ -8,7 +8,8 @@ import { fuzzyMatch } from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
 import chalk from "chalk";
 import { parseThinkingLevel, resolveThinkingLevelForModel } from "../thinking";
-import { isAuthenticated, kNoAuth, MODEL_ROLE_IDS, type ModelRegistry, type ModelRole } from "./model-registry";
+import { compareModelVariantRank } from "./model-equivalence";
+import { isAuthenticatedOrKeyless, MODEL_ROLE_IDS, type ModelRegistry, type ModelRole } from "./model-registry";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 import type { Settings } from "./settings";
 
@@ -259,13 +260,9 @@ function pickPreferredModel(candidates: Model<Api>[], context: ModelPreferenceCo
 			return (aProviderUsage ?? Number.POSITIVE_INFINITY) - (bProviderUsage ?? Number.POSITIVE_INFINITY);
 		}
 
-		// Prefer vision-capable variants over configured provider/registration order
-		// so an ambiguous id never resolves to a text-only namesake when a
-		// vision-capable variant of the same id is available.
-		const aVision = a.input.includes("image") ? 0 : 1;
-		const bVision = b.input.includes("image") ? 0 : 1;
-		if (aVision !== bVision) {
-			return aVision - bVision;
+		const variantRank = compareModelVariantRank(a, b);
+		if (variantRank !== 0) {
+			return variantRank;
 		}
 
 		const aDeprioritized = context.deprioritizedProviders.has(a.provider);
@@ -794,7 +791,7 @@ export async function resolveModelChainWithAuth(
 			}
 		}
 		const key = await modelRegistry.getApiKey(candidate.model, sessionId);
-		if (key === kNoAuth || isAuthenticated(key)) {
+		if (isAuthenticatedOrKeyless(key)) {
 			return { ...candidate, activeIndex, skips };
 		}
 		skips.push({ selector, reason: "unauthenticated" });
@@ -867,7 +864,7 @@ export async function resolveModelOverrideWithAuthFallback(
 			}
 		}
 		const key = await modelRegistry.getApiKey(candidate.model, sessionId);
-		if (key === kNoAuth || isAuthenticated(key)) {
+		if (isAuthenticatedOrKeyless(key)) {
 			return { ...candidate, requestedModel: candidate.model, authFallbackUsed: false, activeIndex, skips };
 		}
 		skips.push({ selector: pattern, reason: "unauthenticated" });
@@ -878,7 +875,7 @@ export async function resolveModelOverrideWithAuthFallback(
 		: { explicitThinkingLevel: false };
 	if (fallback.model) {
 		const fallbackKey = await modelRegistry.getApiKey(fallback.model, sessionId);
-		if (fallbackKey === kNoAuth || isAuthenticated(fallbackKey)) {
+		if (isAuthenticatedOrKeyless(fallbackKey)) {
 			const isParentSubstitution = requestedModel === undefined || !modelsAreEqual(fallback.model, requestedModel);
 			return {
 				...fallback,
