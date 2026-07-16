@@ -36,7 +36,8 @@ export function processStartTime(pid: number): string | null {
 let ownProcessStartTime: string | undefined;
 
 function currentProcessStartTime(): string {
-	return (ownProcessStartTime ??= processStartTime(process.pid) ?? "unknown");
+	if (ownProcessStartTime === undefined) ownProcessStartTime = processStartTime(process.pid) ?? "unknown";
+	return ownProcessStartTime;
 }
 
 function cachedProcessStartTime(owner: FileLockOwnerToken, cache?: Map<string, string | null>): string | null {
@@ -95,8 +96,6 @@ function getLockPath(filePath: string): string {
 	return `${filePath}.lock`;
 }
 
-
-
 /** Outcome of a guarded lock-dir removal attempt (`removeFileLockDirForGc`). */
 export type FileLockGcRemoval = "removed" | "owner_changed" | "missing";
 
@@ -140,7 +139,6 @@ export async function removeFileLockDirForGc(
 		(expected.start_time !== undefined && current.start_time !== expected.start_time) ||
 		current.timestamp !== expected.timestamp
 	) {
-
 		return "owner_changed";
 	}
 	await fs.rm(lockDir, { recursive: true, force: true });

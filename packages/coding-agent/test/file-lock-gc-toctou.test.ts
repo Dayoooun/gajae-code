@@ -24,9 +24,16 @@ async function makeTemp(): Promise<string> {
 	return dir;
 }
 
-async function writeInfo(lockDir: string, info: { pid: number; timestamp: number; start_time?: string }): Promise<void> {
+async function writeInfo(
+	lockDir: string,
+	info: { pid: number; timestamp: number; start_time?: string },
+): Promise<void> {
 	await fs.mkdir(lockDir, { recursive: true });
-	await fs.writeFile(path.join(lockDir, "info"), JSON.stringify({ ...info, start_time: info.start_time ?? "test-start" }), "utf8");
+	await fs.writeFile(
+		path.join(lockDir, "info"),
+		JSON.stringify({ ...info, start_time: info.start_time ?? "test-start" }),
+		"utf8",
+	);
 }
 
 function ctxWith(spoolDir: string, probe: GcPidProbe): GcContext {
@@ -107,11 +114,14 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		const lockedFile = path.join(base, "state.json");
 		const lockDir = `${lockedFile}.lock`;
 		await fs.mkdir(lockDir, { recursive: true });
-		await fs.writeFile(path.join(lockDir, "info"), JSON.stringify({ pid: process.pid, timestamp: Date.now() - 10_000 }));
-
-		await expect(withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 })).rejects.toThrow(
-			"Failed to acquire lock",
+		await fs.writeFile(
+			path.join(lockDir, "info"),
+			JSON.stringify({ pid: process.pid, timestamp: Date.now() - 10_000 }),
 		);
+
+		await expect(
+			withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
+		).rejects.toThrow("Failed to acquire lock");
 		expect(await fs.exists(lockDir)).toBe(true);
 	});
 
@@ -209,7 +219,10 @@ describe("fileLocksGcAdapter.prune TOCTOU (#606)", () => {
 		const racingProbe: GcPidProbe = pid => {
 			if (pid === DEAD_PID && !reclaimed) {
 				reclaimed = true;
-				writeFileSync(path.join(lockDir, "info"), JSON.stringify({ pid: LIVE_PID, start_time: "test-start", timestamp: 2000 }));
+				writeFileSync(
+					path.join(lockDir, "info"),
+					JSON.stringify({ pid: LIVE_PID, start_time: "test-start", timestamp: 2000 }),
+				);
 			}
 			return pid === DEAD_PID ? { status: "dead" } : { status: "keep", reason: "alive" };
 		};

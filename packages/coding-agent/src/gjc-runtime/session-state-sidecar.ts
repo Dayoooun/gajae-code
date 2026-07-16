@@ -2,10 +2,9 @@ import { randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { withFileLock } from "../config/file-lock";
-
 import type { AssistantMessage } from "@gajae-code/ai";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
+import { withFileLock } from "../config/file-lock";
 import { sessionRuntimeDir } from "./session-layout";
 import {
 	isValidOwnerIntent,

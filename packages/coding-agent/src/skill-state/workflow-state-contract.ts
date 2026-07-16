@@ -51,7 +51,6 @@ export interface AuditEntry {
 	paths: string[];
 }
 
-
 export function workflowModeStateFileName(skill: CanonicalGjcWorkflowSkill): string {
 	return `${skill}-state.json`;
 }

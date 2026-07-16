@@ -75,7 +75,6 @@ export async function readUltragoalGjcObjective(
 	cwd: string,
 	sessionId?: string | null,
 ): Promise<{ objective: string; goalsPath: string; provenance: Extract<GoalProvenance, { source: "ultragoal" }> }> {
-
 	const session = sessionId?.trim()
 		? { gjcSessionId: sessionId.trim() }
 		: await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID });
@@ -89,7 +88,6 @@ export async function readUltragoalGjcObjective(
 			goalsPath,
 			provenance: { source: "ultragoal", runId: session.gjcSessionId, goalId },
 		};
-
 	} catch (error) {
 		if (isEnoent(error)) {
 			return {
@@ -109,7 +107,6 @@ export async function writePendingGoalModeRequest(input: {
 	goalsPath?: string;
 	sessionId?: string | null;
 	provenance?: Extract<GoalProvenance, { source: "ultragoal" }>;
-
 }): Promise<PendingGoalModeRequest> {
 	const objective = input.objective.trim();
 	if (!objective) throw new Error("goal objective is required");
@@ -145,13 +142,13 @@ function isNonTerminalGoal(goal: Goal | null): goal is Goal {
 	return goal !== null && goal.status !== "complete" && goal.status !== "dropped";
 }
 
-function matchesGoalModeRequest(existingGoal: Goal, objective: string, provenance: Goal["provenance"]): boolean {
+function matchesGoalModeRequest(existingGoal: Goal, provenance: Goal["provenance"]): boolean {
 	const existingProvenance = existingGoal.provenance;
 	if (existingProvenance?.source === "ultragoal" && provenance?.source === "ultragoal") {
 		return existingProvenance.runId === provenance.runId && existingProvenance.goalId === provenance.goalId;
 	}
-	// Legacy goals predate provenance. Preserve their historical existing-goal
-	// behavior unless both sides prove that this is a different durable plan.
+	// Legacy goals predate provenance. They cannot prove a different durable plan,
+	// so preserve the active goal instead of overwriting unrelated user work.
 	return existingProvenance === undefined || provenance === undefined;
 }
 
@@ -170,7 +167,6 @@ function createGoalModeState(objective: string, provenance: Goal["provenance"]):
 	return { enabled: true, mode: "active", goal };
 }
 
-
 function nextSessionEntryId(entries: readonly SessionEntry[]): string {
 	const existing = new Set(entries.map(entry => entry.id));
 	for (let index = 0; index < 100; index++) {
@@ -184,7 +180,6 @@ export async function writeCurrentSessionGoalModeState(input: {
 	sessionFile?: string | null;
 	objective: string;
 	provenance?: Goal["provenance"];
-
 }): Promise<CurrentSessionGoalModeWriteResult> {
 	const sessionFile = input.sessionFile?.trim();
 	if (!sessionFile) return { status: "unavailable", reason: "missing_session_file" };
@@ -202,7 +197,7 @@ export async function writeCurrentSessionGoalModeState(input: {
 	if (
 		(context.mode === "goal" || context.mode === "goal_paused") &&
 		isNonTerminalGoal(existingGoal) &&
-		matchesGoalModeRequest(existingGoal, objective, input.provenance)
+		matchesGoalModeRequest(existingGoal, input.provenance)
 	) {
 		return { status: "existing_goal", goal: existingGoal };
 	}

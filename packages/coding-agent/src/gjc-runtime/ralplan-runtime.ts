@@ -5,8 +5,6 @@ import { syncSkillActiveState } from "../skill-state/active-state";
 import { buildRalplanHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
-import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
-import { getSkillManifest } from "./workflow-manifest";
 import {
 	formatRalplanStagePresence,
 	parseRalplanIndexLine,
@@ -25,6 +23,8 @@ import {
 	writeArtifact,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
+import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
+import { getSkillManifest } from "./workflow-manifest";
 
 /**
  * Native implementation of `gjc ralplan`.
@@ -57,7 +57,6 @@ type RalplanStage = (typeof KNOWN_STAGES)[number];
 
 const KNOWN_ARCHITECT_KINDS = new Set(["openai-code"]);
 const KNOWN_CRITIC_KINDS = new Set(["openai-code"]);
-
 
 const SUBAGENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 
@@ -94,7 +93,6 @@ const VALUE_FLAGS = new Set([
 	"--fallback-receipt-path",
 ]);
 
-
 export function isRalplanArtifactWriteInvocation(args: readonly string[]): boolean {
 	return hasFlag(args, "--write");
 }
@@ -102,7 +100,6 @@ export function isRalplanArtifactWriteInvocation(args: readonly string[]): boole
 function isRalplanDoctorInvocation(args: readonly string[]): boolean {
 	return args[0] === "doctor";
 }
-
 
 function assertKnownStage(stage: string): asserts stage is RalplanStage {
 	if (!(KNOWN_STAGES as readonly string[]).includes(stage)) {
@@ -199,43 +196,47 @@ function advanceCurrentPhase(existingPhase: unknown, stage: RalplanStage): strin
 
 async function persistActiveRunId(cwd: string, sessionId: string, runId: string, stage: RalplanStage): Promise<void> {
 	const statePath = ralplanStatePath(cwd, sessionId);
-return await withWorkflowStateLock(statePath, async () => {
-	const existingRead = await readExistingStateForMutation(statePath);
-	if (existingRead.kind === "corrupt") {
-		throw new RalplanCommandError(
-			2,
-			`existing ralplan state is corrupt or tampered (${existingRead.error}); refusing to overwrite ${statePath}`,
-		);
-	}
-	let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
+	return await withWorkflowStateLock(
+		statePath,
+		async () => {
+			const existingRead = await readExistingStateForMutation(statePath);
+			if (existingRead.kind === "corrupt") {
+				throw new RalplanCommandError(
+					2,
+					`existing ralplan state is corrupt or tampered (${existingRead.error}); refusing to overwrite ${statePath}`,
+				);
+			}
+			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
 
-	// A new run_id is a fresh run, not a stray write on the prior run: never inherit a
-	// previous run's terminal/locked phase (which would start the new run already
-	// "complete"/"handoff" and disarm the Stop hook). PHASE_LOCK only guards same-run writes.
-	const isNewRun = existing.run_id !== runId;
-	const nextPhase = isNewRun ? stage : advanceCurrentPhase(existing.current_phase, stage);
-	if (
-		existing.run_id === runId &&
-		existing.version === WORKFLOW_STATE_VERSION &&
-		existing.current_phase === nextPhase &&
-		(existing.active === true || getSkillManifest("ralplan").phaseLock.includes(nextPhase))
-	) {
-		return;
-	}
-	existing.run_id = runId;
-	if (typeof existing.skill !== "string") existing.skill = "ralplan";
-	// A successful persist means ralplan is actively writing this run's artifacts, so always
-	// re-assert active. Fallback-only init left active:false after a clear (#644, sibling of #638).
-	existing.active = true;
-	existing.current_phase = nextPhase;
-	existing = migrateWorkflowState(existing, "ralplan").state;
-	existing.updated_at = new Date().toISOString();
-	await writeWorkflowEnvelopeAtomic(statePath, existing, {
-		cwd,
-		receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan persist-run-id", sessionId },
-		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
-	});
-	}, { cwd });
+			// A new run_id is a fresh run, not a stray write on the prior run: never inherit a
+			// previous run's terminal/locked phase (which would start the new run already
+			// "complete"/"handoff" and disarm the Stop hook). PHASE_LOCK only guards same-run writes.
+			const isNewRun = existing.run_id !== runId;
+			const nextPhase = isNewRun ? stage : advanceCurrentPhase(existing.current_phase, stage);
+			if (
+				existing.run_id === runId &&
+				existing.version === WORKFLOW_STATE_VERSION &&
+				existing.current_phase === nextPhase &&
+				(existing.active === true || getSkillManifest("ralplan").phaseLock.includes(nextPhase))
+			) {
+				return;
+			}
+			existing.run_id = runId;
+			if (typeof existing.skill !== "string") existing.skill = "ralplan";
+			// A successful persist means ralplan is actively writing this run's artifacts, so always
+			// re-assert active. Fallback-only init left active:false after a clear (#644, sibling of #638).
+			existing.active = true;
+			existing.current_phase = nextPhase;
+			existing = migrateWorkflowState(existing, "ralplan").state;
+			existing.updated_at = new Date().toISOString();
+			await writeWorkflowEnvelopeAtomic(statePath, existing, {
+				cwd,
+				receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan persist-run-id", sessionId },
+				audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
+			});
+		},
+		{ cwd },
+	);
 }
 
 /* --------------------------- planner run-state --------------------------- */
@@ -359,27 +360,31 @@ function plannerStatePayload(update: PlannerStateUpdate): Record<string, unknown
  */
 async function applyPlannerStateUpdate(cwd: string, sessionId: string, update: PlannerStateUpdate): Promise<void> {
 	const statePath = ralplanStatePath(cwd, sessionId);
-return await withWorkflowStateLock(statePath, async () => {
-	const existingRead = await readExistingStateForMutation(statePath);
-	if (existingRead.kind === "corrupt") {
-		throw new RalplanCommandError(
-			2,
-			`existing ralplan state is corrupt or tampered (${existingRead.error}); refusing to overwrite ${statePath}`,
-		);
-	}
-	let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
-	Object.assign(existing, plannerStatePayload(update));
-	if (typeof existing.skill !== "string") existing.skill = "ralplan";
-	if (typeof existing.active !== "boolean") existing.active = true;
-	if (typeof existing.current_phase !== "string") existing.current_phase = "planner";
-	existing = migrateWorkflowState(existing, "ralplan").state;
-	existing.updated_at = new Date().toISOString();
-	await writeWorkflowEnvelopeAtomic(statePath, existing, {
-		cwd,
-		receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan planner-state", sessionId },
-		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
-	});
-	}, { cwd });
+	return await withWorkflowStateLock(
+		statePath,
+		async () => {
+			const existingRead = await readExistingStateForMutation(statePath);
+			if (existingRead.kind === "corrupt") {
+				throw new RalplanCommandError(
+					2,
+					`existing ralplan state is corrupt or tampered (${existingRead.error}); refusing to overwrite ${statePath}`,
+				);
+			}
+			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
+			Object.assign(existing, plannerStatePayload(update));
+			if (typeof existing.skill !== "string") existing.skill = "ralplan";
+			if (typeof existing.active !== "boolean") existing.active = true;
+			if (typeof existing.current_phase !== "string") existing.current_phase = "planner";
+			existing = migrateWorkflowState(existing, "ralplan").state;
+			existing.updated_at = new Date().toISOString();
+			await writeWorkflowEnvelopeAtomic(statePath, existing, {
+				cwd,
+				receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan planner-state", sessionId },
+				audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
+			});
+		},
+		{ cwd },
+	);
 }
 
 async function resolveArtifactArgs(args: readonly string[], cwd: string): Promise<ResolvedArtifactArgs> {

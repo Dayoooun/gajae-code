@@ -1,10 +1,25 @@
 import * as path from "node:path";
 import { inflateSync } from "node:zlib";
 import {
-	evidenceKindMatches, hasExistingNonEmptyArtifact, hasTypedVerifiedReceipt, isEnoent,
-	isLiveSurfaceFamily, isSubstantiveEvidence, nonEmptyString, nonEmptyStringArray, normalizedEvidenceKind, qualityGateObject,
-	readArtifactBytes, requireObjectArray, requireQualityGateObject, requireResolvedLinks,
-	requireStringLinks, requiredStringField, surfaceFamily, PASSED_STATUS, type JsonObject, type SurfaceFamily,
+	evidenceKindMatches,
+	hasExistingNonEmptyArtifact,
+	hasTypedVerifiedReceipt,
+	isLiveSurfaceFamily,
+	isSubstantiveEvidence,
+	type JsonObject,
+	nonEmptyString,
+	nonEmptyStringArray,
+	normalizedEvidenceKind,
+	PASSED_STATUS,
+	qualityGateObject,
+	readArtifactBytes,
+	requiredStringField,
+	requireObjectArray,
+	requireQualityGateObject,
+	requireResolvedLinks,
+	requireStringLinks,
+	type SurfaceFamily,
+	surfaceFamily,
 } from "./ultragoal-runtime";
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);

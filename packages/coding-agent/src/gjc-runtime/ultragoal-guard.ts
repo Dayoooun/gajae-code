@@ -71,7 +71,6 @@ function objectiveMatches(currentGoal: CurrentGoalLike, plan: UltragoalPlan, ses
 	return plan.goals.some(goal => goal.objective === normalized);
 }
 
-
 function isKnownUltragoalObjective(currentObjective: string): boolean {
 	const normalized = currentObjective.trim();
 	return (
@@ -427,7 +426,6 @@ export async function readUltragoalVerificationState(input: {
 		return { state: "inactive", message: "No Ultragoal plan exists." };
 	}
 	if (!currentGoal || !objectiveMatches(currentGoal, plan, input.sessionId))
-
 		return { state: "unrelated_goal", message: "Current goal is not an active Ultragoal objective." };
 	if (plan.goals.some(goal => goal.status === "review_blocked")) {
 		return {
@@ -442,17 +440,18 @@ export async function readUltragoalVerificationState(input: {
 			message: "Ultragoal has blocked or failed goals; record blockers or rerun verification.",
 		};
 	}
-	const receiptTarget = currentGoal.provenance?.source === "ultragoal"
-		? currentGoal.provenance.goalId === "aggregate" || plan.gjcGoalMode === "aggregate"
-			? (() => {
-					const goal = findFinalAggregateReceiptGoal(plan, ledger);
-					return goal ? { goal, receiptKind: "final-aggregate" as const } : null;
-				})()
-			: (() => {
-					const goal = plan.goals.find(item => item.id === currentGoal.provenance?.goalId);
-					return goal ? { goal, receiptKind: "per-goal" as const } : null;
-				})()
-		: findReceiptGoal(plan, ledger, currentObjective);
+	const receiptTarget =
+		currentGoal.provenance?.source === "ultragoal"
+			? currentGoal.provenance.goalId === "aggregate" || plan.gjcGoalMode === "aggregate"
+				? (() => {
+						const goal = findFinalAggregateReceiptGoal(plan, ledger);
+						return goal ? { goal, receiptKind: "final-aggregate" as const } : null;
+					})()
+				: (() => {
+						const goal = plan.goals.find(item => item.id === currentGoal.provenance?.goalId);
+						return goal ? { goal, receiptKind: "per-goal" as const } : null;
+					})()
+			: findReceiptGoal(plan, ledger, currentObjective);
 
 	if (!receiptTarget) {
 		// When earlier required goals are already complete but later ones remain, name the

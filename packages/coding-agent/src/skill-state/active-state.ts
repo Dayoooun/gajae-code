@@ -8,7 +8,6 @@ import {
 	modeStatePath,
 } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead, SessionResolutionError } from "../gjc-runtime/session-resolution";
-import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
 import {
 	type ActiveSessionScope,
 	readActiveEntries,
@@ -17,6 +16,7 @@ import {
 	setActiveStateCacheInvalidator,
 	writeActiveEntry,
 } from "../gjc-runtime/state-writer";
+import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
 import { CANONICAL_GJC_WORKFLOW_SKILLS, type CanonicalGjcWorkflowSkill } from "./canonical-skills";
 import type { WorkflowStateReceipt } from "./workflow-state-contract";
 
@@ -452,7 +452,6 @@ async function readModeStatePhase(
 		return undefined;
 	}
 }
-
 
 function withCanonicalRalplanPhase(entry: SkillActiveEntry, canonicalPhase: string | undefined): SkillActiveEntry {
 	if (

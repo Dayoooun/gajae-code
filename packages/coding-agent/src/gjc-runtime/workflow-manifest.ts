@@ -137,7 +137,14 @@ function manifest(input: {
 		retention: input.retention,
 		hudFields: input.hudFields,
 		graphLabel: input.graphLabel,
-		stopReleasingPhases: input.stopReleasingPhases ?? ["complete", "completed", "failed", "cancelled", "canceled", "inactive"],
+		stopReleasingPhases: input.stopReleasingPhases ?? [
+			"complete",
+			"completed",
+			"failed",
+			"cancelled",
+			"canceled",
+			"inactive",
+		],
 		phaseLock: input.phaseLock ?? [],
 		canonicalOverrides: input.canonicalOverrides ?? [],
 	};

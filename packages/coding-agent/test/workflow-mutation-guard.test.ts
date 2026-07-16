@@ -13,8 +13,8 @@ import {
 	assertWorkflowMutationRawPathsAllowed,
 	DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE,
 	getWorkflowMutationDecision,
-	readWorkflowGuardContext,
 	RALPLAN_MUTATION_BLOCK_MESSAGE,
+	readWorkflowGuardContext,
 	ULTRAGOAL_GOAL_PLANNING_MUTATION_BLOCK_MESSAGE,
 } from "@gajae-code/coding-agent/skill-state/workflow-mutation-guard";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
@@ -89,8 +89,6 @@ function tool(name: string, extra: Record<string, unknown> = {}): AgentTool {
 		...extra,
 	} as AgentTool;
 }
-
-
 
 function parseStateCommandJson(stdout: string | undefined): Record<string, unknown> {
 	if (!stdout) throw new Error("missing state command stdout");

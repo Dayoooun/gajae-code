@@ -313,7 +313,6 @@ function validArgv(argv: unknown): argv is string[] {
 }
 
 export function isSafeServerProof(
-
 	server: TmuxServerProof,
 	platform: NodeJS.Platform = "linux",
 ): server is TmuxServerProof & {

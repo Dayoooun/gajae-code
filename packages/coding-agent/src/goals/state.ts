@@ -13,7 +13,6 @@ export interface Goal {
 	createdAt: number;
 	updatedAt: number;
 	provenance?: GoalProvenance;
-
 }
 
 export interface GoalModeState {

@@ -25,13 +25,13 @@ import {
 	classifyCgroup,
 	isExactScopedBootstrapSuccessReceipt,
 	isOwnerGenerationBaselineCurrentSync,
+	isSafeServerProof,
 	type OwnerGenerationBaseline,
 	type OwnerIsolationProbe,
 	observeOwnerTerminal,
 	ownerProcessStartTime,
 	planTmuxOwnerIsolation,
 	replaceOwnerGenerationSync,
-	isSafeServerProof,
 	sameServerIdentity,
 	type TmuxServerProof,
 } from "../gjc-runtime/tmux-owner-isolation";
@@ -563,7 +563,6 @@ function isBoundedNoServerDiagnostic(stderr: Uint8Array): boolean {
 		/^(?:no server running on |failed to connect to server|error connecting to )/i.test(diagnostic.trim())
 	);
 }
-
 
 function exactNativeTmuxSessionId(stdout: Uint8Array): string | null {
 	const value = new TextDecoder().decode(stdout);

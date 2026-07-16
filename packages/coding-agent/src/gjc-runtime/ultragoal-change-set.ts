@@ -1,6 +1,10 @@
 import {
-	categorizeComputerChangePath, isSettingsSchemaPath, nonEmptyString, normalizeRepoPath,
-	type UltragoalChangeCategory, type UltragoalChangeSet, type UltragoalChangeSetPath,
+	categorizeComputerChangePath,
+	isSettingsSchemaPath,
+	normalizeRepoPath,
+	type UltragoalChangeCategory,
+	type UltragoalChangeSet,
+	type UltragoalChangeSetPath,
 	type UltragoalChangeStatus,
 } from "./ultragoal-runtime";
 

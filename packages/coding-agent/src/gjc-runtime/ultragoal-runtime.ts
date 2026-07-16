@@ -1,7 +1,6 @@
 import * as crypto from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
-import { inflateSync } from "node:zlib";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
@@ -370,7 +369,11 @@ export function isEnoent(error: unknown): boolean {
 	);
 }
 
-export async function appendLedger(cwd: string, event: JsonObject, sessionId?: string | null): Promise<UltragoalLedgerEvent> {
+export async function appendLedger(
+	cwd: string,
+	event: JsonObject,
+	sessionId?: string | null,
+): Promise<UltragoalLedgerEvent> {
 	const resolvedSessionId =
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	const paths = getUltragoalPaths(cwd, resolvedSessionId);
@@ -2083,22 +2086,22 @@ import {
 	validateArtifactProof,
 	validateCliReplay,
 	validateLiveSurfaceProofPresence,
+	validateReplayExemptFallback,
 	validateStructuralArtifact,
 	validateSurfaceStructuralRequirement,
-	validateReplayExemptFallback,
 	waitForReplayProcessWithTimeout,
 } from "./ultragoal-evidence";
 
+export type { ReplayProcessHandle } from "./ultragoal-evidence";
 export {
 	validateArtifactProof,
 	validateCliReplay,
 	validateLiveSurfaceProofPresence,
+	validateReplayExemptFallback,
 	validateStructuralArtifact,
 	validateSurfaceStructuralRequirement,
-	validateReplayExemptFallback,
 	waitForReplayProcessWithTimeout,
 };
-export type { ReplayProcessHandle } from "./ultragoal-evidence";
 
 async function validateArtifactRefs(cwd: string, executorQa: JsonObject): Promise<Map<string, JsonObject>> {
 	void cwd;
@@ -3605,7 +3608,13 @@ async function readOptionalExecutorQa(cwd: string, value: string | undefined): P
 	return structured as JsonObject;
 }
 
-import { computeCheckpointChangeSet, parseGitNameStatus, parseUnifiedDiffPaths, resolveGitBase, spawnText } from "./ultragoal-change-set";
+import {
+	computeCheckpointChangeSet,
+	parseGitNameStatus,
+	parseUnifiedDiffPaths,
+	resolveGitBase,
+	spawnText,
+} from "./ultragoal-change-set";
 
 export { computeCheckpointChangeSet, parseGitNameStatus, parseUnifiedDiffPaths, resolveGitBase, spawnText };
 

@@ -4,7 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { withFileLock } from "@gajae-code/coding-agent/config/file-lock";
 import { writeCurrentSessionGoalModeState } from "@gajae-code/coding-agent/gjc-runtime/goal-mode-request";
-import { resolveSessionIdFromSources, SessionResolutionError } from "@gajae-code/coding-agent/gjc-runtime/session-resolution";
+import {
+	resolveSessionIdFromSources,
+	SessionResolutionError,
+} from "@gajae-code/coding-agent/gjc-runtime/session-resolution";
 import { validateCliReplay } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-evidence";
 
 const tempDirs: string[] = [];

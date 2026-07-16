@@ -1448,7 +1448,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			? await consumePendingGoalModeRequest(this.sessionManager.getCwd(), this.sessionManager.getSessionId())
 			: null;
 		if (pendingGoal) {
-			await this.#enterGoalMode({ objective: pendingGoal.objective, provenance: pendingGoal.provenance, silent: true });
+			await this.#enterGoalMode({
+				objective: pendingGoal.objective,
+				provenance: pendingGoal.provenance,
+				silent: true,
+			});
 
 			this.#scheduleGoalContinuation();
 			return;
@@ -1609,8 +1613,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	async #enterGoalMode(options: { objective?: string; provenance?: Goal["provenance"]; resume?: boolean; silent?: boolean }): Promise<void> {
-
+	async #enterGoalMode(options: {
+		objective?: string;
+		provenance?: Goal["provenance"];
+		resume?: boolean;
+		silent?: boolean;
+	}): Promise<void> {
 		if (this.goalModeEnabled) {
 			return;
 		}
@@ -1624,7 +1632,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.goalModePaused = false;
 		const state = options.resume
 			? await this.session.goalRuntime.resumeGoal()
-			: await this.session.goalRuntime.createGoal({ objective: options.objective ?? "", provenance: options.provenance });
+			: await this.session.goalRuntime.createGoal({
+					objective: options.objective ?? "",
+					provenance: options.provenance,
+				});
 		await this.session.setActiveToolsByName(goalTools);
 		this.session.setGoalModeState(state);
 		this.goalModeEnabled = true;

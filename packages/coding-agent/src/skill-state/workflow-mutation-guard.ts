@@ -7,11 +7,11 @@ import { expandApplyPatchToEntries } from "../edit/modes/apply-patch";
 import { GJC_SESSION_PREFIX, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import { ModeStateSchema } from "../gjc-runtime/state-schema";
+import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
 import { LocalProtocolHandler, resolveLocalUrlToPath } from "../internal-urls/local-protocol";
 import { resolveToCwd } from "../tools/path-utils";
 import { ToolError } from "../tools/tool-errors";
 import { listActiveSkills, readVisibleSkillActiveState, type SkillActiveEntry } from "./active-state";
-import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
 import {
 	type CanonicalGjcWorkflowSkill,
 	sanctionedWorkflowStateCommand,
@@ -53,7 +53,6 @@ type ToolWithEditMode = AgentTool & {
 };
 
 export interface WorkflowMutationGuardInput {
-
 	cwd: string;
 	sessionId?: string;
 	threadId?: string;
@@ -62,7 +61,6 @@ export interface WorkflowMutationGuardInput {
 	forceOverride?: boolean;
 	enforceWorkflowState?: boolean;
 	guardContext?: WorkflowGuardContext;
-
 }
 
 interface ExtractedTargets {
@@ -71,7 +69,6 @@ interface ExtractedTargets {
 }
 
 export interface WorkflowMutationDecision {
-
 	blocked: boolean;
 	message?: string;
 	targets: string[];
@@ -84,7 +81,6 @@ export interface WorkflowGuardContext {
 	activeState: Awaited<ReturnType<typeof readVisibleSkillActiveState>>;
 	modeStates: ReadonlyMap<string, ModeState | null>;
 }
-
 
 interface ModeState {
 	active?: boolean;
@@ -148,12 +144,13 @@ export async function readWorkflowGuardContext(
 	const skills = activeState ? [...new Set(listActiveSkills(activeState).map(entry => entry.skill))] : [];
 	const modeStates = new Map(
 		await Promise.all(
-			skills.map(async skill => [skill, await readValidatedModeState(modeStatePath(cwd, skill, sessionId))] as const),
+			skills.map(
+				async skill => [skill, await readValidatedModeState(modeStatePath(cwd, skill, sessionId))] as const,
+			),
 		),
 	);
 	return { sessionId, activeState, modeStates };
 }
-
 
 /**
  * Phases that genuinely finish a workflow skill. Mirrors the Stop hook's
@@ -588,14 +585,12 @@ async function planningBlockedTargets(cwd: string, targets: ExtractedTargets): P
 	return blocked;
 }
 export async function assertWorkflowMutationRawPathsAllowed(input: {
-
 	cwd: string;
 	sessionId?: string;
 	threadId?: string;
 	rawPaths: string[];
 	forceOverride?: boolean;
 	guardContext?: WorkflowGuardContext;
-
 }): Promise<void> {
 	const targets: ExtractedTargets = { paths: input.rawPaths, unknown: input.rawPaths.length === 0 };
 	// Always-on `.gjc/**` runtime-owned block, ahead of forceOverride.
@@ -616,9 +611,7 @@ export async function assertWorkflowMutationRawPathsAllowed(input: {
 }
 
 export async function getWorkflowMutationDecision(
-
 	input: WorkflowMutationGuardInput,
-
 ): Promise<WorkflowMutationDecision> {
 	if (!BLOCKED_TOOL_NAMES.has(input.tool.name)) return { blocked: false, targets: [] };
 	const targets = extractTargets(input.tool, input.args);

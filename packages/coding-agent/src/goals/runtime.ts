@@ -309,7 +309,6 @@ export class GoalRuntime {
 		return { enabled: true, mode: "active", goal };
 	}
 
-
 	async createGoal(input: { objective: string; provenance?: Goal["provenance"] }): Promise<GoalModeState> {
 		const objective = validateGoalObjective(input.objective, "create");
 		return await this.#withAccounting(async () => {

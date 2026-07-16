@@ -11,7 +11,6 @@ import {
 	readHighestReceiptSpoolCursor,
 	receiptSpoolFullScanCountForTesting,
 	resetReceiptSpoolCursorCacheForTesting,
-
 	withReceiptSpoolDir,
 } from "../../src/harness-control-plane/receipt-spool";
 import { type CompletionEvidence, validateReceipt } from "../../src/harness-control-plane/receipts";
@@ -294,5 +293,4 @@ if (!result.completed) {
 		expect(await readHighestReceiptSpoolCursor(spoolDir)).toBe(8n);
 		expect(receiptSpoolFullScanCountForTesting()).toBe(2);
 	});
-
 });

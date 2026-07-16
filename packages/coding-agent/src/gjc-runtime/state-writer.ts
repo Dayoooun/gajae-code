@@ -567,7 +567,13 @@ export async function writeGuardedWorkflowEnvelopeAtomic(
 			if (options.expectedRevision !== undefined && options.expectedRevision !== currentRevision) {
 				throw new StateWriteConflictError(filePath, options.expectedRevision, currentRevision);
 			}
-			const next = stampWorkflowEnvelopeRevisionAndChecksum(value, filePath, currentRevision + 1, undefined, options);
+			const next = stampWorkflowEnvelopeRevisionAndChecksum(
+				value,
+				filePath,
+				currentRevision + 1,
+				undefined,
+				options,
+			);
 			const parsed = RequiredOnWriteEnvelopeSchema.safeParse(next);
 			if (!parsed.success) {
 				throw new Error(
@@ -580,7 +586,8 @@ export async function writeGuardedWorkflowEnvelopeAtomic(
 			await maybeAudit(filePath, options);
 			return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 		}
-		const incomingSourceRevision = options.sourceRevision ?? (isPlainObject(value) ? persistedStateRevision(value) : 0);
+		const incomingSourceRevision =
+			options.sourceRevision ?? (isPlainObject(value) ? persistedStateRevision(value) : 0);
 		if (current !== undefined && incomingSourceRevision <= persistedSourceRevision(current)) {
 			return { path: filePath, written: false, reason: "stale-skip", revision: currentRevision };
 		}

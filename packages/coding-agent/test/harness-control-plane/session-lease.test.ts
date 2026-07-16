@@ -85,7 +85,6 @@ describe("SessionLease", () => {
 		expect(taken.lease.leaseEpoch).toBe(2);
 	});
 
-
 	it("does not reap fifo endpoint artifacts", async () => {
 		const fifoPath = path.join(root, "control.fifo");
 		await acquireLease(root, SID, {

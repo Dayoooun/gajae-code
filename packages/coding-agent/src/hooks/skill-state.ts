@@ -20,8 +20,8 @@ import {
 	type SkillActiveState,
 	syncSkillActiveState,
 } from "../skill-state/active-state";
-import { readWorkflowGuardContext } from "../skill-state/workflow-mutation-guard";
 import { initialPhaseForSkill } from "../skill-state/initial-phase";
+import { readWorkflowGuardContext } from "../skill-state/workflow-mutation-guard";
 
 // Re-export for existing callers and tests that imported it from this module.
 export { initialPhaseForSkill };
@@ -748,7 +748,10 @@ function buildHandoffForceAskMessage(skill: GjcWorkflowSkill, phase: string, sta
 }
 
 export async function buildSkillStopOutput(input: StopHookInput): Promise<Record<string, unknown> | null> {
-	const guardContext = await readWorkflowGuardContext(input.cwd, { sessionId: input.sessionId, threadId: input.threadId });
+	const guardContext = await readWorkflowGuardContext(input.cwd, {
+		sessionId: input.sessionId,
+		threadId: input.threadId,
+	});
 	const resolvedSessionId = guardContext.sessionId;
 	if (!resolvedSessionId) return null;
 	const skillState = guardContext.activeState;

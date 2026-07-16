@@ -11,7 +11,6 @@ import {
 	isUltragoalBypassPrompt,
 	isUltragoalPauseBlocked,
 	readUltragoalVerificationState,
-
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
 import {
 	countUltragoalNudges,

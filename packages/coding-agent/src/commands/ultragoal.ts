@@ -32,7 +32,6 @@ export default class Ultragoal extends Command {
 			sessionFile: process.env[GJC_SESSION_FILE_ENV],
 			objective,
 			provenance,
-
 		});
 		await writePendingGoalModeRequest({
 			cwd,
