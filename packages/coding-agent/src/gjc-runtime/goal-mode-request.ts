@@ -145,6 +145,14 @@ function isNonTerminalGoal(goal: Goal | null): goal is Goal {
 	return goal !== null && goal.status !== "complete" && goal.status !== "dropped";
 }
 
+function matchesGoalModeRequest(existingGoal: Goal, objective: string, provenance: Goal["provenance"]): boolean {
+	const existingProvenance = existingGoal.provenance;
+	if (existingProvenance?.source === "ultragoal" && provenance?.source === "ultragoal") {
+		return existingProvenance.runId === provenance.runId && existingProvenance.goalId === provenance.goalId;
+	}
+	return existingProvenance === undefined && (provenance === undefined || existingGoal.objective === objective);
+}
+
 function createGoalModeState(objective: string, provenance: Goal["provenance"]): GoalModeState {
 	const now = Date.now();
 	const goal: Goal = {
@@ -186,13 +194,18 @@ export async function writeCurrentSessionGoalModeState(input: {
 	const entries = fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session");
 	if (fileEntries.length === 0) return { status: "unavailable", reason: "empty_session_file" };
 
+	const requestedProvenance = input.provenance ?? { source: "ultragoal", runId: "legacy", goalId: "aggregate" };
 	const context = buildSessionContext(entries);
 	const existingGoal = goalFromModeData(context.modeData);
-	if ((context.mode === "goal" || context.mode === "goal_paused") && isNonTerminalGoal(existingGoal)) {
+	if (
+		(context.mode === "goal" || context.mode === "goal_paused") &&
+		isNonTerminalGoal(existingGoal) &&
+		matchesGoalModeRequest(existingGoal, objective, input.provenance)
+	) {
 		return { status: "existing_goal", goal: existingGoal };
 	}
 
-	const state = createGoalModeState(objective, input.provenance ?? { source: "ultragoal", runId: "legacy", goalId: "aggregate" });
+	const state = createGoalModeState(objective, requestedProvenance);
 	const entry: ModeChangeEntry = {
 		type: "mode_change",
 		id: nextSessionEntryId(entries),

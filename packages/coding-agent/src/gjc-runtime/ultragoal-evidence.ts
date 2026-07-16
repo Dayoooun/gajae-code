@@ -588,6 +588,7 @@ function validateCliReplayInvariants(invariants: JsonObject[], stdout: string, f
 		const invariantField = `${fieldName}.invariants[${index}]`;
 		const type = requiredStringField(invariant, "type", invariantField);
 		const value = requiredStringField(invariant, "value", invariantField);
+		if (value === "") throw new Error(`qualityGate ${invariantField}.value must not be empty`);
 		if (type === "substring" && !stdout.includes(value))
 			throw new Error(`qualityGate ${invariantField} substring invariant did not match stdout`);
 		else if (type === "not_substring" && stdout.includes(value))
@@ -595,6 +596,8 @@ function validateCliReplayInvariants(invariants: JsonObject[], stdout: string, f
 		else if (type === "regex") {
 			const flags = invariant.flags === undefined ? "" : requiredStringField(invariant, "flags", invariantField);
 			if (!/^[im]*$/.test(flags)) throw new Error(`qualityGate ${invariantField}.flags may only contain i and m`);
+			if (value === ".*" || value === "^.*$")
+				throw new Error(`qualityGate ${invariantField} regex invariant must not match every stdout value`);
 			if (!new RegExp(value, flags).test(stdout))
 				throw new Error(`qualityGate ${invariantField} regex invariant did not match stdout`);
 		} else if (type !== "substring" && type !== "not_substring") {
@@ -744,11 +747,10 @@ export async function validateCliReplay(
 		}
 		const actualStdout = normalizeCliReplayOutput(stdout.text, cwd);
 		const recordedStdout = normalizeCliReplayOutput(replay.recordedStdout, cwd);
-		if (replay.invariants.length > 0) {
-			validateCliReplayInvariants(replay.invariants, actualStdout, fieldName);
-		} else if (actualStdout !== recordedStdout) {
+		if (actualStdout !== recordedStdout) {
 			throw new Error(`qualityGate ${fieldName} CLI replay stdout did not match recordedStdout after normalization`);
 		}
+		validateCliReplayInvariants(replay.invariants, actualStdout, fieldName);
 		return true;
 	} catch (error) {
 		if (error instanceof Error && error.message === "timeout") {
