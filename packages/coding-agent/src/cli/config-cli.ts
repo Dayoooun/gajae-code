@@ -25,7 +25,7 @@ import { initXdg } from "./commands/init-xdg";
 // Types
 // =============================================================================
 
-export type ConfigAction = "list" | "get" | "set" | "reset" | "path" | "init-xdg";
+export type ConfigAction = "list" | "get" | "set" | "reset" | "path" | "doctor" | "init-xdg";
 
 export interface ConfigCommandArgs {
 	action: ConfigAction;
@@ -111,7 +111,7 @@ function getSettingValues(def: CliSettingDef): readonly string[] | undefined {
 // Argument Parser
 // =============================================================================
 
-const VALID_ACTIONS: ConfigAction[] = ["list", "get", "set", "reset", "path", "init-xdg"];
+const VALID_ACTIONS: ConfigAction[] = ["list", "get", "set", "reset", "path", "doctor", "init-xdg"];
 
 /**
  * Parse config subcommand arguments.
@@ -299,6 +299,9 @@ export async function runConfigCommand(cmd: ConfigCommandArgs): Promise<void> {
 		case "path":
 			handlePath();
 			break;
+		case "doctor":
+			handleDoctor(cmd.flags);
+			break;
 		case "init-xdg":
 			await initXdg();
 			break;
@@ -443,6 +446,19 @@ function handlePath(): void {
 	console.log(getAgentDir());
 }
 
+function handleDoctor(flags: { json?: boolean }): void {
+	const report = settings.getSchemaReport();
+	if (flags.json) {
+		console.log(JSON.stringify(report, null, 2));
+		return;
+	}
+	if (report.issues.length === 0) {
+		console.log(chalk.green("Settings schema is healthy."));
+		return;
+	}
+	for (const issue of report.issues) console.log(`${issue.kind}\t${issue.path}\t${issue.detail}`);
+}
+
 // =============================================================================
 // Help
 // =============================================================================
@@ -455,6 +471,7 @@ ${chalk.bold("Commands:")}
   get <key>          Get a specific setting value
   set <key> <value>  Set a setting value
   reset <key>        Reset a setting to its default value
+  doctor             Report unknown, invalid, and pending settings migrations
   path               Print the config directory path
   init-xdg           Initialize XDG Base Directory structure
 

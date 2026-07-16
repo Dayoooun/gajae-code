@@ -6,6 +6,7 @@ import { YAML } from "bun";
 import {
 	type AtomicYamlPatch,
 	AtomicYamlReplaceError,
+	AtomicYamlConflictError,
 	applyAtomicYamlPatches,
 } from "../../src/config/atomic-yaml-patch";
 
@@ -72,6 +73,37 @@ describe("atomic YAML patches", () => {
 
 		await applyAtomicYamlPatches(configPath, [{ path: "feature.enabled", op: "set", value: "newer" }]);
 		expect(await receipt.restore()).toEqual({ status: "conflict", paths: ["feature.enabled"] });
+	});
+
+	test("allows exactly one competing expected-hash writer without clobbering", async () => {
+		const configPath = await configPathForTest();
+		await fs.writeFile(configPath, YAML.stringify({ feature: { enabled: false } }, null, 2));
+		const receipt = await applyAtomicYamlPatches(configPath, [{ path: "feature.enabled", op: "set", value: false }]);
+		const expected = receipt.revisions[0]!.afterHash;
+
+		const writes = await Promise.allSettled([
+			applyAtomicYamlPatches(configPath, [
+				{
+					path: "feature.enabled",
+					op: "set",
+					value: "first",
+					expected: { path: "feature.enabled", hash: expected },
+				},
+			]),
+			applyAtomicYamlPatches(configPath, [
+				{
+					path: "feature.enabled",
+					op: "set",
+					value: "second",
+					expected: { path: "feature.enabled", hash: expected },
+				},
+			]),
+		]);
+
+		expect(writes.filter(write => write.status === "fulfilled")).toHaveLength(1);
+		expect(writes.find(write => write.status === "rejected")?.reason).toBeInstanceOf(AtomicYamlConflictError);
+		const stored = (await readYaml(configPath)).feature as { enabled: string };
+		expect(["first", "second"]).toContain(stored.enabled);
 	});
 
 	test("rejects ambiguous undefined set patches", () => {

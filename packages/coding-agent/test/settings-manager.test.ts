@@ -268,6 +268,19 @@ describe("Settings", () => {
 			expect(settings.getEditVariantForModel("gpt-5.2")).toBe("apply_patch");
 		});
 
+		it("persists configSchemaVersion and does not rerun a completed migration", async () => {
+			await writeSettings({ queueMode: "one-at-a-time" });
+			const first = await Settings.init({ cwd: projectDir, agentDir });
+			await first.flushOrThrow();
+			expect((await readSettings()).configSchemaVersion).toBe(1);
+			expect((await readSettings()).steeringMode).toBe("one-at-a-time");
+
+			resetSettingsForTest();
+			const second = await Settings.init({ cwd: projectDir, agentDir });
+			await second.flushOrThrow();
+			expect(await readSettings()).toEqual({ configSchemaVersion: 1, steeringMode: "one-at-a-time" });
+		});
+
 		it("maps legacy hindsight.dynamicBankId=true onto hindsight.scoping=per-project", async () => {
 			await writeSettings({
 				hindsight: { dynamicBankId: true },

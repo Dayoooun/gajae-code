@@ -4,18 +4,39 @@ import * as path from "node:path";
 import { YAML } from "bun";
 import { withFileLock } from "./file-lock";
 
+export interface AtomicYamlExpectedPrecondition {
+	path: string;
+	hash: string;
+}
+
 export interface AtomicYamlSetPatch {
 	path: string;
 	op: "set";
 	value: unknown;
+	expected?: AtomicYamlExpectedPrecondition;
 }
 
 export interface AtomicYamlUnsetPatch {
 	path: string;
 	op: "unset";
+	expected?: AtomicYamlExpectedPrecondition;
 }
 
 export type AtomicYamlPatch = AtomicYamlSetPatch | AtomicYamlUnsetPatch;
+
+/** Raised when a compare-and-swap precondition no longer matches durable YAML. */
+export class AtomicYamlConflictError extends Error {
+	readonly code = "ATOMIC_YAML_CONFLICT";
+
+	constructor(
+		readonly path: string,
+		readonly expectedHash: string,
+		readonly actualHash: string,
+	) {
+		super(`Atomic YAML precondition failed for ${path}.`);
+		this.name = "AtomicYamlConflictError";
+	}
+}
 
 export interface AtomicYamlPatchRevision {
 	path: string;
@@ -97,6 +118,16 @@ function assertPatch(patch: AtomicYamlPatch): void {
 		patch.path.split(".").some(part => !part)
 	) {
 		throw new Error("Atomic YAML patches require a non-empty dotted path.");
+	}
+	if (
+		patch.expected &&
+		(typeof patch.expected.path !== "string" ||
+			patch.expected.path.length === 0 ||
+			patch.expected.path.split(".").some(part => !part) ||
+			typeof patch.expected.hash !== "string" ||
+			patch.expected.hash.length === 0)
+	) {
+		throw new Error("Atomic YAML patch preconditions require a non-empty dotted path and hash.");
 	}
 	if (patch.op === "set") {
 		if (patch.value === undefined) {
@@ -286,6 +317,13 @@ async function applyPatchesUnderLock(
 ): Promise<CasReceipt> {
 	if (patches.length === 0) return createReceipt(configPath, [], options);
 
+	for (const patch of patches) {
+		if (!patch.expected) continue;
+		const actualHash = stateHash(stateAtPath(current, patch.expected.path.split(".")));
+		if (actualHash !== patch.expected.hash) {
+			throw new AtomicYamlConflictError(patch.expected.path, patch.expected.hash, actualHash);
+		}
+	}
 	const changesByPath = new Map<string, ReceiptChange>();
 	for (const patch of patches) {
 		const segments = patch.path.split(".");
@@ -414,10 +452,16 @@ export function applyAtomicYamlPatches(
 	options: AtomicYamlPatchOptions = {},
 ): Promise<CasReceipt> {
 	for (const patch of patches) assertPatch(patch);
-	const immutablePatches = patches.map(patch =>
-		patch.op === "set"
-			? ({ path: patch.path, op: "set", value: structuredClone(patch.value) } as const)
-			: ({ path: patch.path, op: "unset" } as const),
-	);
+	const immutablePatches = patches.map(patch => {
+		const expected = patch.expected ? { ...patch.expected } : undefined;
+		return patch.op === "set"
+			? ({
+					path: patch.path,
+					op: "set",
+					value: structuredClone(patch.value),
+					...(expected ? { expected } : {}),
+				} as const)
+			: ({ path: patch.path, op: "unset", ...(expected ? { expected } : {}) } as const);
+	});
 	return reserveAtomicYamlPatchSlot(configPath, () => immutablePatches, options);
 }

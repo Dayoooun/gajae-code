@@ -3408,6 +3408,99 @@ export function getEnumValues(path: SettingPath): readonly string[] | undefined 
 	return "values" in def ? (def.values as readonly string[]) : undefined;
 }
 
+export const CONFIG_SCHEMA_VERSION = 1;
+
+export type SettingsSchemaIssue = {
+	path: string;
+	kind: "unknown" | "invalid" | "coerced" | "pending-migration";
+	detail: string;
+};
+
+export type SettingsSchemaReport = {
+	issues: SettingsSchemaIssue[];
+	valid: boolean;
+};
+
+function schemaValueAtPath(value: Record<string, unknown>, path: string): unknown {
+	let current: unknown = value;
+	for (const segment of path.split(".")) {
+		if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
+		current = (current as Record<string, unknown>)[segment];
+	}
+	return current;
+}
+
+function schemaSetAtPath(value: Record<string, unknown>, path: string, next: unknown): void {
+	const segments = path.split(".");
+	let current = value;
+	for (const segment of segments.slice(0, -1)) {
+		const child = current[segment];
+		if (!child || typeof child !== "object" || Array.isArray(child)) current[segment] = {};
+		current = current[segment] as Record<string, unknown>;
+	}
+	current[segments.at(-1)!] = next;
+}
+
+function schemaPaths(value: Record<string, unknown>, prefix = ""): string[] {
+	const paths: string[] = [];
+	for (const [key, child] of Object.entries(value)) {
+		const path = prefix ? `${prefix}.${key}` : key;
+		if (child && typeof child === "object" && !Array.isArray(child))
+			paths.push(...schemaPaths(child as Record<string, unknown>, path));
+		else paths.push(path);
+	}
+	return paths;
+}
+
+/** Coerce supported scalar legacy values and report unknown or invalid settings without dropping them. */
+export function reconcileSettingsSchema(raw: Record<string, unknown>): {
+	settings: Record<string, unknown>;
+	report: SettingsSchemaReport;
+} {
+	const settings = structuredClone(raw);
+	const issues: SettingsSchemaIssue[] = [];
+	const knownPaths = new Set(Object.keys(SETTINGS_SCHEMA));
+	for (const path of schemaPaths(settings)) {
+		if (path === "configSchemaVersion" || knownPaths.has(path)) continue;
+		if (![...knownPaths].some(known => known.startsWith(`${path}.`))) {
+			issues.push({ path, kind: "unknown", detail: "Setting is not recognized by this version." });
+		}
+	}
+	for (const path of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
+		const value = schemaValueAtPath(settings, path);
+		if (value === undefined) continue;
+		const definition = SETTINGS_SCHEMA[path];
+		let next = value;
+		if (definition.type === "boolean" && (value === "true" || value === "false")) next = value === "true";
+		if (
+			definition.type === "number" &&
+			typeof value === "string" &&
+			value.trim() !== "" &&
+			Number.isFinite(Number(value))
+		) {
+			next = Number(value);
+		}
+		if (next !== value) {
+			schemaSetAtPath(settings, path, next);
+			issues.push({ path, kind: "coerced", detail: `Coerced ${typeof value} to ${definition.type}.` });
+		}
+		const valid =
+			(definition.type === "boolean" && typeof next === "boolean") ||
+			(definition.type === "string" && typeof next === "string") ||
+			(definition.type === "number" &&
+				typeof next === "number" &&
+				Number.isFinite(next) &&
+				(!("validate" in definition) || !definition.validate || definition.validate(next))) ||
+			(definition.type === "enum" &&
+				typeof next === "string" &&
+				(definition.values as readonly string[]).includes(next)) ||
+			(definition.type === "array" && Array.isArray(next)) ||
+			(definition.type === "record" && !!next && typeof next === "object" && !Array.isArray(next));
+		if (!valid) issues.push({ path, kind: "invalid", detail: `Expected ${definition.type}.` });
+	}
+	return { settings, report: { issues, valid: !issues.some(issue => issue.kind === "invalid") } };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Derived Types from Schema
 // ═══════════════════════════════════════════════════════════════════════════
