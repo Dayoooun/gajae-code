@@ -440,15 +440,17 @@ export async function readUltragoalVerificationState(input: {
 			message: "Ultragoal has blocked or failed goals; record blockers or rerun verification.",
 		};
 	}
+	const provenance = currentGoal.provenance;
+
 	const receiptTarget =
-		currentGoal.provenance?.source === "ultragoal"
-			? currentGoal.provenance.goalId === "aggregate" || plan.gjcGoalMode === "aggregate"
+		provenance?.source === "ultragoal"
+			? provenance.goalId === "aggregate" || plan.gjcGoalMode === "aggregate"
 				? (() => {
 						const goal = findFinalAggregateReceiptGoal(plan, ledger);
 						return goal ? { goal, receiptKind: "final-aggregate" as const } : null;
 					})()
 				: (() => {
-						const goal = plan.goals.find(item => item.id === currentGoal.provenance?.goalId);
+						const goal = plan.goals.find(item => item.id === provenance.goalId);
 						return goal ? { goal, receiptKind: "per-goal" as const } : null;
 					})()
 			: findReceiptGoal(plan, ledger, currentObjective);

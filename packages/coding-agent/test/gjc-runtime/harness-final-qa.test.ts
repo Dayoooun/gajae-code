@@ -9,6 +9,7 @@ import {
 	SessionResolutionError,
 } from "@gajae-code/coding-agent/gjc-runtime/session-resolution";
 import { validateCliReplay } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-evidence";
+import type { Goal } from "@gajae-code/coding-agent/goals/state";
 
 const tempDirs: string[] = [];
 
@@ -89,7 +90,7 @@ describe("harness final QA regressions", () => {
 			createdAt: 1,
 			updatedAt: 1,
 			provenance: { source: "ultragoal" as const, runId: "run-1", goalId: "aggregate" },
-		};
+		} satisfies Goal;
 		await writeActiveGoal(sessionFile, existingGoal);
 		expect(
 			await writeCurrentSessionGoalModeState({
