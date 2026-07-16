@@ -178,7 +178,7 @@ describe("hindsightBackend.start", () => {
 		const settings = Settings.isolated({
 			"memory.backend": "hindsight",
 			"hindsight.apiUrl": "http://localhost:8888",
-			"hindsight.retainEveryNTurns": 2,
+			"hindsight.retainEveryNTurns": 1,
 		});
 		const retainSpy = vi.spyOn(HindsightApi.prototype, "retain").mockResolvedValue({} as never);
 		vi.spyOn(HindsightApi.prototype, "createBank").mockResolvedValue({} as never);
