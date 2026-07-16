@@ -6036,7 +6036,7 @@ export class AgentSession {
 
 		const previousTools = this.getActiveToolNames();
 		const goalTools = [...new Set([...previousTools, "goal"])];
-		await this.#goalRuntime.createGoal({ objective: pendingGoal.objective });
+		await this.#goalRuntime.createGoal({ objective: pendingGoal.objective, provenance: pendingGoal.provenance });
 		await this.setActiveToolsByName(goalTools);
 		if (this.isStreaming) {
 			await this.sendGoalModeContext({ deliverAs: "steer" });

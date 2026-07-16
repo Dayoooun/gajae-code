@@ -1,7 +1,8 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Snowflake } from "@gajae-code/utils";
-import { type Goal, type GoalModeState, normalizeGoal } from "../goals/state";
+import { type Goal, type GoalModeState, type GoalProvenance, normalizeGoal } from "../goals/state";
+
 import {
 	buildSessionContext,
 	loadEntriesFromFile,
@@ -27,6 +28,8 @@ export interface PendingGoalModeRequest {
 	objective: string;
 	createdAt: string;
 	goalsPath?: string;
+	provenance: Extract<GoalProvenance, { source: "ultragoal" }>;
+
 	/**
 	 * Session id that produced this request (from GJC_SESSION_ID). When present,
 	 * only the originating session may consume it, so concurrent sessions sharing
@@ -42,6 +45,7 @@ export type CurrentSessionGoalModeWriteResult =
 
 interface UltragoalPlanShape {
 	gjcObjective?: unknown;
+	goals?: Array<{ id?: unknown }>;
 }
 
 function isEnoent(error: unknown): boolean {
@@ -70,7 +74,8 @@ export function isUltragoalCreateGoalsInvocation(args: readonly string[]): boole
 export async function readUltragoalGjcObjective(
 	cwd: string,
 	sessionId?: string | null,
-): Promise<{ objective: string; goalsPath: string }> {
+): Promise<{ objective: string; goalsPath: string; provenance: Extract<GoalProvenance, { source: "ultragoal" }> }> {
+
 	const session = sessionId?.trim()
 		? { gjcSessionId: sessionId.trim() }
 		: await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID });
@@ -78,11 +83,22 @@ export async function readUltragoalGjcObjective(
 	try {
 		const plan = (await Bun.file(goalsPath).json()) as UltragoalPlanShape;
 		const objective = typeof plan.gjcObjective === "string" ? plan.gjcObjective.trim() : "";
-		return { objective: objective || DEFAULT_ULTRAGOAL_OBJECTIVE, goalsPath };
+		const goalId = typeof plan.goals?.[0]?.id === "string" ? plan.goals[0].id : "aggregate";
+		return {
+			objective: objective || DEFAULT_ULTRAGOAL_OBJECTIVE,
+			goalsPath,
+			provenance: { source: "ultragoal", runId: session.gjcSessionId, goalId },
+		};
+
 	} catch (error) {
 		if (isEnoent(error)) {
-			return { objective: DEFAULT_ULTRAGOAL_OBJECTIVE, goalsPath };
+			return {
+				objective: DEFAULT_ULTRAGOAL_OBJECTIVE,
+				goalsPath,
+				provenance: { source: "ultragoal", runId: session.gjcSessionId, goalId: "aggregate" },
+			};
 		}
+
 		throw error;
 	}
 }
@@ -92,6 +108,8 @@ export async function writePendingGoalModeRequest(input: {
 	objective: string;
 	goalsPath?: string;
 	sessionId?: string | null;
+	provenance?: Extract<GoalProvenance, { source: "ultragoal" }>;
+
 }): Promise<PendingGoalModeRequest> {
 	const objective = input.objective.trim();
 	if (!objective) throw new Error("goal objective is required");
@@ -106,6 +124,8 @@ export async function writePendingGoalModeRequest(input: {
 		objective,
 		createdAt: new Date().toISOString(),
 		goalsPath: input.goalsPath,
+		provenance: input.provenance ?? { source: "ultragoal", runId: sessionId, goalId: "aggregate" },
+
 		...(sessionId ? { sessionId } : {}),
 	};
 	const filePath = requestPath(input.cwd, sessionId);
@@ -125,7 +145,7 @@ function isNonTerminalGoal(goal: Goal | null): goal is Goal {
 	return goal !== null && goal.status !== "complete" && goal.status !== "dropped";
 }
 
-function createGoalModeState(objective: string): GoalModeState {
+function createGoalModeState(objective: string, provenance: Goal["provenance"]): GoalModeState {
 	const now = Date.now();
 	const goal: Goal = {
 		id: String(Snowflake.next()),
@@ -135,9 +155,11 @@ function createGoalModeState(objective: string): GoalModeState {
 		timeUsedSeconds: 0,
 		createdAt: now,
 		updatedAt: now,
+		...(provenance ? { provenance } : {}),
 	};
 	return { enabled: true, mode: "active", goal };
 }
+
 
 function nextSessionEntryId(entries: readonly SessionEntry[]): string {
 	const existing = new Set(entries.map(entry => entry.id));
@@ -151,6 +173,8 @@ function nextSessionEntryId(entries: readonly SessionEntry[]): string {
 export async function writeCurrentSessionGoalModeState(input: {
 	sessionFile?: string | null;
 	objective: string;
+	provenance?: Goal["provenance"];
+
 }): Promise<CurrentSessionGoalModeWriteResult> {
 	const sessionFile = input.sessionFile?.trim();
 	if (!sessionFile) return { status: "unavailable", reason: "missing_session_file" };
@@ -168,7 +192,7 @@ export async function writeCurrentSessionGoalModeState(input: {
 		return { status: "existing_goal", goal: existingGoal };
 	}
 
-	const state = createGoalModeState(objective);
+	const state = createGoalModeState(objective, input.provenance ?? { source: "ultragoal", runId: "legacy", goalId: "aggregate" });
 	const entry: ModeChangeEntry = {
 		type: "mode_change",
 		id: nextSessionEntryId(entries),

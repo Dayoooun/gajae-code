@@ -72,6 +72,8 @@ describe("GJC ultragoal goal mode request", () => {
 		expect(request?.objective).toBe("Complete ultragoal");
 		expect(request?.source).toBe("ultragoal");
 		expect(consumedAgain).toBeNull();
+		expect(request?.provenance).toEqual({ source: "ultragoal", runId: TEST_SESSION_ID, goalId: "aggregate" });
+
 	});
 
 	it("does not let a concurrent session consume another session's pending request", async () => {
@@ -151,6 +153,7 @@ describe("GJC ultragoal goal mode request", () => {
 			objective: "Complete generated ultragoal plan",
 			status: "active",
 			tokensUsed: 0,
+			provenance: { source: "ultragoal", runId: "legacy", goalId: "aggregate" },
 		});
 	});
 
