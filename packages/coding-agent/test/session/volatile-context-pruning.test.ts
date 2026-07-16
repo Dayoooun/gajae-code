@@ -17,7 +17,10 @@ const custom = (id: string, customType: string, content: string) => ({
 
 describe("maintenance custom-message pruning", () => {
 	it("keeps only the latest volatile project context", () => {
-		const entries = [custom("one", "volatile-project-context", "old tree"), custom("two", "volatile-project-context", "new tree")];
+		const entries = [
+			custom("one", "volatile-project-context", "old tree"),
+			custom("two", "volatile-project-context", "new tree"),
+		];
 		const result = pruneSupersededVolatileProjectContext(entries);
 		expect(result.changed.map(entry => entry.id)).toEqual(["one"]);
 		expect(entries[0]?.content).toBe("[superseded volatile context pruned]");
@@ -41,7 +44,7 @@ describe("maintenance custom-message pruning", () => {
 		const manager = SessionManager.create("/tmp", "/tmp");
 		const id = manager.appendCustomMessageEntry("volatile-project-context", "old tree", false);
 		const canonical = manager.getCanonicalEntryForTests(id);
-		if (!canonical || canonical.type !== "custom_message") throw new Error("Expected custom message entry");
+		if (canonical?.type !== "custom_message") throw new Error("Expected custom message entry");
 		canonical.evictedContent = {
 			evictedAt: Date.now(),
 			reason: "compacted_history",

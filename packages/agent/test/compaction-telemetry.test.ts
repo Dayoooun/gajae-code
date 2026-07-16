@@ -121,7 +121,9 @@ function makePreparation(overrides: Partial<CompactionPreparation> = {}): Compac
 
 describe("compaction oneshot telemetry", () => {
 	it("uses one LLM request and derives shortSummary from the main summary", async () => {
-		const spy = vi.spyOn(ai, "completeSimple").mockResolvedValueOnce(makeAssistantMessage("history summary text", makeUsage(200, 90, 10, 5)));
+		const spy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(makeAssistantMessage("history summary text", makeUsage(200, 90, 10, 5)));
 
 		const telemetry = resolveTelemetry(makeTelemetryConfig(), "session-1");
 		const result = await compact(makePreparation(), MODEL, "test-api-key", undefined, undefined, { telemetry });

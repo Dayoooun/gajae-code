@@ -314,7 +314,8 @@ function readSupersedesRead(
  * (`skip`) and result-shaping flags (`i`, `gitignore`): a later page or a
  * differently-shaped search complements earlier output, it does not replace it.
  */
-const IDEMPOTENT_BASH_COMMAND = /^(?:(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?(?:test|build)\b|git\s+status\b|cargo\s+build\b|(?:make|just)\s+build\b)/;
+const IDEMPOTENT_BASH_COMMAND =
+	/^(?:(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?(?:test|build)\b|git\s+status\b|cargo\s+build\b|(?:make|just)\s+build\b)/;
 
 function normalizedIdempotentBashCommand(call: ToolCall): string | undefined {
 	if (call.name !== "bash") return undefined;

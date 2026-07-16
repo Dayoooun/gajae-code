@@ -187,7 +187,13 @@ describe("hindsightBackend.start", () => {
 			{ role: "assistant", text: "first assistant reply that is long enough" },
 		];
 		const session = makeFakeSession({ sessionId: "s-delta", entries });
-		await hindsightBackend.start({ session: session as never, settings, modelRegistry: {} as never, agentDir: "/tmp", taskDepth: 0 });
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
 
 		session.emit({ type: "agent_end", messages: [] });
 		await Bun.sleep(0);
@@ -216,7 +222,13 @@ describe("hindsightBackend.start", () => {
 		});
 		const retainSpy = vi.spyOn(HindsightApi.prototype, "retain").mockResolvedValue({} as never);
 		const session = makeFakeSession({ sessionId: "s-empty-delta" });
-		await hindsightBackend.start({ session: session as never, settings, modelRegistry: {} as never, agentDir: "/tmp", taskDepth: 0 });
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
 		const state = session.getHindsightSessionState()!;
 		state.lastRetainedTurn = 1;
 
@@ -233,9 +245,10 @@ describe("hindsightBackend.start", () => {
 		});
 		let release!: () => void;
 		const retainSpy = vi.spyOn(HindsightApi.prototype, "retain").mockImplementation(
-			() => new Promise(resolve => {
-				release = () => resolve({} as never);
-			}),
+			() =>
+				new Promise(resolve => {
+					release = () => resolve({} as never);
+				}),
 		);
 		vi.spyOn(HindsightApi.prototype, "createBank").mockResolvedValue({} as never);
 		const entries = [
@@ -243,7 +256,13 @@ describe("hindsightBackend.start", () => {
 			{ role: "assistant" as const, text: "assistant reply that is long enough" },
 		];
 		const session = makeFakeSession({ sessionId: "s-in-flight", entries });
-		await hindsightBackend.start({ session: session as never, settings, modelRegistry: {} as never, agentDir: "/tmp", taskDepth: 0 });
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
 
 		session.emit({ type: "agent_end", messages: [] });
 		session.emit({ type: "agent_end", messages: [] });
@@ -527,7 +546,13 @@ describe("hindsightBackend first-turn injection", () => {
 		const listSpy = vi.spyOn(HindsightApi.prototype, "listMentalModels").mockResolvedValue({
 			items: [{ id: "prefs", bank_id: "bank", name: "Preferences", content: "use tabs" }],
 		} as never);
-		await hindsightBackend.start({ session: session as never, settings, modelRegistry: {} as never, agentDir: "/tmp", taskDepth: 0 });
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
 		await session.getHindsightSessionState()?.mentalModelsLoadPromise;
 		session.refreshBaseSystemPrompt.mockClear();
 

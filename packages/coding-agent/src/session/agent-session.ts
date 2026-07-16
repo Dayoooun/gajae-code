@@ -333,10 +333,6 @@ import {
 } from "./contribution-prep";
 import { pruneStaleFileMentions } from "./file-mention-pruning";
 import {
-	pruneSupersededMaintenanceReminders,
-	pruneSupersededVolatileProjectContext,
-} from "./volatile-context-pruning";
-import {
 	type BashExecutionMessage,
 	type CompactionSummaryMessage,
 	type CustomMessage,
@@ -364,6 +360,7 @@ import {
 	transferSessionMessageIdentity,
 } from "./session-manager";
 import { ToolChoiceQueue } from "./tool-choice-queue";
+import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
 import { YieldQueue } from "./yield-queue";
 
 /** Session-specific events that extend the core AgentEvent */
@@ -2250,7 +2247,10 @@ export class AgentSession {
 			}
 			if (message.role === "toolResult") {
 				const text = Array.isArray(message.content)
-					? message.content.filter(block => block.type === "text").map(block => block.text).join("\n")
+					? message.content
+							.filter(block => block.type === "text")
+							.map(block => block.text)
+							.join("\n")
 					: String(message.content ?? "");
 				const tool = (message as unknown as { toolName?: string }).toolName ?? "tool";
 				const target = (message.details as { path?: unknown } | undefined)?.path;
@@ -8851,7 +8851,11 @@ export class AgentSession {
 		overThreshold = false,
 	): Promise<{ prunedCount: number; tokensSaved: number } | undefined> {
 		const branchEntries = this.sessionManager.getBranch();
-		const result = pruneToolOutputs(branchEntries, DEFAULT_PRUNE_CONFIG, overThreshold ? { relaxedMinimum: 0 } : undefined);
+		const result = pruneToolOutputs(
+			branchEntries,
+			DEFAULT_PRUNE_CONFIG,
+			overThreshold ? { relaxedMinimum: 0 } : undefined,
+		);
 		const argumentResult = pruneAssistantToolArguments(branchEntries, DEFAULT_PRUNE_CONFIG);
 		const fileMentionResult = pruneStaleFileMentions(branchEntries, p =>
 			resolveReadPath(p, this.sessionManager.getCwd()),
@@ -9429,7 +9433,12 @@ export class AgentSession {
 		const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG);
 		if (
 			pruneEstimate.tokensSaved > 0 &&
-			!shouldCompact(Math.max(0, contextTokens - pruneEstimate.tokensSaved), contextWindow, compactionSettings, autoCompactionOutputReserveTokens)
+			!shouldCompact(
+				Math.max(0, contextTokens - pruneEstimate.tokensSaved),
+				contextWindow,
+				compactionSettings,
+				autoCompactionOutputReserveTokens,
+			)
 		) {
 			const pruneResult = await this.#pruneToolOutputs(undefined, true);
 			if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
@@ -9526,7 +9535,12 @@ export class AgentSession {
 			let pruneResult: { prunedCount: number; tokensSaved: number } | undefined;
 			if (
 				pruneEstimate.tokensSaved > 0 &&
-				!shouldCompact(Math.max(0, contextTokens - pruneEstimate.tokensSaved), contextWindow, compactionSettings, autoCompactionOutputReserveTokens)
+				!shouldCompact(
+					Math.max(0, contextTokens - pruneEstimate.tokensSaved),
+					contextWindow,
+					compactionSettings,
+					autoCompactionOutputReserveTokens,
+				)
 			) {
 				pruneResult = await this.#pruneToolOutputs(maintenanceSignal, true);
 				if (isAborted()) return "aborted";
@@ -9699,7 +9713,12 @@ export class AgentSession {
 		const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG);
 		if (
 			pruneEstimate.tokensSaved > 0 &&
-			!shouldCompact(Math.max(0, contextTokens - pruneEstimate.tokensSaved), contextWindow, compactionSettings, autoCompactionOutputReserveTokens)
+			!shouldCompact(
+				Math.max(0, contextTokens - pruneEstimate.tokensSaved),
+				contextWindow,
+				compactionSettings,
+				autoCompactionOutputReserveTokens,
+			)
 		) {
 			const pruneResult = await this.#pruneToolOutputs(undefined, true);
 			if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
@@ -13534,9 +13553,7 @@ export class AgentSession {
 		tokens: number;
 		anchored: boolean;
 	} {
-		const estimate = this.#estimateContextTokensWith(
-			message => this.#estimateMessageCompactionDeltaTokens(message),
-		);
+		const estimate = this.#estimateContextTokensWith(message => this.#estimateMessageCompactionDeltaTokens(message));
 		return {
 			tokens: estimate.tokens + this.#estimateMessagesCompactionDeltaTokens(pendingMessages),
 			anchored: estimate.anchored,

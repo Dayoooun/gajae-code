@@ -35,7 +35,10 @@ export function pruneSupersededVolatileProjectContext(entries: readonly SessionE
 	let bytesSaved = 0;
 	entries.forEach((entry, index) => {
 		if (index >= latest || entry.type !== "custom_message" || entry.customType !== "volatile-project-context") return;
-		const content = typeof entry.content === "string" ? entry.content : entry.content.map(block => block.type === "text" ? block.text : "").join("\n");
+		const content =
+			typeof entry.content === "string"
+				? entry.content
+				: entry.content.map(block => (block.type === "text" ? block.text : "")).join("\n");
 		if (!content) return;
 		entry.content = SUPERSEDED_VOLATILE_CONTEXT_NOTICE;
 		bytesSaved += Buffer.byteLength(content, "utf-8");
@@ -58,8 +61,16 @@ export function pruneSupersededMaintenanceReminders(entries: readonly SessionEnt
 	const changed: CustomMessageEntry[] = [];
 	let bytesSaved = 0;
 	entries.forEach((entry, index) => {
-		if (entry.type !== "custom_message" || latest.get(entry.customType) === undefined || latest.get(entry.customType) === index) return;
-		const text = typeof entry.content === "string" ? entry.content : entry.content.map(block => block.type === "text" ? block.text : "").join("\n");
+		if (
+			entry.type !== "custom_message" ||
+			latest.get(entry.customType) === undefined ||
+			latest.get(entry.customType) === index
+		)
+			return;
+		const text =
+			typeof entry.content === "string"
+				? entry.content
+				: entry.content.map(block => (block.type === "text" ? block.text : "")).join("\n");
 		if (!text) return;
 		entry.content = SUPERSEDED_VOLATILE_CONTEXT_NOTICE;
 		bytesSaved += Buffer.byteLength(text, "utf-8");

@@ -1155,10 +1155,9 @@ export function prepareCompaction(
 	// compaction on a large-context model. Fall back to the explicit floor in that
 	// case so an otherwise-valid manual/idle/overflow compaction can still reduce
 	// history; normal threshold compaction is already well above the scaled window.
-	const historyTokens = pathEntries.slice(boundaryStart, boundaryEnd).reduce(
-		(tokens, entry) => tokens + estimateEntryTokens(entry),
-		0,
-	);
+	const historyTokens = pathEntries
+		.slice(boundaryStart, boundaryEnd)
+		.reduce((tokens, entry) => tokens + estimateEntryTokens(entry), 0);
 	const effectiveKeepRecentTokens =
 		scaledKeepRecentTokens > keepRecentTokens && scaledKeepRecentTokens > historyTokens
 			? keepRecentTokens
