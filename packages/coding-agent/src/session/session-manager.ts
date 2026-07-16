@@ -673,8 +673,13 @@ function migrateToCurrentVersion(entries: FileEntry[]): boolean {
 	const version = header?.version ?? 1;
 	if (version >= CURRENT_SESSION_VERSION) return false;
 	if (version < 2) migrateV1ToV2(entries);
-	if (version < 3) migrateV2ToV3(entries);
-	return version < 3;
+	if (version < 3) {
+		migrateV2ToV3(entries);
+		const migratedHeader = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
+		if (migratedHeader) migratedHeader.version = CURRENT_SESSION_VERSION;
+		return true;
+	}
+	return false;
 }
 
 /** Exported for testing */
@@ -5951,6 +5956,15 @@ export class SessionManager {
 				throw new Error("Captured fork source authority changed before destination write.");
 			}
 			await manager.#rewriteFile();
+			const afterWrite = inspectResumeSessionFile(snapshot.sourcePath, snapshot.storage);
+			if ("kind" in afterWrite) {
+				authorityFailure = afterWrite;
+				throw new Error("Captured fork source authority changed during destination write.");
+			}
+			if (!sameResumeIdentity(snapshot.identity, afterWrite.identity)) {
+				authorityFailure = { kind: "error", reason: "identity-mismatch" };
+				throw new Error("Captured fork source authority changed during destination write.");
+			}
 			if (manager.#sessionFile) writeTerminalBreadcrumb(manager.cwd, manager.#sessionFile);
 			return { kind: "forked", manager };
 		} catch (error) {

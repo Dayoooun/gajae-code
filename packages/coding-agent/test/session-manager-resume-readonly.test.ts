@@ -149,8 +149,8 @@ class ReplaceAfterSnapshotStorage extends FileSessionStorage {
 		return snapshot;
 	}
 }
-class ReplaceBeforeThirdInspectionStorage extends FileSessionStorage {
-	#stats = 0;
+class ReplaceDuringDestinationWriteStorage extends FileSessionStorage {
+	armed = true;
 
 	constructor(
 		private readonly replacementPath: string,
@@ -159,12 +159,15 @@ class ReplaceBeforeThirdInspectionStorage extends FileSessionStorage {
 		super();
 	}
 
-	override statSync(filePath: string): SessionStorageStat {
-		if (path.resolve(filePath) === path.resolve(this.sourcePath)) {
-			this.#stats++;
-			if (this.#stats === 5) fs.renameSync(this.replacementPath, filePath);
+	override openWriter(
+		filePath: string,
+		options?: { flags?: "a" | "w"; onError?: (error: Error) => void },
+	): SessionStorageWriter {
+		if (this.armed && path.resolve(filePath) !== path.resolve(this.sourcePath)) {
+			this.armed = false;
+			fs.renameSync(this.replacementPath, this.sourcePath);
 		}
-		return super.statSync(filePath);
+		return super.openWriter(filePath, options);
 	}
 }
 
@@ -260,7 +263,7 @@ describe("SessionManager read-only resume", () => {
 		fs.mkdirSync(targetCwd);
 		fs.writeFileSync(sourcePath, sessionText("session-a"));
 		fs.writeFileSync(replacementPath, sessionText("session-b"));
-		const storage = new ReplaceBeforeThirdInspectionStorage(replacementPath, sourcePath);
+		const storage = new ReplaceDuringDestinationWriteStorage(replacementPath, sourcePath);
 		const captured = SessionManager.captureTranscriptStrict(sourcePath, storage);
 		if (captured.kind !== "captured") throw new Error("Expected strict transcript capture");
 
@@ -374,7 +377,7 @@ describe("SessionManager read-only resume", () => {
 		});
 	});
 
-	it("preserves inspected migration state until the first persistence rewrite", async () => {
+	it("preserves inspected migration state until the first v4 persistence rewrite", async () => {
 		const storage = new WriteTrackingStorage();
 		const filePath = "/sessions/legacy-v2.jsonl";
 		const header = {
@@ -409,7 +412,7 @@ describe("SessionManager read-only resume", () => {
 			.trim()
 			.split("\n")
 			.map(line => JSON.parse(line));
-		expect(rewritten[0]).toMatchObject({ type: "session", version: 3 });
+		expect(rewritten[0]).toMatchObject({ type: "session", version: 4 });
 		expect(rewritten).toHaveLength(3);
 		expect(rewritten.every(line => line.type === "session" || typeof line.id === "string")).toBe(true);
 	});

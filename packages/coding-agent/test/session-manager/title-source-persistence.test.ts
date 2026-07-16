@@ -9,7 +9,7 @@ import {
 	type SessionHeader,
 	SessionManager,
 } from "@gajae-code/coding-agent/session/session-manager";
-import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
+import { getConfigRootDir, parseJsonlLenient, setAgentDir } from "@gajae-code/utils";
 
 import { makeAssistantMessage } from "./helpers";
 
@@ -113,6 +113,35 @@ describe("session title source persistence", () => {
 			.map(record => JSON.stringify(record))
 			.join("\n");
 		expect(parseSessionEntries(v3)[0]).toMatchObject({ version: 3, cwd: "/new", title: "Final title" });
+	});
+
+	it("lets legacy readers reject v4 patches before they can edit the base transcript", () => {
+		const records = [
+			{ type: "session", version: CURRENT_SESSION_VERSION, id: "v4", timestamp: "2026-01-01T00:00:00.000Z", cwd },
+			{
+				type: "message",
+				id: "message",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:01.000Z",
+				message: { role: "user", content: "original", timestamp: 1 },
+			},
+			{ type: "header_patch", patch: { title: "patched" } },
+			{
+				type: "entry_patch",
+				entryId: "message",
+				patch: { message: { role: "user", content: "patched", timestamp: 1 } },
+			},
+		];
+		const content = `${records.map(record => JSON.stringify(record)).join("\n")}\n`;
+		const legacyRecords = parseJsonlLenient<Record<string, unknown>>(content);
+
+		expect(legacyRecords[0]?.version).toBeGreaterThan(3);
+		expect(legacyRecords.find(record => record.type === "message")?.message).toEqual({
+			role: "user",
+			content: "original",
+			timestamp: 1,
+		});
+		expect(parseSessionEntries(content)[0]).toMatchObject({ title: "patched" });
 	});
 
 	it("appends an entry patch when replay metadata is sanitized on reopen", async () => {

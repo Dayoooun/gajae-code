@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	CURRENT_SESSION_VERSION,
 	type FileEntry,
 	findMostRecentSession,
 	getRecentSessions,
@@ -366,7 +367,7 @@ describe("SessionManager legacy session migration persistence", () => {
 		if (!header) throw new Error("Expected session header");
 
 		expect(fs.statSync(sessionFile).mtimeMs).toBeGreaterThan(initialMtimeMs);
-		expect(header.version).toBe(3);
+		expect(header.version).toBe(CURRENT_SESSION_VERSION);
 		expect(persistedEntries).toHaveLength(4);
 		for (const entry of persistedEntries.filter(entry => entry.type !== "session")) {
 			expect(entry.id).toBeDefined();
@@ -397,7 +398,7 @@ describe("SessionManager legacy session migration persistence", () => {
 		if (!header) throw new Error("Expected session header");
 
 		expect(fs.statSync(sessionFile).mtimeMs).toBeGreaterThan(initialMtimeMs);
-		expect(header.version).toBe(3);
+		expect(header.version).toBe(CURRENT_SESSION_VERSION);
 		expect(persistedEntries).toHaveLength(2);
 		expect(persistedEntries[1]?.type).toBe("message");
 		if (persistedEntries[1]?.type !== "message") throw new Error("Expected message entry");
@@ -429,7 +430,7 @@ describe("SessionManager legacy session migration persistence", () => {
 		if (!header) throw new Error("Expected session header");
 
 		expect(fs.statSync(sessionFile).mtimeMs).toBeGreaterThan(initialMtimeMs);
-		expect(header.version).toBe(3);
+		expect(header.version).toBe(CURRENT_SESSION_VERSION);
 		expect(persistedEntries).toHaveLength(2);
 		expect(persistedEntries[1]?.type).toBe("message");
 		if (persistedEntries[1]?.type !== "message") throw new Error("Expected message entry");

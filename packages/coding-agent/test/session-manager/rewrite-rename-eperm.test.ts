@@ -2,110 +2,39 @@ import { describe, expect, it } from "bun:test";
 import { recoverOrphanedBackups, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { MemorySessionStorage } from "@gajae-code/coding-agent/session/session-storage";
 
-class FsCodeError extends Error {
-	code: string;
+class RenameTrackingStorage extends MemorySessionStorage {
+	renames = 0;
 
-	constructor(code: string, message: string) {
-		super(message);
-		this.code = code;
-	}
-}
-
-class RenameEpermOnceStorage extends MemorySessionStorage {
-	failNextSessionReplace = false;
-	backupCleanupPath: string | undefined;
-
-	rename(source: string, target: string): Promise<void> {
-		if (
-			this.failNextSessionReplace &&
-			source.includes(".tmp") &&
-			target.endsWith(".jsonl") &&
-			this.existsSync(target)
-		) {
-			this.failNextSessionReplace = false;
-			return Promise.reject(
-				new FsCodeError("EPERM", `EPERM: operation not permitted, rename '${source}' -> '${target}'`),
-			);
-		}
+	override rename(source: string, target: string): Promise<void> {
+		this.renames++;
 		return super.rename(source, target);
 	}
-
-	unlink(target: string): Promise<void> {
-		if (target.endsWith(".bak")) {
-			this.backupCleanupPath = target;
-		}
-		return super.unlink(target);
-	}
 }
 
-describe("SessionManager rewrite EPERM replacement fallback", () => {
-	it("keeps the active session healthy when replacing an existing file hits EPERM", async () => {
-		const storage = new RenameEpermOnceStorage();
+describe("SessionManager append-only header patches", () => {
+	it("appends a bounded rename patch without replacing the existing session file", async () => {
+		const storage = new RenameTrackingStorage();
 		const session = SessionManager.create("/cwd", "/sessions", storage);
 		await session.ensureOnDisk();
 		const sessionFile = session.getSessionFile();
 		if (!sessionFile) throw new Error("Expected session file");
+		const before = storage.readTextSync(sessionFile);
+		storage.renames = 0;
 
-		storage.failNextSessionReplace = true;
 		await expect(session.setSessionName("renamed session", "user")).resolves.toBe(true);
 
-		const rewritten = storage.readTextSync(sessionFile);
-		expect(rewritten).toContain('"title":"renamed session"');
-		const backupPath = storage.backupCleanupPath;
-		if (!backupPath) throw new Error("Expected EPERM fallback to create a rollback backup");
-		expect(storage.existsSync(backupPath)).toBe(false);
+		const after = storage.readTextSync(sessionFile);
+		expect(after.startsWith(before)).toBe(true);
+		const patch = JSON.parse(after.slice(before.length));
+		expect(patch).toEqual({
+			type: "header_patch",
+			patch: { title: "renamed session", titleSource: "user" },
+		});
+		expect(after.length - before.length).toBeLessThan(128);
+		expect(storage.renames).toBe(0);
 
-		session.appendMessage({ role: "user", content: "after rewrite", timestamp: Date.now() });
+		session.appendMessage({ role: "user", content: "after patch", timestamp: Date.now() });
 		await expect(session.flush()).resolves.toBeUndefined();
-	});
-});
-
-describe("SessionManager rewrite EPERM rollback failure", () => {
-	it("preserves the original EPERM as the thrown error's cause when rollback also fails", async () => {
-		class DoubleFailStorage extends MemorySessionStorage {
-			failureMode = false;
-			tempRenameAttempts = 0;
-
-			rename(source: string, target: string): Promise<void> {
-				if (!this.failureMode) return super.rename(source, target);
-				// Every temp -> target rename fails with EPERM (both the upstream attempt in
-				// #replaceSessionFile and the retry inside #replaceSessionFileAfterEperm).
-				if (source.includes(".tmp") && target.endsWith(".jsonl")) {
-					this.tempRenameAttempts++;
-					const tag = this.tempRenameAttempts === 1 ? "original" : "retry";
-					return Promise.reject(new FsCodeError("EPERM", `EPERM ${tag}: rename '${source}' -> '${target}'`));
-				}
-				// The rollback rename (backup -> target) fails with a distinct code.
-				if (source.endsWith(".bak") && target.endsWith(".jsonl")) {
-					return Promise.reject(new FsCodeError("EIO", `EIO rollback: rename '${source}' -> '${target}'`));
-				}
-				return super.rename(source, target);
-			}
-		}
-
-		const storage = new DoubleFailStorage();
-		const session = SessionManager.create("/cwd", "/sessions", storage);
-		await session.ensureOnDisk();
-		storage.failureMode = true;
-		const sessionFile = session.getSessionFile();
-		if (!sessionFile) throw new Error("Expected session file");
-
-		let thrown: Error | undefined;
-		try {
-			await session.setSessionName("doomed", "user");
-		} catch (err) {
-			thrown = err as Error;
-		}
-		if (!thrown) throw new Error("Expected setSessionName to reject");
-		// Message text MUST surface both the retry failure and the rollback failure.
-		expect(thrown.message).toContain("rollback");
-		expect(thrown.message).toContain("EIO rollback");
-		expect(thrown.message).toContain("EPERM retry");
-		// `cause` MUST be the original upstream EPERM that started the fallback path,
-		// not the second/retry failure or the rollback failure.
-		const cause = thrown.cause as Error | undefined;
-		expect(cause).toBeInstanceOf(Error);
-		expect(cause?.message).toContain("EPERM original");
 	});
 });
 
