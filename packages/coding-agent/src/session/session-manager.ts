@@ -75,7 +75,14 @@ import type {
 } from "./session-storage";
 import { FileSessionStorage, MemorySessionStorage } from "./session-storage";
 
-export const CURRENT_SESSION_VERSION = 3;
+export const CURRENT_SESSION_VERSION = 4;
+
+/**
+ * Version 4 adds append-only patch records. New writers emit v4 headers; v1–v3
+ * transcripts remain readable. Older builds do not apply these records, so they
+ * must not be used to edit a session after a v4 writer has updated it.
+ */
+
 function isUnderProjectGjc(cwd: string, targetPath: string): boolean {
 	const relative = path.relative(path.join(path.resolve(cwd), ".gjc"), path.resolve(targetPath));
 	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
@@ -365,7 +372,22 @@ export type SessionEntry =
 	| ModeChangeEntry
 	| ConfiguredModelChainEntry;
 
-/** Raw file entry (includes header) */
+/** Append-only replacement for mutable fields on the session header. */
+export interface HeaderPatchRecord {
+	type: "header_patch";
+	patch: Partial<Pick<SessionHeader, "title" | "titleSource" | "cwd">>;
+}
+
+/** Append-only replacement for replay metadata on one existing session entry. */
+export interface EntryPatchRecord {
+	type: "entry_patch";
+	entryId: string;
+	patch: Partial<Pick<SessionMessageEntry, "message">>;
+}
+
+export type SessionPatchRecord = HeaderPatchRecord | EntryPatchRecord;
+
+/** Resolved file entries; patch records are applied by parseSessionEntries(). */
 export type FileEntry = SessionHeader | SessionEntry;
 
 export type DefaultModelSelectionStage = {
@@ -643,19 +665,16 @@ function migrateV2ToV3(entries: FileEntry[]): void {
 }
 
 /**
- * Run all necessary migrations to bring entries to current version.
- * Mutates entries in place. Returns true if any migration was applied.
+ * Run all necessary migrations to bring entries to the current semantic version.
+ * Version 4 only adds trailing patch records, so v3 transcripts require no rewrite.
  */
 function migrateToCurrentVersion(entries: FileEntry[]): boolean {
 	const header = entries.find(e => e.type === "session") as SessionHeader | undefined;
 	const version = header?.version ?? 1;
-
 	if (version >= CURRENT_SESSION_VERSION) return false;
-
 	if (version < 2) migrateV1ToV2(entries);
 	if (version < 3) migrateV2ToV3(entries);
-
-	return true;
+	return version < 3;
 }
 
 /** Exported for testing */
@@ -787,7 +806,49 @@ function resolveManagedSessionRoot(sessionDir: string, cwd: string): string | un
 
 /** Exported for compaction.test.ts */
 export function parseSessionEntries(content: string): FileEntry[] {
-	return parseJsonlLenient<FileEntry>(content);
+	const records = parseJsonlLenient<FileEntry | SessionPatchRecord>(content);
+	const entries: FileEntry[] = [];
+	const entriesById = new Map<string, SessionEntry>();
+	let header: SessionHeader | undefined;
+
+	for (const record of records) {
+		if (record.type === "header_patch") {
+			if (header && isHeaderPatchRecord(record)) Object.assign(header, record.patch);
+			continue;
+		}
+		if (record.type === "entry_patch") {
+			if (isEntryPatchRecord(record)) {
+				const entry = entriesById.get(record.entryId);
+				if (entry?.type === "message" && record.patch.message) entry.message = record.patch.message;
+			}
+			continue;
+		}
+		entries.push(record);
+		if (record.type === "session") header ??= record;
+		else entriesById.set(record.id, record);
+	}
+	return entries;
+}
+
+function isHeaderPatchRecord(record: SessionPatchRecord): record is HeaderPatchRecord {
+	if (record.type !== "header_patch" || !record.patch || typeof record.patch !== "object") return false;
+	const { cwd, title, titleSource } = record.patch;
+	return (
+		(cwd === undefined || typeof cwd === "string") &&
+		(title === undefined || typeof title === "string") &&
+		(titleSource === undefined || titleSource === "auto" || titleSource === "user")
+	);
+}
+
+function isEntryPatchRecord(record: SessionPatchRecord): record is EntryPatchRecord {
+	return (
+		record.type === "entry_patch" &&
+		typeof record.entryId === "string" &&
+		record.patch !== null &&
+		typeof record.patch === "object" &&
+		(record.patch.message === undefined ||
+			(typeof record.patch.message === "object" && record.patch.message !== null))
+	);
 }
 
 function normalizeConfiguredModelChainEntry(entry: unknown): ConfiguredModelChain | undefined {
@@ -1235,7 +1296,7 @@ export async function loadEntriesFromFile(
 		if (isEnoent(err)) return [];
 		throw err;
 	}
-	const entries = parseJsonlLenient<FileEntry>(content);
+	const entries = parseSessionEntries(content);
 
 	// Validate session header
 	if (entries.length === 0) return entries;
@@ -2725,7 +2786,7 @@ class NdjsonFileWriter {
 	}
 
 	/** Queue a write. Returns a promise so callers can await if needed. */
-	write(entry: FileEntry): Promise<void> {
+	write(entry: FileEntry | SessionPatchRecord): Promise<void> {
 		if (this.#closed || this.#closing) throw new Error("Writer closed");
 		if (this.#error) throw this.#error;
 		const line = `${JSON.stringify(entry)}\n`;
@@ -2741,7 +2802,7 @@ class NdjsonFileWriter {
 	 * queue. Use only when no concurrent async write is in flight (the session-manager
 	 * persist path enforces this via `#flushed`/`#needsFullRewriteOnNextPersist`).
 	 */
-	writeSync(entry: FileEntry): void {
+	writeSync(entry: FileEntry | SessionPatchRecord): void {
 		if (this.#closed || this.#closing) throw new Error("Writer closed");
 		if (this.#error) throw this.#error;
 		const line = `${JSON.stringify(entry)}\n`;
@@ -3093,7 +3154,7 @@ async function collectSessionFromFile(
 ): Promise<SessionInfo | undefined> {
 	try {
 		const content = await readSessionListPrefix(file, storage, buffer);
-		const entries = parseJsonlLenient<Record<string, unknown>>(content);
+		const entries = parseSessionEntries(content).map(entry => entry as unknown as Record<string, unknown>);
 		const header = parseSessionListHeader(content, entries);
 		if (!header) return undefined;
 
@@ -3487,6 +3548,7 @@ export class SessionManager {
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		this.#needsFullRewriteOnNextPersist = migrationApplied;
+
 		await resolveBlobRefsInEntries(entries, this.#blobStore);
 		this.#fileEntries = entries;
 		this.#resetResidentTextBlobStore();
@@ -3527,12 +3589,12 @@ export class SessionManager {
 			this.#fileEntries = this.#fileEntries.map(entry =>
 				prepareEntryForResidentSync(entry, this.#residentBlobStores()),
 			);
-			this.sanitizeLoadedOpenAIResponsesReplayMetadata();
 
 			this.#buildIndex();
 			this.#bumpAllRevisions();
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
+			this.sanitizeLoadedOpenAIResponsesReplayMetadata(true);
 		} else {
 			const explicitPath = this.#sessionFile;
 			this.#newSessionSync();
@@ -3723,20 +3785,14 @@ export class SessionManager {
 		this.cwd = resolvedCwd;
 		this.sessionDir = newSessionDir;
 
-		// Update the session header in fileEntries
-		const header = this.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
-		if (header) {
-			header.cwd = resolvedCwd;
-			this.#headerExportRevision++;
-		}
-
-		// Rewrite the session file at its new location with updated header.
-		// hadSessionFile: file existed before move → must rewrite to update cwd
-		// hasAssistant: assistant messages in memory but file missing → recreate from memory
-		// Neither true → fresh session, never written → preserve lazy-persist
 		const hasAssistant = this.#fileEntries.some(e => e.type === "message" && e.message.role === "assistant");
-		if (this.persist && this.#sessionFile && (hadSessionFile || hasAssistant)) {
+		if (this.persist && this.#sessionFile && hadSessionFile) {
+			this.#appendHeaderPatch({ cwd: resolvedCwd });
+		} else if (this.persist && this.#sessionFile && hasAssistant) {
+			this.#appendHeaderPatch({ cwd: resolvedCwd });
 			await this.#rewriteFile();
+		} else {
+			this.#appendHeaderPatch({ cwd: resolvedCwd });
 		}
 
 		// Update terminal breadcrumb
@@ -4537,21 +4593,36 @@ export class SessionManager {
 
 		this.#sessionName = sanitized;
 		this.#titleSource = source;
-
-		// Update the in-memory header (so first flush includes title)
-		const header = this.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
-		if (header) {
-			header.title = sanitized;
-			header.titleSource = source;
-		}
-		this.#headerExportRevision++;
-
-		// Update the session file header with the title (if already flushed)
-		const sessionFile = this.#sessionFile;
-		if (this.persist && sessionFile && this.storage.existsSync(sessionFile)) {
-			await this.#rewriteFile();
-		}
+		this.#appendHeaderPatch({ title: sanitized, titleSource: source });
 		return true;
+	}
+
+	#appendHeaderPatch(patch: HeaderPatchRecord["patch"]): void {
+		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+		if (!header) return;
+		Object.assign(header, patch);
+		this.#headerExportRevision++;
+		this.#persistPatch({ type: "header_patch", patch });
+	}
+
+	#persistPatch(record: SessionPatchRecord): void {
+		if (!this.persist || !this.#sessionFile || !this.storage.existsSync(this.#sessionFile)) return;
+		if (this.#persistError) throw this.#persistError;
+		try {
+			if (this.#needsFullRewriteOnNextPersist || !this.#flushed) {
+				this.#rewriteFileSync();
+				return;
+			}
+			const writer = this.#ensurePersistWriter();
+			if (!writer) {
+				this.#rewriteFileSync();
+				return;
+			}
+			writer.writeSync(record);
+		} catch (error) {
+			this.#recordPersistError(error);
+			throw this.#persistError ?? toError(error);
+		}
 	}
 
 	_persist(entry: SessionEntry): void {
@@ -5386,26 +5457,22 @@ export class SessionManager {
 		return marker ? Object.keys(marker.payloads ?? {}).length : 0;
 	}
 	/** Strip stale OpenAI Responses assistant replay metadata from loaded in-memory entries. */
-	sanitizeLoadedOpenAIResponsesReplayMetadata(): boolean {
+	sanitizeLoadedOpenAIResponsesReplayMetadata(persistPatches = false): boolean {
 		let didSanitize = false;
 		for (const entry of this.#fileEntries) {
-			if (entry.type !== "message" || entry.message.role !== "assistant") {
-				continue;
-			}
-
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
 			const sanitizedMessage = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
-			if (sanitizedMessage === entry.message) {
-				continue;
-			}
-
+			if (sanitizedMessage === entry.message) continue;
 			entry.message = sanitizedMessage;
+			if (persistPatches) {
+				this.#persistPatch({ type: "entry_patch", entryId: entry.id, patch: { message: sanitizedMessage } });
+			}
 			didSanitize = true;
 		}
 		if (didSanitize) {
 			this.#bumpEntryRevision();
 			this.#replayMetadataRevision++;
 		}
-
 		return didSanitize;
 	}
 
