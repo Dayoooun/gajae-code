@@ -3,7 +3,7 @@ import type { ManagedAttemptOutcome } from "@gajae-code/agent-core";
 import { Agent } from "@gajae-code/agent-core";
 import { agentLoopContinue, sanitizedDetachedClone } from "@gajae-code/agent-core/agent-loop";
 import type { AgentContext, AgentEvent, AgentLoopConfig } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, Message } from "@gajae-code/ai";
+import type { AssistantMessage, AssistantMessageEvent, Message } from "@gajae-code/ai";
 
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -826,6 +826,218 @@ describe("managed attempt transaction", () => {
 		expect(
 			agent.state.messages.filter(message => message.role === "assistant").map(message => message.content),
 		).toHaveLength(2);
+	});
+	it("repairs a root-proxied managed assistant shell across published surfaces", async () => {
+		const mock = createMockModel();
+		let live: AssistantMessage | undefined;
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = assistantMessage(mock.model);
+				message.content.push({ type: "text", text: "accepted" });
+				live = new Proxy(message, {});
+				stream.push({ type: "start", partial: live });
+				stream.push({ type: "text_start", contentIndex: 0, partial: live });
+				stream.push({ type: "done", reason: "stop", message: live });
+			});
+			return stream;
+		};
+		const context: AgentContext = {
+			systemPrompt: ["test"],
+			messages: [{ role: "user", content: "run", timestamp: Date.now() }],
+			tools: [],
+		};
+		const callbacks: AssistantMessageEvent[] = [];
+		const stream = agentLoopContinue(
+			context,
+			{
+				model: mock.model,
+				convertToLlm: messages => messages as Message[],
+				fallbackManaged: true,
+				onAssistantMessageEvent: (_message, event) => callbacks.push(event),
+			},
+			undefined,
+			streamFn,
+		);
+		const events: AgentEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+		(live!.content[0] as { type: "text"; text: string }).text = "mutated";
+		const messages = [
+			context.messages.at(-1),
+			result[0],
+			...events.flatMap(event => {
+				if (event.type === "message_start" || event.type === "message_end" || event.type === "turn_end")
+					return [event.message];
+				if (event.type === "message_update") return [event.message];
+				if (event.type === "agent_end") return event.messages;
+				return [];
+			}),
+		];
+		for (const message of messages) {
+			expect(message).toMatchObject({ role: "assistant", content: [{ type: "text", text: "accepted" }] });
+			expect(() => structuredClone(message)).not.toThrow();
+		}
+		expect(callbacks).toHaveLength(1);
+		expect(callbacks[0]).toMatchObject({ type: "text_start", contentIndex: 0, partial: { role: "assistant" } });
+	});
+
+	it("fails a collapsed root proxy locally without managed retry authority", async () => {
+		const mock = createMockModel();
+		const collapsed = new Proxy(assistantMessage(mock.model), {
+			get() {
+				throw new Error("collapsed root");
+			},
+		});
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => stream.push({ type: "start", partial: collapsed }));
+				return stream;
+			},
+		});
+		let outcomes = 0;
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: () => {
+				outcomes += 1;
+				return { type: "retry", continuation: () => {} };
+			},
+		});
+		expect(outcomes).toBe(0);
+		expect(agent.state.error).toContain("local snapshot");
+		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(1);
+	});
+	it("normalizes null and incomplete tool-call blocks before managed dispatch", async () => {
+		const mock = createMockModel();
+		const malformed = assistantMessage(mock.model) as unknown as { content: unknown[] };
+		malformed.content = [null, { type: "toolCall", id: "call", name: "danger" }];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => stream.push({ type: "done", reason: "stop", message: malformed as AssistantMessage }));
+				return stream;
+			},
+		});
+		await agent.prompt("run", { fallbackManaged: true });
+		const message = agent.state.messages.at(-1) as AssistantMessage;
+		expect(message.content).toEqual([]);
+	});
+
+	it("preserves a complete detached toolcall_end event", async () => {
+		const mock = createMockModel();
+		const toolCall = {
+			type: "toolCall" as const,
+			id: "call",
+			name: "safe",
+			arguments: { value: 1 },
+			thoughtSignature: "signature",
+			intent: "inspect safely",
+			customWireName: "custom_safe",
+			incompleteArguments: true,
+		};
+		const callbacks: AssistantMessageEvent[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const partial = assistantMessage(mock.model);
+					stream.push({ type: "start", partial });
+					stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial });
+					stream.push({ type: "done", reason: "stop", message: partial });
+				});
+				return stream;
+			},
+			onAssistantMessageEvent: (_message, event) => callbacks.push(event),
+		});
+		await agent.prompt("run", { fallbackManaged: true });
+		const ended = callbacks.find(event => event.type === "toolcall_end");
+		expect(ended).toMatchObject({ toolCall });
+		expect(ended).not.toBeUndefined();
+		expect(ended?.type === "toolcall_end" ? ended.toolCall : undefined).toMatchObject({
+			thoughtSignature: "signature",
+			intent: "inspect safely",
+			customWireName: "custom_safe",
+			incompleteArguments: true,
+		});
+	});
+
+	it("rejects managed events with hidden required fields as local failures", async () => {
+		const mock = createMockModel();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const partial = assistantMessage(mock.model);
+					stream.push({ type: "start", partial });
+					stream.push(
+						new Proxy(
+							{ type: "text_delta", contentIndex: 0, partial },
+							{ get: (target, key) => (key === "delta" ? undefined : Reflect.get(target, key)) },
+						) as AssistantMessageEvent,
+					);
+					stream.push({ type: "done", reason: "stop", message: partial });
+				});
+				return stream;
+			},
+		});
+		await agent.prompt("run", { fallbackManaged: true });
+		expect(agent.state.error).toContain("local snapshot");
+	});
+	it("normalizes invalid stop reasons and rejects invalid event indices", async () => {
+		const mock = createMockModel();
+		const invalidMessage = {
+			...assistantMessage(mock.model),
+			stopReason: "invalid",
+			timestamp: Number.POSITIVE_INFINITY,
+			errorStatus: Number.NaN,
+		} as unknown as AssistantMessage;
+		const accepted = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => stream.push({ type: "done", reason: "stop", message: invalidMessage }));
+				return stream;
+			},
+		});
+		const published: AssistantMessage[] = [];
+		accepted.subscribe(event => {
+			if ((event.type === "message_end" || event.type === "turn_end") && event.message.role === "assistant")
+				published.push(event.message as AssistantMessage);
+			if (event.type === "agent_end") {
+				published.push(...(event.messages.filter(message => message.role === "assistant") as AssistantMessage[]));
+			}
+		});
+		await accepted.prompt("run", { fallbackManaged: true });
+		const committed = accepted.state.messages.at(-1) as AssistantMessage;
+		expect(committed.stopReason).toBe("stop");
+		expect(Number.isFinite(committed.timestamp)).toBe(true);
+		expect(committed.errorStatus).toBeUndefined();
+		for (const message of published) {
+			expect(["stop", "length", "toolUse", "error", "aborted"]).toContain(message.stopReason);
+			expect(Number.isFinite(message.timestamp)).toBe(true);
+			expect(message.errorStatus).toBeUndefined();
+		}
+
+		const rejected = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const partial = assistantMessage(mock.model);
+					stream.push({ type: "start", partial });
+					stream.push({ type: "text_delta", contentIndex: -1, delta: "x", partial });
+					stream.push({ type: "done", reason: "stop", message: partial });
+				});
+				return stream;
+			},
+		});
+		await rejected.prompt("run", { fallbackManaged: true });
+		expect(rejected.state.error).toContain("local snapshot");
 	});
 });
 

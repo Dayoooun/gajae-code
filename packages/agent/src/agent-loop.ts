@@ -287,7 +287,7 @@ export function agentLoop(
 			messages: [...context.messages, ...prompts],
 		};
 		const transaction = config.fallbackManaged
-			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent)
+			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
 			: undefined;
 		const attemptStream = transaction ?? stream;
 		if (!config.fallbackManaged || emitManagedAgentStart) stream.push({ type: "agent_start" });
@@ -336,7 +336,7 @@ export function agentLoopContinue(
 		const newMessages: AgentMessage[] = [];
 		const currentContext: AgentContext = { ...context };
 		const transaction = config.fallbackManaged
-			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent)
+			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
 			: undefined;
 		const attemptStream = transaction ?? stream;
 		if (!config.fallbackManaged || emitManagedAgentStart) stream.push({ type: "agent_start" });
@@ -516,6 +516,167 @@ function managedAttemptSnapshot<T>(value: T): T {
 }
 
 /**
+ * Recover the required assistant-message shell when a managed snapshot degrades
+ * at its root (notably for Proxy-wrapped provider messages). Only known fields
+ * are read, and executable content is retained only when it has its complete
+ * discriminant shape.
+ */
+function managedAssistantShell(value: unknown, model: AgentLoopConfig["model"]): AssistantMessage {
+	const detailed = managedAttemptSnapshotDetailed(value);
+	const source = isManagedPlainRecord(detailed.snapshot) ? detailed.snapshot : value;
+	if (managedProperty(source, "role") !== "assistant") throw new ManagedAttemptSnapshotError();
+	const rawContent = managedAttemptSnapshot(managedProperty(source, "content"));
+	if (!Array.isArray(rawContent)) throw new ManagedAttemptSnapshotError();
+	const content = rawContent.flatMap(block => {
+		const normalized = managedAssistantContent(block);
+		return normalized ? [normalized] : [];
+	});
+	const usage = managedAssistantUsage(managedAttemptSnapshot(managedProperty(source, "usage")));
+	const api = managedProperty(source, "api");
+	const provider = managedProperty(source, "provider");
+	const messageModel = managedProperty(source, "model");
+	const stopReasonValue = managedProperty(source, "stopReason");
+	const stopReason =
+		stopReasonValue === "stop" ||
+		stopReasonValue === "length" ||
+		stopReasonValue === "toolUse" ||
+		stopReasonValue === "error" ||
+		stopReasonValue === "aborted"
+			? stopReasonValue
+			: "stop";
+	const timestamp = managedProperty(source, "timestamp");
+	const transportFailure = managedTransportFailure(value);
+	const errorMessage = managedProperty(source, "errorMessage");
+	const errorStatus = managedProperty(source, "errorStatus");
+	const safeMetadata: Record<string, unknown> = isManagedPlainRecord(detailed.snapshot)
+		? { ...detailed.snapshot }
+		: {};
+	delete safeMetadata.errorMessage;
+	delete safeMetadata.errorStatus;
+	delete safeMetadata.transportFailure;
+	return {
+		...safeMetadata,
+		role: "assistant",
+		content,
+		api: typeof api === "string" ? (api as AssistantMessage["api"]) : model.api,
+		provider: typeof provider === "string" ? (provider as AssistantMessage["provider"]) : model.provider,
+		model: typeof messageModel === "string" ? messageModel : model.id,
+		usage,
+		stopReason,
+		timestamp: typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : Date.now(),
+		...(transportFailure ? { transportFailure } : {}),
+		...(typeof errorMessage === "string" ? { errorMessage } : {}),
+		...(typeof errorStatus === "number" && Number.isFinite(errorStatus) ? { errorStatus } : {}),
+	};
+}
+
+function managedAssistantContent(value: unknown): AssistantMessage["content"][number] | undefined {
+	if (!isManagedPlainRecord(value)) return undefined;
+	const type = managedProperty(value, "type");
+	if (type === "text") {
+		const text = managedProperty(value, "text");
+		return typeof text === "string" ? { type, text } : undefined;
+	}
+	if (type === "thinking") {
+		const thinking = managedProperty(value, "thinking");
+		return typeof thinking === "string" ? { type, thinking } : undefined;
+	}
+	if (type === "redactedThinking") {
+		const data = managedProperty(value, "data");
+		return typeof data === "string" ? { type, data } : undefined;
+	}
+	if (type !== "toolCall") return undefined;
+	const id = managedProperty(value, "id");
+	const name = managedProperty(value, "name");
+	const argumentsValue = managedProperty(value, "arguments");
+	if (typeof id !== "string" || typeof name !== "string" || !isManagedPlainRecord(argumentsValue)) return undefined;
+	const thoughtSignature = managedProperty(value, "thoughtSignature");
+	const intent = managedProperty(value, "intent");
+	const customWireName = managedProperty(value, "customWireName");
+	const incompleteArguments = managedProperty(value, "incompleteArguments");
+	return {
+		type,
+		id,
+		name,
+		arguments: argumentsValue,
+		...(typeof thoughtSignature === "string" ? { thoughtSignature } : {}),
+		...(typeof intent === "string" ? { intent } : {}),
+		...(typeof customWireName === "string" ? { customWireName } : {}),
+		...(typeof incompleteArguments === "boolean" ? { incompleteArguments } : {}),
+	};
+}
+
+function managedAssistantUsage(value: unknown): AssistantMessage["usage"] {
+	const number = (key: string): number => {
+		const candidate = managedProperty(value, key);
+		return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : 0;
+	};
+	const costValue = managedProperty(value, "cost");
+	const costNumber = (key: string): number => {
+		const candidate = managedProperty(costValue, key);
+		return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : 0;
+	};
+	return {
+		input: number("input"),
+		output: number("output"),
+		cacheRead: number("cacheRead"),
+		cacheWrite: number("cacheWrite"),
+		totalTokens: number("totalTokens"),
+		cost: {
+			input: costNumber("input"),
+			output: costNumber("output"),
+			cacheRead: costNumber("cacheRead"),
+			cacheWrite: costNumber("cacheWrite"),
+			total: costNumber("total"),
+		},
+	};
+}
+
+function managedAssistantEventSnapshot(event: AssistantMessageEvent, message: AssistantMessage): AssistantMessageEvent {
+	const snapshot = managedAttemptSnapshot(event);
+	if (!isManagedPlainRecord(snapshot)) throw new ManagedAttemptSnapshotError();
+	const type = managedProperty(snapshot, "type");
+	const contentIndex = managedProperty(snapshot, "contentIndex");
+	const indexed = () => {
+		if (!Number.isInteger(contentIndex) || (contentIndex as number) < 0) throw new ManagedAttemptSnapshotError();
+		return contentIndex as number;
+	};
+	if (type === "start") return { type, partial: message };
+	if (type === "text_start" || type === "thinking_start" || type === "toolcall_start")
+		return { type, contentIndex: indexed(), partial: message };
+	if (type === "text_delta" || type === "thinking_delta" || type === "toolcall_delta") {
+		const delta = managedProperty(snapshot, "delta");
+		if (typeof delta !== "string") throw new ManagedAttemptSnapshotError();
+		return { type, contentIndex: indexed(), delta, partial: message };
+	}
+	if (type === "text_end" || type === "thinking_end") {
+		const content = managedProperty(snapshot, "content");
+		if (typeof content !== "string") throw new ManagedAttemptSnapshotError();
+		return { type, contentIndex: indexed(), content, partial: message };
+	}
+	if (type === "toolcall_end") {
+		const toolCall = managedAssistantContent(managedProperty(snapshot, "toolCall"));
+		if (toolCall?.type !== "toolCall") throw new ManagedAttemptSnapshotError();
+		return { type, contentIndex: indexed(), toolCall, partial: message };
+	}
+	if (type === "done") {
+		const reason = managedProperty(snapshot, "reason");
+		if (reason !== "stop" && reason !== "length" && reason !== "toolUse") throw new ManagedAttemptSnapshotError();
+		return { type, reason, message };
+	}
+	if (type === "error") {
+		const reason = managedProperty(snapshot, "reason");
+		if (reason !== "aborted" && reason !== "error") throw new ManagedAttemptSnapshotError();
+		return { type, reason, error: message };
+	}
+	throw new ManagedAttemptSnapshotError();
+}
+
+function isManagedPlainRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value) && !nodeUtilTypes.isProxy(value);
+}
+
+/**
  * Holds managed-attempt assistant output above the public event stream. A
  * cancelled provider attempt is therefore unobservable to sessions and their
  * side-effect consumers. Non-managed streams bypass this object entirely.
@@ -532,7 +693,10 @@ class ManagedAttemptTransaction {
 
 	constructor(
 		private readonly stream: EventStream<AgentEvent, AgentMessage[]>,
-		private readonly onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void,
+		private readonly onAssistantMessageEvent:
+			| ((message: AssistantMessage, event: AssistantMessageEvent) => void)
+			| undefined,
+		private readonly model: AgentLoopConfig["model"],
 	) {}
 
 	push(event: AgentEvent): void {
@@ -548,10 +712,11 @@ class ManagedAttemptTransaction {
 	}
 
 	stageAssistantMessageEvent(message: AssistantMessage, event: AssistantMessageEvent): void {
+		const partial = managedAssistantShell(message, this.model);
 		this.#batch.push({
 			type: "assistant_event",
-			message: managedAttemptSnapshot(message),
-			event: managedAttemptSnapshot(event),
+			message: partial,
+			event: managedAssistantEventSnapshot(event, partial),
 		});
 	}
 
@@ -601,7 +766,7 @@ class ManagedAttemptTransaction {
 			this.discard();
 			throw new ManagedAttemptBufferOverflowError();
 		}
-		const detailed = managedAttemptSnapshotDetailed(event);
+		const detailed = managedAttemptSnapshotDetailed(this.#repairAssistantEvent(event));
 		let snapshot = detailed.snapshot;
 		if (bytes === undefined || detailed.degraded) {
 			// Account the bytes of what is actually retained: a degraded
@@ -635,6 +800,31 @@ class ManagedAttemptTransaction {
 		this.#stagedEventCount += 1;
 
 		this.#stagedBytes += bytes;
+	}
+
+	#repairAssistantEvent(event: AgentEvent): AgentEvent {
+		if (event.type === "message_start" || event.type === "message_end" || event.type === "turn_end") {
+			return event.message.role === "assistant"
+				? { ...event, message: managedAssistantShell(event.message, this.model) }
+				: event;
+		}
+		if (event.type === "message_update") {
+			const message = managedAssistantShell(event.message, this.model);
+			return {
+				...event,
+				message,
+				assistantMessageEvent: managedAssistantEventSnapshot(event.assistantMessageEvent, message),
+			};
+		}
+		if (event.type === "agent_end") {
+			return {
+				...event,
+				messages: event.messages.map(message =>
+					message.role === "assistant" ? managedAssistantShell(message, this.model) : message,
+				),
+			};
+		}
+		return event;
 	}
 }
 
@@ -1055,7 +1245,7 @@ async function runLoopBody(
 			const transaction =
 				initialTransaction ??
 				(config.fallbackManaged
-					? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent)
+					? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
 					: undefined);
 			initialTransaction = undefined;
 			const attemptStream = transaction ?? stream;
@@ -1264,7 +1454,7 @@ async function runLoopBody(
 				return;
 			}
 			if (attemptTransaction) {
-				message = managedAttemptSnapshot(message);
+				message = managedAssistantShell(message, config.model);
 				const index = currentContext.messages.length - 1;
 				if (index >= 0 && currentContext.messages[index]?.role === "assistant") {
 					currentContext.messages[index] = message;
@@ -1557,7 +1747,9 @@ async function streamAssistantResponse(
 
 					switch (event.type) {
 						case "start":
-							partialMessage = event.partial;
+							partialMessage = config.fallbackManaged
+								? managedAssistantShell(event.partial, config.model)
+								: event.partial;
 							context.messages.push(partialMessage);
 							addedPartial = true;
 							stream.push({ type: "message_start", message: { ...partialMessage } });
@@ -1577,15 +1769,16 @@ async function streamAssistantResponse(
 						case "toolcall_delta":
 						case "toolcall_end":
 							if (partialMessage) {
-								partialMessage = event.partial;
+								partialMessage = config.fallbackManaged
+									? managedAssistantShell(event.partial, config.model)
+									: event.partial;
+								const partialEvent = config.fallbackManaged ? { ...event, partial: partialMessage } : event;
 								context.messages[context.messages.length - 1] = partialMessage;
-								config.onAssistantMessageEvent?.(partialMessage, event);
-								if (signal?.aborted) {
-									continue;
-								}
+								config.onAssistantMessageEvent?.(partialMessage, partialEvent);
+								if (signal?.aborted) continue;
 								stream.push({
 									type: "message_update",
-									assistantMessageEvent: event,
+									assistantMessageEvent: partialEvent,
 									message: { ...partialMessage },
 								});
 							}
@@ -1593,7 +1786,9 @@ async function streamAssistantResponse(
 
 						case "done":
 						case "error": {
-							const finalMessage = await response.result();
+							const finalMessage = config.fallbackManaged
+								? managedAssistantShell(await response.result(), config.model)
+								: await response.result();
 							if (addedPartial) {
 								context.messages[context.messages.length - 1] = finalMessage;
 							} else {
@@ -1612,7 +1807,9 @@ async function streamAssistantResponse(
 				detachAbortListener?.();
 			}
 
-			const trailing = await response.result();
+			const trailing = config.fallbackManaged
+				? managedAssistantShell(await response.result(), config.model)
+				: await response.result();
 			await finishChat(trailing);
 			return trailing;
 		});
