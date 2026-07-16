@@ -257,6 +257,12 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 	throw new Error(`Failed to acquire lock for ${filePath} after ${opts.retries} attempts`);
 }
 
+/**
+ * Serializes all contenders, including callers in the same process. Because this
+ * API exposes no ownership token, recursive acquisition is indistinguishable
+ * from independent async contention; code that already holds the lock must pass
+ * that fact through its own `lockHeld` path instead of acquiring it again.
+ */
 export async function withFileLock<T>(
 	filePath: string,
 	fn: () => Promise<T>,
