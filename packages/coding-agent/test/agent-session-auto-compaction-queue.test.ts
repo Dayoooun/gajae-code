@@ -550,6 +550,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 	it("keeps context usage available after compaction with a usage anchor", async () => {
 		vi.useRealTimers();
+		session.settings.set("compaction.keepRecentTokens", 1);
 		const assistant: AssistantMessage = {
 			role: "assistant",
 			content: [{ type: "text", text: "anchored response" }],
@@ -573,8 +574,14 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 		await session.compact();
 
+		// P0 regression (#2342 gate): a truthy-number knownAnchor previously made
+		// this path call calculateContextTokens(undefined) and throw. Post-compaction
+		// with no post-boundary assistant, the documented contract is
+		// tokens: null / source: "unknown" — never a throw.
 		const usage = session.getContextUsage();
-		expect(usage?.tokens).toBeGreaterThanOrEqual(110);
+		expect(usage).toBeDefined();
+		expect(usage?.tokens).toBeNull();
+		expect(usage?.source).toBe("unknown");
 	});
 
 	it("runs pre-prompt handoff maintenance before sending the oversized prompt", async () => {
