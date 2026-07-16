@@ -5,7 +5,6 @@ import type { HindsightApi, MemoryItemInput } from "./client";
 import type { HindsightConfig } from "./config";
 import {
 	composeRecallQuery,
-	formatCurrentTime,
 	formatMemories,
 	type HindsightMessage,
 	prepareRetentionTranscript,
@@ -215,6 +214,9 @@ export class HindsightSessionState {
 	unsubscribe?: () => void;
 	/** Alias states delegate persistence config to a primary parent state. */
 	aliasOf?: HindsightSessionState;
+	/** One auto-retain may run at a time; one later agent_end is coalesced. */
+	#autoRetainInFlight?: Promise<void>;
+	#autoRetainPending = false;
 	readonly retainQueue: HindsightRetainQueue;
 
 	constructor(options: HindsightSessionStateOptions) {
@@ -243,6 +245,11 @@ export class HindsightSessionState {
 		this.lastRecallSnippet = undefined;
 	}
 
+	/** Return the current recall payload, resolving subagent aliases to their primary state. */
+	getRecallSnippet(): string | undefined {
+		return this.aliasOf ? this.aliasOf.getRecallSnippet() : this.lastRecallSnippet;
+	}
+
 	enqueueRetain(content: string, context?: string): void {
 		this.retainQueue.enqueue(content, context);
 	}
@@ -264,7 +271,7 @@ export class HindsightSessionState {
 			const results = response.results ?? [];
 			if (results.length === 0) return { context: null, ok: true };
 			const formatted = formatMemories(results);
-			const block = `<memories>\n${this.config.recallPromptPreamble}\nCurrent time: ${formatCurrentTime()} UTC\n\n${formatted}\n</memories>`;
+			const block = `<memories>\n${this.config.recallPromptPreamble}\n\n${formatted}\n</memories>`;
 			return { context: block, ok: true };
 		} catch (err) {
 			if (this.config.debug) {
@@ -274,13 +281,14 @@ export class HindsightSessionState {
 		}
 	}
 
-	async retainSession(messages: HindsightMessage[]): Promise<void> {
+	async retainSession(messages: HindsightMessage[]): Promise<boolean> {
 		const retainFullWindow = this.config.retainMode === "full-session";
 		let target: HindsightMessage[];
 		let documentId: string;
 
 		if (retainFullWindow) {
-			target = messages;
+			target = sliceMessagesAfterUserTurns(messages, this.lastRetainedTurn);
+			if (target.length === 0) return false;
 			documentId = this.sessionId;
 		} else {
 			const windowTurns = this.config.retainEveryNTurns + this.config.retainOverlapTurns;
@@ -289,7 +297,7 @@ export class HindsightSessionState {
 		}
 
 		const { transcript } = prepareRetentionTranscript(target, true);
-		if (!transcript) return;
+		if (!transcript) return false;
 
 		await ensureBankMission(this.client, this.bankId, this.config, this.missionsSet);
 		await this.client.retain(this.bankId, transcript, {
@@ -299,9 +307,29 @@ export class HindsightSessionState {
 			tags: this.retainTags,
 			async: true,
 		});
+		return true;
 	}
 
 	async maybeRetainOnAgentEnd(): Promise<void> {
+		if (this.#autoRetainInFlight) {
+			this.#autoRetainPending = true;
+			return;
+		}
+
+		const retain = this.#maybeRetainOnAgentEnd();
+		this.#autoRetainInFlight = retain;
+		try {
+			await retain;
+		} finally {
+			this.#autoRetainInFlight = undefined;
+			if (this.#autoRetainPending) {
+				this.#autoRetainPending = false;
+				void this.maybeRetainOnAgentEnd();
+			}
+		}
+	}
+
+	async #maybeRetainOnAgentEnd(): Promise<void> {
 		if (!this.config.autoRetain) return;
 		const messages = extractMessages(this.session.sessionManager);
 		if (messages.length === 0) return;
@@ -309,7 +337,8 @@ export class HindsightSessionState {
 		if (userTurns - this.lastRetainedTurn < this.config.retainEveryNTurns) return;
 
 		try {
-			await this.retainSession(messages);
+			const retained = await this.retainSession(messages);
+			if (!retained) return;
 			this.lastRetainedTurn = userTurns;
 			if (this.config.debug) {
 				logger.debug("Hindsight: auto-retain succeeded", {
@@ -332,7 +361,8 @@ export class HindsightSessionState {
 		const messages = extractMessages(this.session.sessionManager);
 		if (messages.length === 0) return;
 		try {
-			await this.retainSession(messages);
+			const retained = await this.retainSession(messages);
+			if (!retained) return;
 			this.lastRetainedTurn = messages.filter(m => m.role === "user").length;
 		} catch (err) {
 			logger.warn("Hindsight: forced retain failed", {
@@ -358,7 +388,6 @@ export class HindsightSessionState {
 		if (!context) return;
 
 		this.lastRecallSnippet = context;
-		await this.#refreshBaseSystemPromptAfter("recall");
 	}
 
 	async beforeAgentStartPrompt(promptText: string): Promise<string | undefined> {
@@ -409,21 +438,23 @@ export class HindsightSessionState {
 			}
 		}
 
-		await this.refreshMentalModelsSnippet();
-		await this.#refreshBaseSystemPromptAfter("MM load");
+		const changed = await this.refreshMentalModelsSnippet();
+		if (changed) await this.#refreshBaseSystemPromptAfter("MM load");
 	}
 
-	async refreshMentalModelsSnippet(): Promise<void> {
+	async refreshMentalModelsSnippet(): Promise<boolean> {
 		const snippet = await loadMentalModelsBlock(this.client, this.bankId, this.config.mentalModelMaxRenderChars);
+		const changed = contentHash(snippet) !== contentHash(this.mentalModelsSnippet);
 		this.mentalModelsSnippet = snippet;
 		this.mentalModelsLoadedAt = Date.now();
+		return changed;
 	}
 
 	async reloadMentalModels(): Promise<boolean> {
 		if (this.aliasOf) return false;
 		if (!this.config.mentalModelsEnabled) return false;
-		await this.refreshMentalModelsSnippet();
-		await this.#refreshBaseSystemPromptAfter("MM reload");
+		const changed = await this.refreshMentalModelsSnippet();
+		if (changed) await this.#refreshBaseSystemPromptAfter("MM reload");
 		return true;
 	}
 
@@ -445,8 +476,8 @@ export class HindsightSessionState {
 					this.mentalModelsLoadedAt !== undefined &&
 					Date.now() - this.mentalModelsLoadedAt >= this.config.mentalModelRefreshIntervalMs
 				) {
-					void this.refreshMentalModelsSnippet().then(async () => {
-						await this.#refreshBaseSystemPromptAfter("MM TTL reload");
+					void this.refreshMentalModelsSnippet().then(async changed => {
+						if (changed) await this.#refreshBaseSystemPromptAfter("MM TTL reload");
 					});
 				}
 			}
@@ -459,11 +490,28 @@ export class HindsightSessionState {
 		this.retainQueue.dispose();
 	}
 
-	async #refreshBaseSystemPromptAfter(reason: "recall" | "MM load" | "MM reload" | "MM TTL reload"): Promise<void> {
+	async #refreshBaseSystemPromptAfter(reason: "MM load" | "MM reload" | "MM TTL reload"): Promise<void> {
 		try {
 			await this.session.refreshBaseSystemPrompt();
 		} catch (err) {
 			logger.debug(`Hindsight: refreshBaseSystemPrompt after ${reason} failed`, { error: String(err) });
 		}
 	}
+}
+
+/** Return the tail beginning with the first user turn after `retainedTurns`. */
+function sliceMessagesAfterUserTurns(messages: HindsightMessage[], retainedTurns: number): HindsightMessage[] {
+	if (retainedTurns <= 0) return messages;
+
+	let seenTurns = 0;
+	for (let i = 0; i < messages.length; i++) {
+		if (messages[i].role !== "user") continue;
+		seenTurns += 1;
+		if (seenTurns > retainedTurns) return messages.slice(i);
+	}
+	return [];
+}
+
+function contentHash(content: string | undefined): string {
+	return Bun.hash(content ?? "").toString(16);
 }
