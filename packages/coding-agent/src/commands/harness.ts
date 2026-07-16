@@ -31,6 +31,8 @@ import {
 	ownerProcessStartTime,
 	planTmuxOwnerIsolation,
 	replaceOwnerGenerationSync,
+	isSafeServerProof,
+	sameServerIdentity,
 	type TmuxServerProof,
 } from "../gjc-runtime/tmux-owner-isolation";
 import { classifyRecovery } from "../harness-control-plane/classifier";
@@ -562,28 +564,6 @@ function isBoundedNoServerDiagnostic(stderr: Uint8Array): boolean {
 	);
 }
 
-function sameServerIdentity(left: TmuxServerProof, right: TmuxServerProof): boolean {
-	return (
-		left.pid === right.pid &&
-		left.startTime === right.startTime &&
-		left.cgroup?.classification === right.cgroup?.classification &&
-		left.cgroup?.scope === right.cgroup?.scope &&
-		left.cgroup?.diagnostic === right.cgroup?.diagnostic
-	);
-}
-
-function isSafeServerProof(proof: TmuxServerProof): boolean {
-	return (
-		proof.state === "safe" &&
-		typeof proof.pid === "number" &&
-		Number.isSafeInteger(proof.pid) &&
-		proof.pid > 0 &&
-		typeof proof.startTime === "string" &&
-		proof.startTime.length > 0 &&
-		(proof.cgroup?.classification === "safe" ||
-			(process.platform !== "linux" && proof.cgroup?.classification === "not_applicable"))
-	);
-}
 
 function exactNativeTmuxSessionId(stdout: Uint8Array): string | null {
 	const value = new TextDecoder().decode(stdout);
@@ -985,7 +965,9 @@ export default class Harness extends Command {
 		proof: TmuxServerProof | null,
 		probeServer: OwnerIsolationProbe["probeServer"],
 	): Promise<void> {
-		if (!nativeSessionId || !proof || !isSafeServerProof(proof)) throw new Error("tmux-owner-cleanup_uncertain");
+		if (!nativeSessionId || !proof || !isSafeServerProof(proof, ownerIsolationPlatform()))
+			throw new Error("tmux-owner-cleanup_uncertain");
+
 		if (!(await this.#nativeSessionBoundToName(tmuxCommand, socketKey, nativeSessionId, sessionName)))
 			throw new Error("tmux-owner-cleanup_uncertain");
 		const current = await probeServer(socketKey, [tmuxCommand, "-L", socketKey]);
@@ -1141,7 +1123,7 @@ export default class Harness extends Command {
 		const postSpawnServer = await probeServer(socketKey, [tmuxCommand, "-L", socketKey]);
 		cleanupProof = postSpawnServer;
 		if (postSpawnServer.state === "unsafe") return fail("tmux-owner-server_unsafe");
-		if (!isSafeServerProof(postSpawnServer)) return fail("tmux-owner-server_unverifiable");
+		if (!isSafeServerProof(postSpawnServer, ownerIsolationPlatform())) return fail("tmux-owner-server_unverifiable");
 		if (
 			scopedReceipt &&
 			(scopedReceipt.sessionName !== sessionName ||
