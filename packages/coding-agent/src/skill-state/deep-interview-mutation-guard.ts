@@ -11,6 +11,7 @@ import { LocalProtocolHandler, resolveLocalUrlToPath } from "../internal-urls/lo
 import { resolveToCwd } from "../tools/path-utils";
 import { ToolError } from "../tools/tool-errors";
 import { listActiveSkills, readVisibleSkillActiveState, type SkillActiveEntry } from "./active-state";
+import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
 import {
 	type CanonicalGjcWorkflowSkill,
 	sanctionedWorkflowStateCommand,
@@ -135,7 +136,6 @@ async function readVisibleModeState(cwd: string, skill: string, sessionId: strin
  * absent so a handoff-required planning skill (deep-interview/ralplan) keeps
  * blocking through its handoff/ask window until it is demoted or cleared.
  */
-const WORKFLOW_FINISHED_PHASES = new Set(["complete", "completed", "failed", "cancelled", "canceled", "inactive"]);
 
 function entryMatchesContext(entry: SkillActiveEntry, sessionId?: string, threadId?: string): boolean {
 	if (sessionId && entry.session_id && entry.session_id !== sessionId) return false;
@@ -165,7 +165,7 @@ function isPlanningSkill(skill: string): skill is "deep-interview" | "ralplan" |
 function isBlockingPlanningPhase(skill: "deep-interview" | "ralplan" | "ultragoal", phase: string): boolean {
 	const normalized = phase.trim().toLowerCase();
 	if (skill === "ultragoal") return normalized === "goal-planning";
-	return !WORKFLOW_FINISHED_PHASES.has(normalized);
+	return !getSkillManifest("ralplan").stopReleasingPhases.includes(normalized);
 }
 
 interface ActivePlanningSkill {

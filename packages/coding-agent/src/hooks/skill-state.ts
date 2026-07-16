@@ -12,6 +12,7 @@ import {
 	writeGuardedWorkflowEnvelopeAtomic,
 } from "../gjc-runtime/state-writer";
 import { isUltragoalBypassPrompt, verifyUltragoalDurableCompletionState } from "../gjc-runtime/ultragoal-guard";
+import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
 import { buildSessionContext, loadEntriesFromFile, type SessionEntry } from "../session/session-manager";
 import {
 	readVisibleSkillActiveState as readCanonicalVisibleSkillActiveState,
@@ -531,7 +532,6 @@ function isTerminalModeState(state: ModeState | null): boolean {
  * declared it is ready to chain but has not yet been demoted/cleared, so it
  * must keep blocking until the chain (or an explicit clear) removes it.
  */
-const STOP_RELEASING_PHASES = ["complete", "completed", "failed", "cancelled", "canceled", "inactive"] as const;
 
 /**
  * Handoff workflows must never stop silently — they always have to offer the
@@ -559,7 +559,7 @@ function modeStateReleasesStop(state: ModeState | null, handoffRequired: boolean
 	const phase = String(state.current_phase ?? "")
 		.trim()
 		.toLowerCase();
-	if ((STOP_RELEASING_PHASES as readonly string[]).includes(phase)) return true;
+	if (getSkillManifest("ralplan").stopReleasingPhases.includes(phase)) return true;
 	if (!handoffRequired && phase === "handoff") return true;
 	return false;
 }
