@@ -5356,7 +5356,8 @@ export class AgentSession {
 		try {
 			const injected = await backend.beforeAgentStartPrompt(this, promptText);
 			if (!injected) return this.#baseSystemPrompt;
-			return [...this.#baseSystemPrompt, injected];
+			// Recall is volatile user-role context. Mental models remain in the stable developer prefix.
+			return this.#baseSystemPrompt;
 		} catch (err) {
 			logger.debug("Memory backend beforeAgentStartPrompt failed", {
 				backend: backend.id,
@@ -6615,6 +6616,17 @@ export class AgentSession {
 			}
 
 			const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
+			const hindsightRecall = this.getHindsightSessionState()?.getRecallSnippet();
+			if (hindsightRecall) {
+				messages.push({
+					role: "custom",
+					customType: "hindsight-recall",
+					content: hindsightRecall,
+					display: false,
+					attribution: "agent",
+					timestamp: Date.now(),
+				});
+			}
 
 			const promptAttribution: "user" | "agent" | undefined =
 				"attribution" in message ? message.attribution : undefined;
