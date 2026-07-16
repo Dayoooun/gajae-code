@@ -153,8 +153,8 @@ describe("staleness supersession ordering", () => {
 
 	it("uses relaxed minimum for over-threshold pruning without changing the default", () => {
 		const entries: SessionEntry[] = [];
-		pair(entries, "c1", "read", { path: "src/a.ts" }, 60_000);
-		pair(entries, "c2", "read", { path: "src/a.ts" }, 60_000);
+		pair(entries, "c1", "read", { path: "src/a.ts" }, 62_000);
+		pair(entries, "c2", "read", { path: "src/a.ts" }, 62_000);
 		expect(pruneToolOutputs(entries, DEFAULT_PRUNE_CONFIG).prunedCount).toBe(0);
 		const result = pruneToolOutputs(entries, DEFAULT_PRUNE_CONFIG, { relaxedMinimum: 0 });
 		expect(result.tokensSaved).toBeGreaterThanOrEqual(15_000);

@@ -106,7 +106,8 @@ describe("prepareCompaction keep-window token correction (Finding 7)", () => {
 
 describe("prepareCompaction scaled keep window", () => {
 	test("a 200k context window keeps at least 25% of the window", () => {
-		const prep = prepareCompaction(buildEntries(500, 4_000), settings(100), { contextWindow: 200_000 });
+		// 8k turns (~160k heuristic tokens) so history extends beyond the scaled keep window.
+		const prep = prepareCompaction(buildEntries(500, 8_000), settings(100), { contextWindow: 200_000 });
 		expect(prep).toBeDefined();
 		expect(prep?.tokenCorrection.keepRecentTokensCorrected).toBe(60_000);
 		expect(prep?.recentMessages.length ?? 0).toBeGreaterThanOrEqual(5_000);
