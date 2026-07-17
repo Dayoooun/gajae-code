@@ -16,7 +16,7 @@ type EvalArtifact = {
 		url: string;
 		retrievedAt: string;
 		implementationCommit: string;
-		finalIntegrationCommit: string;
+		reviewedRepairCommit: string;
 		inputFixtureSha256: string;
 	};
 	capturedAnchors: { proposed: string[] };
@@ -140,7 +140,7 @@ describe("Anthropic cache placement eval (deterministic payload structure)", () 
 				url: "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
 				retrievedAt: "2026-07-17",
 				implementationCommit: "0a43140bb",
-				finalIntegrationCommit: "5106a14da",
+				reviewedRepairCommit: "f01776ce6",
 				inputFixtureSha256: fixtureSha256,
 			},
 			capturedAnchors: { proposed: ["cache_control"] },
@@ -164,7 +164,7 @@ describe("Anthropic cache placement eval (deterministic payload structure)", () 
 					"merge-base",
 					"--is-ancestor",
 					artifact.source.implementationCommit,
-					artifact.source.finalIntegrationCommit,
+					artifact.source.reviewedRepairCommit,
 				],
 				{ stdout: "pipe", stderr: "pipe" },
 			);
