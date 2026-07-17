@@ -18,10 +18,17 @@ export class ModelBindingsApplier {
 	#lastAppliedAgentOverrides = new Map<string, ModelSelectorValue>();
 
 	setBindings(bindings: ConfiguredModelBindings | undefined): void {
-		this.#bindings = bindings;
+		this.#bindings = bindings && {
+			modelRoles: this.#cloneBindings(bindings.modelRoles),
+			agentModelOverrides: this.#cloneBindings(bindings.agentModelOverrides),
+		};
 	}
 
 	applyTo(targetSettings: Settings): void {
+		if (this.#targetSettings && this.#targetSettings !== targetSettings) {
+			this.#restoreTarget(this.#targetSettings);
+			this.#clearTargetLifecycle();
+		}
 		this.#targetSettings = targetSettings;
 		this.apply();
 	}
@@ -30,7 +37,7 @@ export class ModelBindingsApplier {
 		const targetSettings = this.#targetSettings;
 		if (!targetSettings) return;
 		const bindings = this.#bindings;
-		const nextModelRoles = { ...targetSettings.get("modelRoles") };
+		const nextModelRoles = { ...(targetSettings.get("modelRoles") ?? {}) };
 		this.#sync(
 			nextModelRoles,
 			bindings?.modelRoles ?? {},
@@ -40,7 +47,7 @@ export class ModelBindingsApplier {
 		);
 		targetSettings.override("modelRoles", nextModelRoles);
 
-		const nextAgentOverrides = { ...targetSettings.get("task.agentModelOverrides") };
+		const nextAgentOverrides = { ...(targetSettings.get("task.agentModelOverrides") ?? {}) };
 		this.#sync(
 			nextAgentOverrides,
 			bindings?.agentModelOverrides ?? {},
@@ -49,6 +56,31 @@ export class ModelBindingsApplier {
 			this.#lastAppliedAgentOverrides,
 		);
 		targetSettings.override("task.agentModelOverrides", nextAgentOverrides);
+	}
+
+	#restoreTarget(targetSettings: Settings): void {
+		const modelRoles = { ...(targetSettings.get("modelRoles") ?? {}) };
+		this.#sync(modelRoles, {}, this.#appliedRoles, this.#roleBaselines, this.#lastAppliedRoles);
+		targetSettings.override("modelRoles", modelRoles);
+
+		const agentOverrides = { ...(targetSettings.get("task.agentModelOverrides") ?? {}) };
+		this.#sync(
+			agentOverrides,
+			{},
+			this.#appliedAgentOverrides,
+			this.#agentBaselines,
+			this.#lastAppliedAgentOverrides,
+		);
+		targetSettings.override("task.agentModelOverrides", agentOverrides);
+	}
+
+	#clearTargetLifecycle(): void {
+		this.#appliedRoles.clear();
+		this.#appliedAgentOverrides.clear();
+		this.#roleBaselines.clear();
+		this.#agentBaselines.clear();
+		this.#lastAppliedRoles.clear();
+		this.#lastAppliedAgentOverrides.clear();
 	}
 
 	#sync(
@@ -74,12 +106,22 @@ export class ModelBindingsApplier {
 			const previous = lastApplied.get(key);
 			if (!baselines.has(key)) baselines.set(key, this.#clone(target[key]));
 			if (previous === undefined || this.#equal(target[key], previous)) {
-				target[key] = this.#clone(value)!;
-				lastApplied.set(key, this.#clone(value)!);
+				const appliedValue = this.#clone(value)!;
+				target[key] = appliedValue;
+				lastApplied.set(key, this.#clone(appliedValue)!);
 			}
 		}
 		applied.clear();
 		for (const key of configuredKeys) applied.add(key);
+	}
+
+	#cloneBindings(
+		bindings: Record<string, ModelSelectorValue> | undefined,
+	): Record<string, ModelSelectorValue> | undefined {
+		if (!bindings) return undefined;
+		const copy: Record<string, ModelSelectorValue> = {};
+		for (const [key, value] of Object.entries(bindings)) copy[key] = this.#clone(value)!;
+		return copy;
 	}
 
 	#clone(value: ModelSelectorValue | undefined): ModelSelectorValue | undefined {

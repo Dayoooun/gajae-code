@@ -52,4 +52,43 @@ describe("ModelBindingsApplier", () => {
 		expect(values.modelRoles).toEqual({ default: "user/chosen-model" });
 		expect(values["task.agentModelOverrides"]).toEqual({ executor: "anthropic/claude-sonnet" });
 	});
+	test("keeps binding lifecycle isolated per Settings instance", () => {
+		const first = createSettings({
+			modelRoles: { default: "first/baseline" },
+			agentModelOverrides: { executor: "first/executor" },
+		});
+		const second = createSettings({
+			modelRoles: { default: "second/baseline" },
+			agentModelOverrides: { executor: "second/executor" },
+		});
+		const applier = new ModelBindingsApplier();
+
+		applier.setBindings({
+			modelRoles: { default: "config/default" },
+			agentModelOverrides: { executor: "config/executor" },
+		});
+		applier.applyTo(first.settings);
+		applier.applyTo(second.settings);
+
+		expect(first.values).toEqual({
+			modelRoles: { default: "first/baseline" },
+			"task.agentModelOverrides": { executor: "first/executor" },
+		});
+		expect(second.values).toEqual({
+			modelRoles: { default: "config/default" },
+			"task.agentModelOverrides": { executor: "config/executor" },
+		});
+	});
+
+	test("snapshots configured selector arrays before applying them", () => {
+		const { settings, values } = createSettings({ modelRoles: {}, agentModelOverrides: {} });
+		const applier = new ModelBindingsApplier();
+		const configuredChain = ["config/primary", "config/fallback"];
+
+		applier.setBindings({ modelRoles: { default: configuredChain } });
+		configuredChain[0] = "caller/mutated";
+		applier.applyTo(settings);
+
+		expect(values.modelRoles.default).toEqual(["config/primary", "config/fallback"]);
+	});
 });

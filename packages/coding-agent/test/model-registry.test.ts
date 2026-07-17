@@ -16,6 +16,17 @@ describe("model roles", () => {
 	});
 });
 
+test("package exports keep extracted model helpers internal", () => {
+	const packageJson = JSON.parse(fs.readFileSync(path.resolve(import.meta.dir, "../package.json"), "utf8")) as {
+		exports: Record<string, unknown>;
+	};
+
+	expect(packageJson.exports["./config/model-auth"]).toBeNull();
+	expect(packageJson.exports["./config/model-bindings-applier"]).toBeNull();
+	expect(packageJson.exports["./config/model-discovery-manager"]).toBeNull();
+	expect(packageJson.exports["./*"]).toBeDefined();
+});
+
 describe("ModelRegistry", () => {
 	let tempDir: string;
 	let modelsJsonPath: string;
@@ -669,6 +680,25 @@ describe("ModelRegistry", () => {
 			expect(canonical).toBeDefined();
 			expect(bare).toBeDefined();
 			expect(`${bare!.provider}/${bare!.id}`).toBe(`${canonical!.provider}/${canonical!.id}`);
+		});
+		test("keeps an explicitly seeded canonical variant sticky for a session", () => {
+			writeRawModelsJson({
+				demo: providerConfig("https://demo.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const demoVariant = registry
+				.getCanonicalVariants("claude-sonnet-4-5")
+				.find(entry => entry.model.provider === "demo");
+
+			expect(demoVariant).toBeDefined();
+			expect(registry.seedCanonicalVariant("session", demoVariant!.model)).toBe(true);
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: false,
+					candidates: registry.getAll(),
+					sessionId: "session",
+				}),
+			).toBe(demoVariant!.model);
 		});
 	});
 
