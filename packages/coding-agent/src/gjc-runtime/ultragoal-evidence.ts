@@ -601,12 +601,14 @@ function parseCliReplayRecord(
 function isMeaningfulCliReplayInvariant(invariant: JsonObject, stdout: string, fieldName: string): boolean {
 	const type = requiredStringField(invariant, "type", fieldName);
 	const value = requiredStringField(invariant, "value", fieldName);
-	if (type === "substring") return value.trim().length > 0 && stdout.includes(value);
+	if (type === "substring") return value.trim().length >= 4 && stdout.includes(value);
 	if (type === "regex") {
 		const flags = invariant.flags === undefined ? "" : requiredStringField(invariant, "flags", fieldName);
 		if (!/^[im]*$/.test(flags)) throw new Error(`qualityGate ${fieldName}.flags may only contain i and m`);
 		const expression = new RegExp(value, flags);
-		return !expression.test("") && !expression.test("gjc-replay-random-nonce-7f3a9c") && expression.test(stdout);
+		if (expression.test("") || expression.test("gjc-replay-random-nonce-7f3a9c")) return false;
+		const match = expression.exec(stdout);
+		return match !== null && match[0].length >= 4;
 	}
 	if (type === "not_substring") return false;
 	throw new Error(`qualityGate ${fieldName}.type must be substring, regex, or not_substring`);

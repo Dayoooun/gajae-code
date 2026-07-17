@@ -142,14 +142,23 @@ function isNonTerminalGoal(goal: Goal | null): goal is Goal {
 	return goal !== null && goal.status !== "complete" && goal.status !== "dropped";
 }
 
-function matchesGoalModeRequest(existingGoal: Goal, provenance: Goal["provenance"]): boolean {
+function matchesGoalModeRequest(existingGoal: Goal, objective: string, provenance: Goal["provenance"]): boolean {
 	const existingProvenance = existingGoal.provenance;
 	if (existingProvenance?.source === "ultragoal" && provenance?.source === "ultragoal") {
 		return existingProvenance.runId === provenance.runId && existingProvenance.goalId === provenance.goalId;
 	}
-	// Legacy goals predate provenance. They cannot prove a different durable plan,
-	// so preserve the active goal instead of overwriting unrelated user work.
-	return existingProvenance === undefined || provenance === undefined;
+	// Legacy goals have no durable identity. Only an exact normalized objective can
+	// establish that they are the same goal.
+	return existingGoal.objective.trim() === objective;
+}
+
+function hasProvenDifferentDurablePlan(existingGoal: Goal, provenance: Goal["provenance"]): boolean {
+	const existingProvenance = existingGoal.provenance;
+	return (
+		existingProvenance?.source === "ultragoal" &&
+		provenance?.source === "ultragoal" &&
+		existingProvenance.runId !== provenance.runId
+	);
 }
 
 function createGoalModeState(objective: string, provenance: Goal["provenance"]): GoalModeState {
@@ -194,12 +203,16 @@ export async function writeCurrentSessionGoalModeState(input: {
 	const requestedProvenance = input.provenance;
 	const context = buildSessionContext(entries);
 	const existingGoal = goalFromModeData(context.modeData);
-	if (
-		(context.mode === "goal" || context.mode === "goal_paused") &&
-		isNonTerminalGoal(existingGoal) &&
-		matchesGoalModeRequest(existingGoal, input.provenance)
-	) {
-		return { status: "existing_goal", goal: existingGoal };
+	if ((context.mode === "goal" || context.mode === "goal_paused") && isNonTerminalGoal(existingGoal)) {
+		if (matchesGoalModeRequest(existingGoal, objective, requestedProvenance)) {
+			return { status: "existing_goal", goal: existingGoal };
+		}
+		// A legacy or user goal cannot establish that the incoming ultragoal request
+		// belongs to a different durable plan. Preserve it rather than overwriting
+		// active user work; only a distinct ultragoal run ID may replace it.
+		if (!hasProvenDifferentDurablePlan(existingGoal, requestedProvenance)) {
+			return { status: "existing_goal", goal: existingGoal };
+		}
 	}
 
 	const state = createGoalModeState(objective, requestedProvenance);

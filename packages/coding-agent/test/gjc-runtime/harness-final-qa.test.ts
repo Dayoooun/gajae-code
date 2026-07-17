@@ -60,25 +60,37 @@ describe("harness final QA regressions", () => {
 		expect(events).toEqual(["first", "second"]);
 	});
 
-	test("rejects an always-match replay invariant", async () => {
-		await expect(
-			validateCliReplay(
-				process.cwd(),
-				{
-					kind: "cli-replay",
-					schemaVersion: 1,
-					replaySafe: true,
-					command: ["bun", "-e", 'console.log("actual")'],
-					recordedStdout: "recorded\n",
-					invariants: [{ type: "regex", value: ".*" }],
-				},
-				"replay",
-				{ live: false },
-			),
-		).rejects.toThrow("must be a meaningful positive invariant that matches stdout");
+	test("rejects replay invariant bypasses that lack four characters of stdout evidence", async () => {
+		const cases: Array<{ type: "substring" | "regex"; value: string; message?: string }> = [
+			{ type: "regex", value: ".*" },
+			{ type: "regex", value: "(?=x)" },
+			{ type: "substring", value: "x" },
+			{ type: "substring", value: " \t ", message: "must be a non-empty string" },
+			{ type: "regex", value: "[\\s\\S]*" },
+			{ type: "regex", value: "[^]*" },
+			{ type: "regex", value: "^" },
+			{ type: "regex", value: "(?:)" },
+		];
+		for (const invariant of cases) {
+			await expect(
+				validateCliReplay(
+					process.cwd(),
+					{
+						kind: "cli-replay",
+						schemaVersion: 1,
+						replaySafe: true,
+						command: ["bun", "-e", 'console.log("x reliable replay evidence")'],
+						recordedStdout: "recorded\n",
+						invariants: [invariant],
+					},
+					"replay",
+					{ live: false },
+				),
+			).rejects.toThrow(invariant.message ?? "must be a meaningful positive invariant that matches stdout");
+		}
 	});
 
-	test("matches reworded ultragoal requests by provenance but replaces stale plan provenance", async () => {
+	test("matches durable provenance, uses exact trimmed legacy identity, and preserves unproven active goals", async () => {
 		const dir = await tempDir();
 		const sessionFile = path.join(dir, "session.jsonl");
 		const existingGoal = {
@@ -108,20 +120,32 @@ describe("harness final QA regressions", () => {
 		).toMatchObject({ status: "updated", goal: { objective: "New plan objective" } });
 
 		const legacySessionFile = path.join(dir, "legacy-session.jsonl");
-		await writeActiveGoal(legacySessionFile, { ...existingGoal, provenance: undefined });
+		const legacyGoal = { ...existingGoal, objective: "  Original wording  ", provenance: undefined };
+		await writeActiveGoal(legacySessionFile, legacyGoal);
 		expect(
 			await writeCurrentSessionGoalModeState({
 				sessionFile: legacySessionFile,
-				objective: existingGoal.objective,
+				objective: "Original wording",
 				provenance: existingGoal.provenance,
 			}),
-		).toMatchObject({ status: "existing_goal" });
+		).toEqual({ status: "existing_goal", goal: legacyGoal });
 		expect(
 			await writeCurrentSessionGoalModeState({
 				sessionFile: legacySessionFile,
 				objective: "Legacy rewording",
 				provenance: existingGoal.provenance,
 			}),
-		).toMatchObject({ status: "existing_goal" });
+		).toEqual({ status: "existing_goal", goal: legacyGoal });
+
+		const userSessionFile = path.join(dir, "user-session.jsonl");
+		const userGoal = { ...existingGoal, provenance: { source: "user" as const } };
+		await writeActiveGoal(userSessionFile, userGoal);
+		expect(
+			await writeCurrentSessionGoalModeState({
+				sessionFile: userSessionFile,
+				objective: "A different ultragoal objective",
+				provenance: { source: "ultragoal", runId: "run-2", goalId: "aggregate" },
+			}),
+		).toEqual({ status: "existing_goal", goal: userGoal });
 	});
 });
