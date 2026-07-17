@@ -198,6 +198,11 @@ function cloneState(state: PathState): PathState {
 	return state.exists ? { exists: true, value: structuredClone(state.value) } : state;
 }
 
+/** Hash a dotted YAML path state for an expected-hash patch precondition. */
+export function atomicYamlPathHash(value: Record<string, unknown>, path: string): string {
+	return stateHash(stateAtPath(value, path.split(".")));
+}
+
 async function readYaml(configPath: string): Promise<Record<string, unknown>> {
 	try {
 		const parsed = YAML.parse(await fs.readFile(configPath, "utf8"));
@@ -324,6 +329,7 @@ async function applyPatchesUnderLock(
 			throw new AtomicYamlConflictError(patch.expected.path, patch.expected.hash, actualHash);
 		}
 	}
+
 	const changesByPath = new Map<string, ReceiptChange>();
 	for (const patch of patches) {
 		const segments = patch.path.split(".");

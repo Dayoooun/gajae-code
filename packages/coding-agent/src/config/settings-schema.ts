@@ -647,6 +647,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"tools.preAdmissionArtifactSpill": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			label: "Pre-admission artifact spill",
+			description:
+				"Experimental opt-in: save oversized tool results before provider context construction, retaining a UTF-8-safe head, tail, digest, and artifact receipt inline",
+		},
+	},
+
 	"tools.readArtifactSpillThreshold": {
 		type: "number",
 		default: 0,
@@ -3416,10 +3427,7 @@ export type SettingsSchemaIssue = {
 	detail: string;
 };
 
-export type SettingsSchemaReport = {
-	issues: SettingsSchemaIssue[];
-	valid: boolean;
-};
+export type SettingsSchemaReport = { issues: SettingsSchemaIssue[]; valid: boolean };
 
 function schemaValueAtPath(value: Record<string, unknown>, path: string): unknown {
 	let current: unknown = value;
@@ -3445,11 +3453,33 @@ function schemaPaths(value: Record<string, unknown>, prefix = ""): string[] {
 	const paths: string[] = [];
 	for (const [key, child] of Object.entries(value)) {
 		const path = prefix ? `${prefix}.${key}` : key;
-		if (child && typeof child === "object" && !Array.isArray(child))
+		const definition = SETTINGS_SCHEMA[path as SettingPath];
+		// Records intentionally accept user-defined keys; validate their entries below.
+		if (definition?.type === "record") {
+			paths.push(path);
+		} else if (child && typeof child === "object" && !Array.isArray(child)) {
 			paths.push(...schemaPaths(child as Record<string, unknown>, path));
-		else paths.push(path);
+		} else {
+			paths.push(path);
+		}
 	}
 	return paths;
+}
+
+function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], value: unknown): boolean {
+	return (
+		(definition.type === "boolean" && typeof value === "boolean") ||
+		(definition.type === "string" && typeof value === "string") ||
+		(definition.type === "number" &&
+			typeof value === "number" &&
+			Number.isFinite(value) &&
+			(!("validate" in definition) || !definition.validate || definition.validate(value))) ||
+		(definition.type === "enum" &&
+			typeof value === "string" &&
+			(definition.values as readonly string[]).includes(value)) ||
+		(definition.type === "array" && Array.isArray(value)) ||
+		(definition.type === "record" && !!value && typeof value === "object" && !Array.isArray(value))
+	);
 }
 
 /** Coerce supported scalar legacy values and report unknown or invalid settings without dropping them. */
@@ -3484,19 +3514,23 @@ export function reconcileSettingsSchema(raw: Record<string, unknown>): {
 			schemaSetAtPath(settings, path, next);
 			issues.push({ path, kind: "coerced", detail: `Coerced ${typeof value} to ${definition.type}.` });
 		}
-		const valid =
-			(definition.type === "boolean" && typeof next === "boolean") ||
-			(definition.type === "string" && typeof next === "string") ||
-			(definition.type === "number" &&
-				typeof next === "number" &&
-				Number.isFinite(next) &&
-				(!("validate" in definition) || !definition.validate || definition.validate(next))) ||
-			(definition.type === "enum" &&
-				typeof next === "string" &&
-				(definition.values as readonly string[]).includes(next)) ||
-			(definition.type === "array" && Array.isArray(next)) ||
-			(definition.type === "record" && !!next && typeof next === "object" && !Array.isArray(next));
-		if (!valid) issues.push({ path, kind: "invalid", detail: `Expected ${definition.type}.` });
+		if (!validSettingValue(definition, next))
+			issues.push({ path, kind: "invalid", detail: `Expected ${definition.type}.` });
+		if (
+			definition.type === "record" &&
+			"valueSchema" in definition &&
+			definition.valueSchema &&
+			validSettingValue(definition, next)
+		) {
+			for (const [key, entry] of Object.entries(next as Record<string, unknown>)) {
+				if (
+					definition.valueSchema.type === "model-selector-value" &&
+					!(typeof entry === "string" || (Array.isArray(entry) && entry.every(item => typeof item === "string")))
+				) {
+					issues.push({ path: `${path}.${key}`, kind: "invalid", detail: "Expected model-selector-value." });
+				}
+			}
+		}
 	}
 	return { settings, report: { issues, valid: !issues.some(issue => issue.kind === "invalid") } };
 }

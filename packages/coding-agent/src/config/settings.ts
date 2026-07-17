@@ -475,36 +475,104 @@ export class Settings implements NotificationSettingsReader {
 	 * are deliberately excluded from this trust boundary.
 	 */
 	getNotificationSettingsSnapshot(): NotificationSettingsSnapshot {
+		const enabled = this.#getGlobalResolved("notifications.enabled");
+		const botToken = this.#getGlobalResolved("notifications.telegram.botToken");
+		const chatId = this.#getGlobalResolved("notifications.telegram.chatId");
 		const activation = this.#getGlobalResolved("notifications.telegram.activation");
+		const activationSnapshot =
+			activation && Object.keys(activation).length > 0 ? structuredClone(activation) : undefined;
+		const richEnabled = this.#getGlobalResolved("notifications.telegram.rich.enabled");
+		const richDraftEnabled = this.#getGlobalResolved("notifications.telegram.richDraft.enabled");
+		const nameTemplate = this.#getGlobalResolved("notifications.telegram.topics.nameTemplate");
+		const discordBotToken = this.#getGlobalResolved("notifications.discord.botToken");
+		const discordApplicationId = this.#getGlobalResolved("notifications.discord.applicationId");
+		const discordGuildId = this.#getGlobalResolved("notifications.discord.guildId");
+		const discordParentChannelId = this.#getGlobalResolved("notifications.discord.parentChannelId");
+		const slackBotToken = this.#getGlobalResolved("notifications.slack.botToken");
+		const slackAppToken = this.#getGlobalResolved("notifications.slack.appToken");
+		const slackWorkspaceId = this.#getGlobalResolved("notifications.slack.workspaceId");
+		const slackChannelId = this.#getGlobalResolved("notifications.slack.channelId");
+		const slackAuthorizedUserId = this.#getGlobalResolved("notifications.slack.authorizedUserId");
+		const redact = this.#getGlobalResolved("notifications.redact");
 		const verbosity = this.#getGlobalResolved("notifications.verbosity");
 		const sessionScope = this.#getGlobalResolved("notifications.sessionScope");
+		const idleTimeoutMs = this.#getGlobalResolved("notifications.daemon.idleTimeoutMs");
+
 		return {
-			enabled: this.#getGlobalResolved("notifications.enabled"),
+			enabled: typeof enabled === "boolean" ? enabled : getDefault("notifications.enabled"),
 			telegram: {
-				botToken: this.#getGlobalResolved("notifications.telegram.botToken"),
-				chatId: this.#getGlobalResolved("notifications.telegram.chatId"),
-				...(Object.keys(activation).length > 0 ? { activation: structuredClone(activation) } : {}),
-				rich: { enabled: this.#getGlobalResolved("notifications.telegram.rich.enabled") },
-				richDraft: { enabled: this.#getGlobalResolved("notifications.telegram.richDraft.enabled") },
-				topics: { nameTemplate: this.#getGlobalResolved("notifications.telegram.topics.nameTemplate") },
+				botToken:
+					typeof botToken === "string" && botToken.length > 0
+						? botToken
+						: getDefault("notifications.telegram.botToken"),
+				chatId:
+					typeof chatId === "string" && chatId.length > 0 ? chatId : getDefault("notifications.telegram.chatId"),
+				...(activationSnapshot === undefined ? {} : { activation: activationSnapshot }),
+				rich: {
+					enabled:
+						typeof richEnabled === "boolean" ? richEnabled : getDefault("notifications.telegram.rich.enabled"),
+				},
+				richDraft: {
+					enabled:
+						typeof richDraftEnabled === "boolean"
+							? richDraftEnabled
+							: getDefault("notifications.telegram.richDraft.enabled"),
+				},
+				topics: {
+					nameTemplate:
+						typeof nameTemplate === "string" && nameTemplate.length > 0
+							? nameTemplate
+							: getDefault("notifications.telegram.topics.nameTemplate"),
+				},
 			},
 			discord: {
-				botToken: this.#getGlobalResolved("notifications.discord.botToken"),
-				applicationId: this.#getGlobalResolved("notifications.discord.applicationId"),
-				guildId: this.#getGlobalResolved("notifications.discord.guildId"),
-				parentChannelId: this.#getGlobalResolved("notifications.discord.parentChannelId"),
+				botToken:
+					typeof discordBotToken === "string" && discordBotToken.length > 0
+						? discordBotToken
+						: getDefault("notifications.discord.botToken"),
+				applicationId:
+					typeof discordApplicationId === "string" && discordApplicationId.length > 0
+						? discordApplicationId
+						: getDefault("notifications.discord.applicationId"),
+				guildId:
+					typeof discordGuildId === "string" && discordGuildId.length > 0
+						? discordGuildId
+						: getDefault("notifications.discord.guildId"),
+				parentChannelId:
+					typeof discordParentChannelId === "string" && discordParentChannelId.length > 0
+						? discordParentChannelId
+						: getDefault("notifications.discord.parentChannelId"),
 			},
 			slack: {
-				botToken: this.#getGlobalResolved("notifications.slack.botToken"),
-				appToken: this.#getGlobalResolved("notifications.slack.appToken"),
-				workspaceId: this.#getGlobalResolved("notifications.slack.workspaceId"),
-				channelId: this.#getGlobalResolved("notifications.slack.channelId"),
-				authorizedUserId: this.#getGlobalResolved("notifications.slack.authorizedUserId"),
+				botToken:
+					typeof slackBotToken === "string" && slackBotToken.length > 0
+						? slackBotToken
+						: getDefault("notifications.slack.botToken"),
+				appToken:
+					typeof slackAppToken === "string" && slackAppToken.length > 0
+						? slackAppToken
+						: getDefault("notifications.slack.appToken"),
+				workspaceId:
+					typeof slackWorkspaceId === "string" && slackWorkspaceId.length > 0
+						? slackWorkspaceId
+						: getDefault("notifications.slack.workspaceId"),
+				channelId:
+					typeof slackChannelId === "string" && slackChannelId.length > 0
+						? slackChannelId
+						: getDefault("notifications.slack.channelId"),
+				authorizedUserId:
+					typeof slackAuthorizedUserId === "string" && slackAuthorizedUserId.length > 0
+						? slackAuthorizedUserId
+						: getDefault("notifications.slack.authorizedUserId"),
 			},
-			redact: this.#getGlobalResolved("notifications.redact"),
-			verbosity: verbosity === "verbose" ? "verbose" : "lean",
-			sessionScope: sessionScope === "primary" ? "primary" : "all",
-			idleTimeoutMs: this.#getGlobalResolved("notifications.daemon.idleTimeoutMs"),
+			redact: typeof redact === "boolean" ? redact : getDefault("notifications.redact"),
+			verbosity: verbosity === "verbose" || getDefault("notifications.verbosity") === "verbose" ? "verbose" : "lean",
+			sessionScope:
+				sessionScope === "primary" || getDefault("notifications.sessionScope") === "primary" ? "primary" : "all",
+			idleTimeoutMs:
+				typeof idleTimeoutMs === "number" && Number.isFinite(idleTimeoutMs) && idleTimeoutMs > 0
+					? idleTimeoutMs
+					: getDefault("notifications.daemon.idleTimeoutMs"),
 		};
 	}
 
@@ -1131,12 +1199,12 @@ export class Settings implements NotificationSettingsReader {
 			this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
 			await this.#migrateFromLegacy();
 			this.#global = await this.#loadYaml(this.#configPath!);
-			if (this.#schemaMigrationPending)
-				this.#recordLegacyFallbackMigrationPatch("configSchemaVersion", CONFIG_SCHEMA_VERSION);
 			const configVersion = readConfigVersion(this.#configPath!);
 			this.#defaultModelRoleOwnership.configVersion = configVersion;
 			this.#defaultModelRoleOwnership.defaultConfigVersion = configVersion;
 		}
+		if (this.#schemaMigrationPending)
+			this.#recordLegacyFallbackMigrationPatch("configSchemaVersion", CONFIG_SCHEMA_VERSION);
 
 		this.#project = await projectPromise;
 
@@ -1156,20 +1224,21 @@ export class Settings implements NotificationSettingsReader {
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 				return {};
 			}
-			const configSchemaVersion = (parsed as RawSettings).configSchemaVersion;
+			const parsedRaw = parsed as RawSettings;
+			const configSchemaVersion = parsedRaw.configSchemaVersion;
 			if (
 				filePath === this.#configPath &&
 				(typeof configSchemaVersion !== "number" || configSchemaVersion < CONFIG_SCHEMA_VERSION)
 			) {
 				this.#schemaMigrationPending = true;
 			}
-			const migrated = this.#migrateRawSettings(parsed as RawSettings);
+			const migrated = this.#migrateRawSettings(parsedRaw);
 			const reconciled = reconcileSettingsSchema(migrated);
-			if (typeof migrated.configSchemaVersion === "number" && migrated.configSchemaVersion > CONFIG_SCHEMA_VERSION) {
+			if (typeof configSchemaVersion === "number" && configSchemaVersion > CONFIG_SCHEMA_VERSION) {
 				reconciled.report.issues.push({
 					path: "configSchemaVersion",
 					kind: "pending-migration",
-					detail: `Configuration requires schema version ${migrated.configSchemaVersion}.`,
+					detail: `Configuration requires schema version ${configSchemaVersion}.`,
 				});
 			}
 			this.#schemaReport = reconciled.report;
@@ -1427,6 +1496,11 @@ export class Settings implements NotificationSettingsReader {
 			raw.steeringMode = raw.queueMode;
 			delete raw.queueMode;
 		}
+		// ask.timeout: v0 stored milliseconds; v1 stores seconds.
+		if (raw.ask && typeof (raw.ask as Record<string, unknown>).timeout === "number") {
+			const oldValue = (raw.ask as Record<string, unknown>).timeout as number;
+			if (oldValue > 1000) (raw.ask as Record<string, unknown>).timeout = Math.round(oldValue / 1000);
+		}
 
 		// Migrate old flat "theme" string to nested theme.dark/theme.light
 		if (typeof raw.theme === "string") {
@@ -1555,6 +1629,7 @@ export class Settings implements NotificationSettingsReader {
 		}
 
 		raw.configSchemaVersion = CONFIG_SCHEMA_VERSION;
+
 		return raw;
 	}
 

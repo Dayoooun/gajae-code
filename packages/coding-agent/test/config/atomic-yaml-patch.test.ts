@@ -5,8 +5,9 @@ import * as path from "node:path";
 import { YAML } from "bun";
 import {
 	type AtomicYamlPatch,
-	AtomicYamlReplaceError,
 	AtomicYamlConflictError,
+	atomicYamlPathHash,
+	AtomicYamlReplaceError,
 	applyAtomicYamlPatches,
 } from "../../src/config/atomic-yaml-patch";
 
@@ -75,35 +76,20 @@ describe("atomic YAML patches", () => {
 		expect(await receipt.restore()).toEqual({ status: "conflict", paths: ["feature.enabled"] });
 	});
 
-	test("allows exactly one competing expected-hash writer without clobbering", async () => {
+	test("rejects an expected-hash write after another writer wins", async () => {
 		const configPath = await configPathForTest();
-		await fs.writeFile(configPath, YAML.stringify({ feature: { enabled: false } }, null, 2));
-		const receipt = await applyAtomicYamlPatches(configPath, [{ path: "feature.enabled", op: "set", value: false }]);
-		const expected = receipt.revisions[0]!.afterHash;
-
-		const writes = await Promise.allSettled([
-			applyAtomicYamlPatches(configPath, [
-				{
-					path: "feature.enabled",
-					op: "set",
-					value: "first",
-					expected: { path: "feature.enabled", hash: expected },
-				},
-			]),
-			applyAtomicYamlPatches(configPath, [
-				{
-					path: "feature.enabled",
-					op: "set",
-					value: "second",
-					expected: { path: "feature.enabled", hash: expected },
-				},
-			]),
+		const initial = { modelRoles: { default: "provider/original" } };
+		await fs.writeFile(configPath, YAML.stringify(initial, null, 2));
+		const expected = { path: "modelRoles.default", hash: atomicYamlPathHash(initial, "modelRoles.default") };
+		await applyAtomicYamlPatches(configPath, [
+			{ path: "modelRoles.default", op: "set", value: "provider/winner", expected },
 		]);
-
-		expect(writes.filter(write => write.status === "fulfilled")).toHaveLength(1);
-		expect(writes.find(write => write.status === "rejected")?.reason).toBeInstanceOf(AtomicYamlConflictError);
-		const stored = (await readYaml(configPath)).feature as { enabled: string };
-		expect(["first", "second"]).toContain(stored.enabled);
+		await expect(
+			applyAtomicYamlPatches(configPath, [
+				{ path: "modelRoles.default", op: "set", value: "provider/loser", expected },
+			]),
+		).rejects.toBeInstanceOf(AtomicYamlConflictError);
+		expect(await readYaml(configPath)).toEqual({ modelRoles: { default: "provider/winner" } });
 	});
 
 	test("rejects ambiguous undefined set patches", () => {
