@@ -3248,6 +3248,12 @@ function extractTextFromContent(content: Message["content"]): string {
 
 const SESSION_LIST_PREFIX_BYTES = 4096;
 const SESSION_LIST_TRAILING_PATCH_BYTES = 4096;
+// Hard cap on how many trailing bytes the listers may scan for header patches.
+// moveTo folds cwd patches into line 1 via a full atomic rewrite, so only a
+// recent title patch can live unfolded near EOF; anything buried deeper is
+// folded on the next natural full rewrite. Keeping this bounded preserves the
+// O(SESSION_LIST_PREFIX_BYTES) listing cost that SESSION_LIST_PREFIX_BYTES exists for.
+const SESSION_LIST_TRAILING_PATCH_SCAN_CAP = SESSION_LIST_TRAILING_PATCH_BYTES * 4;
 
 const SESSION_LIST_PARALLEL_THRESHOLD = 64;
 const SESSION_LIST_MAX_WORKERS = 16;
@@ -3284,11 +3290,12 @@ async function readSessionListTrailingPatches(
 	if (size <= SESSION_LIST_PREFIX_BYTES) return [];
 	const latest: HeaderPatchRecord["patch"] = {};
 	let position = size;
+	const scanFloor = Math.max(0, size - SESSION_LIST_TRAILING_PATCH_SCAN_CAP);
 	let trailingFragment = Buffer.alloc(0);
 	const chunkSize = Math.min(buffer.byteLength, SESSION_LIST_TRAILING_PATCH_BYTES);
 	const handle = await fs.promises.open(file, "r");
 	try {
-		while (position > 0 && (latest.cwd === undefined || latest.title === undefined)) {
+		while (position > scanFloor && (latest.cwd === undefined || latest.title === undefined)) {
 			const start = Math.max(0, position - chunkSize);
 			const length = position - start;
 			const { bytesRead } = await handle.read(buffer, 0, length, start);
