@@ -3,7 +3,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
-import type { AssistantMessage, ToolResultMessage } from "@gajae-code/ai";
+import type { AssistantMessage, Context, ToolResultMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -24,17 +24,21 @@ describe("AgentSession pre-admission artifact spill", () => {
 		await session?.dispose();
 		authStorage?.close();
 		tempDir?.removeSync();
-		tempDir = undefined;
-		session = undefined;
-		authStorage = undefined;
 	});
 
-	it("spills one oversized result before context admission and preserves a readable artifact", async () => {
+	it("awaits delayed spill I/O before provider context construction and preserves resumed artifacts", async () => {
 		tempDir = TempDir.createSync("@gjc-pre-admission-spill-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic model");
+
+		let providerContext: Context | undefined;
+		let resolveWrite!: () => void;
+		const writeGate = new Promise<void>(resolve => {
+			resolveWrite = resolve;
+		});
+		let sessionRef: AgentSession | undefined;
 		const agent = new Agent({
 			initialState: {
 				model: { ...model, contextWindow: 200_000, maxTokens: 128_000 },
@@ -42,7 +46,12 @@ describe("AgentSession pre-admission artifact spill", () => {
 				tools: [],
 				messages: [],
 			},
-			streamFn: () => {
+			transformContext: async messages => {
+				await sessionRef?.awaitPendingContextTransformations();
+				return messages;
+			},
+			streamFn: (_model, context) => {
+				providerContext = context;
 				const stream = new AssistantMessageEventStream();
 				queueMicrotask(() => {
 					const message: AssistantMessage = {
@@ -53,11 +62,11 @@ describe("AgentSession pre-admission artifact spill", () => {
 						model: "claude-sonnet-4-5",
 						stopReason: "stop",
 						usage: {
-							input: 100,
-							output: 10,
+							input: 0,
+							output: 0,
 							cacheRead: 0,
 							cacheWrite: 0,
-							totalTokens: 110,
+							totalTokens: 0,
 							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 						},
 						timestamp: Date.now(),
@@ -70,17 +79,22 @@ describe("AgentSession pre-admission artifact spill", () => {
 		});
 		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
+		const allocateArtifactPath = sessionManager.allocateArtifactPath.bind(sessionManager);
+		(
+			sessionManager as unknown as { allocateArtifactPath: typeof sessionManager.allocateArtifactPath }
+		).allocateArtifactPath = async toolType => {
+			await writeGate;
+			return await allocateArtifactPath(toolType);
+		};
 		session = new AgentSession({
 			agent,
 			sessionManager,
-			settings: Settings.isolated({
-				"tools.preAdmissionArtifactSpill": true,
-				"compaction.thresholdTokens": 3_000,
-			}),
+			settings: Settings.isolated({ "tools.preAdmissionArtifactSpill": true }),
 			modelRegistry: new ModelRegistry(authStorage),
 		});
+		sessionRef = session;
 
-		const fullText = `packages/coding-agent/src/session/messages.ts\n${"middle\n".repeat(10_000)}terminal-status`;
+		const fullText = `${"h".repeat(4095)}😀${"middle\n".repeat(10_000)}😀${"t".repeat(4095)}`;
 		const toolResult: ToolResultMessage = {
 			role: "toolResult",
 			toolCallId: "large-read",
@@ -89,43 +103,43 @@ describe("AgentSession pre-admission artifact spill", () => {
 			isError: false,
 			timestamp: Date.now(),
 		};
-		const { promise: spillComplete, resolve } = Promise.withResolvers<void>();
-		session.subscribe(event => {
-			if (event.type === "message_end" && event.message === toolResult) resolve();
-		});
 		agent.emitExternalEvent({ type: "message_end", message: toolResult });
-		await withTimeout(spillComplete, 1_000, "Artifact spill did not complete");
+		const prompt = session.prompt("continue without waiting for spill completion");
+		await Bun.sleep(25);
+		expect(providerContext).toBeUndefined();
+		resolveWrite();
+		await withTimeout(prompt, 1_000, "Provider did not resume after artifact spill");
 
 		const preview = toolResult.content.find(block => block.type === "text");
 		expect(preview?.type).toBe("text");
 		if (preview?.type !== "text") throw new Error("Expected text preview");
-		expect(preview.text).toStartWith("packages/coding-agent/src/session/messages.ts");
-		expect(preview.text).toContain("terminal-status");
+		expect(preview.text).toStartWith("h".repeat(4095));
+		expect(preview.text).toEndWith("t".repeat(4095));
+		expect(Buffer.from(preview.text, "utf8").toString("utf8")).not.toContain("�");
 		expect(preview.text).toContain(crypto.createHash("sha256").update(fullText).digest("hex"));
 		const artifactId = preview.text.match(SPILL_URI)?.[1];
 		expect(artifactId).toBeDefined();
 		if (!artifactId) throw new Error("Expected artifact URI");
+		expect(toolResult.details?.meta?.truncation?.artifactId).toBe(artifactId);
+		expect(
+			providerContext?.messages.some(message => JSON.stringify(message).includes(`artifact://${artifactId}`)),
+		).toBe(true);
+
 		const artifactPath = await sessionManager.getArtifactPath(artifactId);
 		expect(artifactPath).not.toBeNull();
 		if (!artifactPath) throw new Error("Expected artifact path");
 		expect(await fs.readFile(artifactPath, "utf8")).toBe(fullText);
+		const resumed = await SessionManager.open(sessionManager.getSessionFile()!);
+		expect(await resumed.getArtifactPath(artifactId)).toBe(artifactPath);
 
-		await session.prompt("continue after the large read");
-		expect(sessionManager.getBranch().some(entry => entry.type === "compaction")).toBe(false);
-
-		expect(Settings.isolated().get("tools.preAdmissionArtifactSpill")).toBe(false);
-		session.settings.set("tools.preAdmissionArtifactSpill", false);
-		const disabledResult: ToolResultMessage = {
-			...toolResult,
-			toolCallId: "large-read-disabled",
-			content: [{ type: "text", text: fullText }],
-		};
-		const { promise: disabledComplete, resolve: resolveDisabled } = Promise.withResolvers<void>();
-		session.subscribe(event => {
-			if (event.type === "message_end" && event.message === disabledResult) resolveDisabled();
-		});
-		agent.emitExternalEvent({ type: "message_end", message: disabledResult });
-		await withTimeout(disabledComplete, 1_000, "Disabled artifact spill did not complete");
-		expect(disabledResult.content).toEqual([{ type: "text", text: fullText }]);
+		await session.dispose();
+		session = undefined;
+		await sessionManager.dropSession(sessionManager.getSessionFile()!);
+		expect(
+			await fs.stat(path.dirname(artifactPath)).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
 	});
 });

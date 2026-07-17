@@ -152,9 +152,9 @@ function utf8Suffix(text: string, maxBytes: number): string {
 }
 
 /**
- * Build the deterministic inline receipt for a tool result that was saved before
- * it can substantially increase the next provider request. The preserved prefix
- * keeps read-tool paths and headers visible; the suffix retains terminal status.
+ * Build the deterministic inline receipt for a tool result saved before the
+ * next provider context is constructed. Byte boundaries never split UTF-8
+ * code points, so head/tail recovery remains readable for emoji and CJK text.
  */
 export function createPreAdmissionArtifactSpillPreview(fullText: string, artifactId: string, digest: string): string {
 	const totalBytes = Buffer.byteLength(fullText, "utf-8");
