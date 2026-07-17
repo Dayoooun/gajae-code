@@ -127,7 +127,7 @@ describe("Anthropic cache placement eval (deterministic payload structure)", () 
 			source: {
 				url: "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
 				retrievedAt: "2026-07-17",
-				codeCommit: "cc044a646e46f4fffd44480531de299b26ad3cba",
+				codeCommit: "0a43140bb",
 				inputFixtureSha256: await sha256(JSON.stringify(fixture)),
 			},
 			capturedAnchors: { proposed: ["cache_control"] },
