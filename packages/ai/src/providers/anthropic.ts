@@ -438,13 +438,24 @@ function getCacheControl(
 ): { mode: AnthropicCacheMode; cacheControl?: AnthropicCacheControl } {
 	const retention = resolveCacheRetention(cacheRetention, "long");
 	if (retention === "none") return { mode: "none" };
-	// The pinned SDK and current Anthropic contract support top-level automatic
-	// caching only on the canonical API. Compatible endpoints have no equivalent
-	// capability contract in this provider, so they receive no generated marker.
-	if (!isAnthropicApiBaseUrl(baseUrl)) return { mode: "none" };
-	const supportsLongCacheRetention = getAnthropicCompat(model).supportsLongCacheRetention;
+
+	const isCanonicalApi = isAnthropicApiBaseUrl(baseUrl);
+	const promptCacheMode = model.compat?.promptCacheMode;
+	const mode: AnthropicCacheMode =
+		promptCacheMode === "none"
+			? "none"
+			: promptCacheMode === "explicit"
+				? "explicit"
+				: isCanonicalApi
+					? "automatic"
+					: "none";
+	if (mode === "none") return { mode };
+
+	const supportsLongCacheRetention = isCanonicalApi
+		? getAnthropicCompat(model).supportsLongCacheRetention
+		: model.compat?.supportsLongCacheRetention === true;
 	return {
-		mode: "automatic",
+		mode,
 		cacheControl: {
 			type: "ephemeral",
 			...(retention === "long" && supportsLongCacheRetention ? { ttl: "1h" } : {}),
@@ -1074,6 +1085,7 @@ function getAnthropicCompat(
 		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? true,
 		supportsToolChoice: model.compat?.supportsToolChoice ?? true,
 		supportsForcedToolChoice: model.compat?.supportsForcedToolChoice ?? true,
+		promptCacheMode: model.compat?.promptCacheMode ?? "none",
 		toolChoiceSupport: model.compat?.toolChoiceSupport,
 	};
 }
@@ -2115,45 +2127,27 @@ function applyCacheControlToLastCacheableBlock(
 }
 
 function applyExplicitPromptCaching(params: AnthropicCacheParams, cacheControl: AnthropicCacheControl): void {
-	let remaining = 4 - countCacheControlBreakpoints(params);
-	if (remaining <= 0) return;
-	if (params.tools?.length) {
-		const index = params.tools.length - 1;
-		params.tools[index] = { ...params.tools[index], cache_control: { ...cacheControl } };
-		remaining--;
-	}
-	if (remaining > 0 && Array.isArray(params.system) && params.system.length) {
-		const index = params.system.length - 1;
-		params.system[index] = { ...params.system[index], cache_control: { ...cacheControl } };
-		remaining--;
-	}
-	if (remaining <= 0) return;
+	if (countCacheControlBreakpoints(params) >= 4) return;
+
 	const currentUserIndex = params.messages.findLastIndex(message => message.role === "user");
 	if (currentUserIndex < 0) return;
-	for (let index = currentUserIndex - 1; index >= 0 && remaining > 1; index--) {
-		const message = params.messages[index];
-		if (message?.role === "assistant" && Array.isArray(message.content)) {
-			if (
-				applyCacheControlToLastCacheableBlock(
-					message.content as Array<ContentBlockParam & CacheControlBlock>,
-					cacheControl,
-				)
-			) {
-				remaining--;
-			}
-			break;
-		}
-	}
 	const currentUser = params.messages[currentUserIndex];
-	if (remaining > 0 && currentUser) {
-		if (typeof currentUser.content === "string" && currentUser.content.trim()) {
-			currentUser.content = [{ type: "text", text: currentUser.content, cache_control: { ...cacheControl } }];
-		} else if (Array.isArray(currentUser.content)) {
-			applyCacheControlToLastCacheableBlock(
-				currentUser.content as Array<ContentBlockParam & CacheControlBlock>,
-				cacheControl,
-			);
-		}
+	if (!currentUser) return;
+
+	/*
+	 * Anthropic's explicit-cache lookup examines the inclusive final 20 candidate
+	 * positions. This client cannot observe a previous request's cache writes, so
+	 * it must not claim that an older generated marker is reusable. Refresh only
+	 * the latest cacheable user content (delta 0, within that window); without one
+	 * there is no safe generated explicit breakpoint.
+	 */
+	if (typeof currentUser.content === "string" && currentUser.content.trim()) {
+		currentUser.content = [{ type: "text", text: currentUser.content, cache_control: { ...cacheControl } }];
+	} else if (Array.isArray(currentUser.content)) {
+		applyCacheControlToLastCacheableBlock(
+			currentUser.content as Array<ContentBlockParam & CacheControlBlock>,
+			cacheControl,
+		);
 	}
 }
 

@@ -12,7 +12,13 @@ type EvalArtifact = {
 	issue: 2383;
 	status: "pass";
 	evidenceType: "deterministic-non-billing-provider-payload-structure";
-	source: { url: string; retrievedAt: string; codeCommit: string; inputFixtureSha256: string };
+	source: {
+		url: string;
+		retrievedAt: string;
+		implementationCommit: string;
+		finalIntegrationCommit: string;
+		inputFixtureSha256: string;
+	};
 	capturedAnchors: { proposed: string[] };
 	derivedMetrics: {
 		estimator: "floor(utf8Bytes/4)";
@@ -48,6 +54,11 @@ function sha256(value: string): Promise<string> {
 	return crypto.subtle
 		.digest("SHA-256", new TextEncoder().encode(value))
 		.then(digest => Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join(""));
+}
+
+function hasGitMetadata(): boolean {
+	const result = Bun.spawnSync(["git", "rev-parse", "--is-inside-work-tree"], { stdout: "pipe", stderr: "pipe" });
+	return result.exitCode === 0 && result.stdout.toString().trim() === "true";
 }
 
 function abortedSignal(): AbortSignal {
@@ -111,15 +122,16 @@ function estimatedTokens(bytes: number): number {
 }
 
 describe("Anthropic cache placement eval (deterministic payload structure)", () => {
-	it("derives only non-billing structural evidence from the finalized provider payload", async () => {
+	it("binds finalized payload evidence to immutable implementation and integration provenance", async () => {
 		expect(await Bun.file(artifactPath).exists()).toBe(true);
 		const artifact = (await Bun.file(artifactPath).json()) as EvalArtifact;
 		const payload = await capturePayload();
 		const serializedBytes = new TextEncoder().encode(JSON.stringify(payload)).byteLength;
+		const fixtureSha256 = await sha256(JSON.stringify(fixture));
 
 		expect(payload.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
 		expect(estimatedTokens(serializedBytes)).toBeGreaterThan(0);
-		expect(artifact).toMatchObject({
+		expect(artifact).toEqual({
 			schemaVersion: 1,
 			issue: 2383,
 			status: "pass",
@@ -127,14 +139,36 @@ describe("Anthropic cache placement eval (deterministic payload structure)", () 
 			source: {
 				url: "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
 				retrievedAt: "2026-07-17",
-				codeCommit: "0a43140bb",
-				inputFixtureSha256: await sha256(JSON.stringify(fixture)),
+				implementationCommit: "0a43140bb",
+				finalIntegrationCommit: "5106a14da",
+				inputFixtureSha256: fixtureSha256,
 			},
 			capturedAnchors: { proposed: ["cache_control"] },
-			derivedMetrics: { estimator: "floor(utf8Bytes/4)", billing: "not-a-billing-estimate" },
+			derivedMetrics: {
+				estimator: "floor(utf8Bytes/4)",
+				billing: "not-a-billing-estimate",
+				proposedSerializedBytes: serializedBytes,
+				proposedStructuralTokenEstimate: estimatedTokens(serializedBytes),
+			},
+			method:
+				"One finalized provider-built payload is inspected for the canonical top-level automatic cache_control field. The serialized byte count is a structural diagnostic only.",
+			limitations:
+				"No request is dispatched and no provider usage or cost fields are observed. The floor(utf8Bytes/4) value is explicitly non-billing, cannot establish cache reuse, and cannot establish a cost improvement.",
+			testCommand: "bun test packages/ai/test/anthropic-cache-eval.integration.test.ts",
 		});
-		expect(artifact.derivedMetrics.proposedSerializedBytes).toBeGreaterThan(0);
-		expect(artifact.derivedMetrics.proposedStructuralTokenEstimate).toBeGreaterThan(0);
-		expect(artifact.limitations).toContain("cannot establish cache reuse");
+
+		if (hasGitMetadata()) {
+			const ancestry = Bun.spawnSync(
+				[
+					"git",
+					"merge-base",
+					"--is-ancestor",
+					artifact.source.implementationCommit,
+					artifact.source.finalIntegrationCommit,
+				],
+				{ stdout: "pipe", stderr: "pipe" },
+			);
+			expect(ancestry.exitCode).toBe(0);
+		}
 	});
 });

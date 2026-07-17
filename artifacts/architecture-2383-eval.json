@@ -6,7 +6,8 @@
   "source": {
     "url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
     "retrievedAt": "2026-07-17",
-    "codeCommit": "0a43140bb",
+    "implementationCommit": "0a43140bb",
+    "finalIntegrationCommit": "5106a14da",
     "inputFixtureSha256": "92d345cb801a3aed1329fad84a031e464ffc2ad47c6660bc86e8e91537a227c3"
   },
   "capturedAnchors": {
@@ -17,8 +18,8 @@
   "derivedMetrics": {
     "estimator": "floor(utf8Bytes/4)",
     "billing": "not-a-billing-estimate",
-    "proposedSerializedBytes": 537,
-    "proposedStructuralTokenEstimate": 134
+    "proposedSerializedBytes": 668,
+    "proposedStructuralTokenEstimate": 167
   },
   "method": "One finalized provider-built payload is inspected for the canonical top-level automatic cache_control field. The serialized byte count is a structural diagnostic only.",
   "limitations": "No request is dispatched and no provider usage or cost fields are observed. The floor(utf8Bytes/4) value is explicitly non-billing, cannot establish cache reuse, and cannot establish a cost improvement.",
