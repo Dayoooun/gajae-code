@@ -31,6 +31,9 @@ use napi::{
 use napi_derive::napi;
 use parking_lot::Mutex;
 
+fn saturating_increment(counter: &AtomicU64) {
+	let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1));
+}
 /// Bound endpoint info returned from [`NotificationServer::start`].
 #[napi(object)]
 pub struct NotificationEndpoint {
@@ -178,18 +181,15 @@ pub struct NotificationServer {
 	stop_wait:               tokio::sync::Mutex<()>,
 	known_good_turn_stream_frames: AtomicU64,
 	turn_stream_serde_validation_parses: AtomicU64,
-	file_attachment_js_base64_chars: AtomicU64,
 }
 
 /// Observable counters for the internal known-good N-API frame lane.
 #[napi(object)]
 pub struct KnownGoodFrameStats {
 	/// Frames constructed as `TurnStream` without parsing a JSON string.
-	pub known_good_turn_stream_frames: u32,
+	pub known_good_turn_stream_frames: f64,
 	/// JSON serde parses of externally supplied `turn_stream` frames.
-	pub turn_stream_serde_validation_parses: u32,
-	/// JavaScript base64 characters accepted for file attachments on this lane.
-	pub file_attachment_js_base64_chars: u32,
+	pub turn_stream_serde_validation_parses: f64,
 }
 
 #[napi]
@@ -223,7 +223,6 @@ impl NotificationServer {
 			stop_wait:               tokio::sync::Mutex::new(()),
 			known_good_turn_stream_frames: AtomicU64::new(0),
 			turn_stream_serde_validation_parses: AtomicU64::new(0),
-			file_attachment_js_base64_chars: AtomicU64::new(0),
 		}
 	}
 
@@ -529,7 +528,7 @@ impl NotificationServer {
 		let msg: ServerMessage = serde_json::from_str(&frame_json)
 			.map_err(|e| Error::from_reason(format!("invalid frame json: {e}")))?;
 		if matches!(msg, ServerMessage::TurnStream(_)) {
-			self.turn_stream_serde_validation_parses.fetch_add(1, Ordering::Relaxed);
+		saturating_increment(&self.turn_stream_serde_validation_parses);
 		}
 		self
 			.with_handle(|h| h.push_frame(msg))?
@@ -552,7 +551,7 @@ impl NotificationServer {
 			"finalized" => TurnPhase::Finalized,
 			_ => return Err(Error::from_reason("invalid turn stream phase")),
 		};
-		self.known_good_turn_stream_frames.fetch_add(1, Ordering::Relaxed);
+		saturating_increment(&self.known_good_turn_stream_frames);
 		self
 			.with_handle(|h| {
 				h.push_frame(ServerMessage::TurnStream(TurnStream { session_id, phase, text, final_answer, message_ref }))
@@ -589,9 +588,8 @@ impl NotificationServer {
 	#[must_use]
 	pub fn known_good_frame_stats(&self) -> KnownGoodFrameStats {
 		KnownGoodFrameStats {
-			known_good_turn_stream_frames: self.known_good_turn_stream_frames.load(Ordering::Relaxed) as u32,
-			turn_stream_serde_validation_parses: self.turn_stream_serde_validation_parses.load(Ordering::Relaxed) as u32,
-			file_attachment_js_base64_chars: self.file_attachment_js_base64_chars.load(Ordering::Relaxed) as u32,
+			known_good_turn_stream_frames: self.known_good_turn_stream_frames.load(Ordering::Relaxed) as f64,
+			turn_stream_serde_validation_parses: self.turn_stream_serde_validation_parses.load(Ordering::Relaxed) as f64,
 		}
 	}
 

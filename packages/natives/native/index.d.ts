@@ -1234,8 +1234,6 @@ export interface KnownGoodFrameStats {
   knownGoodTurnStreamFrames: number
   /** JSON serde parses of externally supplied `turn_stream` frames. */
   turnStreamSerdeValidationParses: number
-  /** JavaScript base64 characters accepted for file attachments on this lane. */
-  fileAttachmentJsBase64Chars: number
 }
 
 /** A lifecycle request forwarded to the TypeScript daemon for orchestration. */

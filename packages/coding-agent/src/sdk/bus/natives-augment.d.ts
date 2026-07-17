@@ -54,7 +54,6 @@ declare module "@gajae-code/natives" {
 		knownGoodFrameStats(): {
 			knownGoodTurnStreamFrames: number;
 			turnStreamSerdeValidationParses: number;
-			fileAttachmentJsBase64Chars: number;
 		};
 	}
 }

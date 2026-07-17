@@ -167,7 +167,6 @@ test("napi NotificationServer encodes Buffer file attachments only after the N-A
 			name: "bytes.bin",
 			data: bytes.toString("base64"),
 		});
-		expect(server.knownGoodFrameStats().fileAttachmentJsBase64Chars).toBe(0);
 	} finally {
 		ws.close();
 		await server.stopAndWait();

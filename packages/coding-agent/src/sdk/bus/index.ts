@@ -956,7 +956,7 @@ function pushFileAttachment(
 	frame: { type: "file_attachment"; sessionId: string; name: string; mime?: string; caption?: string },
 	data: Buffer,
 ): void {
-	runtime.host.emitEvent({ kind: frame.type, payload: { ...frame, data } });
+	runtime.host.emitEvent({ kind: frame.type, payload: { ...frame, data: data.toString("base64") } });
 	runtime.server.pushFileAttachmentUnchecked(frame.sessionId, frame.name, frame.mime, data, frame.caption);
 }
 
