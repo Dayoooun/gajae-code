@@ -334,6 +334,34 @@ function findExactCanonicalModelMatch(
 }
 
 /**
+ * Resolve an unqualified exact alias through its canonical record so it uses
+ * the registry's equivalent-variant ranking rather than generic fuzzy policy.
+ */
+function findExactEquivalentModelMatch(
+	modelReference: string,
+	availableModels: Model<Api>[],
+	modelRegistry: CanonicalModelRegistry | undefined,
+	sessionId?: string,
+): Model<Api> | undefined {
+	if (!modelRegistry?.getCanonicalId || !modelRegistry.resolveCanonicalModel) return undefined;
+	const trimmedReference = modelReference.trim();
+	if (!trimmedReference || trimmedReference.includes("/")) return undefined;
+	const exactMatches = availableModels.filter(model => model.id.toLowerCase() === trimmedReference.toLowerCase());
+	if (exactMatches.length === 0) return undefined;
+	const canonicalIds = new Set(
+		exactMatches
+			.map(model => modelRegistry.getCanonicalId!(model))
+			.filter((canonicalId): canonicalId is string => Boolean(canonicalId)),
+	);
+	if (canonicalIds.size !== 1) return undefined;
+	return modelRegistry.resolveCanonicalModel([...canonicalIds][0]!, {
+		availableOnly: false,
+		candidates: availableModels,
+		sessionId,
+	});
+}
+
+/**
  * Try to match a pattern to a model from the available models list.
  * Returns the matched model or undefined if no match found.
  */
@@ -358,6 +386,16 @@ function tryMatchModel(
 	);
 	if (exactCanonicalMatch) {
 		return exactCanonicalMatch;
+	}
+
+	const exactEquivalentMatch = findExactEquivalentModelMatch(
+		modelPattern,
+		availableModels,
+		options?.modelRegistry,
+		options?.sessionId,
+	);
+	if (exactEquivalentMatch) {
+		return exactEquivalentMatch;
 	}
 
 	// Exact ID match (case-insensitive) — this must happen before provider-scoped

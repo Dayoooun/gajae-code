@@ -2541,6 +2541,13 @@ export class ModelRegistry {
 		};
 	}
 
+	async #getApiKeyOrNoAuth(provider: string, lookup: () => Promise<string | undefined>): Promise<string | undefined> {
+		if (this.#keylessProviders.has(provider) && !this.authStorage.hasAuth(provider)) {
+			return kNoAuth;
+		}
+		return lookup();
+	}
+
 	/**
 	 * Get API key for a model.
 	 */
@@ -2549,14 +2556,13 @@ export class ModelRegistry {
 		sessionId?: string,
 		options: { credentialSelector?: AuthCredentialSelector } = {},
 	): Promise<string | undefined> {
-		if (this.#keylessProviders.has(model.provider) && !this.authStorage.hasAuth(model.provider)) {
-			return kNoAuth;
-		}
-		return this.authStorage.getApiKey(model.provider, sessionId, {
-			baseUrl: model.baseUrl,
-			modelId: model.id,
-			credentialSelector: options.credentialSelector,
-		});
+		return this.#getApiKeyOrNoAuth(model.provider, () =>
+			this.authStorage.getApiKey(model.provider, sessionId, {
+				baseUrl: model.baseUrl,
+				modelId: model.id,
+				credentialSelector: options.credentialSelector,
+			}),
+		);
 	}
 
 	/**
@@ -2568,20 +2574,16 @@ export class ModelRegistry {
 		baseUrl?: string,
 		options: { credentialSelector?: AuthCredentialSelector } = {},
 	): Promise<string | undefined> {
-		if (this.#keylessProviders.has(provider) && !this.authStorage.hasAuth(provider)) {
-			return kNoAuth;
-		}
-		return this.authStorage.getApiKey(provider, sessionId, {
-			baseUrl,
-			credentialSelector: options.credentialSelector,
-		});
+		return this.#getApiKeyOrNoAuth(provider, () =>
+			this.authStorage.getApiKey(provider, sessionId, {
+				baseUrl,
+				credentialSelector: options.credentialSelector,
+			}),
+		);
 	}
 
 	async #peekApiKeyForProvider(provider: string): Promise<string | undefined> {
-		if (this.#keylessProviders.has(provider) && !this.authStorage.hasAuth(provider)) {
-			return kNoAuth;
-		}
-		return this.authStorage.peekApiKey(provider);
+		return this.#getApiKeyOrNoAuth(provider, () => this.authStorage.peekApiKey(provider));
 	}
 
 	/**

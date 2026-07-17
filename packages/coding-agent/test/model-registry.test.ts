@@ -736,25 +736,32 @@ describe("ModelRegistry", () => {
 			expect(resolved?.input.includes("image")).toBe(true);
 			expect(resolved?.provider).toBe("anthropic");
 		});
-		test("ranks bare and canonical references to the same variant", async () => {
+		test("ranks bare aliases and canonical ids identically across provider order conflicts", async () => {
 			await Settings.init({
 				inMemory: true,
-				overrides: { modelProviderOrder: ["demo", "anthropic"] },
+				overrides: { modelProviderOrder: ["beta", "alpha"] },
 			});
 			writeRawModelsJson({
-				demo: providerConfig("https://demo.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+				alpha: providerConfig("https://alpha.example.com/v1", [{ id: "claude-sonnet-4.5" }]),
+				beta: providerConfig("https://beta.example.com/v1", [{ id: "claude-sonnet-4.5" }]),
 			});
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			const candidates = registry.getAll();
+			const candidates = [registry.find("alpha", "claude-sonnet-4.5")!, registry.find("beta", "claude-sonnet-4.5")!];
+			const variants = registry.getCanonicalVariants("claude-sonnet-4-5", { candidates });
 			const canonical = registry.resolveCanonicalModel("claude-sonnet-4-5", {
 				availableOnly: false,
 				candidates,
 			});
-			const bare = resolveModelFromString("claude-sonnet-4-5", candidates, undefined, registry);
+			const bare = resolveModelFromString("claude-sonnet-4.5", candidates, undefined, registry);
 
-			expect(canonical).toBeDefined();
-			expect(bare).toBeDefined();
-			expect(`${bare!.provider}/${bare!.id}`).toBe(`${canonical!.provider}/${canonical!.id}`);
+			// Vision, canonical exactness, source, and input plus cache-read cost all tie.
+			// Provider rank must win even though alpha appears first in catalog order.
+			expect(variants).toHaveLength(2);
+			expect(variants.every(variant => variant.model.id !== "claude-sonnet-4-5")).toBe(true);
+			expect(new Set(variants.map(variant => variant.source)).size).toBe(1);
+			expect(variants.map(variant => variant.model.cost.input + variant.model.cost.cacheRead)).toEqual([0, 0]);
+			expect(canonical).toMatchObject({ provider: "beta", id: "claude-sonnet-4.5" });
+			expect(bare).toBe(canonical);
 		});
 		test("keeps an explicitly seeded canonical variant sticky for a session", () => {
 			writeRawModelsJson({
