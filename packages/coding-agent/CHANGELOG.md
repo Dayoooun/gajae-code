@@ -4,6 +4,7 @@
 
 ### Fixed
 - Skill invocation failures now list available skill names so agents can recover from typos without a blind retry loop.
+- Workflow state receipts now use canonical session-layout paths, require resolved session identity, and report a `state_path` that matches native write/clear output (#2393).
 
 
 ### Fixed
