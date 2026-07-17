@@ -2,7 +2,6 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getWorktreesDir } from "@gajae-code/utils/dirs";
-import { SPAWN_PROVENANCE_ENV } from "../sdk/bus/config";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildTeamHudSummary as buildWorkflowTeamHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -20,6 +19,7 @@ import {
 	writeReport,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
+import { buildWorkerCommand } from "./team-launch";
 import {
 	listTeamMailbox,
 	markTeamMailboxMessage,
@@ -43,28 +43,27 @@ import type {
 } from "./team-store";
 import {
 	GjcTeamTaskStore,
-	getGjcTeamTaskCompletionEvidenceFailure,
 	isGjcTeamTaskCompletionVerified,
-	normalizeGjcTeamTask as normalizeTask,
 	readGjcTeamTasksFromDir as readTasks,
 	taskMetadataFromInput,
 	writeGjcTeamTaskToDir as writeTask,
 } from "./team-store";
 import {
+	type GjcTeamWorkerOrchestrationRuntime,
+	type GjcTeamWorkerRuntime,
+	readWorkerLifecycleById as readLifecycleById,
 	readGjcShutdownAck as readShutdownAck,
 	readGjcWorkerHeartbeat as readWorkerHeartbeat,
 	readGjcWorkerStatus as readWorkerStatus,
-	readWorkerLifecycleById as readLifecycleById,
-	readWorkerLifecycleRecord as readLifecycleRecord,
-	readWorkerStatusFile as readStatusFile,
+	reconcileGjcTeamStaleClaims as reconcileStaleClaimsWorkers,
+	shutdownGjcTeamWorkers,
 	updateGjcWorkerHeartbeat as updateWorkerHeartbeat,
 	updateGjcWorkerStatus as updateWorkerStatus,
+	writeWorkerLifecycleForConfig as writeLifecycleForConfig,
 	writeGjcShutdownRequest as writeShutdownRequest,
 	writeGjcWorkerStartupAck as writeWorkerStartupAck,
-	writeWorkerLifecycleForConfig as writeLifecycleForConfig,
-	writeWorkerLifecycleRecord as writeLifecycleRecord,
-	type GjcTeamWorkerRuntime,
 } from "./team-workers";
+
 import {
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxUntaggedSessionHint,
@@ -1105,22 +1104,29 @@ const workerRuntime: GjcTeamWorkerRuntime = {
 	now,
 	stableHash,
 };
-const readWorkerStatusFile = (dir: string, worker: string) => readStatusFile(workerRuntime, dir, worker);
-const readWorkerLifecycleRecord = (dir: string, worker: GjcTeamWorker) =>
-	readLifecycleRecord(workerRuntime, dir, worker);
+
 const readWorkerLifecycleById = (dir: string, config: GjcTeamConfig) => readLifecycleById(workerRuntime, dir, config);
-const writeWorkerLifecycleRecord = (
-	dir: string,
-	worker: GjcTeamWorker,
-	state: GjcTeamWorkerLifecycleState,
-	updates: Partial<GjcTeamWorkerLifecycle> = {},
-) => writeLifecycleRecord(workerRuntime, dir, worker, state, updates);
 const writeWorkerLifecycleForConfig = (
 	dir: string,
 	config: GjcTeamConfig,
 	state: GjcTeamWorkerLifecycleState,
 	updatesFor: (worker: GjcTeamWorker) => Partial<GjcTeamWorkerLifecycle> = () => ({}),
 ) => writeLifecycleForConfig(workerRuntime, dir, config, state, updatesFor);
+
+const workerOrchestrationRuntime: GjcTeamWorkerOrchestrationRuntime = {
+	...workerRuntime,
+	readTasks,
+	writeTask,
+	appendTelemetry,
+	paneBelongsToTeamTarget,
+	parseDurationEnv,
+	killWorkerPanes,
+	removeCleanCreatedWorktrees,
+	readMonitorSnapshot: dir => readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir)),
+	hasPendingIntegration: hasPendingGjcTeamIntegration,
+	writePhase,
+	readSnapshot: readGjcTeamSnapshot,
+};
 
 function teamModeStatePath(cwd: string, sessionId: string): string {
 	return modeStatePath(cwd, sessionId, "team");
@@ -1169,19 +1175,6 @@ export async function persistGjcTeamModeStateSummary(snapshot: GjcTeamSnapshot, 
 	});
 }
 
-function appendLivenessRecoveryReason(
-	reasons: GjcTeamLivenessRecoveryReason[],
-	reason: GjcTeamLivenessRecoveryReason,
-): void {
-	if (!reasons.includes(reason)) reasons.push(reason);
-}
-
-function isPastTimestamp(value: string | undefined): boolean {
-	if (!value) return false;
-	const timestamp = Date.parse(value);
-	return Number.isFinite(timestamp) && timestamp <= Date.now();
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value != null;
 }
@@ -1194,105 +1187,6 @@ function readClaimRecord(value: unknown): GjcTeamTaskClaim | undefined {
 	return { owner, token, leased_until: leasedUntil };
 }
 
-function isWorkerHeartbeatStale(
-	worker: GjcTeamWorker,
-	heartbeat: WorkerHeartbeatFile | null,
-	env: NodeJS.ProcessEnv,
-): boolean {
-	const thresholdMs = parseDurationEnv(env, "GJC_TEAM_HEARTBEAT_STALE_MS", 120_000);
-	if (thresholdMs <= 0) return false;
-	const heartbeatAt = Date.parse(heartbeat?.last_turn_at ?? worker.last_heartbeat);
-	return Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt >= thresholdMs;
-}
-
-async function detectGjcTeamWorkerLivenessReasons(
-	dir: string,
-	config: GjcTeamConfig,
-	worker: GjcTeamWorker,
-	env: NodeJS.ProcessEnv,
-): Promise<GjcTeamLivenessRecoveryReason[]> {
-	const reasons: GjcTeamLivenessRecoveryReason[] = [];
-	const lifecycle = await readWorkerLifecycleRecord(dir, worker);
-	const heartbeat = await readJsonFile<WorkerHeartbeatFile>(path.join(workerDir(dir, worker.id), "heartbeat.json"));
-	if (lifecycle.lifecycle_state === "failed") appendLivenessRecoveryReason(reasons, "worker_lifecycle_failed");
-	if (lifecycle.lifecycle_state === "stopped") appendLivenessRecoveryReason(reasons, "worker_lifecycle_stopped");
-	if (isWorkerHeartbeatStale(worker, heartbeat, env)) appendLivenessRecoveryReason(reasons, "stale_heartbeat");
-	if (!config.dry_run && (!worker.pane_id?.startsWith("%") || !paneBelongsToTeamTarget(config, worker.pane_id)))
-		appendLivenessRecoveryReason(reasons, "missing_pane");
-	return reasons;
-}
-
-async function reconcileGjcTeamStaleClaims(
-	teamName: string,
-	dir: string,
-	config: GjcTeamConfig,
-	env: NodeJS.ProcessEnv,
-): Promise<GjcTeamLivenessRecoveryResult> {
-	const staleWorkers: Record<string, GjcTeamLivenessRecoveryReason[]> = {};
-	for (const worker of config.workers) {
-		const reasons = await detectGjcTeamWorkerLivenessReasons(dir, config, worker, env);
-		if (reasons.length === 0) continue;
-		staleWorkers[worker.id] = reasons;
-		if (reasons.includes("missing_pane") && reasons.includes("worker_lifecycle_stopped") === false) {
-			await writeWorkerLifecycleRecord(dir, worker, "failed", {
-				stop_reason: "pane_missing",
-			});
-		}
-	}
-
-	const recoveredClaims: GjcTeamRecoveredClaim[] = [];
-	for (const task of await readTasks(dir)) {
-		if (task.status === "completed" || task.status === "failed") continue;
-		const claimPath = path.join(dir, "claims", `${task.id}.json`);
-		const diskClaim = readClaimRecord(await readJsonFile<unknown>(claimPath));
-		const claim = task.claim ?? diskClaim;
-		if (!claim) continue;
-
-		const reasons = [...(staleWorkers[claim.owner] ?? [])];
-		if (isPastTimestamp(claim.leased_until)) appendLivenessRecoveryReason(reasons, "claim_expired");
-		if (reasons.length === 0) continue;
-
-		await fs.rm(claimPath, { force: true });
-		recoveredClaims.push({ task_id: task.id, worker: claim.owner, reasons });
-		if (task.status !== "in_progress") {
-			await appendEvent(dir, {
-				type: "task_claim_recovered",
-				task_id: task.id,
-				worker: claim.owner,
-				message: "Removed stale task claim file",
-				data: { reasons },
-			});
-			continue;
-		}
-
-		const recoveredTask = normalizeTask({
-			...task,
-			status: "pending",
-			assignee: undefined,
-			claim: undefined,
-			version: task.version + 1,
-			updated_at: now(),
-		});
-		await writeTask(dir, recoveredTask);
-		await appendEvent(dir, {
-			type: "task_claim_recovered",
-			task_id: task.id,
-			worker: claim.owner,
-			message: "Recovered task from stale worker claim",
-			data: { reasons },
-		});
-	}
-
-	if (recoveredClaims.length > 0)
-		await appendTelemetry(dir, {
-			type: "team_liveness_recovery",
-			message: `Recovered ${recoveredClaims.length} stale team task claim(s)`,
-			data: { team_name: teamName, recovered_claims: recoveredClaims },
-		});
-
-	return { recovered_claims: recoveredClaims, stale_workers: staleWorkers };
-}
-
 export async function recoverGjcTeamStaleClaims(
 	teamName: string,
 	cwd = process.cwd(),
@@ -1300,7 +1194,7 @@ export async function recoverGjcTeamStaleClaims(
 ): Promise<GjcTeamLivenessRecoveryResult> {
 	const dir = await findTeamDir(teamName, cwd, env);
 	const config = await readConfig(dir);
-	return reconcileGjcTeamStaleClaims(teamName, dir, config, env);
+	return reconcileStaleClaimsWorkers(workerOrchestrationRuntime, teamName, dir, config, env);
 }
 const GJC_TEAM_INTEGRATION_ATTENTION_STATUSES = new Set<GjcTeamIntegrationStatus>([
 	"integration_failed",
@@ -1713,85 +1607,7 @@ export function resolveGjcWorkerCommand(
 	if (!executable) throw unresolvedWorkerAuthorityError();
 	return formatWorkerExecutable(platform, executable);
 }
-/** @internal Exported for unit tests. */
-export function buildWorkerCommand(
-	config: GjcTeamConfig,
-	worker: GjcTeamWorker,
-	platform: NodeJS.Platform = process.platform,
-): string {
-	const quote = platform === "win32" ? powershellQuote : shellQuote;
-	const envAssignment = (key: string, value: string): string =>
-		platform === "win32" ? `$env:${key} = ${quote(value)};` : `${key}=${quote(value)}`;
-	const workspace = worker.worktree_path
-		? `Worker worktree: ${worker.worktree_path}.`
-		: `Worker cwd: ${config.leader.cwd}.`;
-	// The worker prompt body must stay single-line because fallback startup on
-	// Windows/psmux dispatches the command through `tmux send-keys`, where
-	// embedded LF characters are treated as Enter keypresses. POSIX tmux starts
-	// workers by passing the command directly to `split-window`, but keeping the
-	// body normalized there too makes fake-tmux logs and shell argv handling
-	// deterministic. Strip a defensive U+FEFF in case a caller managed to inject
-	// a UTF-8 BOM into the task text. Empty / whitespace-only bodies fall back to
-	// a one-line placeholder so the worker never sits idle at an empty prompt.
-	const normalizePrompt = (raw: string): string =>
-		raw
-			.replace(/[\uFEFF\u200B]/g, "")
-			.replace(/\r?\n+/g, " ")
-			.trim();
-	const rawPrompt = [
-		`You are ${worker.id} in gjc team ${config.team_name}.`,
-		`Team state root: ${config.state_root}.`,
-		workspace,
-		`Team brief (context only): ${config.task}`,
-		"Before implementation, claim your worker-owned task and treat the claimed task record as the source of truth. Do not implement directly from the broad team brief.",
-		`Before claiming work, send startup ACK: gjc team api worker-startup-ack --input '{"team_name":"${config.team_name}","worker_id":"${worker.id}","protocol_version":"1"}' --json.`,
-		`Use gjc team api update-worker-status to report task-local activity, then claim-task/transition-task-status with this worker id; keep heartbeat current during long work, record completion_evidence (summary plus a passed command or verified inspection/artifact item) before completed, and do not mutate leader-owned goal state.`,
-	].join("\n");
-	const prompt = normalizePrompt(rawPrompt) || `Worker ${worker.id} ready.`;
-	const envLines = [
-		envAssignment("GJC_TEAM_WORKER", `${config.team_name}/${worker.id}`),
-		envAssignment("GJC_TEAM_INTERNAL_WORKER", `${config.team_name}/${worker.id}`),
-		envAssignment("GJC_TEAM_NAME", config.team_name),
-		envAssignment("GJC_TEAM_WORKER_ID", worker.id),
-		envAssignment("GJC_TEAM_STATE_ROOT", config.state_root),
-		envAssignment("GJC_TEAM_LEADER_CWD", config.leader.cwd),
-		envAssignment("GJC_TEAM_DISPLAY_NAME", config.display_name),
-		// Canonical GJC spawn-provenance marker so `notifications.sessionScope =
-		// "primary"` suppresses the worker's own notification endpoint/topic. The
-		// value is informational (leader session id, falling back to the team name
-		// so it is always non-blank); presence is what marks the worker.
-		envAssignment(SPAWN_PROVENANCE_ENV, config.leader.session_id.trim() || config.team_name),
-		...(worker.worktree_path ? [envAssignment("GJC_TEAM_WORKTREE_PATH", worker.worktree_path)] : []),
-	];
-	const joined = platform === "win32" ? envLines.join(" ") : envLines.join(" ");
-	// On Windows we wrap the worker command invocation in `& { & 'cmd' 'arg1' ... }`
-	// so pwsh keeps the whole multi-statement body in command position. Two
-	// failure modes this avoids:
-	//   1. Bare `bun 'cli.ts' 'prompt'` after `$env:X = 'y'; ...` would be
-	//      parsed in expression position and PowerShell would reject the
-	//      second quoted token with "Unexpected token '<cli.ts>'".
-	//   2. `& { 'cmd' 'arg1' 'arg2' }` (single & inside a block with adjacent
-	//      single-quoted tokens) is itself invalid because pwsh does not
-	//      concatenate adjacent single-quoted strings inside a script block.
-	// The nested `&` inside the block forces command-position parsing for
-	// the invocation. POSIX shells do not need this — they already treat
-	// `cmd 'arg'` as a normal command invocation after `;`-separated
-	// variable assignments.
-	//
-	// ASSUMPTION: this branch only fires when the worker pane is a PowerShell
-	// shell. psmux launches pwsh by default on Windows, so the unset /
-	// unset-and-replace cases are correct. If a user has explicitly set
-	// `set -g default-shell "C:/Program Files/Git/bin/bash.exe"` (or any
-	// other non-pwsh shell), this branch will send PowerShell syntax to a
-	// bash pane and the worker will fail with a parse error. Detecting the
-	// pane's shell at runtime and switching the quoting + invocation style
-	// accordingly is a follow-up; for now the pwsh default is assumed.
-	if (platform === "win32") {
-		const invocation = `& ${config.worker_command} ${quote(prompt)}`;
-		return `& { ${joined} ${invocation} }`;
-	}
-	return `${joined} ${config.worker_command} ${quote(prompt)}`;
-}
+export { buildWorkerCommand } from "./team-launch";
 
 function shouldDispatchWorkerWithSendKeys(tmuxCommand: string, platform: NodeJS.Platform = process.platform): boolean {
 	return platform === "win32" || path.basename(tmuxCommand).toLowerCase() === "psmux";
@@ -3072,7 +2888,7 @@ export async function monitorGjcTeam(
 	const dir = await findTeamDir(teamName, cwd, env);
 	const config = await readConfig(dir);
 	const previous = await readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir));
-	await reconcileGjcTeamStaleClaims(teamName, dir, config, env);
+	await reconcileStaleClaimsWorkers(workerOrchestrationRuntime, teamName, dir, config, env);
 	const integrationByWorker = await integrateGjcWorkerCommits(config, dir, previous, cwd, env);
 	await writeJsonFile(monitorSnapshotPath(dir), {
 		integration_by_worker: integrationByWorker,
@@ -3221,95 +3037,7 @@ export async function shutdownGjcTeam(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamSnapshot> {
-	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	const tasks = await readTasks(dir);
-	const evidenceFailures = tasks
-		.map(task => {
-			const reason = task.status === "completed" ? getGjcTeamTaskCompletionEvidenceFailure(task) : null;
-			return reason ? { task_id: task.id, reason } : null;
-		})
-		.filter((failure): failure is { task_id: string; reason: string } => failure != null);
-	const shutdownRequestId = `shutdown-${stableHash([config.team_name, now(), randomUUID()].join(":"))}`;
-	const shutdownRequestedAt = now();
-	await Promise.all(
-		config.workers.map(worker =>
-			writeGjcShutdownRequest(
-				teamName,
-				worker.id,
-				"leader-fixed",
-				cwd,
-				env,
-				shutdownRequestId,
-				"graceful",
-				shutdownRequestedAt,
-			),
-		),
-	);
-	const monitor = await readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir));
-	const completionVerified = tasks.length === 0 || tasks.every(isGjcTeamTaskCompletionVerified);
-	const pendingIntegration = completionVerified ? await hasPendingGjcTeamIntegration(dir, config, monitor) : false;
-	killWorkerPanes(config);
-	await removeCleanCreatedWorktrees(config.workers);
-	const stopped = {
-		...config,
-		workers: config.workers.map(worker => ({
-			...worker,
-			status: "stopped" as const,
-			last_heartbeat: now(),
-		})),
-		updated_at: now(),
-	};
-	await writeJsonFile(path.join(dir, "config.json"), stopped);
-	await writeWorkerLifecycleForConfig(dir, stopped, "stopped", worker => ({
-		pane_id: worker.pane_id,
-		stopped_at: stopped.updated_at,
-		stop_reason: "graceful_shutdown",
-		shutdown_request_id: shutdownRequestId,
-		shutdown_requested_at: shutdownRequestedAt,
-		shutdown_mode: "graceful",
-	}));
-	const workerLifecycleById = await readWorkerLifecycleById(dir, stopped);
-	const gracefulShutdownComplete = stopped.workers.every(worker => {
-		const lifecycle = workerLifecycleById[worker.id];
-		return (
-			lifecycle?.lifecycle_state === "stopped" &&
-			lifecycle.shutdown_request_id === shutdownRequestId &&
-			lifecycle.shutdown_mode === "graceful"
-		);
-	});
-	const shutdownPhase: GjcTeamPhase =
-		completionVerified && gracefulShutdownComplete
-			? pendingIntegration
-				? "awaiting_integration"
-				: "complete"
-			: evidenceFailures.length > 0 || tasks.some(task => task.status === "failed" || task.status === "blocked")
-				? "failed"
-				: "cancelled";
-	await writePhase(dir, shutdownPhase);
-	const shutdownData: Record<string, unknown> = {
-		phase: shutdownPhase,
-		shutdown_request_id: shutdownRequestId,
-		graceful_shutdown_complete: gracefulShutdownComplete,
-	};
-	if (evidenceFailures.length > 0) shutdownData.evidence_failures = evidenceFailures;
-	await appendEvent(dir, {
-		type: "team_shutdown",
-		message:
-			shutdownPhase === "complete"
-				? "Shut down native gjc team runtime after completed tasks"
-				: "Shut down native gjc team runtime with incomplete tasks",
-		data: shutdownData,
-	});
-	await appendTelemetry(dir, {
-		type: "team_shutdown",
-		message: `Native gjc team runtime stopped with phase ${shutdownPhase}`,
-		data: {
-			shutdown_request_id: shutdownRequestId,
-			graceful_shutdown_complete: gracefulShutdownComplete,
-		},
-	});
-	return readGjcTeamSnapshot(config.team_name, cwd, env);
+	return shutdownGjcTeamWorkers(workerOrchestrationRuntime, teamName, cwd, env);
 }
 
 function taskStore(dir: string): GjcTeamTaskStore {
@@ -3373,7 +3101,7 @@ export async function claimGjcTeamTask(
 	const dir = await findTeamDir(teamName, cwd, env);
 	const config = await readConfig(dir);
 	const worker = findKnownWorker(config, workerId);
-	const recovered = await reconcileGjcTeamStaleClaims(teamName, dir, config, env);
+	const recovered = await reconcileStaleClaimsWorkers(workerOrchestrationRuntime, teamName, dir, config, env);
 	const reasons = recovered.stale_workers[workerId];
 	if (reasons?.length)
 		return {

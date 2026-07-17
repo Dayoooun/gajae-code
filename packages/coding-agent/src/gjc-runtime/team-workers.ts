@@ -1,8 +1,14 @@
-/** File-backed worker lifecycle, heartbeat, and shutdown state. */
+/** File-backed worker lifecycle, heartbeat, stale-claim recovery, and shutdown state. */
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type {
 	GjcTeamConfig,
+	GjcTeamLivenessRecoveryReason,
+	GjcTeamLivenessRecoveryResult,
+	GjcTeamPhase,
+	GjcTeamRecoveredClaim,
 	GjcTeamShutdownMode,
+	GjcTeamSnapshot,
 	GjcTeamWorker,
 	GjcTeamWorkerLifecycle,
 	GjcTeamWorkerLifecycleState,
@@ -10,6 +16,12 @@ import type {
 	WorkerHeartbeatFile,
 	WorkerStatusFile,
 } from "./team-runtime";
+import type { GjcTeamTask, GjcTeamTaskClaim } from "./team-store";
+import {
+	getGjcTeamTaskCompletionEvidenceFailure,
+	isGjcTeamTaskCompletionVerified,
+	normalizeGjcTeamTask,
+} from "./team-store";
 
 export interface GjcTeamWorkerLifecycleContext {
 	config: GjcTeamConfig;
@@ -29,10 +41,27 @@ export interface GjcTeamWorkerRuntime {
 	writeJson(filePath: string, value: unknown): Promise<void>;
 	appendEvent(
 		dir: string,
-		event: { type: string; worker?: string; message: string; data?: Record<string, unknown> },
+		event: { type: string; worker?: string; task_id?: string; message: string; data?: Record<string, unknown> },
 	): Promise<unknown>;
 	now(): string;
 	stableHash(value: string): string;
+}
+
+export interface GjcTeamWorkerOrchestrationRuntime extends GjcTeamWorkerRuntime {
+	readTasks(dir: string): Promise<GjcTeamTask[]>;
+	writeTask(dir: string, task: GjcTeamTask): Promise<void>;
+	appendTelemetry(
+		dir: string,
+		event: { type: string; message: string; data?: Record<string, unknown> },
+	): Promise<unknown>;
+	paneBelongsToTeamTarget(config: GjcTeamConfig, paneId: string): boolean;
+	parseDurationEnv(env: NodeJS.ProcessEnv, name: string, fallback: number): number;
+	killWorkerPanes(config: GjcTeamConfig): void;
+	removeCleanCreatedWorktrees(workers: GjcTeamWorker[]): Promise<void>;
+	readMonitorSnapshot(dir: string): Promise<unknown>;
+	hasPendingIntegration(dir: string, config: GjcTeamConfig, monitor: unknown): Promise<boolean>;
+	writePhase(dir: string, phase: GjcTeamPhase): Promise<void>;
+	readSnapshot(teamName: string, cwd: string, env: NodeJS.ProcessEnv): Promise<GjcTeamSnapshot>;
 }
 
 export function workerLifecycleContext(
@@ -319,4 +348,191 @@ export async function readGjcShutdownAck(
 	const dir = await runtime.findTeamDir(teamName, cwd, env);
 	runtime.assertKnownWorker(await runtime.readConfig(dir), worker);
 	return runtime.readJson<Record<string, unknown>>(path.join(runtime.workerDir(dir, worker), "shutdown-ack.json"));
+}
+
+function addRecoveryReason(reasons: GjcTeamLivenessRecoveryReason[], reason: GjcTeamLivenessRecoveryReason): void {
+	if (!reasons.includes(reason)) reasons.push(reason);
+}
+
+function claimFromUnknown(value: unknown): GjcTeamTaskClaim | undefined {
+	if (typeof value !== "object" || value == null) return undefined;
+	const record = value as Record<string, unknown>;
+	const owner = typeof record.owner === "string" ? record.owner : "";
+	const token = typeof record.token === "string" ? record.token : "";
+	const leasedUntil = typeof record.leased_until === "string" ? record.leased_until : "";
+	return owner && token && leasedUntil ? { owner, token, leased_until: leasedUntil } : undefined;
+}
+
+function claimIsExpired(value: string | undefined): boolean {
+	if (!value) return false;
+	const timestamp = Date.parse(value);
+	return Number.isFinite(timestamp) && timestamp <= Date.now();
+}
+
+async function livenessReasons(
+	runtime: GjcTeamWorkerOrchestrationRuntime,
+	dir: string,
+	config: GjcTeamConfig,
+	worker: GjcTeamWorker,
+	env: NodeJS.ProcessEnv,
+): Promise<GjcTeamLivenessRecoveryReason[]> {
+	const reasons: GjcTeamLivenessRecoveryReason[] = [];
+	const lifecycle = await readWorkerLifecycleRecord(runtime, dir, worker);
+	const heartbeat = await runtime.readJson<WorkerHeartbeatFile>(heartbeatPath(runtime, dir, worker.id));
+	if (lifecycle.lifecycle_state === "failed") addRecoveryReason(reasons, "worker_lifecycle_failed");
+	if (lifecycle.lifecycle_state === "stopped") addRecoveryReason(reasons, "worker_lifecycle_stopped");
+	const staleMs = runtime.parseDurationEnv(env, "GJC_TEAM_HEARTBEAT_STALE_MS", 120_000);
+	const heartbeatAt = Date.parse(heartbeat?.last_turn_at ?? worker.last_heartbeat);
+	if (staleMs > 0 && Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt >= staleMs)
+		addRecoveryReason(reasons, "stale_heartbeat");
+	if (
+		!config.dry_run &&
+		(!worker.pane_id?.startsWith("%") || !runtime.paneBelongsToTeamTarget(config, worker.pane_id))
+	)
+		addRecoveryReason(reasons, "missing_pane");
+	return reasons;
+}
+
+export async function reconcileGjcTeamStaleClaims(
+	runtime: GjcTeamWorkerOrchestrationRuntime,
+	teamName: string,
+	dir: string,
+	config: GjcTeamConfig,
+	env: NodeJS.ProcessEnv,
+): Promise<GjcTeamLivenessRecoveryResult> {
+	const staleWorkers: Record<string, GjcTeamLivenessRecoveryReason[]> = {};
+	for (const worker of config.workers) {
+		const reasons = await livenessReasons(runtime, dir, config, worker, env);
+		if (reasons.length === 0) continue;
+		staleWorkers[worker.id] = reasons;
+		if (reasons.includes("missing_pane") && !reasons.includes("worker_lifecycle_stopped"))
+			await writeWorkerLifecycleRecord(runtime, dir, worker, "failed", { stop_reason: "pane_missing" });
+	}
+	const recoveredClaims: GjcTeamRecoveredClaim[] = [];
+	for (const task of await runtime.readTasks(dir)) {
+		if (task.status === "completed" || task.status === "failed") continue;
+		const claimPath = path.join(dir, "claims", `${task.id}.json`);
+		const claim = task.claim ?? claimFromUnknown(await runtime.readJson<unknown>(claimPath));
+		if (!claim) continue;
+		const reasons = [...(staleWorkers[claim.owner] ?? [])];
+		if (claimIsExpired(claim.leased_until)) addRecoveryReason(reasons, "claim_expired");
+		if (reasons.length === 0) continue;
+		await fs.rm(claimPath, { force: true });
+		recoveredClaims.push({ task_id: task.id, worker: claim.owner, reasons });
+		if (task.status === "in_progress")
+			await runtime.writeTask(
+				dir,
+				normalizeGjcTeamTask({
+					...task,
+					status: "pending",
+					assignee: undefined,
+					claim: undefined,
+					version: task.version + 1,
+					updated_at: runtime.now(),
+				}),
+			);
+		await runtime.appendEvent(dir, {
+			type: "task_claim_recovered",
+			task_id: task.id,
+			worker: claim.owner,
+			message:
+				task.status === "in_progress" ? "Recovered task from stale worker claim" : "Removed stale task claim file",
+			data: { reasons },
+		});
+	}
+	if (recoveredClaims.length > 0)
+		await runtime.appendTelemetry(dir, {
+			type: "team_liveness_recovery",
+			message: `Recovered ${recoveredClaims.length} stale team task claim(s)`,
+			data: { team_name: teamName, recovered_claims: recoveredClaims },
+		});
+	return { recovered_claims: recoveredClaims, stale_workers: staleWorkers };
+}
+
+export async function shutdownGjcTeamWorkers(
+	runtime: GjcTeamWorkerOrchestrationRuntime,
+	teamName: string,
+	cwd: string,
+	env: NodeJS.ProcessEnv,
+): Promise<GjcTeamSnapshot> {
+	const dir = await runtime.findTeamDir(teamName, cwd, env);
+	const config = await runtime.readConfig(dir);
+	const tasks = await runtime.readTasks(dir);
+	const evidenceFailures = tasks.flatMap(task => {
+		const reason = task.status === "completed" ? getGjcTeamTaskCompletionEvidenceFailure(task) : null;
+		return reason ? [{ task_id: task.id, reason }] : [];
+	});
+	const requestId = `shutdown-${runtime.stableHash([config.team_name, runtime.now(), crypto.randomUUID()].join(":"))}`;
+	const requestedAt = runtime.now();
+	await Promise.all(
+		config.workers.map(worker =>
+			writeGjcShutdownRequest(
+				runtime,
+				teamName,
+				worker.id,
+				"leader-fixed",
+				cwd,
+				env,
+				requestId,
+				"graceful",
+				requestedAt,
+			),
+		),
+	);
+	const completionVerified = tasks.length === 0 || tasks.every(isGjcTeamTaskCompletionVerified);
+	const pendingIntegration = completionVerified
+		? await runtime.hasPendingIntegration(dir, config, await runtime.readMonitorSnapshot(dir))
+		: false;
+	runtime.killWorkerPanes(config);
+	await runtime.removeCleanCreatedWorktrees(config.workers);
+	const stopped: GjcTeamConfig = {
+		...config,
+		workers: config.workers.map(worker => ({ ...worker, status: "stopped", last_heartbeat: runtime.now() })),
+		updated_at: runtime.now(),
+	};
+	await runtime.writeJson(path.join(dir, "config.json"), stopped);
+	await writeWorkerLifecycleForConfig(runtime, dir, stopped, "stopped", worker => ({
+		pane_id: worker.pane_id,
+		stopped_at: stopped.updated_at,
+		stop_reason: "graceful_shutdown",
+		shutdown_request_id: requestId,
+		shutdown_requested_at: requestedAt,
+		shutdown_mode: "graceful",
+	}));
+	const lifecycle = await readWorkerLifecycleById(runtime, dir, stopped);
+	const graceful = stopped.workers.every(
+		worker =>
+			lifecycle[worker.id]?.lifecycle_state === "stopped" &&
+			lifecycle[worker.id]?.shutdown_request_id === requestId &&
+			lifecycle[worker.id]?.shutdown_mode === "graceful",
+	);
+	const phase: GjcTeamPhase =
+		completionVerified && graceful
+			? pendingIntegration
+				? "awaiting_integration"
+				: "complete"
+			: evidenceFailures.length > 0 || tasks.some(task => task.status === "failed" || task.status === "blocked")
+				? "failed"
+				: "cancelled";
+	await runtime.writePhase(dir, phase);
+	const data: Record<string, unknown> = {
+		phase,
+		shutdown_request_id: requestId,
+		graceful_shutdown_complete: graceful,
+	};
+	if (evidenceFailures.length > 0) data.evidence_failures = evidenceFailures;
+	await runtime.appendEvent(dir, {
+		type: "team_shutdown",
+		message:
+			phase === "complete"
+				? "Shut down native gjc team runtime after completed tasks"
+				: "Shut down native gjc team runtime with incomplete tasks",
+		data,
+	});
+	await runtime.appendTelemetry(dir, {
+		type: "team_shutdown",
+		message: `Native gjc team runtime stopped with phase ${phase}`,
+		data: { shutdown_request_id: requestId, graceful_shutdown_complete: graceful },
+	});
+	return runtime.readSnapshot(config.team_name, cwd, env);
 }
