@@ -666,20 +666,17 @@ function migrateV2ToV3(entries: FileEntry[]): void {
 
 /**
  * Run all necessary migrations to bring entries to the current semantic version.
- * Version 4 only adds trailing patch records, so v3 transcripts require no rewrite.
+ * Version 4 adds trailing patch records, so v3 transcripts must be atomically upgraded before they can receive one.
  */
 function migrateToCurrentVersion(entries: FileEntry[]): boolean {
 	const header = entries.find(e => e.type === "session") as SessionHeader | undefined;
 	const version = header?.version ?? 1;
 	if (version >= CURRENT_SESSION_VERSION) return false;
 	if (version < 2) migrateV1ToV2(entries);
-	if (version < 3) {
-		migrateV2ToV3(entries);
-		const migratedHeader = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
-		if (migratedHeader) migratedHeader.version = CURRENT_SESSION_VERSION;
-		return true;
-	}
-	return false;
+	if (version < 3) migrateV2ToV3(entries);
+	const migratedHeader = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
+	if (migratedHeader) migratedHeader.version = CURRENT_SESSION_VERSION;
+	return true;
 }
 
 /** Exported for testing */
@@ -818,7 +815,7 @@ export function parseSessionEntries(content: string): FileEntry[] {
 
 	for (const record of records) {
 		if (record.type === "header_patch") {
-			if (header && isHeaderPatchRecord(record)) Object.assign(header, record.patch);
+			if (header && isHeaderPatchRecord(record)) applyHeaderPatch(header, record.patch);
 			continue;
 		}
 		if (record.type === "entry_patch") {
@@ -837,12 +834,16 @@ export function parseSessionEntries(content: string): FileEntry[] {
 
 function isHeaderPatchRecord(record: SessionPatchRecord): record is HeaderPatchRecord {
 	if (record.type !== "header_patch" || !record.patch || typeof record.patch !== "object") return false;
+	const keys = Object.keys(record.patch);
+	if (!keys.every(key => key === "cwd" || key === "title" || key === "titleSource")) return false;
 	const { cwd, title, titleSource } = record.patch;
-	return (
-		(cwd === undefined || typeof cwd === "string") &&
-		(title === undefined || typeof title === "string") &&
-		(titleSource === undefined || titleSource === "auto" || titleSource === "user")
-	);
+	return (cwd === undefined || typeof cwd === "string") && (title === undefined || typeof title === "string") && (titleSource === undefined || titleSource === "auto" || titleSource === "user");
+}
+
+function applyHeaderPatch(header: SessionHeader, patch: HeaderPatchRecord["patch"]): void {
+	if (patch.cwd !== undefined) header.cwd = patch.cwd;
+	if (patch.title !== undefined) header.title = patch.title;
+	if (patch.titleSource !== undefined) header.titleSource = patch.titleSource;
 }
 
 function isEntryPatchRecord(record: SessionPatchRecord): record is EntryPatchRecord {
@@ -4165,21 +4166,17 @@ export class SessionManager {
 		}
 	}
 
-	async #rewriteFile(): Promise<void> {
+	async #rewriteFileContents(): Promise<void> {
 		if (!this.persist || !this.#sessionFile) return;
-		await this.#queuePersistTask(async () => {
-			await this.#closePersistWriterInternal();
-			const entries = await Promise.all(
-				materializeResidentEntriesForPersistenceSync(this.#fileEntries, this.#residentBlobStores()).map(entry =>
-					prepareEntryForPersistence(entry, this.#blobStore),
-				),
-			);
-			await this.#writeEntriesAtomically(entries);
-			this.#needsFullRewriteOnNextPersist = false;
-			this.#flushed = true;
-			this.#ensuredOnDisk = true;
-		});
+		await this.#closePersistWriterInternal();
+		const entries = await Promise.all(materializeResidentEntriesForPersistenceSync(this.#fileEntries, this.#residentBlobStores()).map(entry => prepareEntryForPersistence(entry, this.#blobStore)));
+		await this.#writeEntriesAtomically(entries);
+		this.#needsFullRewriteOnNextPersist = false;
+		this.#flushed = true;
+		this.#ensuredOnDisk = true;
 	}
+
+	async #rewriteFile(): Promise<void> { await this.#queuePersistTask(async () => { await this.#rewriteFileContents(); }); }
 
 	#rewriteFileSync(): void {
 		if (!this.persist || !this.#sessionFile) return;
@@ -4598,36 +4595,27 @@ export class SessionManager {
 
 		this.#sessionName = sanitized;
 		this.#titleSource = source;
-		this.#appendHeaderPatch({ title: sanitized, titleSource: source });
+		await this.#appendHeaderPatch({ title: sanitized, titleSource: source });
 		return true;
 	}
 
-	#appendHeaderPatch(patch: HeaderPatchRecord["patch"]): void {
+	async #appendHeaderPatch(patch: HeaderPatchRecord["patch"]): Promise<void> {
 		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		if (!header) return;
-		Object.assign(header, patch);
+		applyHeaderPatch(header, patch);
 		this.#headerExportRevision++;
-		this.#persistPatch({ type: "header_patch", patch });
+		await this.#persistPatch({ type: "header_patch", patch });
 	}
 
-	#persistPatch(record: SessionPatchRecord): void {
+	async #persistPatch(record: SessionPatchRecord): Promise<void> {
 		if (!this.persist || !this.#sessionFile || !this.storage.existsSync(this.#sessionFile)) return;
-		if (this.#persistError) throw this.#persistError;
-		try {
-			if (this.#needsFullRewriteOnNextPersist || !this.#flushed) {
-				this.#rewriteFileSync();
-				return;
-			}
+		await this.#queuePersistTask(async () => {
+			const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+			if (this.#needsFullRewriteOnNextPersist || !this.#flushed || (header?.version ?? 1) < CURRENT_SESSION_VERSION) return this.#rewriteFileContents();
 			const writer = this.#ensurePersistWriter();
-			if (!writer) {
-				this.#rewriteFileSync();
-				return;
-			}
-			writer.writeSync(record);
-		} catch (error) {
-			this.#recordPersistError(error);
-			throw this.#persistError ?? toError(error);
-		}
+			if (!writer) return this.#rewriteFileContents();
+			await writer.write(record);
+		});
 	}
 
 	_persist(entry: SessionEntry): void {
