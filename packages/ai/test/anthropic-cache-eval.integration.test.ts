@@ -61,6 +61,33 @@ function hasGitMetadata(): boolean {
 	return result.exitCode === 0 && result.stdout.toString().trim() === "true";
 }
 
+function assertCommitAncestry(ancestor: string, descendant: string): void {
+	for (const [label, commit] of [
+		["ancestor", ancestor],
+		["descendant", descendant],
+	] as const) {
+		const objectCheck = Bun.spawnSync(["git", "cat-file", "-e", `${commit}^{commit}`], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (objectCheck.exitCode !== 0) {
+			throw new Error(
+				`Missing ${label} commit ${commit}: ${objectCheck.stderr.toString().trim() || "git object not found"}`,
+			);
+		}
+	}
+
+	const ancestry = Bun.spawnSync(["git", "merge-base", "--is-ancestor", ancestor, descendant], {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (ancestry.exitCode !== 0) {
+		throw new Error(
+			`Commit ${ancestor} is not an ancestor of ${descendant}: ${ancestry.stderr.toString().trim() || `git exited ${ancestry.exitCode}`}`,
+		);
+	}
+}
+
 function abortedSignal(): AbortSignal {
 	const controller = new AbortController();
 	controller.abort();
@@ -158,17 +185,16 @@ describe("Anthropic cache placement eval (deterministic payload structure)", () 
 		});
 
 		if (hasGitMetadata()) {
-			const ancestry = Bun.spawnSync(
-				[
-					"git",
-					"merge-base",
-					"--is-ancestor",
-					artifact.source.implementationCommit,
-					artifact.source.reviewedRepairCommit,
-				],
-				{ stdout: "pipe", stderr: "pipe" },
-			);
-			expect(ancestry.exitCode).toBe(0);
+			assertCommitAncestry(artifact.source.implementationCommit, artifact.source.reviewedRepairCommit);
 		}
+	});
+
+	it("fails closed for missing and reversed provenance commits", () => {
+		if (!hasGitMetadata()) return;
+
+		expect(() => assertCommitAncestry("0000000000000000000000000000000000000000", "f01776ce6")).toThrow(
+			"Missing ancestor commit",
+		);
+		expect(() => assertCommitAncestry("f01776ce6", "0a43140bb")).toThrow("is not an ancestor");
 	});
 });
