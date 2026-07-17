@@ -75,7 +75,7 @@ describe("harness final QA regressions", () => {
 				"replay",
 				{ live: false },
 			),
-		).rejects.toThrow("regex invariant must not match every stdout value");
+		).rejects.toThrow("must be a meaningful positive invariant that matches stdout");
 	});
 
 	test("matches reworded ultragoal requests by provenance but replaces stale plan provenance", async () => {

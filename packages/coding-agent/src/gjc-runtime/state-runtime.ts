@@ -1102,8 +1102,9 @@ export async function reconcileWorkflowSkillState(options: {
 		payloadSessionId: options.sessionId,
 		envSessionId: process.env.GJC_SESSION_ID,
 	});
-	return withWorkflowStateLock(path.relative(options.cwd, activeStateFile(options.cwd, sessionId)), async () =>
-		reconcileWorkflowSkillStateUnlocked(options, sessionId),
+	return withWorkflowStateLock(
+		path.relative(options.cwd, modeStateFile(options.cwd, options.mode, sessionId)),
+		async () => reconcileWorkflowSkillStateUnlocked(options, sessionId),
 	);
 }
 
@@ -1164,6 +1165,7 @@ async function reconcileWorkflowSkillStateUnlocked(
 	const writeResult = await writeGuardedWorkflowEnvelopeAtomic(filePath, merged, {
 		cwd,
 		policy: "source",
+		lockHeld: true,
 		receipt: {
 			cwd,
 			skill: mode,
