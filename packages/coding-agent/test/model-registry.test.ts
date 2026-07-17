@@ -29,6 +29,8 @@ test("package exports keep extracted model helpers internal", () => {
 	expect(packageJson.exports["./config/model-auth"]).toBeNull();
 	expect(packageJson.exports["./config/model-bindings-applier"]).toBeNull();
 	expect(packageJson.exports["./config/model-discovery-manager"]).toBeNull();
+	expect(packageJson.exports["./config/model-equivalence"]).toBeUndefined();
+	expect(packageJson.exports["./config/*"]).toBeDefined();
 	expect(packageJson.exports["./*"]).toBeDefined();
 });
 
