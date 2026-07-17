@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { type Api, type Model, writeModelCache } from "@gajae-code/ai";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { type Api, closeModelCache, type Model, readModelCache, writeModelCache } from "@gajae-code/ai";
 import { ModelDiscoveryManager } from "../src/config/model-discovery-manager";
 
 function model(id: string): Model<Api> {
@@ -23,6 +26,16 @@ const unauthenticatedCallbacks = {
 	isAuthenticated: () => false,
 	fetchModels: async () => [model("unexpected")],
 };
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason?: unknown) => void } {
+	let resolve!: (value: T) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+		resolve = resolvePromise;
+		reject = rejectPromise;
+	});
+	return { promise, resolve, reject };
+}
 
 describe("ModelDiscoveryManager", () => {
 	test("snapshots provider inputs and clears state on reset", () => {
@@ -118,5 +131,75 @@ describe("ModelDiscoveryManager", () => {
 		const stale = await first;
 		expect(stale).toMatchObject({ current: false, models: [] });
 		expect(manager.getState("openai")).toMatchObject({ status: "ok", models: ["newest"] });
+	});
+
+	test("keeps newer same-provider discoveries authoritative in the cache", async () => {
+		const cacheDir = mkdtempSync(join(tmpdir(), "model-discovery-race-"));
+		const cacheDbPath = join(cacheDir, "models.db");
+		const provider = { provider: "test" };
+		const manager = new ModelDiscoveryManager<typeof provider>();
+		manager.setProviders([provider]);
+		const callbacks = (fetchModels: () => Promise<Model<Api>[]>) => ({
+			requiresAuth: () => false,
+			peekApiKey: async () => undefined,
+			isAuthenticated: () => true,
+			fetchModels,
+			cacheDbPath,
+		});
+
+		try {
+			const staleSuccessFetch = deferred<Model<Api>[]>();
+			const staleSuccess = manager.discover(
+				provider,
+				"online",
+				callbacks(() => staleSuccessFetch.promise),
+			);
+			const newest = await manager.discover(
+				provider,
+				"online",
+				callbacks(async () => [model("newest")]),
+			);
+			expect(newest.current).toBe(true);
+			staleSuccessFetch.resolve([model("stale-success")]);
+			expect((await staleSuccess).current).toBe(false);
+
+			const staleFailureFetch = deferred<Model<Api>[]>();
+			const staleFailure = manager.discover(
+				provider,
+				"online",
+				callbacks(() => staleFailureFetch.promise),
+			);
+			const newestAfterFailure = await manager.discover(
+				provider,
+				"online",
+				callbacks(async () => [model("newest-after-failure")]),
+			);
+			expect(newestAfterFailure.current).toBe(true);
+			staleFailureFetch.reject(new Error("stale failure"));
+			expect((await staleFailure).current).toBe(false);
+
+			const cache = readModelCache<Api>(provider.provider, 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
+			expect(cache).toMatchObject({
+				authoritative: true,
+				models: [expect.objectContaining({ id: "newest-after-failure" })],
+			});
+			expect(cache?.models.map(entry => entry.id)).not.toContain("stale-success");
+
+			const offlineSuccessor = new ModelDiscoveryManager<typeof provider>();
+			offlineSuccessor.setProviders([provider]);
+			const offline = await offlineSuccessor.discover(
+				provider,
+				"offline",
+				callbacks(async () => [model("unexpected")]),
+			);
+			expect(offline).toMatchObject({
+				current: true,
+				models: [expect.objectContaining({ id: "newest-after-failure" })],
+				state: { status: "cached", models: ["newest-after-failure"] },
+			});
+		} finally {
+			closeModelCache(cacheDbPath);
+			rmSync(cacheDir, { recursive: true, force: true });
+		}
 	});
 });
