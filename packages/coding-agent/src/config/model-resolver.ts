@@ -8,8 +8,9 @@ import { fuzzyMatch } from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
 import chalk from "chalk";
 import { parseThinkingLevel, resolveThinkingLevelForModel } from "../thinking";
+import { isAuthenticatedOrKeyless } from "./model-auth";
 import { compareModelVariantRank } from "./model-equivalence";
-import { isAuthenticatedOrKeyless, MODEL_ROLE_IDS, type ModelRegistry, type ModelRole } from "./model-registry";
+import { MODEL_ROLE_IDS, type ModelRegistry, type ModelRole } from "./model-registry";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 import type { Settings } from "./settings";
 

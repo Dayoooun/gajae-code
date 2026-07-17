@@ -40,6 +40,7 @@ import { isValidThemeColor, type ThemeColor } from "../modes/theme/theme";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
 import { type ConfigError, ConfigFile } from "./config-file";
+import { isAuthenticated, kNoAuth } from "./model-auth";
 import { ModelBindingsApplier } from "./model-bindings-applier";
 import { ModelDiscoveryManager } from "./model-discovery-manager";
 import {
@@ -69,15 +70,7 @@ import { type Settings, settings } from "./settings";
 
 export type { CanonicalModelIndex, CanonicalModelRecord, CanonicalModelVariant, ModelEquivalenceConfig };
 
-export const kNoAuth = "N/A";
-
-export function isAuthenticated(apiKey: string | undefined | null): apiKey is string {
-	return Boolean(apiKey) && apiKey !== kNoAuth;
-}
-
-export function isAuthenticatedOrKeyless(apiKey: string | undefined | null): boolean {
-	return apiKey === kNoAuth || isAuthenticated(apiKey);
-}
+export { isAuthenticated, kNoAuth };
 
 export type ModelRole = "default";
 
