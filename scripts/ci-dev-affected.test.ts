@@ -345,7 +345,12 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		});
 		expect(result.exitCode).toBe(0);
 		const output = await Bun.file(outputFile).text();
-		const changedPaths = output.split("changed_paths<<__GJC_PATHS_EOF__\n")[1]?.split("\n__GJC_PATHS_EOF__")[0]?.split("\n").filter(Boolean).sort();
+		const outputLines = output.split("\n");
+		const changedPathsStart = outputLines.indexOf("changed_paths<<__GJC_PATHS_EOF__");
+		const changedPathsEnd = outputLines.indexOf("__GJC_PATHS_EOF__", changedPathsStart + 1);
+		expect(changedPathsStart).toBeGreaterThanOrEqual(0);
+		expect(changedPathsEnd).toBeGreaterThan(changedPathsStart);
+		const changedPaths = outputLines.slice(changedPathsStart + 1, changedPathsEnd).filter(Boolean).sort();
 		expect(changedPaths).toEqual(expected);
 	});
 
