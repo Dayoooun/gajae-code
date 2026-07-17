@@ -332,6 +332,56 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(missingHead.stderr).toContain("is not available");
 	});
 
+	test("PR base resolution keeps a successful merge-base ahead of GITHUB_BASE_SHA", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-affected-base-"));
+		tempDirs.push(tempDir);
+		const outputFile = path.join(tempDir, "github-output.txt");
+		const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot }).stdout.toString().trim();
+		const mergeBase = Bun.spawnSync(["git", "merge-base", "HEAD", "origin/dev"], { cwd: repoRoot }).stdout.toString().trim();
+		const expected = Bun.spawnSync(["git", "diff", "--name-only", "-z", `${mergeBase}...${head}`], { cwd: repoRoot }).stdout.toString().split("\0").filter(Boolean).sort();
+		const result = await runScript(["--matrix-json"], "", {
+			GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev", GITHUB_BASE_SHA: head,
+			CI_DEV_SOURCE_SHA: head, GITHUB_OUTPUT: outputFile,
+		});
+		expect(result.exitCode).toBe(0);
+		const output = await Bun.file(outputFile).text();
+		const outputLines = output.split("\n");
+		const changedPathsStart = outputLines.indexOf("changed_paths<<__GJC_PATHS_EOF__");
+		const changedPathsEnd = outputLines.indexOf("__GJC_PATHS_EOF__", changedPathsStart + 1);
+		expect(changedPathsStart).toBeGreaterThanOrEqual(0);
+		expect(changedPathsEnd).toBeGreaterThan(changedPathsStart);
+		const changedPaths = outputLines.slice(changedPathsStart + 1, changedPathsEnd).filter(Boolean).sort();
+		expect(changedPaths).toEqual(expected);
+	});
+
+	test("PR shallow checkout falls back to its available exact base SHA", async () => {
+		const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot }).stdout.toString().trim();
+		const result = await runScript(["--matrix-json"], "", {
+			GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "missing-shallow-base", GITHUB_BASE_SHA: head,
+			CI_DEV_SOURCE_SHA: head,
+		});
+		expect(result.exitCode).toBe(0);
+	});
+
+	test("PR without a base SHA retains the origin base-ref fallback", async () => {
+		const result = await runScript(["--matrix-json"], "", {
+			GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "missing-shallow-base", GITHUB_BASE_SHA: "",
+			CI_DEV_SOURCE_SHA: "HEAD",
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("base 'origin/missing-shallow-base' is not available");
+	});
+
+	test("PR missing base object still fails at the commit-object gate", async () => {
+		const missingBaseSha = "f".repeat(40);
+		const result = await runScript(["--matrix-json"], "", {
+			GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "missing-shallow-base", GITHUB_BASE_SHA: missingBaseSha,
+			CI_DEV_SOURCE_SHA: "HEAD",
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain(`base '${missingBaseSha}' is not available`);
+	});
+
 	test("Cargo selection includes transitive dependents and never emits vendored shards", async () => {
 		const sdk = await runScript(["--matrix-json"], "crates/gjc-sdk/src/lib.rs");
 		expect(sdk.exitCode).toBe(0);
@@ -452,6 +502,53 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		});
 		expect(receiptMissing.exitCode).toBe(1);
 		expect(receiptMissing.stderr).toContain("shard receipt set does not match canonical plan");
+		await Bun.write(path.join(receiptDir, "0.json"), JSON.stringify({ key: expectedShards[0]!.key, identity: expectedShards[0]!.identity }));
+		await Bun.write(path.join(receiptDir, "stale-extra.json"), JSON.stringify({ key: "stale", identity: "stale" }));
+		const receiptExtra = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptExtra.exitCode).toBe(1);
+		expect(receiptExtra.stderr).toContain("shard receipt set does not match canonical plan");
+		await fs.rm(path.join(receiptDir, "stale-extra.json"));
+		await Bun.write(path.join(receiptDir, "duplicate.json"), JSON.stringify({ key: expectedShards[0]!.key, identity: expectedShards[0]!.identity }));
+		const receiptDuplicate = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptDuplicate.exitCode).toBe(1);
+		expect(receiptDuplicate.stderr).toContain("shard receipt set does not match canonical plan");
+		await fs.rm(path.join(receiptDir, "duplicate.json"));
+		await Bun.write(path.join(receiptDir, "0.json"), JSON.stringify({ key: expectedShards[0]!.key, identity: "wrong" }));
+		const receiptWrongIdentity = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptWrongIdentity.exitCode).toBe(1);
+		expect(receiptWrongIdentity.stderr).toContain("shard receipt set does not match canonical plan");
+		await Bun.write(path.join(receiptDir, "0.json"), "{");
+		const receiptMalformedJson = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptMalformedJson.exitCode).toBe(1);
+		await Bun.write(path.join(receiptDir, "0.json"), JSON.stringify({ key: expectedShards[0]!.key, identity: expectedShards[0]!.identity, extra: true }));
+		const receiptMalformedObject = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptMalformedObject.exitCode).toBe(1);
+		expect(receiptMalformedObject.stderr).toContain("malformed shard receipt");
 		const wrongSource = await runScript(["--validate-plan"], "packages/stats/src/index.ts", {
 			CI_DEV_AFFECTED_PLAN: planFile,
 			CI_DEV_PLAN_DIGEST: digest as string,
