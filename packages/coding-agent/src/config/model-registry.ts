@@ -58,6 +58,7 @@ import {
 	mergeModelProfiles,
 } from "./model-profiles";
 import {
+	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
 	type ModelOverride,
 	type ModelProfileConfig,
 	type ModelsConfig,
@@ -101,20 +102,14 @@ export const MODEL_ROLES: Record<ModelRole, ModelRoleInfo> = {
 export const MODEL_ROLE_IDS: ModelRole[] = ["default"];
 export const MODEL_PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 export const MODEL_PROFILE_NAME_PATTERN_DESCRIPTION = "lowercase letters, numbers, dots, underscores, or hyphens";
-export type GjcModelAssignmentTargetId = "default" | "executor" | "architect" | "planner" | "critic";
+export type GjcModelAssignmentTargetId = (typeof GJC_MODEL_ASSIGNMENT_TARGET_IDS)[number];
 
 export interface GjcModelAssignmentTargetInfo extends ModelRoleInfo {
 	id: GjcModelAssignmentTargetId;
 	settingsPath: "modelRoles" | "task.agentModelOverrides";
 }
 
-export const GJC_MODEL_ASSIGNMENT_TARGET_IDS: GjcModelAssignmentTargetId[] = [
-	"default",
-	"executor",
-	"architect",
-	"planner",
-	"critic",
-];
+export { GJC_MODEL_ASSIGNMENT_TARGET_IDS };
 
 export const GJC_MODEL_ASSIGNMENT_TARGETS: Record<GjcModelAssignmentTargetId, GjcModelAssignmentTargetInfo> = {
 	default: { id: "default", tag: "DEFAULT", name: "Default", color: "success", settingsPath: "modelRoles" },
@@ -2471,7 +2466,6 @@ export class ModelRegistry {
 			this.#sessionCanonicalVariants.delete(this.#sessionCanonicalVariants.keys().next().value!);
 		}
 	}
-
 	#resolveCanonicalVariant(
 		variants: readonly CanonicalModelVariant[],
 		allCandidates: readonly Model<Api>[],
@@ -2485,7 +2479,6 @@ export class ModelRegistry {
 			return stickyVariant;
 		}
 		if (sessionId && stickySelector) this.#sessionCanonicalVariants.delete(sessionId);
-
 		const providerRank = this.#providerRank(allCandidates);
 		const modelOrder = new Map<string, number>();
 		for (let index = 0; index < allCandidates.length; index += 1) {
@@ -2546,7 +2539,10 @@ export class ModelRegistry {
 		return this.#canonicalIndex.bySelector.get(formatCanonicalVariantSelector(model).toLowerCase());
 	}
 
-	/** Seed a child canonical scope from a concrete parent model. */
+	/**
+	 * Seed a child canonical scope from a concrete parent model without touching
+	 * the parent's canonical selection.
+	 */
 	seedCanonicalVariant(sessionId: string, model: Model<Api>): boolean {
 		const scope = sessionId.trim();
 		if (!scope) return false;
