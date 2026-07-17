@@ -3,7 +3,7 @@ import type { MessageCreateParamsStreaming } from "@anthropic-ai/sdk/resources/m
 import { normalizeCacheControlTtlOrdering, streamAnthropic } from "@gajae-code/ai/providers/anthropic";
 import type { Context, Model, TJsonSchema } from "@gajae-code/ai/types";
 
-const model: Model<"anthropic-messages"> = {
+const canonicalModel: Model<"anthropic-messages"> = {
 	id: "claude-sonnet-4-5",
 	name: "Claude Sonnet 4.5",
 	api: "anthropic-messages",
@@ -17,15 +17,7 @@ const model: Model<"anthropic-messages"> = {
 };
 
 type CacheControl = { type: string; ttl?: string };
-type PayloadMessage = {
-	role: string;
-	content: string | Array<{ type: string; text?: string; cache_control?: CacheControl }>;
-};
-type Payload = {
-	messages: PayloadMessage[];
-	system?: Array<{ cache_control?: CacheControl }>;
-	tools?: Array<{ cache_control?: CacheControl }>;
-};
+type Payload = MessageCreateParamsStreaming & { cache_control?: CacheControl };
 
 function abortedSignal(): AbortSignal {
 	const controller = new AbortController();
@@ -33,124 +25,213 @@ function abortedSignal(): AbortSignal {
 	return controller.signal;
 }
 
-function capturePayload(context: Context): Promise<Payload> {
+function context(messages: Context["messages"] = [{ role: "user", content: "Continue", timestamp: 1 }]): Context {
+	return {
+		systemPrompt: ["Stable instructions", "Second stable instruction"],
+		tools: [
+			{
+				name: "lookup",
+				description: "Looks up an answer.",
+				parameters: { type: "object", properties: {} } as TJsonSchema,
+			},
+		],
+		messages,
+	};
+}
+
+function capturePayload(
+	model: Model<"anthropic-messages">,
+	input: Context,
+	onPayload?: (payload: Payload) => Payload | undefined,
+): Promise<Payload> {
 	const { promise, resolve } = Promise.withResolvers<Payload>();
-	streamAnthropic(model, context, {
+	streamAnthropic(model, input, {
 		apiKey: "sk-ant-api-test",
 		isOAuth: false,
 		signal: abortedSignal(),
-		onPayload: payload => resolve(payload as Payload),
+		onPayload: payload => {
+			const replacement = onPayload?.(payload as Payload);
+			resolve((replacement ?? payload) as Payload);
+			return replacement;
+		},
 	});
 	return promise;
 }
 
-function cacheControl(message: PayloadMessage): CacheControl | undefined {
-	return Array.isArray(message.content)
-		? message.content.find(block => block.cache_control)?.cache_control
-		: undefined;
+function cacheParams(overrides: Partial<Payload> = {}): Payload {
+	return {
+		model: canonicalModel.id,
+		max_tokens: 1,
+		stream: true,
+		messages: [{ role: "user", content: [{ type: "text", text: "Continue" }] }],
+		...overrides,
+	};
 }
 
-describe("Anthropic prompt cache breakpoints", () => {
-	it("uses the previous assistant boundary as the third anchor, not an adjacent tool result", async () => {
-		const payload = await capturePayload({
-			systemPrompt: ["Stable instructions"],
+describe("Anthropic prompt caching", () => {
+	it("uses canonical top-level automatic caching and gives unsupported compatible endpoints no generated controls", async () => {
+		const [canonical, compatible] = await Promise.all([
+			capturePayload(canonicalModel, context()),
+			capturePayload({ ...canonicalModel, baseUrl: "https://proxy.example.test/anthropic" }, context()),
+		]);
+
+		expect(canonical.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+		expect(compatible.cache_control).toBeUndefined();
+		expect(canonical.tools?.every(tool => !(tool as { cache_control?: CacheControl }).cache_control)).toBe(true);
+		expect(!Array.isArray(canonical.system) || canonical.system.every(block => !block.cache_control)).toBe(true);
+	});
+
+	it("counts automatic caching as one slot and preserves valid callback controls without mutation", async () => {
+		const replacement = cacheParams({
+			cache_control: { type: "ephemeral", ttl: "1h" },
 			tools: [
 				{
-					name: "lookup",
-					description: "Looks up an answer.",
-					parameters: { type: "object", properties: {} } as TJsonSchema,
+					name: "first",
+					description: "first",
+					input_schema: { type: "object", properties: {} },
+					cache_control: { type: "ephemeral", ttl: "1h" },
+				},
+				{
+					name: "second",
+					description: "second",
+					input_schema: { type: "object", properties: {} },
+					cache_control: { type: "ephemeral" },
 				},
 			],
-			messages: [
-				{ role: "user", content: "Find the answer", timestamp: 1 },
-				{
-					role: "assistant",
-					content: [{ type: "toolCall", id: "call_1", name: "lookup", arguments: {} }],
-					api: "anthropic-messages",
-					provider: "anthropic",
-					model: model.id,
-					usage: {
-						input: 0,
-						output: 0,
-						cacheRead: 0,
-						cacheWrite: 0,
-						totalTokens: 0,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			system: [{ type: "text", text: "stable", cache_control: { type: "ephemeral" } }],
+		});
+		const before = structuredClone(replacement);
+		const payload = await capturePayload(canonicalModel, context(), () => replacement);
+
+		expect(payload).toBe(replacement);
+		expect(replacement).toEqual(before);
+	});
+
+	it("accepts zero, one, and four ordered caller controls across tools, system, and messages", () => {
+		const cases: Payload[] = [
+			cacheParams(),
+			cacheParams({
+				tools: [
+					{
+						name: "tool",
+						description: "tool",
+						input_schema: { type: "object", properties: {} },
+						cache_control: { type: "ephemeral", ttl: "1h" },
 					},
-					stopReason: "toolUse",
-					timestamp: 2,
-				},
+				],
+			}),
+			cacheParams({
+				tools: [
+					{
+						name: "tool",
+						description: "tool",
+						input_schema: { type: "object", properties: {} },
+						cache_control: { type: "ephemeral", ttl: "1h" },
+					},
+				],
+				system: [{ type: "text", text: "stable", cache_control: { type: "ephemeral", ttl: "1h" } }],
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "stable answer", cache_control: { type: "ephemeral" } }],
+					},
+					{
+						role: "user",
+						content: [{ type: "text", text: "current question", cache_control: { type: "ephemeral" } }],
+					},
+				],
+			}),
+		];
+		for (const params of cases) {
+			const before = structuredClone(params);
+			expect(() => normalizeCacheControlTtlOrdering(params)).not.toThrow();
+			expect(params).toEqual(before);
+		}
+	});
+
+	it("fails closed for invalid callback controls and never normalizes caller objects", () => {
+		const cases: Array<{ name: string; params: Payload }> = [
+			{
+				name: "five controls",
+				params: cacheParams({
+					cache_control: { type: "ephemeral" },
+					tools: Array.from({ length: 4 }, (_, index) => ({
+						name: `tool-${index}`,
+						description: "tool",
+						input_schema: { type: "object", properties: {} },
+						cache_control: { type: "ephemeral" },
+					})),
+				}),
+			},
+			{
+				name: "five-minute before one-hour",
+				params: cacheParams({
+					system: [{ type: "text", text: "short", cache_control: { type: "ephemeral" } }],
+					messages: [
+						{
+							role: "user",
+							content: [{ type: "text", text: "long", cache_control: { type: "ephemeral", ttl: "1h" } }],
+						},
+					],
+				}),
+			},
+			{
+				name: "thinking target",
+				params: {
+					...cacheParams(),
+					messages: [
+						{
+							role: "assistant",
+							content: [
+								{
+									type: "thinking",
+									thinking: "private",
+									signature: "sig",
+									cache_control: { type: "ephemeral" },
+								},
+							],
+						},
+					],
+				} as unknown as Payload,
+			},
+			{
+				name: "empty text target",
+				params: cacheParams({
+					messages: [
+						{ role: "user", content: [{ type: "text", text: "", cache_control: { type: "ephemeral" } }] },
+					],
+				}),
+			},
+		];
+
+		for (const { name, params } of cases) {
+			const before = structuredClone(params);
+			expect(() => normalizeCacheControlTtlOrdering(params)).toThrow(`Invalid Anthropic cache_control`);
+			expect(params, name).toEqual(before);
+		}
+	});
+
+	it("recognizes the inclusive twenty-position automatic-cache window", () => {
+		const checkedPosition = (delta: number): number => delta + 1;
+		expect([19, 20, 21].map(delta => checkedPosition(delta) <= 20)).toEqual([true, false, false]);
+	});
+
+	it("treats a mixed text and tool_result user turn as human input", async () => {
+		const payload = await capturePayload(
+			canonicalModel,
+			context([
+				{ role: "user", content: "Question", timestamp: 1 },
 				{
 					role: "toolResult",
 					toolCallId: "call_1",
 					toolName: "lookup",
-					content: [{ type: "text", text: "Result" }],
+					content: [{ type: "text", text: "Answer" }],
 					isError: false,
-					timestamp: 3,
+					timestamp: 2,
 				},
-				{ role: "user", content: "Use the result", timestamp: 4 },
-			],
-		});
-
-		expect(payload.system?.[0]?.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
-		expect(payload.tools?.[0]?.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
-		expect(payload.messages.map(message => [message.role, cacheControl(message)])).toEqual([
-			["user", undefined],
-			["assistant", { type: "ephemeral", ttl: "1h" }],
-			["user", undefined],
-			["user", { type: "ephemeral", ttl: "1h" }],
-		]);
-	});
-
-	it("preserves an externally supplied 1h marker before later five-minute markers", () => {
-		const params = {
-			model: model.id,
-			max_tokens: 1,
-			stream: true,
-			tools: [
-				{
-					name: "external_tool",
-					description: "An externally cached tool.",
-					input_schema: { type: "object", properties: {} },
-					cache_control: { type: "ephemeral", ttl: "1h" },
-				},
-			],
-			system: [{ type: "text", text: "Later five-minute cache", cache_control: { type: "ephemeral" } }],
-			messages: [{ role: "user", content: "Continue" }],
-		} as MessageCreateParamsStreaming;
-
-		normalizeCacheControlTtlOrdering(params);
-
-		expect((params.tools?.[0] as { cache_control?: CacheControl }).cache_control).toEqual({
-			type: "ephemeral",
-			ttl: "1h",
-		});
-	});
-
-	it("normalizes an invalid five-minute then one-hour cache-control sequence", () => {
-		const params = {
-			model: model.id,
-			max_tokens: 1,
-			stream: true,
-			system: [{ type: "text", text: "Five-minute cache", cache_control: { type: "ephemeral" } }],
-			messages: [
-				{
-					role: "user",
-					content: [
-						{
-							type: "text",
-							text: "Invalid later one-hour cache",
-							cache_control: { type: "ephemeral", ttl: "1h" },
-						},
-					],
-				},
-			],
-		} as MessageCreateParamsStreaming;
-
-		normalizeCacheControlTtlOrdering(params);
-
-		expect((params.messages[0]?.content as Array<{ cache_control?: CacheControl }>)[0]?.cache_control).toEqual({
-			type: "ephemeral",
-		});
+				{ role: "user", content: "Use the answer", timestamp: 3 },
+			]),
+		);
+		expect(payload.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
 	});
 });

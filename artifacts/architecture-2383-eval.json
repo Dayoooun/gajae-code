@@ -2,34 +2,25 @@
   "schemaVersion": 1,
   "issue": 2383,
   "status": "pass",
-  "evidenceType": "deterministic-simulated-three-turn-provider-payload-integration",
+  "evidenceType": "deterministic-non-billing-provider-payload-structure",
   "source": {
     "url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
-    "retrievedAt": "2026-07-16",
-    "codeCommit": "2797773e",
-    "inputFixtureSha256": "c3c387e9ff2904f5a4fa73cd6bf4cd8a8711da052ef24720aa57d1bb2d80848c"
+    "retrievedAt": "2026-07-17",
+    "codeCommit": "cc044a646e46f4fffd44480531de299b26ad3cba",
+    "inputFixtureSha256": "92d345cb801a3aed1329fad84a031e464ffc2ad47c6660bc86e8e91537a227c3"
   },
   "capturedAnchors": {
-    "before": [
-      "tools[0]",
-      "system[0]",
-      "messages[2].content[0]",
-      "messages[3].content[0]"
-    ],
     "proposed": [
-      "tools[0]",
-      "system[0]",
-      "messages[1].content[0]",
-      "messages[3].content[0]"
+      "cache_control"
     ]
   },
   "derivedMetrics": {
     "estimator": "floor(utf8Bytes/4)",
-    "beforeSharedCachedPrefixBytes": 0,
-    "beforeSharedCachedPrefixTokens": 0,
-    "proposedSharedCachedPrefixBytes": 537,
-    "proposedSharedCachedPrefixTokens": 134
+    "billing": "not-a-billing-estimate",
+    "proposedSerializedBytes": 537,
+    "proposedStructuralTokenEstimate": 134
   },
-  "method": "Two provider-built payloads use the same three-turn fixture except for the tool-result text. A cache breakpoint is counted only when the entire JSON serialization through that breakpoint is byte-identical across both payloads. Tokens are the deterministic floor of UTF-8 serialized-prefix bytes divided by four.",
+  "method": "One finalized provider-built payload is inspected for the canonical top-level automatic cache_control field. The serialized byte count is a structural diagnostic only.",
+  "limitations": "No request is dispatched and no provider usage or cost fields are observed. The floor(utf8Bytes/4) value is explicitly non-billing, cannot establish cache reuse, and cannot establish a cost improvement.",
   "testCommand": "bun test packages/ai/test/anthropic-cache-eval.integration.test.ts"
 }

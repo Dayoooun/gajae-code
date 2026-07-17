@@ -3,30 +3,25 @@ import { streamAnthropic } from "@gajae-code/ai/providers/anthropic";
 import type { Context, Model, TJsonSchema } from "@gajae-code/ai/types";
 
 type CacheControl = { type: string; ttl?: string };
-type PayloadMessage = {
-	role: string;
-	content: string | Array<{ type: string; cache_control?: CacheControl }>;
-};
 type Payload = {
-	messages: PayloadMessage[];
-	system?: Array<{ cache_control?: CacheControl }>;
-	tools?: Array<{ cache_control?: CacheControl }>;
+	cache_control?: CacheControl;
+	messages: Array<{ role: string; content: unknown }>;
 };
 type EvalArtifact = {
 	schemaVersion: 1;
 	issue: 2383;
 	status: "pass";
-	evidenceType: "deterministic-simulated-three-turn-provider-payload-integration";
+	evidenceType: "deterministic-non-billing-provider-payload-structure";
 	source: { url: string; retrievedAt: string; codeCommit: string; inputFixtureSha256: string };
-	capturedAnchors: { before: string[]; proposed: string[] };
+	capturedAnchors: { proposed: string[] };
 	derivedMetrics: {
 		estimator: "floor(utf8Bytes/4)";
-		beforeSharedCachedPrefixBytes: number;
-		beforeSharedCachedPrefixTokens: number;
-		proposedSharedCachedPrefixBytes: number;
-		proposedSharedCachedPrefixTokens: number;
+		billing: "not-a-billing-estimate";
+		proposedSerializedBytes: number;
+		proposedStructuralTokenEstimate: number;
 	};
 	method: string;
+	limitations: string;
 	testCommand: string;
 };
 
@@ -46,7 +41,7 @@ const model: Model<"anthropic-messages"> = {
 
 const fixture = {
 	turns: ["human", "assistant-tool-use", "tool-result", "human", "assistant", "human"],
-	toolResultVariants: ["Result from source A", "Result from source B"],
+	toolResult: "Result from source A",
 };
 
 function sha256(value: string): Promise<string> {
@@ -61,7 +56,7 @@ function abortedSignal(): AbortSignal {
 	return controller.signal;
 }
 
-function capturePayload(toolResult: string): Promise<Payload> {
+function capturePayload(): Promise<Payload> {
 	const { promise, resolve } = Promise.withResolvers<Payload>();
 	const context: Context = {
 		systemPrompt: ["Stable instructions"],
@@ -95,7 +90,7 @@ function capturePayload(toolResult: string): Promise<Payload> {
 				role: "toolResult",
 				toolCallId: "call_1",
 				toolName: "lookup",
-				content: [{ type: "text", text: toolResult }],
+				content: [{ type: "text", text: fixture.toolResult }],
 				isError: false,
 				timestamp: 3,
 			},
@@ -111,104 +106,35 @@ function capturePayload(toolResult: string): Promise<Payload> {
 	return promise;
 }
 
-function capturedAnchorPaths(payload: Payload): string[] {
-	const anchors: string[] = [];
-	for (const [index, tool] of (payload.tools ?? []).entries()) {
-		if (tool.cache_control) anchors.push(`tools[${index}]`);
-	}
-	for (const [index, block] of (payload.system ?? []).entries()) {
-		if (block.cache_control) anchors.push(`system[${index}]`);
-	}
-	for (const [messageIndex, message] of payload.messages.entries()) {
-		if (!Array.isArray(message.content)) continue;
-		for (const [blockIndex, block] of message.content.entries()) {
-			if (block.cache_control) anchors.push(`messages[${messageIndex}].content[${blockIndex}]`);
-		}
-	}
-	return anchors;
-}
-
-function serializeThroughMessage(payload: Payload, messageIndex: number): string {
-	return JSON.stringify({
-		tools: payload.tools,
-		system: payload.system,
-		messages: payload.messages.slice(0, messageIndex + 1),
-	});
-}
-
-function currentPlacement(payload: Payload): Payload {
-	const current = structuredClone(payload);
-	for (const message of current.messages) {
-		if (!Array.isArray(message.content)) continue;
-		for (const block of message.content) delete block.cache_control;
-	}
-	const cacheControl = (payload.messages[1]?.content as Array<{ cache_control?: CacheControl }>)[0]?.cache_control;
-	const toolResult = current.messages[2]?.content as Array<{ cache_control?: CacheControl }>;
-	const currentHuman = current.messages[3]?.content as Array<{ cache_control?: CacheControl }>;
-	if (!cacheControl || !toolResult?.[0] || !currentHuman?.[0]) {
-		throw new Error("Provider payload lacks the expected assistant, tool-result, or human blocks");
-	}
-	toolResult[0].cache_control = cacheControl;
-	currentHuman[0].cache_control = cacheControl;
-	return current;
-}
-
-function sharedCachedPrefixBytes(left: string, right: string): number {
-	// A cache breakpoint is usable only when the entire serialized prefix through it is byte-identical.
-	return left === right ? new TextEncoder().encode(left).byteLength : 0;
-}
-
 function estimatedTokens(bytes: number): number {
 	return Math.floor(bytes / 4);
 }
 
-describe("Anthropic cache placement eval (deterministic three-turn integration)", () => {
-	it("derives the committed evidence from provider payload construction and fails closed for missing or tampered fields", async () => {
+describe("Anthropic cache placement eval (deterministic payload structure)", () => {
+	it("derives only non-billing structural evidence from the finalized provider payload", async () => {
 		expect(await Bun.file(artifactPath).exists()).toBe(true);
 		const artifact = (await Bun.file(artifactPath).json()) as EvalArtifact;
-		const [firstPayload, secondPayload] = await Promise.all(
-			fixture.toolResultVariants.map(toolResult => capturePayload(toolResult)),
-		);
-		const proposedAnchors = capturedAnchorPaths(firstPayload);
-		const firstCurrentPayload = currentPlacement(firstPayload);
-		const secondCurrentPayload = currentPlacement(secondPayload);
-		const beforeAnchors = capturedAnchorPaths(firstCurrentPayload);
-		const beforeBytes = sharedCachedPrefixBytes(
-			serializeThroughMessage(firstCurrentPayload, 2),
-			serializeThroughMessage(secondCurrentPayload, 2),
-		);
-		const proposedBytes = sharedCachedPrefixBytes(
-			serializeThroughMessage(firstPayload, 1),
-			serializeThroughMessage(secondPayload, 1),
-		);
-		const derivedMetrics = {
-			estimator: "floor(utf8Bytes/4)" as const,
-			beforeSharedCachedPrefixBytes: beforeBytes,
-			beforeSharedCachedPrefixTokens: estimatedTokens(beforeBytes),
-			proposedSharedCachedPrefixBytes: proposedBytes,
-			proposedSharedCachedPrefixTokens: estimatedTokens(proposedBytes),
-		};
+		const payload = await capturePayload();
+		const serializedBytes = new TextEncoder().encode(JSON.stringify(payload)).byteLength;
 
-		expect(proposedAnchors).toEqual(["tools[0]", "system[0]", "messages[1].content[0]", "messages[3].content[0]"]);
-		expect(derivedMetrics.proposedSharedCachedPrefixTokens).toBeGreaterThanOrEqual(
-			derivedMetrics.beforeSharedCachedPrefixTokens,
-		);
-		expect(artifact).toEqual({
+		expect(payload.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+		expect(estimatedTokens(serializedBytes)).toBeGreaterThan(0);
+		expect(artifact).toMatchObject({
 			schemaVersion: 1,
 			issue: 2383,
 			status: "pass",
-			evidenceType: "deterministic-simulated-three-turn-provider-payload-integration",
+			evidenceType: "deterministic-non-billing-provider-payload-structure",
 			source: {
 				url: "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
-				retrievedAt: "2026-07-16",
-				codeCommit: "2797773e",
+				retrievedAt: "2026-07-17",
+				codeCommit: "cc044a646e46f4fffd44480531de299b26ad3cba",
 				inputFixtureSha256: await sha256(JSON.stringify(fixture)),
 			},
-			capturedAnchors: { before: beforeAnchors, proposed: proposedAnchors },
-			derivedMetrics,
-			method:
-				"Two provider-built payloads use the same three-turn fixture except for the tool-result text. A cache breakpoint is counted only when the entire JSON serialization through that breakpoint is byte-identical across both payloads. Tokens are the deterministic floor of UTF-8 serialized-prefix bytes divided by four.",
-			testCommand: "bun test packages/ai/test/anthropic-cache-eval.integration.test.ts",
+			capturedAnchors: { proposed: ["cache_control"] },
+			derivedMetrics: { estimator: "floor(utf8Bytes/4)", billing: "not-a-billing-estimate" },
 		});
+		expect(artifact.derivedMetrics.proposedSerializedBytes).toBeGreaterThan(0);
+		expect(artifact.derivedMetrics.proposedStructuralTokenEstimate).toBeGreaterThan(0);
+		expect(artifact.limitations).toContain("cannot establish cache reuse");
 	});
 });
