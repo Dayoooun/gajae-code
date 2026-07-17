@@ -70,15 +70,15 @@ Breadcrumb content is two lines: original cwd, then session file path. `continue
 Session files are JSONL: one JSON object per line.
 
 - Line 1 is always the session header (`type: "session"`).
-- Remaining lines are `SessionEntry` values.
-- Entries are append-only at runtime; branch navigation moves a pointer (`leafId`) rather than mutating existing entries.
+- Remaining lines are `SessionEntry` values or v4 append-only patch records. `header_patch` records update header metadata and `entry_patch` records replace a message payload when replay metadata is sanitized.
+- Entries and patch records are append-only at runtime; branch navigation moves a pointer (`leafId`) rather than mutating existing entries.
 
 ### Header (`SessionHeader`)
 
 ```json
 {
   "type": "session",
-  "version": 3,
+  "version": 4,
   "id": "1f9d2a6b9c0d1234",
   "timestamp": "2026-02-16T10:20:30.000Z",
   "cwd": "/work/pi",

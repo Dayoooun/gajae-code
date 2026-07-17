@@ -1772,6 +1772,11 @@ async function getSortedSessions(sessionDir: string, storage: SessionStorage): P
 					if (entries.length === 0) return;
 					const header = entries[0] as Record<string, unknown>;
 					if (header.type !== "session" || typeof header.id !== "string") return;
+					for (const record of parseJsonlLenient<SessionPatchRecord>(
+						await readSessionListTail(path, storage, Buffer.allocUnsafe(SESSION_LIST_PREFIX_BYTES)),
+					)) {
+						if (isHeaderPatchRecord(record)) applyHeaderPatch(header as unknown as SessionHeader, record.patch);
+					}
 					const mtime = storage.statSync(path).mtimeMs;
 					const firstPrompt = header.title ? undefined : extractFirstUserPrompt(entries);
 					sessions.push(new RecentSessionInfo(path, mtime, header, firstPrompt));
@@ -3240,6 +3245,23 @@ async function readSessionListPrefix(file: string, storage: SessionStorage, buff
 	}
 }
 
+async function readSessionListTail(file: string, storage: SessionStorage, buffer: Buffer): Promise<string> {
+	if (!(storage instanceof FileSessionStorage)) {
+		const content = await storage.readText(file);
+		return content.slice(-buffer.byteLength);
+	}
+
+	const handle = await fs.promises.open(file, "r");
+	try {
+		const { size } = await handle.stat();
+		const position = Math.max(0, size - buffer.byteLength);
+		const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, position);
+		return sessionListPrefixDecoder.decode(buffer.subarray(0, bytesRead));
+	} finally {
+		await handle.close();
+	}
+}
+
 function decodeJsonStringFragment(value: string): string {
 	const safeValue = value.endsWith("\\") ? value.slice(0, -1) : value;
 	try {
@@ -3381,6 +3403,9 @@ async function collectSessionFromFile(
 		const entries = parseSessionEntries(content).map(entry => entry as unknown as Record<string, unknown>);
 		const header = parseSessionListHeader(content, entries);
 		if (!header) return undefined;
+		for (const record of parseJsonlLenient<SessionPatchRecord>(await readSessionListTail(file, storage, buffer))) {
+			if (isHeaderPatchRecord(record)) applyHeaderPatch(header as SessionHeader, record.patch);
+		}
 
 		let parsedMessageCount = 0;
 		let firstMessage = "";
@@ -3779,7 +3804,6 @@ export class SessionManager {
 		this.#fileEntries = this.#fileEntries.map(entry =>
 			prepareEntryForResidentSync(entry, this.#residentBlobStores()),
 		);
-		this.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		this.#buildIndex();
 		this.#bumpAllRevisions();
 		this.#flushed = true;
@@ -4048,13 +4072,9 @@ export class SessionManager {
 		this.sessionDir = newSessionDir;
 
 		const hasAssistant = this.#fileEntries.some(e => e.type === "message" && e.message.role === "assistant");
-		if (this.persist && this.#sessionFile && hadSessionFile) {
-			this.#appendHeaderPatch({ cwd: resolvedCwd });
-		} else if (this.persist && this.#sessionFile && hasAssistant) {
-			this.#appendHeaderPatch({ cwd: resolvedCwd });
+		await this.#appendHeaderPatch({ cwd: resolvedCwd });
+		if (this.persist && this.#sessionFile && (hadSessionFile || hasAssistant)) {
 			await this.#rewriteFile();
-		} else {
-			this.#appendHeaderPatch({ cwd: resolvedCwd });
 		}
 
 		// Update terminal breadcrumb
@@ -4882,7 +4902,18 @@ export class SessionManager {
 				return this.#rewriteFileContents();
 			const writer = this.#ensurePersistWriter();
 			if (!writer) return this.#rewriteFileContents();
-			await writer.write(record);
+			const persistedRecord =
+				record.type === "entry_patch"
+					? (prepareEntryForPersistenceSync(
+							materializeResidentEntryForPersistenceSync(
+								record as unknown as FileEntry,
+								this.#residentBlobStores(),
+								new Map(),
+							),
+							this.#blobStore,
+						) as unknown as SessionPatchRecord)
+					: record;
+			await writer.write(persistedRecord);
 		});
 	}
 
@@ -6495,6 +6526,7 @@ export class SessionManager {
 			return { kind: "error", reason: "identity-mismatch" };
 		}
 		writeTerminalBreadcrumb(manager.cwd, sessionPath);
+		if (manager.sanitizeLoadedOpenAIResponsesReplayMetadata(true)) await manager.flush();
 		return { kind: "opened", manager };
 	}
 

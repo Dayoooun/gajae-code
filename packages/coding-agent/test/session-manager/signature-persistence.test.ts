@@ -135,6 +135,7 @@ describe("SessionManager signature persistence", () => {
 
 	it("rehydrates assistant replay metadata with an append-only patch", async () => {
 		using tempDir = TempDir.createSync("@pi-session-rehydrate-persistence-");
+		const thinking = "reasoning".repeat(200);
 		const session = SessionManager.create(tempDir.path(), tempDir.path());
 		const providerPayload = {
 			type: "openaiResponsesHistory" as const,
@@ -155,7 +156,7 @@ describe("SessionManager signature persistence", () => {
 		session.appendMessage({
 			role: "assistant",
 			content: [
-				{ type: "thinking", thinking: "reasoning", thinkingSignature: JSON.stringify(providerPayload.items[0]) },
+				{ type: "thinking", thinking, thinkingSignature: JSON.stringify(providerPayload.items[0]) },
 				{ type: "text", text: "done" },
 			],
 			api: "openai-responses",
@@ -186,7 +187,7 @@ describe("SessionManager signature persistence", () => {
 		expect(assistant.providerPayload).toBeUndefined();
 		expect(assistant.content[0]).toMatchObject({
 			type: "thinking",
-			thinking: "reasoning",
+			thinking,
 			thinkingSignature: undefined,
 		});
 		const persistedAfter = await fs.readFile(sessionFile, "utf8");
@@ -196,5 +197,9 @@ describe("SessionManager signature persistence", () => {
 		expect(patch.patch.message).not.toHaveProperty("providerPayload");
 		expect(patch.patch.message.content[0]).not.toHaveProperty("thinkingSignature");
 		await reloaded.close();
+		await reloaded.close();
+		const reopened = await SessionManager.open(sessionFile);
+		expect(getAssistantMessage(reopened).content[0]).toMatchObject({ type: "thinking", thinking });
+		await reopened.close();
 	});
 });

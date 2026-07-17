@@ -140,6 +140,9 @@ describe("SessionManager.moveTo", () => {
 		const header = getHeader(entries);
 		expect(header?.cwd).toBe(path.resolve(cwdB));
 		expect(hasAssistantEntry(entries)).toBe(true);
+		const reopened = await SessionManager.open(newFile);
+		expect(reopened.getCwd()).toBe(path.resolve(cwdB));
+		await reopened.close();
 	});
 
 	it("does not replace an existing destination transcript", async () => {

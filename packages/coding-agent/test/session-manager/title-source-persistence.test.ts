@@ -104,6 +104,8 @@ describe("session title source persistence", () => {
 			title: "Patched title",
 			titleSource: "user",
 		});
+		const listed = await SessionManager.listForResumePickerReadOnly(cwd, path.dirname(sessionFile));
+		expect(listed.find(candidate => candidate.path === sessionFile)?.title).toBe("Patched title");
 
 		const v3 = [
 			{ type: "session", version: 3, id: "old", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/old" },
