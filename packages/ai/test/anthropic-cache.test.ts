@@ -126,4 +126,31 @@ describe("Anthropic prompt cache breakpoints", () => {
 			ttl: "1h",
 		});
 	});
+
+	it("normalizes an invalid five-minute then one-hour cache-control sequence", () => {
+		const params = {
+			model: model.id,
+			max_tokens: 1,
+			stream: true,
+			system: [{ type: "text", text: "Five-minute cache", cache_control: { type: "ephemeral" } }],
+			messages: [
+				{
+					role: "user",
+					content: [
+						{
+							type: "text",
+							text: "Invalid later one-hour cache",
+							cache_control: { type: "ephemeral", ttl: "1h" },
+						},
+					],
+				},
+			],
+		} as MessageCreateParamsStreaming;
+
+		normalizeCacheControlTtlOrdering(params);
+
+		expect((params.messages[0]?.content as Array<{ cache_control?: CacheControl }>)[0]?.cache_control).toEqual({
+			type: "ephemeral",
+		});
+	});
 });
