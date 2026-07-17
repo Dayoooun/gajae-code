@@ -373,7 +373,7 @@ describe("SessionManager read-only resume", () => {
 		});
 	});
 
-	it("preserves inspected migration state until the first persistence rewrite", async () => {
+	it("preserves inspected migration state until the first v4 persistence rewrite", async () => {
 		const storage = new WriteTrackingStorage();
 		const filePath = "/sessions/legacy-v2.jsonl";
 		const header = {
@@ -408,7 +408,7 @@ describe("SessionManager read-only resume", () => {
 			.trim()
 			.split("\n")
 			.map(line => JSON.parse(line));
-		expect(rewritten[0]).toMatchObject({ type: "session", version: 3 });
+		expect(rewritten[0]).toMatchObject({ type: "session", version: 4 });
 		expect(rewritten).toHaveLength(3);
 		expect(rewritten.every(line => line.type === "session" || typeof line.id === "string")).toBe(true);
 	});

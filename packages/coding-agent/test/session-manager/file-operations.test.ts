@@ -131,6 +131,65 @@ describe("getRecentSessions", () => {
 		expect(sessions).toHaveLength(5);
 		expect(sessions.map(session => session.name)).toContain("Recent Session 4");
 	});
+
+	it("replays trailing header patches for transcripts larger than the listing prefix", async () => {
+		const file = path.join(tempDir, "patched-large.jsonl");
+		const header = { type: "session", id: "patched-large", timestamp: "2025-01-01T00:00:00Z", cwd: "/stale" };
+		const largeMessage = {
+			type: "message",
+			id: "message",
+			parentId: null,
+			timestamp: "2025-01-01T00:00:01Z",
+			message: { role: "user", content: "x".repeat(5_000), timestamp: 1 },
+		};
+		const patches = [
+			{ type: "header_patch", patch: { title: "Patched title" } },
+			{ type: "header_patch", patch: { cwd: "/patched-cwd" } },
+		];
+		fs.writeFileSync(file, `${[header, largeMessage, ...patches].map(entry => JSON.stringify(entry)).join("\n")}\n`);
+
+		const [session] = await getRecentSessions(tempDir);
+
+		expect(session?.name).toBe("Patched title");
+	});
+
+	it("replays oversized and separated strict header patches in both listing paths", async () => {
+		const file = path.join(tempDir, "patched-oversized.jsonl");
+		const title = `Patched ${"title".repeat(1_200)}`;
+		const records = [
+			{
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: "patched-oversized",
+				timestamp: "2025-01-01T00:00:00Z",
+				cwd: "/stale",
+			},
+			{
+				type: "message",
+				id: "one",
+				parentId: null,
+				timestamp: "2025-01-01T00:00:01Z",
+				message: { role: "user", content: "x".repeat(5_000), timestamp: 1 },
+			},
+			{ type: "header_patch", patch: { title } },
+			{
+				type: "message",
+				id: "two",
+				parentId: "one",
+				timestamp: "2025-01-01T00:00:02Z",
+				message: { role: "user", content: "y".repeat(5_000), timestamp: 2 },
+			},
+			{ type: "header_patch", patch: { cwd: "/patched-cwd" } },
+			{ type: "header_patch", patch: { title: "malformed", unexpected: true } },
+		];
+		fs.writeFileSync(file, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+
+		const [recent] = await getRecentSessions(tempDir);
+		const [listed] = await SessionManager.list("/patched-cwd", tempDir);
+
+		expect(recent?.name).toBe(title);
+		expect(listed).toMatchObject({ id: "patched-oversized", title, cwd: "/patched-cwd" });
+	});
 });
 
 describe("resolveResumableSession", () => {
@@ -442,7 +501,7 @@ describe("SessionManager legacy session migration persistence", () => {
 		if (!header) throw new Error("Expected session header");
 
 		expect(fs.statSync(sessionFile).mtimeMs).toBeGreaterThan(initialMtimeMs);
-		expect(header.version).toBe(3);
+		expect(header.version).toBe(CURRENT_SESSION_VERSION);
 		expect(persistedEntries).toHaveLength(4);
 		for (const entry of persistedEntries.filter(entry => entry.type !== "session")) {
 			expect(entry.id).toBeDefined();
@@ -473,7 +532,7 @@ describe("SessionManager legacy session migration persistence", () => {
 		if (!header) throw new Error("Expected session header");
 
 		expect(fs.statSync(sessionFile).mtimeMs).toBeGreaterThan(initialMtimeMs);
-		expect(header.version).toBe(3);
+		expect(header.version).toBe(CURRENT_SESSION_VERSION);
 		expect(persistedEntries).toHaveLength(2);
 		expect(persistedEntries[1]?.type).toBe("message");
 		if (persistedEntries[1]?.type !== "message") throw new Error("Expected message entry");
@@ -505,7 +564,7 @@ describe("SessionManager legacy session migration persistence", () => {
 		if (!header) throw new Error("Expected session header");
 
 		expect(fs.statSync(sessionFile).mtimeMs).toBeGreaterThan(initialMtimeMs);
-		expect(header.version).toBe(3);
+		expect(header.version).toBe(CURRENT_SESSION_VERSION);
 		expect(persistedEntries).toHaveLength(2);
 		expect(persistedEntries[1]?.type).toBe("message");
 		if (persistedEntries[1]?.type !== "message") throw new Error("Expected message entry");
