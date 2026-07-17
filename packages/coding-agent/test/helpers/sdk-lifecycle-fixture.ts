@@ -235,6 +235,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 	const agentDir = path.join(repo, ".gjc", "agent");
 	const stateRoot = path.join(repo, ".gjc", "state");
 	const environment = createFixtureBrokerEnvironment(repo, agentDir);
+
 	const started = await startFixtureBrokerWithLeaseForTest({ agentDir, env: environment });
 	const cleanup = createFixtureRootCleanup(repo, agentDir, started.lease);
 	return {

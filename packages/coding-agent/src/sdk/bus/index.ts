@@ -922,8 +922,6 @@ interface SessionRuntime {
 	inFlightTools: Map<string, { toolName: string; args: unknown }>;
 	/** Cancels the postmortem cleanup that emits `session_closed` on process teardown. */
 	cancelPostmortemCleanup: () => void;
-	/** Stops optional broker presence heartbeats. */
-	stopBrokerHeartbeat: () => void;
 }
 
 const SENSITIVE_MODEL_LABEL =
@@ -2438,9 +2436,6 @@ export function createNotificationsExtension(
 			rt.cancelPostmortemCleanup();
 		} catch {}
 		try {
-			rt.stopBrokerHeartbeat();
-		} catch {}
-		try {
 			rt.disposeAnswerSource();
 		} catch {}
 		try {
@@ -2601,7 +2596,6 @@ export function createNotificationsExtension(
 		}
 		const gatePresentations = new PresentationArbiter(server, () => runtime?.redact ?? redact, tag);
 		let inboundSdkFrame: ((connectionId: string, frame: Record<string, unknown>) => void) | undefined;
-		let stopBrokerHeartbeat = () => {};
 		const inFlightGateResolutions = new Set<Promise<void>>();
 		const trackGateResolution = <T>(resolution: Promise<T>): Promise<T> => {
 			const quiesced = resolution.then(
@@ -3026,7 +3020,6 @@ export function createNotificationsExtension(
 			gatePresentations,
 			stopping: false,
 			cancelPostmortemCleanup: () => {},
-			stopBrokerHeartbeat,
 
 			redact,
 			verbosity,
@@ -3504,25 +3497,14 @@ export function createNotificationsExtension(
 					});
 					throwIfLifecycleStopped();
 					runtime.brokerRegistrationActive = true;
-					const timer = setInterval(() => {
-						void index
-							.append({
-								type: "host_heartbeat",
-								sessionId: id,
-								locator,
-								endpointGeneration: host.generation,
-								pid: process.pid,
-							})
-							.catch(error => logger.warn(`sdk broker heartbeat failed: ${String(error)}`));
-					}, 5_000);
-					stopBrokerHeartbeat = () => clearInterval(timer);
+					// Host liveness is derived from alive(pid) when the index is read; heartbeats
+					// are deliberately not appended to the durable session index.
 				} catch (brokerError) {
 					if (lifecycleRequired) throw brokerError;
 					logger.warn(`sdk broker registration skipped: ${String(brokerError)}`);
 				}
 			}
 
-			runtime.stopBrokerHeartbeat = stopBrokerHeartbeat;
 			const startedRuntime = runtime;
 			runtime.enableNotifications = () => {
 				const runtime = startedRuntime;

@@ -74,6 +74,7 @@ import {
 	sanitizeRehydratedOpenAIResponsesAssistantMessage,
 	stripInternalDetailsFields,
 } from "./messages";
+import { type SessionManagerReadAccess, sessionManagerReadCapability } from "./session-manager-internal";
 import type {
 	SessionStorage,
 	SessionStorageSnapshot,
@@ -819,7 +820,12 @@ export function parseSessionEntries(content: string): FileEntry[] {
 }
 
 function isHeaderPatchRecord(record: SessionPatchRecord): record is HeaderPatchRecord {
-	if (record.type !== "header_patch" || !record.patch || typeof record.patch !== "object") return false;
+	if (
+		record.type !== "header_patch" ||
+		!isRecord(record.patch) ||
+		!Object.keys(record).every(key => key === "type" || key === "patch")
+	)
+		return false;
 	const keys = Object.keys(record.patch);
 	if (!keys.every(key => key === "cwd" || key === "title" || key === "titleSource")) return false;
 	const { cwd, title, titleSource } = record.patch;
@@ -840,10 +846,10 @@ function isEntryPatchRecord(record: SessionPatchRecord): record is EntryPatchRec
 	return (
 		record.type === "entry_patch" &&
 		typeof record.entryId === "string" &&
-		record.patch !== null &&
-		typeof record.patch === "object" &&
-		(record.patch.message === undefined ||
-			(typeof record.patch.message === "object" && record.patch.message !== null))
+		isRecord(record.patch) &&
+		Object.keys(record).every(key => key === "type" || key === "entryId" || key === "patch") &&
+		Object.keys(record.patch).every(key => key === "message") &&
+		(record.patch.message === undefined || isRecord(record.patch.message))
 	);
 }
 
@@ -1181,6 +1187,18 @@ function cloneSessionContext(context: SessionContext): SessionContext {
 		selectedMCPToolNames: [...context.selectedMCPToolNames],
 		modeData: cloneJsonSemantic(context.modeData),
 	};
+}
+
+function freezeInternalReadSnapshot<T>(value: T): T {
+	if (process.env.NODE_ENV !== "test" && process.env.NODE_ENV !== "development") return value;
+	const copy = cloneJsonSemantic(value);
+	const freeze = (item: unknown): void => {
+		if (!item || typeof item !== "object" || Object.isFrozen(item)) return;
+		for (const child of Object.values(item as Record<string, unknown>)) freeze(child);
+		Object.freeze(item);
+	};
+	freeze(copy);
+	return copy;
 }
 
 /** Resolve and prepare the default v2 session scope before any managed writer exists. */
@@ -1767,11 +1785,15 @@ async function getSortedSessions(sessionDir: string, storage: SessionStorage): P
 		await Promise.all(
 			files.map(async (path: string) => {
 				try {
-					const content = await storage.readTextPrefix(path, 4096);
+					const buffer = Buffer.allocUnsafe(SESSION_LIST_PREFIX_BYTES);
+					const content = await readSessionListPrefix(path, storage, buffer);
 					const entries = parseJsonlLenient<Record<string, unknown>>(content);
 					if (entries.length === 0) return;
 					const header = entries[0] as Record<string, unknown>;
 					if (header.type !== "session" || typeof header.id !== "string") return;
+					for (const patch of await readSessionListTrailingPatches(path, storage, buffer)) {
+						applySessionListHeaderPatch(header as unknown as SessionListHeader, patch);
+					}
 					const mtime = storage.statSync(path).mtimeMs;
 					const firstPrompt = header.title ? undefined : extractFirstUserPrompt(entries);
 					sessions.push(new RecentSessionInfo(path, mtime, header, firstPrompt));
@@ -2376,19 +2398,12 @@ function cloneJsonSemantic<T>(value: T): T {
 	return cloned as T;
 }
 
-function cloneAgentMessage<T extends AgentMessage>(message: T): T {
-	const cloned = {
-		...message,
-		...("content" in message ? { content: cloneJsonSemantic(message.content) } : {}),
-		...("providerPayload" in message ? { providerPayload: cloneJsonSemantic(message.providerPayload) } : {}),
-	} as T;
-	transferSessionMessageIdentity([message], [cloned]);
-	return cloned;
-}
-
 function cloneSessionEntry(entry: SessionEntry): SessionEntry {
-	if (entry.type !== "message") return { ...entry };
-	return { ...entry, message: cloneAgentMessage(entry.message) } as SessionEntry;
+	const cloned = cloneJsonSemantic(entry);
+	if (entry.type === "message" && cloned.type === "message") {
+		transferSessionMessageIdentity([entry.message], [cloned.message]);
+	}
+	return cloned;
 }
 
 function materializeProviderVisibleEntrySync(entry: SessionEntry, stores: ResidentBlobStores): SessionEntry {
@@ -3221,6 +3236,8 @@ function extractTextFromContent(content: Message["content"]): string {
 }
 
 const SESSION_LIST_PREFIX_BYTES = 4096;
+const SESSION_LIST_TRAILING_PATCH_BYTES = 4096;
+
 const SESSION_LIST_PARALLEL_THRESHOLD = 64;
 const SESSION_LIST_MAX_WORKERS = 16;
 const sessionListPrefixDecoder = new TextDecoder("utf-8", { fatal: false });
@@ -3238,6 +3255,69 @@ async function readSessionListPrefix(file: string, storage: SessionStorage, buff
 	} finally {
 		await handle.close();
 	}
+}
+
+async function readSessionListTrailingPatches(
+	file: string,
+	storage: SessionStorage,
+	buffer: Buffer,
+): Promise<HeaderPatchRecord["patch"][]> {
+	if (!(storage instanceof FileSessionStorage)) {
+		const content = await storage.readText(file);
+		const entries = parseSessionEntries(content);
+		const header = entries[0] as SessionHeader | undefined;
+		return header?.type === "session" ? [{ cwd: header.cwd, title: header.title }] : [];
+	}
+
+	const size = storage.statSync(file).size;
+	if (size <= SESSION_LIST_PREFIX_BYTES) return [];
+	const latest: HeaderPatchRecord["patch"] = {};
+	let position = size;
+	let trailingFragment = Buffer.alloc(0);
+	const chunkSize = Math.min(buffer.byteLength, SESSION_LIST_TRAILING_PATCH_BYTES);
+	const handle = await fs.promises.open(file, "r");
+	try {
+		while (position > 0 && (latest.cwd === undefined || latest.title === undefined)) {
+			const start = Math.max(0, position - chunkSize);
+			const length = position - start;
+			const { bytesRead } = await handle.read(buffer, 0, length, start);
+			const combined = Buffer.concat([buffer.subarray(0, bytesRead), trailingFragment]);
+			let complete = combined;
+			if (start > 0) {
+				const firstNewline = combined.indexOf(0x0a);
+				if (firstNewline === -1) {
+					trailingFragment = combined;
+					position = start;
+					continue;
+				}
+				trailingFragment = combined.subarray(0, firstNewline);
+				complete = combined.subarray(firstNewline + 1);
+			}
+			const lines = complete.toString("utf8").split("\n");
+			for (let index = lines.length - 1; index >= 0; index--) {
+				const line = lines[index];
+				if (!line) continue;
+				try {
+					const record = JSON.parse(line) as SessionPatchRecord;
+					if (!isHeaderPatchRecord(record)) continue;
+					if (latest.cwd === undefined && typeof record.patch.cwd === "string") latest.cwd = record.patch.cwd;
+					if (latest.title === undefined && typeof record.patch.title === "string")
+						latest.title = record.patch.title;
+				} catch {
+					// Ignore malformed or partial records exactly as the canonical loader does.
+				}
+			}
+			position = start;
+		}
+		return latest.cwd === undefined && latest.title === undefined ? [] : [latest];
+	} finally {
+		await handle.close();
+	}
+}
+
+function applySessionListHeaderPatch(header: SessionListHeader, patch: HeaderPatchRecord["patch"]): void {
+	if (typeof patch.cwd === "string") header.cwd = patch.cwd;
+	if (typeof patch.title === "string") header.title = patch.title;
 }
 
 function decodeJsonStringFragment(value: string): string {
@@ -3381,6 +3461,9 @@ async function collectSessionFromFile(
 		const entries = parseSessionEntries(content).map(entry => entry as unknown as Record<string, unknown>);
 		const header = parseSessionListHeader(content, entries);
 		if (!header) return undefined;
+		for (const patch of await readSessionListTrailingPatches(file, storage, buffer)) {
+			applySessionListHeaderPatch(header, patch);
+		}
 
 		let parsedMessageCount = 0;
 		let firstMessage = "";
@@ -3578,7 +3661,7 @@ export class SessionManager {
 	#replayMetadataRevision = 0;
 	#materializedEntriesRevision = -1;
 	#materializedEntriesCache: SessionEntry[] | undefined;
-	#sessionContextCache: WeakRef<SessionContext> | undefined;
+	#sessionContextCache: SessionContext | undefined;
 	#sessionContextEntryRevision = -1;
 	#sessionContextLeafRevision = -1;
 	#sessionContextReplayMetadataRevision = -1;
@@ -3592,6 +3675,11 @@ export class SessionManager {
 	#getEntriesMaterializerCallCount = 0;
 	#materializedEntriesCachePopulateCount = 0;
 	#pathOnlyContextBuildCount = 0;
+	#internalReadAccess: SessionManagerReadAccess = {
+		getEntries: () => freezeInternalReadSnapshot(this.#getMaterializedEntriesInternal()),
+		getSessionContext: () => this.#getSessionContextForRead(),
+		getTree: () => this.#getTree(freezeInternalReadSnapshot(this.#getMaterializedEntriesInternal())),
+	};
 
 	private constructor(
 		private cwd: string,
@@ -3766,20 +3854,19 @@ export class SessionManager {
 	}
 
 	async #hydrateExistingSession(sessionFile: string, entries: FileEntry[], migrationApplied: boolean): Promise<void> {
-		const header = entries[0] as SessionHeader;
+		const ownedEntries = structuredClone(entries) as FileEntry[];
+		const header = ownedEntries[0] as SessionHeader;
 		this.#sessionFile = this.storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		this.#sessionId = header.id;
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		this.#needsFullRewriteOnNextPersist = migrationApplied;
-
-		await resolveBlobRefsInEntries(entries, this.#blobStore);
-		this.#fileEntries = entries;
+		await resolveBlobRefsInEntries(ownedEntries, this.#blobStore);
+		this.#fileEntries = ownedEntries;
 		this.#resetResidentTextBlobStore();
 		this.#fileEntries = this.#fileEntries.map(entry =>
 			prepareEntryForResidentSync(entry, this.#residentBlobStores()),
 		);
-		this.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		this.#buildIndex();
 		this.#bumpAllRevisions();
 		this.#flushed = true;
@@ -3818,7 +3905,7 @@ export class SessionManager {
 			this.#bumpAllRevisions();
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
-			this.sanitizeLoadedOpenAIResponsesReplayMetadata(true);
+			await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 		} else {
 			const explicitPath = this.#sessionFile;
 			this.#newSessionSync();
@@ -3938,6 +4025,10 @@ export class SessionManager {
 	async moveTo(newCwd: string): Promise<void> {
 		const resolvedCwd = path.resolve(newCwd);
 		if (resolvedCwd === this.cwd) return;
+		const previousCwd = this.cwd;
+		const previousSessionDir = this.sessionDir;
+		const previousSessionFile = this.#sessionFile;
+		const previousArtifactDir = previousSessionFile?.slice(0, -6);
 
 		const managedSessionsRoot =
 			this.storage instanceof FileSessionStorage ? resolveManagedSessionRoot(this.sessionDir, this.cwd) : undefined;
@@ -4043,21 +4134,63 @@ export class SessionManager {
 			this.#bumpAllRevisions();
 		}
 
-		// Update cwd and sessionDir after the move succeeds.
+		// Update cwd and sessionDir after the physical move succeeds, but roll the move back if metadata persistence fails.
 		this.cwd = resolvedCwd;
 		this.sessionDir = newSessionDir;
 
 		const hasAssistant = this.#fileEntries.some(e => e.type === "message" && e.message.role === "assistant");
-		if (this.persist && this.#sessionFile && hadSessionFile) {
-			this.#appendHeaderPatch({ cwd: resolvedCwd });
-		} else if (this.persist && this.#sessionFile && hasAssistant) {
-			this.#appendHeaderPatch({ cwd: resolvedCwd });
-			await this.#rewriteFile();
-		} else {
-			this.#appendHeaderPatch({ cwd: resolvedCwd });
+		try {
+			if (this.persist && this.#sessionFile && hadSessionFile) {
+				await this.#appendHeaderPatch({ cwd: resolvedCwd });
+				await this.#rewriteFile();
+			} else if (this.persist && this.#sessionFile && hasAssistant) {
+				await this.#appendHeaderPatch({ cwd: resolvedCwd });
+				await this.#rewriteFile();
+			} else {
+				await this.#appendHeaderPatch({ cwd: resolvedCwd });
+			}
+		} catch (error) {
+			const failedSessionFile = this.#sessionFile;
+			const failedArtifactDir = failedSessionFile?.slice(0, -6);
+			try {
+				await this.#closePersistWriter().catch(() => {});
+				this.#persistChain = Promise.resolve();
+				this.#persistError = undefined;
+				this.#persistErrorReported = false;
+				if (
+					this.storage instanceof FileSessionStorage &&
+					failedArtifactDir &&
+					previousArtifactDir &&
+					failedArtifactDir !== previousArtifactDir &&
+					fs.existsSync(failedArtifactDir)
+				) {
+					await movePathAcrossDevicesSafe(failedArtifactDir, previousArtifactDir);
+				}
+				if (
+					this.storage instanceof FileSessionStorage &&
+					failedSessionFile &&
+					previousSessionFile &&
+					failedSessionFile !== previousSessionFile &&
+					fs.existsSync(failedSessionFile)
+				) {
+					await movePathAcrossDevicesSafe(failedSessionFile, previousSessionFile);
+				}
+				this.#sessionFile = previousSessionFile;
+				this.cwd = previousCwd;
+				this.sessionDir = previousSessionDir;
+				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+				if (header) applyHeaderPatch(header, { cwd: previousCwd });
+				this.#headerExportRevision++;
+				if (previousSessionFile && this.storage.existsSync(previousSessionFile)) await this.#rewriteFile();
+			} catch (rollbackError) {
+				throw new Error(`Failed to rollback session move: ${toError(rollbackError).message}`, {
+					cause: toError(error),
+				});
+			}
+			throw error;
 		}
 
-		// Update terminal breadcrumb
+		// Update terminal breadcrumb only after the durable cwd transition succeeds.
 		if (this.#sessionFile) {
 			writeTerminalBreadcrumb(resolvedCwd, this.#sessionFile);
 		}
@@ -5326,7 +5459,9 @@ export class SessionManager {
 	getLeafEntry(): SessionEntry | undefined {
 		if (!this.#leafId) return undefined;
 		const entry = this.#byId.get(this.#leafId);
-		return entry ? materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()) : undefined;
+		return entry
+			? cloneSessionEntry(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()))
+			: undefined;
 	}
 
 	getResidentImageBytes(): number {
@@ -5511,10 +5646,12 @@ export class SessionManager {
 	getEntryForFidelity(id: string): SessionEntry | undefined {
 		const entry = this.#byId.get(id);
 		return entry
-			? rehydrateColdSpillEntry(
-					materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()),
-					this.#blobStore,
-					this.#residentBlobStoresForColdRehydrate(),
+			? cloneSessionEntry(
+					rehydrateColdSpillEntry(
+						materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()),
+						this.#blobStore,
+						this.#residentBlobStoresForColdRehydrate(),
+					),
 				)
 			: undefined;
 	}
@@ -5528,10 +5665,12 @@ export class SessionManager {
 			if (visited.has(current.id)) break;
 			visited.add(current.id);
 			path.push(
-				rehydrateColdSpillEntry(
-					materializeResidentEntryForReadSync(current, this.#residentBlobStores(), cache),
-					this.#blobStore,
-					this.#residentBlobStoresForColdRehydrate(),
+				cloneSessionEntry(
+					rehydrateColdSpillEntry(
+						materializeResidentEntryForReadSync(current, this.#residentBlobStores(), cache),
+						this.#blobStore,
+						this.#residentBlobStoresForColdRehydrate(),
+					),
 				),
 			);
 			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
@@ -5568,10 +5707,12 @@ export class SessionManager {
 		return this.#fileEntries
 			.filter((entry): entry is SessionEntry => entry.type !== "session")
 			.map(entry =>
-				rehydrateColdSpillEntry(
-					materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache),
-					this.#blobStore,
-					this.#residentBlobStoresForColdRehydrate(),
+				cloneSessionEntry(
+					rehydrateColdSpillEntry(
+						materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache),
+						this.#blobStore,
+						this.#residentBlobStoresForColdRehydrate(),
+					),
 				),
 			);
 	}
@@ -5580,7 +5721,9 @@ export class SessionManager {
 		this.#publicMaterializerCallCount++;
 		this.#getEntryMaterializerCallCount++;
 		const entry = this.#byId.get(id);
-		return entry ? materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()) : undefined;
+		return entry
+			? cloneSessionEntry(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()))
+			: undefined;
 	}
 
 	/**
@@ -5591,7 +5734,9 @@ export class SessionManager {
 		const children: SessionEntry[] = [];
 		for (const entry of this.#byId.values()) {
 			if (entry.parentId === parentId) {
-				children.push(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache));
+				children.push(
+					cloneSessionEntry(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache)),
+				);
 			}
 		}
 		return children;
@@ -5646,7 +5791,7 @@ export class SessionManager {
 		while (current) {
 			if (visited.has(current.id)) break;
 			visited.add(current.id);
-			path.push(materializeResidentEntryForReadSync(current, this.#residentBlobStores(), cache));
+			path.push(cloneSessionEntry(materializeResidentEntryForReadSync(current, this.#residentBlobStores(), cache)));
 			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
 		}
 		path.reverse();
@@ -5657,15 +5802,26 @@ export class SessionManager {
 	 * Build the session context (what gets sent to the LLM).
 	 * Uses tree traversal from current leaf.
 	 */
+	/**
+	 * Return a defensive context snapshot for public consumers.
+	 */
 	buildSessionContext(): SessionContext {
-		const cached = this.#sessionContextCache?.deref();
+		return cloneSessionContext(this.#getSessionContextForRead());
+	}
+
+	/**
+	 * Return the revision-keyed context cache for internal read-only consumers.
+	 * The strong reference avoids GC-driven rebuilds during a session.
+	 */
+	#getSessionContextForRead(): Readonly<SessionContext> {
+		const cached = this.#sessionContextCache;
 		if (
 			cached &&
 			this.#sessionContextEntryRevision === this.#entryRevision &&
 			this.#sessionContextLeafRevision === this.#leafRevision &&
 			this.#sessionContextReplayMetadataRevision === this.#replayMetadataRevision
 		) {
-			return cloneSessionContext(cached);
+			return cached;
 		}
 		this.#pathOnlyContextBuildCount++;
 		const context = buildSessionContext(
@@ -5674,11 +5830,12 @@ export class SessionManager {
 			undefined,
 			this.#sessionId,
 		);
-		this.#sessionContextCache = new WeakRef(context);
+		this.#sessionContextCache = freezeInternalReadSnapshot(context);
+		transferSessionMessageIdentity(context.messages, this.#sessionContextCache.messages);
 		this.#sessionContextEntryRevision = this.#entryRevision;
 		this.#sessionContextLeafRevision = this.#leafRevision;
 		this.#sessionContextReplayMetadataRevision = this.#replayMetadataRevision;
-		return cloneSessionContext(context);
+		return this.#sessionContextCache;
 	}
 
 	#getActivePathEntriesForProviderContext(fromId?: string | null): SessionEntry[] {
@@ -5733,24 +5890,33 @@ export class SessionManager {
 		const marker = entry.type === "message" || entry.type === "custom_message" ? entry.evictedContent : undefined;
 		return marker ? Object.keys(marker.payloads ?? {}).length : 0;
 	}
-	/** Strip stale OpenAI Responses assistant replay metadata from loaded in-memory entries. */
-	sanitizeLoadedOpenAIResponsesReplayMetadata(persistPatches = false): boolean {
-		let didSanitize = false;
+	/** Strip stale OpenAI Responses assistant replay metadata from loaded in-memory entries without persisting it. */
+	sanitizeLoadedOpenAIResponsesReplayMetadata(): boolean {
+		return this.#sanitizeLoadedOpenAIResponsesReplayMetadata().length > 0;
+	}
+
+	async #sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist(): Promise<boolean> {
+		const patches = this.#sanitizeLoadedOpenAIResponsesReplayMetadata();
+		for (const patch of patches) {
+			await this.#persistPatch(patch);
+		}
+		return patches.length > 0;
+	}
+
+	#sanitizeLoadedOpenAIResponsesReplayMetadata(): EntryPatchRecord[] {
+		const patches: EntryPatchRecord[] = [];
 		for (const entry of this.#fileEntries) {
 			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
 			const sanitizedMessage = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
 			if (sanitizedMessage === entry.message) continue;
 			entry.message = sanitizedMessage;
-			if (persistPatches) {
-				this.#persistPatch({ type: "entry_patch", entryId: entry.id, patch: { message: sanitizedMessage } });
-			}
-			didSanitize = true;
+			patches.push({ type: "entry_patch", entryId: entry.id, patch: { message: sanitizedMessage } });
 		}
-		if (didSanitize) {
+		if (patches.length > 0) {
 			this.#bumpEntryRevision();
 			this.#replayMetadataRevision++;
 		}
-		return didSanitize;
+		return patches;
 	}
 
 	/**
@@ -5762,9 +5928,7 @@ export class SessionManager {
 	}
 
 	/**
-	 * Get all session entries (excludes header). Returns a shallow copy.
-	 * The session is append-only: use appendXXX() to add entries, branch() to
-	 * change the leaf pointer. Entries cannot be modified or deleted.
+	 * Internal materialized entry cache. Public getters clone this snapshot before returning it.
 	 */
 	#getMaterializedEntriesInternal(): SessionEntry[] {
 		if (this.#materializedEntriesRevision === this.#entryRevision && this.#materializedEntriesCache) {
@@ -5790,12 +5954,14 @@ export class SessionManager {
 	}
 
 	/**
-	 * Get the session as a tree structure. Returns a shallow defensive copy of all entries.
+	 * Get the session as a tree structure. Returns defensive copies of all entries.
 	 * A well-formed session has exactly one root (first entry with parentId === null).
 	 * Orphaned entries (broken parent chain) are also returned as roots.
 	 */
 	getTree(): SessionTreeNode[] {
-		const entries = this.getEntries();
+		return this.#getTree(this.getEntries());
+	}
+	#getTree(entries: readonly SessionEntry[]): SessionTreeNode[] {
 		const nodeMap = new Map<string, SessionTreeNode>();
 		const roots: SessionTreeNode[] = [];
 
@@ -5867,7 +6033,9 @@ export class SessionManager {
 
 		return roots;
 	}
-
+	[sessionManagerReadCapability](): SessionManagerReadAccess {
+		return this.#internalReadAccess;
+	}
 	// =========================================================================
 	// Branching
 	// =========================================================================
@@ -6137,7 +6305,6 @@ export class SessionManager {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
 		const forkEntries = structuredClone(await loadEntriesFromFile(managedSourcePath, storage)) as FileEntry[];
-
 		migrateToCurrentVersion(forkEntries);
 		await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
 		manager.#fileEntries = forkEntries;
@@ -6480,7 +6647,7 @@ export class SessionManager {
 		) {
 			return { kind: "error", reason: "identity-mismatch" };
 		}
-		const entries = structuredClone(inspected.entries) as FileEntry[];
+		const entries = inspected.entries;
 		const header = entries[0] as SessionHeader;
 		const dir = sessionDir ?? path.resolve(sessionPath, "..");
 		const manager = new SessionManager(header.cwd || getProjectDir(), dir, true, storage);
@@ -6494,6 +6661,7 @@ export class SessionManager {
 			await manager.close();
 			return { kind: "error", reason: "identity-mismatch" };
 		}
+		await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 		writeTerminalBreadcrumb(manager.cwd, sessionPath);
 		return { kind: "opened", manager };
 	}

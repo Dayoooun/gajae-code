@@ -2,6 +2,15 @@ import { describe, expect, it } from "bun:test";
 import { recoverOrphanedBackups, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { MemorySessionStorage } from "@gajae-code/coding-agent/session/session-storage";
 
+class FsCodeError extends Error {
+	constructor(
+		readonly code: string,
+		message: string,
+	) {
+		super(message);
+	}
+}
+
 class RenameTrackingStorage extends MemorySessionStorage {
 	renames = 0;
 
@@ -9,6 +18,34 @@ class RenameTrackingStorage extends MemorySessionStorage {
 		this.renames++;
 		return super.rename(source, target);
 	}
+}
+
+class AsyncRenameEpermStorage extends MemorySessionStorage {
+	mode: "recover" | "rollback-failure" | undefined;
+
+	override rename(source: string, target: string): Promise<void> {
+		if (this.mode && source.includes(".tmp") && target.endsWith(".jsonl")) {
+			if (this.mode === "recover") {
+				this.mode = undefined;
+				return Promise.reject(new FsCodeError("EPERM", "initial replacement rejected"));
+			}
+			if (!this.existsSync(target)) {
+				return Promise.reject(new Error("replacement retry rejected"));
+			}
+			return Promise.reject(new FsCodeError("EPERM", "initial replacement rejected"));
+		}
+		if (this.mode === "rollback-failure" && source.endsWith(".bak") && target.endsWith(".jsonl")) {
+			return Promise.reject(new Error("rollback rejected"));
+		}
+		return super.rename(source, target);
+	}
+}
+
+async function appendPersistedSession(storage: MemorySessionStorage): Promise<SessionManager> {
+	const session = SessionManager.create("/cwd", "/sessions", storage);
+	session.appendMessage({ role: "user", content: "first", timestamp: 1 });
+	await session.ensureOnDisk();
+	return session;
 }
 
 describe("SessionManager append-only header patches", () => {
@@ -35,6 +72,40 @@ describe("SessionManager append-only header patches", () => {
 
 		session.appendMessage({ role: "user", content: "after patch", timestamp: Date.now() });
 		await expect(session.flush()).resolves.toBeUndefined();
+	});
+});
+
+describe("SessionManager async atomic rewrite EPERM recovery", () => {
+	it("replaces the transcript after an EPERM overwrite failure", async () => {
+		const storage = new AsyncRenameEpermStorage();
+		const session = await appendPersistedSession(storage);
+		await session.flush();
+		const sessionFile = session.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+
+		storage.mode = "recover";
+		await expect(session.rewriteEntries()).resolves.toBeUndefined();
+
+		expect(storage.readTextSync(sessionFile)).toContain('"content":"first"');
+		expect(storage.listFilesSync("/sessions", "*.bak")).toEqual([]);
+	});
+
+	it("surfaces the original EPERM as the cause when replacement rollback fails", async () => {
+		const storage = new AsyncRenameEpermStorage();
+		const session = await appendPersistedSession(storage);
+		await session.flush();
+
+		storage.mode = "rollback-failure";
+		let thrown: Error | undefined;
+		try {
+			await session.rewriteEntries();
+		} catch (error) {
+			thrown = error as Error;
+		}
+
+		expect(thrown?.message).toContain("rollback from");
+		expect(thrown?.message).toContain("rollback rejected");
+		expect(thrown?.cause).toMatchObject({ code: "EPERM", message: "initial replacement rejected" });
 	});
 });
 

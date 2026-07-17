@@ -152,9 +152,7 @@ class ReplaceAfterSnapshotStorage extends FileSessionStorage {
 		return snapshot;
 	}
 }
-class ReplaceDuringDestinationWriteStorage extends FileSessionStorage {
-	armed = true;
-
+class ReplaceDuringFinalAuthorityInspectionStorage extends FileSessionStorage {
 	constructor(
 		private readonly replacementPath: string,
 		private readonly sourcePath: string,
@@ -162,15 +160,10 @@ class ReplaceDuringDestinationWriteStorage extends FileSessionStorage {
 		super();
 	}
 
-	override openWriter(
-		filePath: string,
-		options?: { flags?: "a" | "w"; onError?: (error: Error) => void },
-	): SessionStorageWriter {
-		if (this.armed && path.resolve(filePath) !== path.resolve(this.sourcePath)) {
-			this.armed = false;
+	override async rename(filePath: string, nextPath: string): Promise<void> {
+		await super.rename(filePath, nextPath);
+		if (path.resolve(nextPath) !== path.resolve(this.sourcePath) && nextPath.endsWith(".jsonl"))
 			fs.renameSync(this.replacementPath, this.sourcePath);
-		}
-		return super.openWriter(filePath, options);
 	}
 }
 
@@ -266,7 +259,7 @@ describe("SessionManager read-only resume", () => {
 		fs.mkdirSync(targetCwd);
 		fs.writeFileSync(sourcePath, sessionText("session-a"));
 		fs.writeFileSync(replacementPath, sessionText("session-b"));
-		const storage = new ReplaceDuringDestinationWriteStorage(replacementPath, sourcePath);
+		const storage = new ReplaceDuringFinalAuthorityInspectionStorage(replacementPath, sourcePath);
 		const captured = SessionManager.captureTranscriptStrict(sourcePath, storage);
 		if (captured.kind !== "captured") throw new Error("Expected strict transcript capture");
 

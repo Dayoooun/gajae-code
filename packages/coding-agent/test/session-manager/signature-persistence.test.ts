@@ -192,6 +192,7 @@ describe("SessionManager signature persistence", () => {
 		const persistedAfter = await fs.readFile(sessionFile, "utf8");
 		expect(persistedAfter.startsWith(persistedBefore)).toBe(true);
 		const patch = JSON.parse(persistedAfter.slice(persistedBefore.length));
+		expect(persistedAfter.slice(persistedBefore.length)).toEndWith("\n");
 		expect(patch).toMatchObject({ type: "entry_patch" });
 		expect(patch.patch.message).not.toHaveProperty("providerPayload");
 		expect(patch.patch.message.content[0]).not.toHaveProperty("thinkingSignature");

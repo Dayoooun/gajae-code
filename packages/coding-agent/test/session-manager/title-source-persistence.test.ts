@@ -9,15 +9,79 @@ import {
 	type SessionHeader,
 	SessionManager,
 } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	FileSessionStorage,
+	type SessionStorageWriter,
+	type SessionStorageWriterOpenOptions,
+} from "@gajae-code/coding-agent/session/session-storage";
 import { getConfigRootDir, parseJsonlLenient, setAgentDir } from "@gajae-code/utils";
 
 import { makeAssistantMessage } from "./helpers";
+
+class FailingHeaderPatchStorage extends FileSessionStorage {
+	failHeaderPatchWrites = false;
+
+	override openWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+		const writer = super.openWriter(path, options);
+		return {
+			writeLine: async line => {
+				if (this.failHeaderPatchWrites && line.includes('"type":"header_patch"')) {
+					throw new Error("header patch write failed");
+				}
+				await writer.writeLine(line);
+			},
+			writeLineSync: line => writer.writeLineSync(line),
+			flush: () => writer.flush(),
+			fsync: () => writer.fsync(),
+			close: () => writer.close(),
+			closeSync: () => writer.closeSync(),
+			getError: () => writer.getError(),
+			getCloseState: () => writer.getCloseState(),
+			getCloseError: () => writer.getCloseError(),
+		};
+	}
+}
 
 function getHeader(entries: unknown[]): SessionHeader | undefined {
 	return entries.find(
 		(entry): entry is SessionHeader =>
 			typeof entry === "object" && entry !== null && "type" in entry && entry.type === "session",
 	);
+}
+
+class FailingPatchStorage extends FileSessionStorage {
+	rewrites = 0;
+	syncRewrites = 0;
+
+	override writeTextSync(filePath: string, content: string): void {
+		this.syncRewrites++;
+		super.writeTextSync(filePath, content);
+	}
+
+	override async writeText(filePath: string, content: string): Promise<void> {
+		this.rewrites++;
+		await super.writeText(filePath, content);
+	}
+
+	override openWriter(
+		filePath: string,
+		options?: { flags?: "a" | "w"; onError?: (error: Error) => void },
+	): SessionStorageWriter {
+		const writer = super.openWriter(filePath, options);
+		return {
+			writeLine: async () => {
+				throw new Error("entry patch failed");
+			},
+			writeLineSync: line => writer.writeLineSync(line),
+			flush: () => writer.flush(),
+			fsync: () => writer.fsync(),
+			close: () => writer.close(),
+			closeSync: () => writer.closeSync(),
+			getError: () => writer.getError(),
+			getCloseState: () => writer.getCloseState(),
+			getCloseError: () => writer.getCloseError(),
+		};
+	}
 }
 
 describe("session title source persistence", () => {
@@ -113,9 +177,15 @@ describe("session title source persistence", () => {
 			.map(record => JSON.stringify(record))
 			.join("\n");
 		expect(parseSessionEntries(v3)[0]).toMatchObject({ version: 3, cwd: "/new", title: "Final title" });
+
+		const ignoredPatches = `${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "strict", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/original" })}\n${JSON.stringify({ type: "message", id: "message", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "original", timestamp: 1 } })}\n${JSON.stringify({ type: "header_patch", patch: { title: "ignored", unexpected: true }, outerUnexpected: true })}\n${JSON.stringify({ type: "entry_patch", entryId: "message", patch: { message: { role: "user", content: "ignored", timestamp: 1 }, unexpected: true }, outerUnexpected: true })}\n`;
+		expect(parseSessionEntries(ignoredPatches)).toMatchObject([
+			{ type: "session", cwd: "/original" },
+			{ type: "message", message: { content: "original" } },
+		]);
 	});
 
-	it("lets legacy readers reject v4 patches before they can edit the base transcript", () => {
+	it("keeps v4 patch records lossless through the pinned pre-v4 reader rewrite", () => {
 		const records = [
 			{ type: "session", version: CURRENT_SESSION_VERSION, id: "v4", timestamp: "2026-01-01T00:00:00.000Z", cwd },
 			{
@@ -134,6 +204,12 @@ describe("session title source persistence", () => {
 		];
 		const content = `${records.map(record => JSON.stringify(record)).join("\n")}\n`;
 		const legacyRecords = parseJsonlLenient<Record<string, unknown>>(content);
+		const pinnedPreV4Commit = "904eab21c3c7991868c740a6563ccd4fbbbbcf84";
+		const rewrittenByPinnedV3Semantics = `${legacyRecords.map(record => JSON.stringify(record)).join("\n")}\n`;
+
+		expect(pinnedPreV4Commit).toHaveLength(40);
+		expect(rewrittenByPinnedV3Semantics).toBe(content);
+		expect(parseSessionEntries(rewrittenByPinnedV3Semantics)[0]).toMatchObject({ title: "patched" });
 
 		expect(legacyRecords[0]?.version).toBeGreaterThan(3);
 		expect(legacyRecords.find(record => record.type === "message")?.message).toEqual({
@@ -180,6 +256,38 @@ describe("session title source persistence", () => {
 		expect(session.getEntries()[0]).toMatchObject({
 			type: "message",
 			message: { providerPayload: undefined, content: [{ thinkingSignature: undefined }] },
+		});
+	});
+
+	it("propagates replay patch failures without rewriting the base transcript", async () => {
+		const sessionFile = path.join(cwd, "replay-patch-failure.jsonl");
+		const base = `${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "replay", timestamp: "2026-01-01T00:00:00.000Z", cwd })}\n${JSON.stringify({ type: "message", id: "assistant", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", message: { role: "assistant", content: [{ type: "thinking", thinking: "private", thinkingSignature: "stale" }], provider: "openai", model: "gpt-5", timestamp: 1, providerPayload: { type: "openaiResponsesHistory", provider: "openai", items: [] }, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } })}\n`;
+		fs.writeFileSync(sessionFile, base);
+		const storage = new FailingPatchStorage();
+
+		await expect(SessionManager.open(sessionFile, cwd, storage)).rejects.toThrow("entry patch failed");
+		expect(fs.readFileSync(sessionFile, "utf8")).toBe(base);
+		expect(storage.rewrites).toBe(0);
+		expect(storage.syncRewrites).toBe(0);
+	});
+
+	describe("moveTo header patch persistence", () => {
+		it("rejects when the moved session cwd patch cannot be written", async () => {
+			const destinationCwd = path.join(testAgentDir, "destination-cwd");
+			fs.mkdirSync(destinationCwd, { recursive: true });
+			const storage = new FailingHeaderPatchStorage();
+			const session = SessionManager.create(cwd, undefined, storage);
+			session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+			session.appendMessage(makeAssistantMessage());
+			await session.flush();
+			const originalFile = session.getSessionFile();
+			expect(originalFile).toBeDefined();
+
+			storage.failHeaderPatchWrites = true;
+			await expect(session.moveTo(destinationCwd)).rejects.toThrow("header patch write failed");
+			expect(session.getCwd()).toBe(cwd);
+			expect(session.getSessionFile()).toBe(originalFile);
+			expect((await loadEntriesFromFile(originalFile!, storage))[0]).toMatchObject({ cwd });
 		});
 	});
 });
