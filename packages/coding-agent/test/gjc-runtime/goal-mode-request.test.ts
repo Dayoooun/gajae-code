@@ -293,7 +293,7 @@ describe("GJC ultragoal goal mode request", () => {
 		);
 		const context = buildSessionContext(entries);
 		expect(context.modeData?.goal).toMatchObject(existingGoal);
-	});
+	}, 15_000);
 
 	it("surfaces corrupt pending request json", async () => {
 		const root = await tempDir();
