@@ -837,7 +837,11 @@ function isHeaderPatchRecord(record: SessionPatchRecord): record is HeaderPatchR
 	const keys = Object.keys(record.patch);
 	if (!keys.every(key => key === "cwd" || key === "title" || key === "titleSource")) return false;
 	const { cwd, title, titleSource } = record.patch;
-	return (cwd === undefined || typeof cwd === "string") && (title === undefined || typeof title === "string") && (titleSource === undefined || titleSource === "auto" || titleSource === "user");
+	return (
+		(cwd === undefined || typeof cwd === "string") &&
+		(title === undefined || typeof title === "string") &&
+		(titleSource === undefined || titleSource === "auto" || titleSource === "user")
+	);
 }
 
 function applyHeaderPatch(header: SessionHeader, patch: HeaderPatchRecord["patch"]): void {
@@ -4169,14 +4173,22 @@ export class SessionManager {
 	async #rewriteFileContents(): Promise<void> {
 		if (!this.persist || !this.#sessionFile) return;
 		await this.#closePersistWriterInternal();
-		const entries = await Promise.all(materializeResidentEntriesForPersistenceSync(this.#fileEntries, this.#residentBlobStores()).map(entry => prepareEntryForPersistence(entry, this.#blobStore)));
+		const entries = await Promise.all(
+			materializeResidentEntriesForPersistenceSync(this.#fileEntries, this.#residentBlobStores()).map(entry =>
+				prepareEntryForPersistence(entry, this.#blobStore),
+			),
+		);
 		await this.#writeEntriesAtomically(entries);
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
 	}
 
-	async #rewriteFile(): Promise<void> { await this.#queuePersistTask(async () => { await this.#rewriteFileContents(); }); }
+	async #rewriteFile(): Promise<void> {
+		await this.#queuePersistTask(async () => {
+			await this.#rewriteFileContents();
+		});
+	}
 
 	#rewriteFileSync(): void {
 		if (!this.persist || !this.#sessionFile) return;
@@ -4611,7 +4623,8 @@ export class SessionManager {
 		if (!this.persist || !this.#sessionFile || !this.storage.existsSync(this.#sessionFile)) return;
 		await this.#queuePersistTask(async () => {
 			const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-			if (this.#needsFullRewriteOnNextPersist || !this.#flushed || (header?.version ?? 1) < CURRENT_SESSION_VERSION) return this.#rewriteFileContents();
+			if (this.#needsFullRewriteOnNextPersist || !this.#flushed || (header?.version ?? 1) < CURRENT_SESSION_VERSION)
+				return this.#rewriteFileContents();
 			const writer = this.#ensurePersistWriter();
 			if (!writer) return this.#rewriteFileContents();
 			await writer.write(record);
