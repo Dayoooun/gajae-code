@@ -32,6 +32,8 @@ import type { NotificationSettingsReader, NotificationSettingsSnapshot } from ".
 import { AgentStorage } from "../session/agent-storage";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
 import {
+	AtomicYamlConflictError,
+	atomicYamlPathHash,
 	type AtomicYamlPatch,
 	applyAtomicYamlPatches,
 	applyAtomicYamlPatchesWithCurrent,
@@ -76,6 +78,8 @@ type SettingsPatch = {
 	readonly modelRole?: string;
 	readonly modelRoleRevision?: number;
 	readonly configVersion?: string;
+	/** Durable default state observed before this default-role mutation. */
+	readonly expectedDefaultModelRoleHash?: string;
 	readonly legacyFallbackMigration?: boolean;
 };
 
@@ -614,6 +618,8 @@ export class Settings implements NotificationSettingsReader {
 			revision: ++this.#nextRevision,
 			modelRoleRevision,
 			configVersion: this.#defaultModelRoleOwnership.configVersion,
+			expectedDefaultModelRoleHash:
+				path === "modelRoles" && defaultModelRoleMayHaveChanged ? this.#expectedDefaultModelRoleHash() : undefined,
 		};
 		setByPath(this.#global, path.split("."), structuredClone(clonedValue));
 		this.#pathRevisions.set(path, patch.revision);
@@ -644,6 +650,7 @@ export class Settings implements NotificationSettingsReader {
 			revision: ++this.#nextRevision,
 			modelRoleRevision,
 			configVersion: this.#defaultModelRoleOwnership.configVersion,
+			expectedDefaultModelRoleHash: path === "modelRoles" ? this.#expectedDefaultModelRoleHash() : undefined,
 		};
 		deleteByPath(this.#global, path.split("."));
 		this.#pathRevisions.set(path, patch.revision);
@@ -942,6 +949,7 @@ export class Settings implements NotificationSettingsReader {
 			modelRole: role,
 			modelRoleRevision,
 			configVersion: this.#defaultModelRoleOwnership.configVersion,
+			expectedDefaultModelRoleHash: role === "default" ? this.#expectedDefaultModelRoleHash() : undefined,
 		};
 		setRawModelRole(this.#global, role, modelId);
 		this.#pathRevisions.set("modelRoles", revision);
@@ -996,11 +1004,19 @@ export class Settings implements NotificationSettingsReader {
 			};
 		}
 
+		const expectedDefaultModelRoleHash =
+			role === "default" ? atomicYamlPathHash(this.#global, "modelRoles.default") : undefined;
 		let durableBeforeWrite: RawSettings | undefined;
 		let durableVersionBeforeWrite: string | undefined;
 		try {
 			const result = await reserveAtomicYamlUpdateSlot(this.#configPath, () => ({
 				apply: current => {
+					if (expectedDefaultModelRoleHash !== undefined) {
+						const actualHash = atomicYamlPathHash(current, "modelRoles.default");
+						if (actualHash !== expectedDefaultModelRoleHash) {
+							throw new AtomicYamlConflictError("modelRoles.default", expectedDefaultModelRoleHash, actualHash);
+						}
+					}
 					durableBeforeWrite = structuredClone(current);
 					durableVersionBeforeWrite = readConfigVersion(this.#configPath!);
 					const durablePreviousDefault = defaultModelRoleFrom(current);
@@ -1691,6 +1707,17 @@ export class Settings implements NotificationSettingsReader {
 					durableBeforeWrite = structuredClone(current);
 					durableVersionBeforeWrite = currentConfigVersion;
 					const externalLineageBreak = currentConfigVersion !== this.#defaultModelRoleOwnership.configVersion;
+					for (const patch of captured) {
+						if (patch.expectedDefaultModelRoleHash === undefined) continue;
+						const actualHash = atomicYamlPathHash(current, "modelRoles.default");
+						if (actualHash !== patch.expectedDefaultModelRoleHash) {
+							throw new AtomicYamlConflictError(
+								"modelRoles.default",
+								patch.expectedDefaultModelRoleHash,
+								actualHash,
+							);
+						}
+					}
 					const applicablePatches = captured.filter(
 						patch =>
 							!this.#isStaleDefaultModelRolePatch(patch, currentConfigVersion) || patch.modelRole !== "default",
@@ -1780,6 +1807,13 @@ export class Settings implements NotificationSettingsReader {
 			slot.released = true;
 			slot.release();
 		}, 100);
+	}
+
+	#expectedDefaultModelRoleHash(): string {
+		for (const patch of this.#modified.values()) {
+			if (patch.expectedDefaultModelRoleHash !== undefined) return patch.expectedDefaultModelRoleHash;
+		}
+		return atomicYamlPathHash(this.#global, "modelRoles.default");
 	}
 
 	#isStaleDefaultModelRolePatch(
