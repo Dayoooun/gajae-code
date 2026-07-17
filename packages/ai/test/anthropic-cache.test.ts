@@ -184,6 +184,27 @@ describe("Anthropic prompt caching", () => {
 		}
 	});
 
+	it("accepts nullable cache controls as absent without mutation", () => {
+		const params = cacheParams({
+			cache_control: null,
+			tools: [
+				{
+					name: "tool",
+					description: "tool",
+					input_schema: { type: "object", properties: {} },
+					cache_control: null,
+				},
+			],
+			system: [{ type: "text", text: "stable", cache_control: null }],
+			messages: [{ role: "user", content: [{ type: "text", text: "question", cache_control: null }] }],
+		} as Payload);
+		const before = structuredClone(params);
+
+		expect(() => normalizeCacheControlTtlOrdering(params)).not.toThrow();
+		expect(params).toEqual(before);
+		expect(cacheControls(params)).toHaveLength(0);
+	});
+
 	it("fails closed for invalid callback controls and never normalizes caller objects", () => {
 		const cases: Array<{ name: string; params: Payload }> = [
 			{
@@ -290,6 +311,45 @@ describe("Anthropic prompt caching", () => {
 		).toEqual({
 			type: "ephemeral",
 		});
+	});
+
+	it("does not treat a tool-result-only wire user turn as the explicit human refresh", async () => {
+		const payload = await capturePayload(
+			explicitCompatibleModel,
+			context([
+				{ role: "user", content: "Question", timestamp: 1 },
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call_1", name: "lookup", arguments: {} }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: canonicalModel.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: 2,
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call_1",
+					toolName: "lookup",
+					content: [{ type: "text", text: "Answer" }],
+					isError: false,
+					timestamp: 3,
+				},
+			]),
+		);
+		const firstUserContent = payload.messages[0]?.content as Array<{ cache_control?: CacheControl }>;
+		const toolResultContent = payload.messages.at(-1)?.content as Array<{ cache_control?: CacheControl }>;
+
+		expect(firstUserContent.at(-1)?.cache_control).toEqual({ type: "ephemeral" });
+		expect(toolResultContent.some(block => block.cache_control)).toBe(false);
 	});
 
 	it("keeps explicit markers off tools, system/schema, and thinking blocks", async () => {

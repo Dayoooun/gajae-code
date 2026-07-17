@@ -2082,7 +2082,7 @@ function validateCacheControls(params: AnthropicCacheParams): void {
 	const seenFiveMinute = { value: false };
 	let count = 0;
 	const validate = (control: unknown, path: string): void => {
-		if (control === undefined) return;
+		if (control == null) return;
 		count++;
 		validateCacheControl(control, path, seenFiveMinute);
 	};
@@ -2101,7 +2101,7 @@ function validateCacheControls(params: AnthropicCacheParams): void {
 		if (!Array.isArray(message.content)) continue;
 		for (const [blockIndex, block] of message.content.entries()) {
 			const control = (block as CacheControlBlock).cache_control;
-			if (control !== undefined && !isCacheableContentBlock(block)) {
+			if (control != null && !isCacheableContentBlock(block)) {
 				throw cacheControlError(
 					`messages[${messageIndex}].content[${blockIndex}].cache_control`,
 					"block is not cacheable",
@@ -2126,10 +2126,16 @@ function applyCacheControlToLastCacheableBlock(
 	return false;
 }
 
+function isHumanUserMessage(message: MessageCreateParamsStreaming["messages"][number]): boolean {
+	if (message.role !== "user") return false;
+	if (typeof message.content === "string") return true;
+	return message.content.some(block => block.type !== "tool_result");
+}
+
 function applyExplicitPromptCaching(params: AnthropicCacheParams, cacheControl: AnthropicCacheControl): void {
 	if (countCacheControlBreakpoints(params) >= 4) return;
 
-	const currentUserIndex = params.messages.findLastIndex(message => message.role === "user");
+	const currentUserIndex = params.messages.findLastIndex(isHumanUserMessage);
 	if (currentUserIndex < 0) return;
 	const currentUser = params.messages[currentUserIndex];
 	if (!currentUser) return;
