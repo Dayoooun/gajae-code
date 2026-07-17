@@ -165,21 +165,28 @@ pub struct SdkFrameEvent {
 	pub json:          String,
 }
 
+/// Callback delivering a connection's negotiated v3 capabilities
+/// (`connection_id`, `capabilities`) to TypeScript. Aliased to keep the
+/// `ThreadsafeFunction` payload out of complex nested type positions
+/// (`clippy::type_complexity`).
+type NegotiatedCapabilitiesFn = ThreadsafeFunction<(String, Vec<String>)>;
+
 /// In-process notification server handle exposed to TypeScript.
 #[napi]
 pub struct NotificationServer {
-	config:                  Mutex<Option<ServerConfig>>,
-	handle:                  Mutex<Option<ServerHandle>>,
+	config:                     Mutex<Option<ServerConfig>>,
+	handle:                     Mutex<Option<ServerHandle>>,
 	/// The one current presentation that may be retired only by its exact lease.
 	/// This is private routing state, never workflow-gate authority.
-	arbitrated_presentation: Mutex<Option<ActionIdentity>>,
-	on_reply:                Mutex<Option<ThreadsafeFunction<ReplyEvent>>>,
-	on_inbound:              Mutex<Option<ThreadsafeFunction<InboundEvent>>>,
-	on_frame:                Mutex<Option<ThreadsafeFunction<SdkFrameEvent>>>,
-	on_connection_close:     Mutex<Option<ThreadsafeFunction<String>>>,
-	pump_tasks:              Mutex<Vec<tokio::task::JoinHandle<()>>>,
-	stop_wait:               tokio::sync::Mutex<()>,
-	known_good_turn_stream_frames: AtomicU64,
+	arbitrated_presentation:             Mutex<Option<ActionIdentity>>,
+	on_reply:                            Mutex<Option<ThreadsafeFunction<ReplyEvent>>>,
+	on_inbound:                          Mutex<Option<ThreadsafeFunction<InboundEvent>>>,
+	on_frame:                            Mutex<Option<ThreadsafeFunction<SdkFrameEvent>>>,
+	on_negotiated_capabilities:          Mutex<Option<NegotiatedCapabilitiesFn>>,
+	on_connection_close:                 Mutex<Option<ThreadsafeFunction<String>>>,
+	pump_tasks:                          Mutex<Vec<tokio::task::JoinHandle<()>>>,
+	stop_wait:                           tokio::sync::Mutex<()>,
+	known_good_turn_stream_frames:       AtomicU64,
 	turn_stream_serde_validation_parses: AtomicU64,
 }
 
@@ -212,16 +219,17 @@ impl NotificationServer {
 		// TS always owns gate resolution, so the core forwards replies.
 		config.forward_replies = true;
 		Self {
-			config:                  Mutex::new(Some(config)),
-			handle:                  Mutex::new(None),
-			arbitrated_presentation: Mutex::new(None),
-			on_reply:                Mutex::new(None),
-			on_inbound:              Mutex::new(None),
-			on_frame:                Mutex::new(None),
-			on_connection_close:     Mutex::new(None),
-			pump_tasks:              Mutex::new(Vec::new()),
-			stop_wait:               tokio::sync::Mutex::new(()),
-			known_good_turn_stream_frames: AtomicU64::new(0),
+			config:                             Mutex::new(Some(config)),
+			handle:                             Mutex::new(None),
+			arbitrated_presentation:             Mutex::new(None),
+			on_reply:                            Mutex::new(None),
+			on_inbound:                          Mutex::new(None),
+			on_frame:                            Mutex::new(None),
+			on_negotiated_capabilities:          Mutex::new(None),
+			on_connection_close:                 Mutex::new(None),
+			pump_tasks:                          Mutex::new(Vec::new()),
+			stop_wait:                           tokio::sync::Mutex::new(()),
+			known_good_turn_stream_frames:       AtomicU64::new(0),
 			turn_stream_serde_validation_parses: AtomicU64::new(0),
 		}
 	}
@@ -244,6 +252,14 @@ impl NotificationServer {
 	#[napi(ts_args_type = "callback: (err: null | Error, frame: SdkFrameEvent) => void")]
 	pub fn on_sdk_frame(&self, callback: ThreadsafeFunction<SdkFrameEvent>) {
 		*self.on_frame.lock() = Some(callback);
+	}
+
+	/// Register the negotiated-capabilities callback. Must be called before
+	/// [`Self::start`].
+	#[napi(ts_args_type = "callback: (err: null | Error, connectionId: string, capabilities: \
+	                       string[]) => void")]
+	pub fn on_negotiated_capabilities(&self, callback: NegotiatedCapabilitiesFn) {
+		*self.on_negotiated_capabilities.lock() = Some(callback);
 	}
 
 	/// Register the connection-close callback. Must be called before
@@ -378,6 +394,19 @@ impl NotificationServer {
 				}
 			});
 			self.pump_tasks.lock().push(task);
+		}
+
+		let capability_tsfn = self.on_negotiated_capabilities.lock().take();
+		let capability_rx = handle.take_capability_receiver();
+		if let (Some(tsfn), Some(mut rx)) = (capability_tsfn, capability_rx) {
+			napi::tokio::spawn(async move {
+				while let Some(update) = rx.recv().await {
+					tsfn.call(
+						Ok((update.connection_id, update.capabilities)),
+						ThreadsafeFunctionCallMode::NonBlocking,
+					);
+				}
+			});
 		}
 
 		let close_tsfn = self.on_connection_close.lock().take();
@@ -554,7 +583,13 @@ impl NotificationServer {
 		saturating_increment(&self.known_good_turn_stream_frames);
 		self
 			.with_handle(|h| {
-				h.push_frame(ServerMessage::TurnStream(TurnStream { session_id, phase, text, final_answer, message_ref }))
+				h.push_frame(ServerMessage::TurnStream(TurnStream {
+					session_id,
+					phase,
+					text,
+					final_answer,
+					message_ref,
+				}))
 			})?
 			.map_err(|error| Error::from_reason(error.to_string()))
 	}
@@ -593,14 +628,17 @@ impl NotificationServer {
 		}
 	}
 
-	/// Send raw JSON to one connected v3 SDK client.
+	/// Send a validated, bounded JSON envelope to one connected v3 SDK client.
 	#[napi]
 	pub fn send_to(&self, connection_id: String, json: String) -> Result<()> {
 		let handle = self.handle()?;
 		if handle.send_to(&connection_id, json) {
 			Ok(())
 		} else {
-			Err(Error::from_reason("SDK connection is not available"))
+			Err(Error::from_reason(
+				"SDK connection is unavailable or directed frame is invalid, oversized, or \
+				 unauthorized",
+			))
 		}
 	}
 

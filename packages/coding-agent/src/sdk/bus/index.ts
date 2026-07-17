@@ -28,7 +28,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import type { ImageContent, TextContent } from "@gajae-code/ai";
+import type { ImageContent, TextContent, Tool } from "@gajae-code/ai";
 import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
 import { logger, postmortem, VERSION } from "@gajae-code/utils";
 import { Settings } from "../../config/settings";
@@ -76,7 +76,7 @@ import {
 	sessionTag,
 } from "./config";
 import { telegramControlCommandUsage } from "./config-commands";
-import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage } from "./helpers";
+import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import { type EnsureDaemonResult, ensureTelegramDaemonRunningDetailed } from "./telegram-daemon";
@@ -869,6 +869,7 @@ interface SessionRuntime {
 	disposeAckRecoveryParticipant: () => void;
 	disposeGateEmitterListener: () => void;
 	waitForGateResolutionQuiescence: () => Promise<void>;
+	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>;
 	workflowGate?: WorkflowGateEmitter;
 	gatePresentations?: PresentationArbiter;
 	redact: boolean;
@@ -918,10 +919,50 @@ interface SessionRuntime {
 	/** True between turn_end and the next turn_start: drops late async message_update
 	 * frames so a stale live edit can never be emitted after the finalized turn. */
 	turnClosed?: boolean;
+	/** Started tool calls awaiting a terminal activity frame, keyed by tool call id. */
+	inFlightTools: Map<string, { toolName: string; args: unknown }>;
 	/** Cancels the postmortem cleanup that emits `session_closed` on process teardown. */
 	cancelPostmortemCleanup: () => void;
-	/** Stops optional broker presence heartbeats. */
-	stopBrokerHeartbeat: () => void;
+}
+
+const SENSITIVE_MODEL_LABEL =
+	/(?:\b(?:https?|wss?):\/\/|\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|\b(?:api[-_ ]?key|access[-_ ]?token|bearer|secret|password|account(?:\s*id)?|email|exception|stack trace)\b|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}\b)/i;
+const TOOL_SUMMARY_MAX = 280;
+const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
+
+/** Stable projection of the tool-owned safe-display seam (never the full Tool surface). */
+type SafeSummaryTool = Pick<Tool, "safeSummary" | "safeSummaryFields">;
+
+export function projectToolSummary(
+	tool: SafeSummaryTool | undefined,
+	kind: "args" | "result",
+	value: unknown,
+): string | undefined {
+	let summary: string | undefined;
+	try {
+		if (tool?.safeSummary) {
+			summary = tool.safeSummary(kind, value);
+		} else {
+			const fields = tool?.safeSummaryFields?.[kind];
+			if (fields) {
+				const source =
+					value && typeof value === "object" && !Array.isArray(value)
+						? (value as Record<string, unknown>)
+						: undefined;
+				if (source) {
+					const projected: Record<string, unknown> = {};
+					for (const field of fields) if (Object.hasOwn(source, field)) projected[field] = source[field];
+					summary = JSON.stringify(projected);
+				}
+			}
+		}
+	} catch {
+		return undefined;
+	}
+	if (typeof summary !== "string") return undefined;
+	const normalized = summary.replace(/[\u0000-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069]/g, " ").trim();
+	if (!normalized || SENSITIVE_MODEL_LABEL.test(normalized)) return undefined;
+	return truncate(normalized, TOOL_SUMMARY_MAX);
 }
 
 /** Request-local requester authority for stable ControlSurface dispatches. */
@@ -1647,11 +1688,18 @@ function hasTerminalArbitrationCapability(
 	Required<
 		Pick<
 			WorkflowGateEmitter,
-			"resolveGate" | "prepareTerminalization" | "clearPreparedTerminalization" | "registerGateTerminalController"
+			| "resolveGate"
+			| "recoverAcceptedGates"
+			| "lookupCompletedResolution"
+			| "prepareTerminalization"
+			| "clearPreparedTerminalization"
+			| "registerGateTerminalController"
 		>
 	> {
 	return (
 		typeof workflowGate?.resolveGate === "function" &&
+		typeof workflowGate.recoverAcceptedGates === "function" &&
+		typeof workflowGate.lookupCompletedResolution === "function" &&
 		typeof workflowGate.prepareTerminalization === "function" &&
 		typeof workflowGate.clearPreparedTerminalization === "function" &&
 		typeof workflowGate.registerGateTerminalController === "function"
@@ -2005,7 +2053,7 @@ function sdkControlSurface(
 			pending.completeDirect();
 			return { resolved: true };
 		},
-		answerGate: async (id, response, expectedSessionId) => {
+		answerGate: async (id, response, expectedSessionId, idempotencyKey) => {
 			if (!acceptGateResolution())
 				throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
 			if (expectedSessionId === undefined) auditMissingExpectedSessionId("workflow.gate_answer");
@@ -2018,6 +2066,26 @@ function sdkControlSurface(
 				throw Object.assign(new Error("Workflow gates are unavailable for this session."), {
 					code: "resource_gone",
 				});
+			const workflowGate = ctx.workflowGate;
+			if (!hasTerminalArbitrationCapability(workflowGate))
+				throw Object.assign(new Error("Workflow gates are unavailable for this session."), {
+					code: "resource_gone",
+				});
+			const gateResponse = {
+				gate_id: id,
+				answer: response,
+				idempotency_key: idempotencyKey ?? id,
+			};
+			const completed = workflowGate.lookupCompletedResolution(gateResponse);
+			if (completed.kind === "completed") return completed.resolution;
+			if (completed.kind === "accepted_incomplete") {
+				await trackGateResolution(workflowGate.recoverAcceptedGates());
+				const recovered = workflowGate.lookupCompletedResolution(gateResponse);
+				if (recovered.kind === "completed") return recovered.resolution;
+				throw Object.assign(new Error("Workflow gate resolution outcome is uncertain."), {
+					code: "terminal_uncertain",
+				});
+			}
 			const prepared = presentations.prepareDirectControl(id);
 			if (!prepared || prepared.status === "stale")
 				throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
@@ -2026,31 +2094,22 @@ function sdkControlSurface(
 			if (prepared.status !== "queued" && prepared.status !== "retired")
 				throw new Error(`Unexpected direct control preparation: ${prepared.status}`);
 			if (
-				ctx.workflowGate?.prepareTerminalization?.(
-					id,
-					prepared.status === "queued" ? "not_published" : "retired",
-				) !== true
+				workflowGate.prepareTerminalization(id, prepared.status === "queued" ? "not_published" : "retired") !== true
 			) {
 				presentations.finishDirectControl(id, prepared, "rejected");
 				throw Object.assign(new Error("Workflow gate lacks a terminalization proof."), { code: "resource_gone" });
 			}
 			try {
-				const resolution = await trackGateResolution(
-					ctx.workflowGate?.resolveGate?.({
-						gate_id: id,
-						answer: response,
-						idempotency_key: id,
-					}) ?? unavailable("workflow.gate_answer", "workflow gates are unavailable for this session")(),
-				);
+				const resolution = await trackGateResolution(workflowGate.resolveGate(gateResponse));
 				const status = (resolution as { status?: unknown }).status;
 				if (status === "accepted" || status === "rejected") {
-					if (status === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+					if (status === "rejected") workflowGate.clearPreparedTerminalization(id);
 					presentations.finishDirectControl(id, prepared, status);
 					return resolution;
 				}
 			} catch (error) {
 				const outcome = reconcileDirectControlFailure(id);
-				if (outcome === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+				if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 				presentations.finishDirectControl(id, prepared, outcome);
 				if (outcome === "unknown")
 					throw Object.assign(new Error("Workflow gate resolution outcome is uncertain."), {
@@ -2059,7 +2118,7 @@ function sdkControlSurface(
 				throw error;
 			}
 			const outcome = reconcileDirectControlFailure(id);
-			if (outcome === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+			if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 			presentations.finishDirectControl(id, prepared, outcome);
 			logger.warn("workflow_gate_direct_control_uncertain_outcome", {
 				operation: "workflow.gate_answer",
@@ -2083,6 +2142,22 @@ function sdkControlSurface(
 				throw Object.assign(new Error("Workflow gates are unavailable for this session."), {
 					code: "resource_gone",
 				});
+			const workflowGate = ctx.workflowGate;
+			if (!hasTerminalArbitrationCapability(workflowGate))
+				throw Object.assign(new Error("Workflow gates are unavailable for this session."), {
+					code: "resource_gone",
+				});
+			const gateResponse = { gate_id: id, answer: choice, idempotency_key: id };
+			const completed = workflowGate.lookupCompletedResolution(gateResponse);
+			if (completed.kind === "completed") return completed.resolution;
+			if (completed.kind === "accepted_incomplete") {
+				await trackGateResolution(workflowGate.recoverAcceptedGates());
+				const recovered = workflowGate.lookupCompletedResolution(gateResponse);
+				if (recovered.kind === "completed") return recovered.resolution;
+				throw Object.assign(new Error("Workflow plan resolution outcome is uncertain."), {
+					code: "terminal_uncertain",
+				});
+			}
 			const prepared = presentations.prepareDirectControl(id);
 			if (!prepared || prepared.status === "stale")
 				throw Object.assign(new Error("Workflow plan is no longer answerable."), { code: "resource_gone" });
@@ -2091,31 +2166,22 @@ function sdkControlSurface(
 			if (prepared.status !== "queued" && prepared.status !== "retired")
 				throw new Error(`Unexpected direct control preparation: ${prepared.status}`);
 			if (
-				ctx.workflowGate?.prepareTerminalization?.(
-					id,
-					prepared.status === "queued" ? "not_published" : "retired",
-				) !== true
+				workflowGate.prepareTerminalization(id, prepared.status === "queued" ? "not_published" : "retired") !== true
 			) {
 				presentations.finishDirectControl(id, prepared, "rejected");
 				throw Object.assign(new Error("Workflow plan lacks a terminalization proof."), { code: "resource_gone" });
 			}
 			try {
-				const resolution = await trackGateResolution(
-					ctx.workflowGate?.resolveGate?.({
-						gate_id: id,
-						answer: choice,
-						idempotency_key: id,
-					}) ?? unavailable("workflow.plan_approve", "workflow gates are unavailable for this session")(),
-				);
+				const resolution = await trackGateResolution(workflowGate.resolveGate(gateResponse));
 				const status = (resolution as { status?: unknown }).status;
 				if (status === "accepted" || status === "rejected") {
-					if (status === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+					if (status === "rejected") workflowGate.clearPreparedTerminalization(id);
 					presentations.finishDirectControl(id, prepared, status);
 					return resolution;
 				}
 			} catch (error) {
 				const outcome = reconcileDirectControlFailure(id);
-				if (outcome === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+				if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 				presentations.finishDirectControl(id, prepared, outcome);
 				if (outcome === "unknown")
 					throw Object.assign(new Error("Workflow plan resolution outcome is uncertain."), {
@@ -2124,7 +2190,7 @@ function sdkControlSurface(
 				throw error;
 			}
 			const outcome = reconcileDirectControlFailure(id);
-			if (outcome === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+			if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 			presentations.finishDirectControl(id, prepared, outcome);
 			logger.warn("workflow_gate_direct_control_uncertain_outcome", {
 				operation: "workflow.plan_approve",
@@ -2143,14 +2209,14 @@ function sdkControlSurface(
 				throw Object.assign(new Error("skill.invoke args must be a string."), { code: "invalid_input" });
 			return ctx.invokeSkill(name, args);
 		},
-		setPlanMode: on => {
+		setPlanMode: async on => {
 			if (!bindings.has("setPlanMode") || !ctx.setPlanMode)
 				return unavailable("mode.plan.set", "no plan-mode seam is installed")();
 
 			if (typeof on !== "boolean")
 				throw Object.assign(new Error("mode.plan.set requires a boolean on value."), { code: "invalid_input" });
 
-			return { state: ctx.setPlanMode(on) };
+			return { state: await ctx.setPlanMode(on) };
 		},
 		operateGoal: (op, objective) => {
 			if (!bindings.has("operateGoal") || !ctx.operateGoal)
@@ -2415,9 +2481,6 @@ export function createNotificationsExtension(
 			rt.cancelPostmortemCleanup();
 		} catch {}
 		try {
-			rt.stopBrokerHeartbeat();
-		} catch {}
-		try {
 			rt.disposeAnswerSource();
 		} catch {}
 		try {
@@ -2425,6 +2488,9 @@ export function createNotificationsExtension(
 		} catch {}
 		try {
 			rt.disposeGateListener();
+		} catch {}
+		try {
+			rt.workflowGate?.setRuntimeTurnProvider?.(null);
 		} catch {}
 		await rt.waitForGateResolutionQuiescence();
 		try {
@@ -2578,7 +2644,6 @@ export function createNotificationsExtension(
 		}
 		const gatePresentations = new PresentationArbiter(server, () => runtime?.redact ?? redact, tag);
 		let inboundSdkFrame: ((connectionId: string, frame: Record<string, unknown>) => void) | undefined;
-		let stopBrokerHeartbeat = () => {};
 		const inFlightGateResolutions = new Set<Promise<void>>();
 		const trackGateResolution = <T>(resolution: Promise<T>): Promise<T> => {
 			const quiesced = resolution.then(
@@ -2619,6 +2684,8 @@ export function createNotificationsExtension(
 		const removeProviderDefinitions = (capability: string) => {
 			if (capability === "permission") ctx.setSdkPermissionProvider?.(undefined);
 		};
+
+		const hostCapCache = new Map<string, ReadonlySet<string>>();
 
 		const configOverrides = new Map<string, unknown>();
 		const configRevision = { current: 0 };
@@ -2778,6 +2845,11 @@ export function createNotificationsExtension(
 			submission.failed = true;
 			submission.error = error;
 			removePendingPromptCorrelation(correlation);
+			if (
+				runtime?.activePromptCorrelation?.commandId === correlation.commandId &&
+				runtime.activePromptCorrelation.turnId === correlation.turnId
+			)
+				runtime.activePromptCorrelation = undefined;
 			emitPromptFailure(correlation, error);
 		};
 		const acknowledgePrompt = (connectionId: string, correlation: { commandId: string; turnId: string }) => {
@@ -2876,6 +2948,7 @@ export function createNotificationsExtension(
 			stateRoot,
 			token,
 			sendFrame: (connectionId, frame) => sendSdkFrame(connectionId, frame),
+			connectionCapabilities: connectionId => hostCapCache.get(connectionId) ?? EMPTY_CAPABILITIES,
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
 			onFrame: handler => {
@@ -2993,6 +3066,7 @@ export function createNotificationsExtension(
 			disposeGateTerminalController: () => {},
 			disposeAckRecoveryParticipant: () => {},
 			disposeGateEmitterListener: () => {},
+			trackGateResolution,
 			waitForGateResolutionQuiescence: async () => {
 				await Promise.allSettled(inFlightGateResolutions);
 			},
@@ -3000,7 +3074,6 @@ export function createNotificationsExtension(
 			gatePresentations,
 			stopping: false,
 			cancelPostmortemCleanup: () => {},
-			stopBrokerHeartbeat,
 
 			redact,
 			verbosity,
@@ -3012,6 +3085,7 @@ export function createNotificationsExtension(
 			recordPromptTerminal,
 			emitPromptLifecycle,
 			pendingInbound: new Set<number>(),
+			inFlightTools: new Map<string, { toolName: string; args: unknown }>(),
 		};
 		runtimes.set(id, runtime);
 		activeRuntimeId = id;
@@ -3054,9 +3128,23 @@ export function createNotificationsExtension(
 					inboundSdkFrame?.(inbound.connectionId, JSON.parse(inbound.json) as Record<string, unknown>);
 				} catch {}
 			});
+			// Required: the negotiated-capability callback is how the TS host learns
+			// each connection's caps for replay-frame gating. If the linked
+			// @gajae-code/natives binary predates it (linked/deduped installs where the
+			// version did not change), fail loudly with an actionable message instead of
+			// silently shipping a half-wired capability bridge.
+			if (typeof server.onNegotiatedCapabilities !== "function") {
+				throw new Error(
+					"@gajae-code/natives is out of date: missing onNegotiatedCapabilities. Rebuild the native addon (bun --cwd=packages/natives run build).",
+				);
+			}
+			server.onNegotiatedCapabilities((_err, connectionId, capabilities) => {
+				if (connectionId) hostCapCache.set(connectionId, new Set(capabilities));
+			});
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
 				host.handleDisconnect(connectionId);
+				hostCapCache.delete(connectionId);
 				for (const submission of promptSubmissions.values())
 					if (submission.connectionId === connectionId) abandonPrompt(submission);
 			});
@@ -3332,6 +3420,12 @@ export function createNotificationsExtension(
 						update.verbosity = inbound.verbosity;
 					}
 					if (typeof inbound.redact === "boolean") {
+						// Redact turning ON: terminalize any already-visible in-flight tool
+						// bubbles (while redact is still off so the helper emits) so they never
+						// strand permanently in "started"; subsequent detail is then suppressed.
+						if (inbound.redact && !runtime.redact) {
+							terminalizeInFlightTools(runtime, runtime.id, "unknown");
+						}
 						runtime.redact = inbound.redact;
 						update.redact = inbound.redact;
 					}
@@ -3457,25 +3551,14 @@ export function createNotificationsExtension(
 					});
 					throwIfLifecycleStopped();
 					runtime.brokerRegistrationActive = true;
-					const timer = setInterval(() => {
-						void index
-							.append({
-								type: "host_heartbeat",
-								sessionId: id,
-								locator,
-								endpointGeneration: host.generation,
-								pid: process.pid,
-							})
-							.catch(error => logger.warn(`sdk broker heartbeat failed: ${String(error)}`));
-					}, 5_000);
-					stopBrokerHeartbeat = () => clearInterval(timer);
+					// Host liveness is derived from alive(pid) when the index is read; heartbeats
+					// are deliberately not appended to the durable session index.
 				} catch (brokerError) {
 					if (lifecycleRequired) throw brokerError;
 					logger.warn(`sdk broker registration skipped: ${String(brokerError)}`);
 				}
 			}
 
-			runtime.stopBrokerHeartbeat = stopBrokerHeartbeat;
 			const startedRuntime = runtime;
 			runtime.enableNotifications = () => {
 				const runtime = startedRuntime;
@@ -3522,6 +3605,7 @@ export function createNotificationsExtension(
 			const attachWorkflowGate = (gate: WorkflowGateEmitter | undefined): void => {
 				if (activeRuntime.workflowGate === gate) return;
 				activeRuntime.disposeGateListener();
+				activeRuntime.workflowGate?.setRuntimeTurnProvider?.(null);
 				activeRuntime.disposeAckRecoveryParticipant();
 				gatePresentations.dispose();
 				activeRuntime.disposeGateTerminalController();
@@ -3534,6 +3618,7 @@ export function createNotificationsExtension(
 					return;
 				}
 				activeRuntime.workflowGate = gate;
+				gate.setRuntimeTurnProvider?.(() => activeRuntime.activePromptCorrelation?.turnId);
 				if (hasTerminalArbitrationCapability(gate)) {
 					const controller: WorkflowGateTerminalController = {
 						completeGateInteractions: gateId => gatePresentations.complete(gateId),
@@ -3587,7 +3672,9 @@ export function createNotificationsExtension(
 					});
 					activeRuntime.disposeAckRecoveryParticipant = () => gate.setAckRecoveryParticipant?.(null);
 				}
-				void gate.recoverAcceptedGates?.();
+				void (typeof gate.recoverAcceptedGates === "function"
+					? trackGateResolution(gate.recoverAcceptedGates()).catch(() => {})
+					: Promise.resolve());
 			};
 			activeRuntime.disposeGateEmitterListener = registerWorkflowGateEmitterListener(id, attachWorkflowGate);
 			if (ctx.workflowGate) attachWorkflowGate(ctx.workflowGate);
@@ -3747,6 +3834,19 @@ export function createNotificationsExtension(
 		await rotateSessionAuthority(event, ctx);
 	});
 
+	const terminalizeInFlightTools = (rt: SessionRuntime, id: string, phase: "cancelled" | "unknown"): void => {
+		if (rt.notificationsActive && !rt.redact) {
+			for (const [toolCallId, { toolName }] of rt.inFlightTools) {
+				try {
+					pushSessionFrame(rt, { type: "tool_activity", sessionId: id, toolCallId, toolName, phase });
+				} catch (e) {
+					logger.warn(`notifications: synthetic tool_activity failed: ${String(e)}`);
+				}
+			}
+		}
+		rt.inFlightTools.clear();
+	};
+
 	// Drive the live typing indicator: mark busy when the agent loop starts so
 	// the daemon shows "typing…" in the thread while the agent is thinking,
 	// before any turn output exists. Cleared on `agent_end` below.
@@ -3775,7 +3875,9 @@ export function createNotificationsExtension(
 	api.on("turn_start", (_event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
-		if (!rt?.notificationsActive) return;
+		if (!rt) return;
+		rt.turnSeq = (rt.turnSeq ?? 0) + 1;
+		if (!rt.notificationsActive) return;
 		// A new turn is live: re-open the live-stream window (see turnClosed).
 		rt.turnClosed = false;
 		if (rt.pendingInbound.size === 0) return;
@@ -3793,7 +3895,7 @@ export function createNotificationsExtension(
 	// per `turn_end`. turn_end fires once per turn iteration, so a single
 	// user-visible idle previously produced many idle pings (the flood); agent_end
 	// fires exactly once per settle, yielding exactly one idle notification.
-	api.on("agent_end", (_event, ctx) => {
+	api.on("agent_end", (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
@@ -3806,13 +3908,17 @@ export function createNotificationsExtension(
 		} else {
 			rt.emitPromptLifecycle(undefined, { type: "agent_end", sessionId: id });
 		}
+		rt.activePromptCorrelation = undefined;
+		terminalizeInFlightTools(rt, id, event.stopReason === "cancelled" ? "cancelled" : "unknown");
 		try {
 			pushSessionFrame(rt, { type: "activity", sessionId: id, state: "idle" });
 		} catch (e) {
 			logger.warn(`notifications: activity (idle) failed: ${String(e)}`);
 		}
 		if (!rt.notificationsActive) return;
-		void rt.workflowGate?.recoverAcceptedGates?.();
+		void (typeof rt.workflowGate?.recoverAcceptedGates === "function"
+			? rt.trackGateResolution(rt.workflowGate.recoverAcceptedGates()).catch(() => {})
+			: Promise.resolve());
 		const seq = rt.idleSeq++;
 		// Re-assert the identity header so the daemon renames the topic once the
 		// session title has been auto-generated ("{repo}/{branch} - {title}"). The
@@ -3884,11 +3990,10 @@ export function createNotificationsExtension(
 		rt.preAskFlushedText = text;
 		// Decision A: a stream-enabled turn must finalize as an in-place edit of ONE
 		// live message, never a fresh (rich-promotable) send. If live frames were
-		// async-queued and none landed before this flush, allocate the per-turn ref
-		// now so the finalized frame always carries a messageRef → the daemon keeps it
-		// editable (HTML edit) and never rich-promotes a streamed final.
-		if (finalAnswer && rt.stream && rt.liveRef === undefined) {
-			rt.turnSeq = (rt.turnSeq ?? 0) + 1;
+		// async-queued and none landed before this flush, reuse the per-turn ref
+		// assigned at turn_start so the finalized frame remains editable (HTML edit)
+		// and never rich-promotes a streamed final.
+		if (finalAnswer && rt.stream && rt.liveRef === undefined && rt.turnSeq !== undefined) {
 			rt.liveRef = String(rt.turnSeq);
 		}
 		try {
@@ -3912,11 +4017,99 @@ export function createNotificationsExtension(
 	// path and ordered before it — unlike message_update, which is queued async),
 	// then flushed here before the ask tool's execute calls registerAsk.
 	api.on("tool_execution_start", (event, ctx) => {
-		if (event.toolName !== "ask") return;
+		if (event.toolName === "ask") {
+			const id = sessionId(ctx);
+			const rt = runtimes.get(id);
+			if (!rt?.notificationsActive || rt.redact) return;
+			flushTurnText(rt, id, rt.currentTurnText, false);
+		}
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt?.notificationsActive || rt.redact) return;
-		flushTurnText(rt, id, rt.currentTurnText, false);
+		rt.inFlightTools.set(event.toolCallId, { toolName: event.toolName, args: event.args });
+		try {
+			pushSessionFrame(rt, {
+				type: "tool_activity",
+				sessionId: id,
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				phase: "started",
+			});
+		} catch (e) {
+			logger.warn(`notifications: tool_activity start failed: ${String(e)}`);
+		}
+	});
+
+	api.on("tool_execution_end", (event, ctx) => {
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
+		if (!rt) return;
+		const inFlight = rt.inFlightTools.get(event.toolCallId);
+		if (!rt.notificationsActive || rt.redact) {
+			rt.inFlightTools.delete(event.toolCallId);
+			return;
+		}
+		try {
+			const frame: {
+				type: "tool_activity";
+				sessionId: string;
+				toolCallId: string;
+				toolName: string;
+				phase: "completed" | "failed";
+				isError: boolean;
+				argsSummary?: string;
+				resultSummary?: string;
+			} = {
+				type: "tool_activity",
+				sessionId: id,
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				phase: event.isError ? "failed" : "completed",
+				isError: event.isError,
+			};
+			if (rt.verbosity === "verbose") {
+				const tool = ctx.resolveTool(event.toolName);
+				const argsSummary = projectToolSummary(tool, "args", inFlight?.args);
+				const resultSummary = projectToolSummary(tool, "result", event.result);
+				if (argsSummary !== undefined) frame.argsSummary = argsSummary;
+				if (resultSummary !== undefined) frame.resultSummary = resultSummary;
+			}
+			pushSessionFrame(rt, frame);
+		} catch (e) {
+			logger.warn(`notifications: tool_activity end failed: ${String(e)}`);
+		} finally {
+			rt.inFlightTools.delete(event.toolCallId);
+		}
+	});
+
+	api.on("reasoning_summary_end", (event, ctx) => {
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
+		if (!rt?.notificationsActive || rt.redact || rt.verbosity !== "verbose") return;
+		if (!event.message || typeof event.message !== "object" || !("content" in event.message)) return;
+		const content = event.message.content;
+		if (!Array.isArray(content)) return;
+		const block = content[event.contentIndex];
+		if (block?.type !== "thinking" || (block.provenance !== "summary" && block.provenance !== "mixed")) return;
+		// CoT boundary: emit ONLY the canonical provider-marked summaryText. Never
+		// fall back to the event payload, which could carry inconsistent/mutated text.
+		const text = block.summaryText;
+		if (typeof text !== "string" || text === "") return;
+		try {
+			pushSessionFrame(rt, {
+				type: "reasoning_summary",
+				sessionId: id,
+				text,
+				// Coalesce on the reasoning block's stable itemId carried on the event, NOT
+				// the mutable rt.turnSeq: a streamed reasoning_summary_end is queued async and
+				// turn_start for the next iteration advances turnSeq synchronously first, so
+				// reading turnSeq here could bind turn N's summary to turn N+1. Absent an
+				// itemId, omit turnRef (threaded-render sends a fresh non-editable message).
+				...((block as { itemId?: string }).itemId ? { turnRef: (block as { itemId?: string }).itemId } : {}),
+			});
+		} catch (e) {
+			logger.warn(`notifications: reasoning_summary failed: ${String(e)}`);
+		}
 	});
 
 	api.on("turn_end", (event, ctx) => {
@@ -3946,8 +4139,7 @@ export function createNotificationsExtension(
 		const rt = runtimes.get(id);
 		if (!rt?.notificationsActive || !rt.stream || rt.redact || rt.turnClosed) return;
 		if ((event.message as { role?: unknown }).role !== "assistant") return;
-		if (rt.liveRef === undefined) {
-			rt.turnSeq = (rt.turnSeq ?? 0) + 1;
+		if (rt.liveRef === undefined && rt.turnSeq !== undefined) {
 			rt.liveRef = String(rt.turnSeq);
 		}
 		const now = Date.now();
@@ -3993,9 +4185,12 @@ export function createNotificationsExtension(
 	});
 
 	api.on("session_shutdown", async (_event, ctx) => {
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
+		if (rt) terminalizeInFlightTools(rt, id, "unknown");
 		const controllerStop =
 			typeof ctx.sessionManager.getCwd === "function" ? controller.stopCurrentSession(ctx) : Promise.resolve(false);
 		void controllerStop.catch(error => logger.warn(`notifications: controller shutdown failed: ${String(error)}`));
-		await stopSession(sessionId(ctx));
+		await stopSession(id);
 	});
 }
