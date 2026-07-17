@@ -42,7 +42,10 @@ import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/type
 import { type ConfigError, ConfigFile } from "./config-file";
 import { isAuthenticated, kNoAuth } from "./model-auth";
 import { ModelBindingsApplier } from "./model-bindings-applier";
-import { ModelDiscoveryManager } from "./model-discovery-manager";
+import { ModelDiscoveryManager, type ProviderDiscoveryState } from "./model-discovery-manager";
+
+export type { ProviderDiscoveryState, ProviderDiscoveryStatus } from "./model-discovery-manager";
+
 import {
 	buildCanonicalModelIndex,
 	type CanonicalModelIndex,
@@ -521,18 +524,6 @@ interface DiscoveryProviderConfig {
 	cacheRetention?: CacheRetention;
 	discovery: ProviderDiscovery;
 	optional?: boolean;
-}
-
-export type ProviderDiscoveryStatus = "idle" | "ok" | "empty" | "cached" | "unavailable" | "unauthenticated";
-
-export interface ProviderDiscoveryState {
-	provider: string;
-	status: ProviderDiscoveryStatus;
-	optional: boolean;
-	stale: boolean;
-	fetchedAt?: number;
-	models: string[];
-	error?: string;
 }
 
 export interface CanonicalModelQueryOptions {
@@ -1025,7 +1016,7 @@ export class ModelRegistry {
 	#customProviderApiKeys: Map<string, string> = new Map();
 	#providerWebSearchModes: Map<string, WebSearchMode> = new Map();
 	#keylessProviders: Set<string> = new Set();
-	#discoveryManager = new ModelDiscoveryManager<DiscoveryProviderConfig, ProviderDiscoveryState>();
+	#discoveryManager = new ModelDiscoveryManager<DiscoveryProviderConfig>();
 	#customModelOverlays: CustomModelOverlay[] = [];
 	#providerOverrides: Map<string, ProviderOverride> = new Map();
 	#modelOverrides: Map<string, Map<string, ModelOverride>> = new Map();
@@ -1039,7 +1030,6 @@ export class ModelRegistry {
 	#cacheDbPath?: string;
 	#suppressedSelectors: Map<string, number> = new Map();
 	#backgroundRefresh?: Promise<void>;
-	#lastDiscoveryWarnings: Map<string, string> = new Map();
 	// Runtime extension model overlays — persist across refresh() cycles so that
 	// models registered by extensions survive the model selector's offline reload.
 	#runtimeModelOverlays: CustomModelOverlay[] = [];
@@ -1317,33 +1307,15 @@ export class ModelRegistry {
 	#loadCachedDiscoverableModels(): Model<Api>[] {
 		const cachedModels: Model<Api>[] = [];
 		for (const providerConfig of this.#discoveryManager.providers) {
-			const cache = readModelCache<Api>(providerConfig.provider, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
-			if (!cache) {
-				this.#discoveryManager.setState(providerConfig.provider, {
-					provider: providerConfig.provider,
-					status: "idle",
-					optional: providerConfig.optional ?? false,
-					stale: false,
-					models: [],
-				});
-				continue;
-			}
-			const models = this.#applyProviderModelOverrides(
+			const models = this.#discoveryManager.loadCached(providerConfig, this.#cacheDbPath);
+			const normalized = this.#applyProviderModelOverrides(
 				providerConfig.provider,
 				this.#normalizeDiscoverableModels(
 					providerConfig,
-					this.#applyProviderCompat(providerConfig.compat, cache.models),
+					this.#applyProviderCompat(providerConfig.compat, [...models]),
 				),
 			);
-			cachedModels.push(...models);
-			this.#discoveryManager.setState(providerConfig.provider, {
-				provider: providerConfig.provider,
-				status: "cached",
-				optional: providerConfig.optional ?? false,
-				stale: !cache.fresh || !cache.authoritative,
-				fetchedAt: cache.updatedAt,
-				models: models.map(model => model.id),
-			});
+			cachedModels.push(...normalized);
 		}
 		return cachedModels;
 	}
@@ -1751,89 +1723,26 @@ export class ModelRegistry {
 		providerConfig: DiscoveryProviderConfig,
 		strategy: ModelRefreshStrategy,
 	): Promise<Model<Api>[]> {
-		const refreshToken = this.#discoveryManager.beginRefresh(providerConfig.provider);
-		const cached = readModelCache<Api>(providerConfig.provider, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
-		const cachedModels = applyFinalCodexGpt56ContextCap(cached?.models ?? []);
-		const requiresAuth = !this.#keylessProviders.has(providerConfig.provider);
-		if (requiresAuth) {
-			const apiKey = await this.#peekApiKeyForProvider(providerConfig.provider);
-			if (!this.#discoveryManager.isCurrent(refreshToken)) {
-				return [];
-			}
-			if (!isAuthenticated(apiKey)) {
-				this.#discoveryManager.setState(
-					providerConfig.provider,
-					{
-						provider: providerConfig.provider,
-						status: "unauthenticated",
-						optional: providerConfig.optional ?? false,
-						stale: cached !== null,
-						fetchedAt: cached?.updatedAt,
-						models: cachedModels.map(model => model.id),
-					},
-					refreshToken,
-				);
-				this.#lastDiscoveryWarnings.delete(providerConfig.provider);
-				return cachedModels;
-			}
-		}
-
-		const providerId = providerConfig.provider;
-		let discoveryError: string | undefined;
-		const fetchDynamicModels = async (): Promise<readonly Model<Api>[] | null> => {
-			try {
-				return await this.#discoverModelsByProviderType(providerConfig);
-			} catch (error) {
-				discoveryError = error instanceof Error ? error.message : String(error);
-				return null;
-			}
-		};
-
-		const manager = createModelManager<Api>({
-			providerId,
-			staticModels: [],
+		const mergeInput = await this.#discoveryManager.discover(providerConfig, strategy, {
 			cacheDbPath: this.#cacheDbPath,
-			cacheTtlMs: 24 * 60 * 60 * 1000,
-			fetchDynamicModels,
+			requiresAuth: provider => !this.#keylessProviders.has(provider.provider),
+			peekApiKey: provider => this.#peekApiKeyForProvider(provider.provider),
+			isAuthenticated,
+			fetchModels: provider => this.#discoverModelsByProviderType(provider),
 		});
-		const result = await manager.refresh(strategy);
-		if (!this.#discoveryManager.isCurrent(refreshToken)) {
-			return [];
-		}
-		const status = discoveryError
-			? result.models.length > 0
-				? "cached"
-				: "unavailable"
-			: strategy === "offline"
-				? cached
-					? "cached"
-					: "idle"
-				: result.models.length > 0
-					? "ok"
-					: "empty";
-		this.#discoveryManager.setState(
-			providerId,
-			{
-				provider: providerId,
-				status,
-				optional: providerConfig.optional ?? false,
-				stale: result.stale || status === "cached",
-				fetchedAt: discoveryError ? cached?.updatedAt : Date.now(),
-				models: result.models.map(model => model.id),
-				error: discoveryError,
-			},
-			refreshToken,
-		);
-		if (discoveryError) {
-			this.#warnProviderDiscoveryFailure(providerConfig, discoveryError);
-		} else {
-			this.#lastDiscoveryWarnings.delete(providerId);
+		if (!mergeInput.current) return [];
+		if (mergeInput.warning) {
+			logger.warn("model discovery failed for provider", {
+				provider: providerConfig.provider,
+				url: providerConfig.baseUrl,
+				error: mergeInput.warning,
+			});
 		}
 		return this.#applyProviderModelOverrides(
-			providerId,
+			providerConfig.provider,
 			this.#normalizeDiscoverableModels(
 				providerConfig,
-				this.#applyProviderCompat(providerConfig.compat, result.models),
+				this.#applyProviderCompat(providerConfig.compat, [...mergeInput.models]),
 			),
 		);
 	}
@@ -1848,19 +1757,6 @@ export class ModelRegistry {
 			case "openai-models-list":
 				return this.#discoverOpenAIModelsList(providerConfig);
 		}
-	}
-
-	#warnProviderDiscoveryFailure(providerConfig: DiscoveryProviderConfig, error: string): void {
-		const previous = this.#lastDiscoveryWarnings.get(providerConfig.provider);
-		if (previous === error) {
-			return;
-		}
-		this.#lastDiscoveryWarnings.set(providerConfig.provider, error);
-		logger.warn("model discovery failed for provider", {
-			provider: providerConfig.provider,
-			url: providerConfig.baseUrl,
-			error,
-		});
 	}
 
 	async #discoverBuiltInProviderModels(
