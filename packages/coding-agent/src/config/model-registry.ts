@@ -1751,20 +1751,28 @@ export class ModelRegistry {
 		providerConfig: DiscoveryProviderConfig,
 		strategy: ModelRefreshStrategy,
 	): Promise<Model<Api>[]> {
+		const refreshToken = this.#discoveryManager.beginRefresh(providerConfig.provider);
 		const cached = readModelCache<Api>(providerConfig.provider, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
 		const cachedModels = applyFinalCodexGpt56ContextCap(cached?.models ?? []);
 		const requiresAuth = !this.#keylessProviders.has(providerConfig.provider);
 		if (requiresAuth) {
 			const apiKey = await this.#peekApiKeyForProvider(providerConfig.provider);
+			if (!this.#discoveryManager.isCurrent(refreshToken)) {
+				return [];
+			}
 			if (!isAuthenticated(apiKey)) {
-				this.#discoveryManager.setState(providerConfig.provider, {
-					provider: providerConfig.provider,
-					status: "unauthenticated",
-					optional: providerConfig.optional ?? false,
-					stale: cached !== null,
-					fetchedAt: cached?.updatedAt,
-					models: cachedModels.map(model => model.id),
-				});
+				this.#discoveryManager.setState(
+					providerConfig.provider,
+					{
+						provider: providerConfig.provider,
+						status: "unauthenticated",
+						optional: providerConfig.optional ?? false,
+						stale: cached !== null,
+						fetchedAt: cached?.updatedAt,
+						models: cachedModels.map(model => model.id),
+					},
+					refreshToken,
+				);
 				this.#lastDiscoveryWarnings.delete(providerConfig.provider);
 				return cachedModels;
 			}
@@ -1774,9 +1782,7 @@ export class ModelRegistry {
 		let discoveryError: string | undefined;
 		const fetchDynamicModels = async (): Promise<readonly Model<Api>[] | null> => {
 			try {
-				const models = await this.#discoverModelsByProviderType(providerConfig);
-				this.#lastDiscoveryWarnings.delete(providerId);
-				return models;
+				return await this.#discoverModelsByProviderType(providerConfig);
 			} catch (error) {
 				discoveryError = error instanceof Error ? error.message : String(error);
 				return null;
@@ -1791,6 +1797,9 @@ export class ModelRegistry {
 			fetchDynamicModels,
 		});
 		const result = await manager.refresh(strategy);
+		if (!this.#discoveryManager.isCurrent(refreshToken)) {
+			return [];
+		}
 		const status = discoveryError
 			? result.models.length > 0
 				? "cached"
@@ -1802,17 +1811,23 @@ export class ModelRegistry {
 				: result.models.length > 0
 					? "ok"
 					: "empty";
-		this.#discoveryManager.setState(providerId, {
-			provider: providerId,
-			status,
-			optional: providerConfig.optional ?? false,
-			stale: result.stale || status === "cached",
-			fetchedAt: discoveryError ? cached?.updatedAt : Date.now(),
-			models: result.models.map(model => model.id),
-			error: discoveryError,
-		});
+		this.#discoveryManager.setState(
+			providerId,
+			{
+				provider: providerId,
+				status,
+				optional: providerConfig.optional ?? false,
+				stale: result.stale || status === "cached",
+				fetchedAt: discoveryError ? cached?.updatedAt : Date.now(),
+				models: result.models.map(model => model.id),
+				error: discoveryError,
+			},
+			refreshToken,
+		);
 		if (discoveryError) {
 			this.#warnProviderDiscoveryFailure(providerConfig, discoveryError);
+		} else {
+			this.#lastDiscoveryWarnings.delete(providerId);
 		}
 		return this.#applyProviderModelOverrides(
 			providerId,

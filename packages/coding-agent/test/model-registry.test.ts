@@ -2371,6 +2371,48 @@ describe("ModelRegistry", () => {
 			expect(gemma?.reasoning).toBe(false);
 		});
 
+		test("keeps the newest same-provider discovery result when overlapping refreshes complete out of order", async () => {
+			writeRawModelsJson({
+				race: {
+					baseUrl: "https://race.example.com/v1",
+					api: "openai-completions",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const firstResponse = Promise.withResolvers<Response>();
+			const firstRequest = Promise.withResolvers<void>();
+			let requests = 0;
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("https://race.example.com/v1/models");
+				requests += 1;
+				if (requests === 1) {
+					firstRequest.resolve();
+					return firstResponse.promise;
+				}
+				return new Response(JSON.stringify({ data: [{ id: "new-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const firstRefresh = registry.refreshProvider("race", "online");
+			await firstRequest.promise;
+			await registry.refreshProvider("race", "online");
+			firstResponse.resolve(
+				new Response(JSON.stringify({ data: [{ id: "old-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			await firstRefresh;
+
+			expect(registry.getProviderDiscoveryState("race")?.models).toEqual(["new-model"]);
+			expect(registry.find("race", "new-model")).toBeDefined();
+			expect(registry.find("race", "old-model")).toBeUndefined();
+		});
+
 		test("discovery failure does not fail model registry refresh", async () => {
 			writeRawModelsJson({
 				ollama: {
