@@ -812,12 +812,16 @@ export function parseSessionEntries(content: string): FileEntry[] {
 	let header: SessionHeader | undefined;
 
 	for (const record of records) {
+		// Patch records are defined only by v4 transcripts. Ignore them before a
+		// v4 header as well: a truncated or malicious prefix must not mutate a
+		// later header/entry when replay catches up.
 		if (record.type === "header_patch") {
-			if (header && isHeaderPatchRecord(record)) applyHeaderPatch(header, record.patch);
+			if (header?.version === CURRENT_SESSION_VERSION && isHeaderPatchRecord(record))
+				applyHeaderPatch(header, record.patch);
 			continue;
 		}
 		if (record.type === "entry_patch") {
-			if (isEntryPatchRecord(record)) {
+			if (header?.version === CURRENT_SESSION_VERSION && isEntryPatchRecord(record)) {
 				const entry = entriesById.get(record.entryId);
 				if (entry?.type === "message" && record.patch.message) entry.message = record.patch.message;
 			}
@@ -3254,6 +3258,7 @@ const SESSION_LIST_TRAILING_PATCH_BYTES = 4096;
 // folded on the next natural full rewrite. Keeping this bounded preserves the
 // O(SESSION_LIST_PREFIX_BYTES) listing cost that SESSION_LIST_PREFIX_BYTES exists for.
 const SESSION_LIST_TRAILING_PATCH_SCAN_CAP = SESSION_LIST_TRAILING_PATCH_BYTES * 4;
+const SESSION_NAME_MAX_CHARS = 1_000;
 const SESSION_LIST_PARALLEL_THRESHOLD = 64;
 const SESSION_LIST_MAX_WORKERS = 16;
 const sessionListPrefixDecoder = new TextDecoder("utf-8", { fatal: false });
@@ -3419,6 +3424,8 @@ function extractFirstUserMessageFromPrefix(content: string): string | undefined 
 interface SessionListHeader {
 	type: "session";
 	id: string;
+	version?: number;
+
 	cwd?: string;
 	title?: string;
 	parentSession?: string;
@@ -3434,6 +3441,7 @@ function parseSessionListHeader(
 		return {
 			type: "session",
 			id: parsedHeader.id,
+			version: typeof parsedHeader.version === "number" ? parsedHeader.version : undefined,
 			cwd: typeof parsedHeader.cwd === "string" ? parsedHeader.cwd : undefined,
 			title: typeof parsedHeader.title === "string" ? parsedHeader.title : undefined,
 			parentSession: typeof parsedHeader.parentSession === "string" ? parsedHeader.parentSession : undefined,
@@ -3451,6 +3459,7 @@ function parseSessionListHeader(
 	return {
 		type: "session",
 		id,
+		version: Number(extractStringProperty(firstLine, "version")) || undefined,
 		cwd: extractStringProperty(firstLine, "cwd"),
 		title: extractStringProperty(firstLine, "title"),
 		parentSession: extractStringProperty(firstLine, "parentSession"),
@@ -3477,8 +3486,10 @@ async function collectSessionFromFile(
 		const entries = parseSessionEntries(content).map(entry => entry as unknown as Record<string, unknown>);
 		const header = parseSessionListHeader(content, entries);
 		if (!header) return undefined;
-		for (const patch of await readSessionListTrailingPatches(file, storage, buffer)) {
-			applySessionListHeaderPatch(header, patch);
+		if (header.version === CURRENT_SESSION_VERSION) {
+			for (const patch of await readSessionListTrailingPatches(file, storage, buffer)) {
+				applySessionListHeaderPatch(header, patch);
+			}
 		}
 
 		let parsedMessageCount = 0;
@@ -3656,6 +3667,7 @@ export class SessionManager {
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
 	#persistErrorReported = false;
+
 	#artifactManager: ArtifactManager | null = null;
 	#artifactManagerSessionFile: string | null = null;
 	// When set, take precedence over the lazily-derived per-session manager.
@@ -4995,7 +5007,8 @@ export class SessionManager {
 		return name
 			.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
 			.replace(/ +/g, " ")
-			.trim();
+			.trim()
+			.slice(0, SESSION_NAME_MAX_CHARS);
 	}
 
 	/**
@@ -5058,6 +5071,7 @@ export class SessionManager {
 			if (!hasAssistant) {
 				// Mark as not flushed so when assistant arrives, all entries get written.
 				this.#flushed = false;
+
 				this.#ensuredOnDisk = false;
 				return;
 			}
@@ -6688,9 +6702,13 @@ export class SessionManager {
 			await manager.close();
 			return { kind: "error", reason: "identity-mismatch" };
 		}
-		await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
-		writeTerminalBreadcrumb(manager.cwd, sessionPath);
-		await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
+		try {
+			await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
+			writeTerminalBreadcrumb(manager.cwd, sessionPath);
+		} catch (error) {
+			await manager.close();
+			throw error;
+		}
 		return { kind: "opened", manager };
 	}
 

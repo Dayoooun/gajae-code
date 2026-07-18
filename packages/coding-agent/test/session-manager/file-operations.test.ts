@@ -134,7 +134,13 @@ describe("getRecentSessions", () => {
 
 	it("replays trailing header patches for transcripts larger than the listing prefix", async () => {
 		const file = path.join(tempDir, "patched-large.jsonl");
-		const header = { type: "session", id: "patched-large", timestamp: "2025-01-01T00:00:00Z", cwd: "/stale" };
+		const header = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: "patched-large",
+			timestamp: "2025-01-01T00:00:00Z",
+			cwd: "/stale",
+		};
 		const largeMessage = {
 			type: "message",
 			id: "message",

@@ -179,6 +179,7 @@ describe("SessionManager signature persistence", () => {
 		const sessionFile = session.getSessionFile();
 		if (!sessionFile) throw new Error("Expected persisted session file");
 		const persistedBefore = await fs.readFile(sessionFile, "utf8");
+		expect(JSON.parse(persistedBefore.split("\n", 1)[0]!).version).toBe(4);
 		await session.close();
 
 		const reloaded = await SessionManager.open(sessionFile);
@@ -197,6 +198,7 @@ describe("SessionManager signature persistence", () => {
 		expect(patch).toMatchObject({ type: "entry_patch" });
 		expect(patch.patch.message).not.toHaveProperty("providerPayload");
 		expect(patch.patch.message.content[0]).not.toHaveProperty("thinkingSignature");
+		expect(patch.patch.message.content[0]).toMatchObject({ type: "thinking", thinking });
 		await reloaded.close();
 		await reloaded.close();
 		const reopened = await SessionManager.open(sessionFile);
