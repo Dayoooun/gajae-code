@@ -445,7 +445,7 @@
 				},
 				"preAdmissionArtifactSpill": {
 					"type": "boolean",
-					"description": "Experimental opt-in: save oversized tool results as artifacts before they enter provider context, leaving a deterministic head, tail, digest, and artifact URI inline",
+					"description": "Experimental opt-in: save oversized tool results before provider context construction, retaining a UTF-8-safe head, tail, digest, and artifact receipt inline",
 					"default": false
 				},
 				"readArtifactSpillThreshold": {

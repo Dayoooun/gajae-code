@@ -662,7 +662,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "tools",
 			label: "Pre-admission artifact spill",
 			description:
-				"Experimental opt-in: save oversized tool results as artifacts before they enter provider context, leaving a deterministic head, tail, digest, and artifact URI inline",
+				"Experimental opt-in: save oversized tool results before provider context construction, retaining a UTF-8-safe head, tail, digest, and artifact receipt inline",
 		},
 	},
 
@@ -3443,6 +3443,122 @@ export function getType(path: SettingPath): SettingDef["type"] {
 export function getEnumValues(path: SettingPath): readonly string[] | undefined {
 	const def = SETTINGS_SCHEMA[path];
 	return "values" in def ? (def.values as readonly string[]) : undefined;
+}
+
+export const CONFIG_SCHEMA_VERSION = 1;
+
+export type SettingsSchemaIssue = {
+	path: string;
+	kind: "unknown" | "invalid" | "coerced" | "pending-migration";
+	detail: string;
+};
+
+export type SettingsSchemaReport = { issues: SettingsSchemaIssue[]; valid: boolean };
+
+function schemaValueAtPath(value: Record<string, unknown>, path: string): unknown {
+	let current: unknown = value;
+	for (const segment of path.split(".")) {
+		if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
+		current = (current as Record<string, unknown>)[segment];
+	}
+	return current;
+}
+
+function schemaSetAtPath(value: Record<string, unknown>, path: string, next: unknown): void {
+	const segments = path.split(".");
+	let current = value;
+	for (const segment of segments.slice(0, -1)) {
+		const child = current[segment];
+		if (!child || typeof child !== "object" || Array.isArray(child)) current[segment] = {};
+		current = current[segment] as Record<string, unknown>;
+	}
+	current[segments.at(-1)!] = next;
+}
+
+function schemaPaths(value: Record<string, unknown>, prefix = ""): string[] {
+	const paths: string[] = [];
+	for (const [key, child] of Object.entries(value)) {
+		const path = prefix ? `${prefix}.${key}` : key;
+		const definition = SETTINGS_SCHEMA[path as SettingPath];
+		// Records intentionally accept user-defined keys; validate their entries below.
+		if (definition?.type === "record") {
+			paths.push(path);
+		} else if (child && typeof child === "object" && !Array.isArray(child)) {
+			paths.push(...schemaPaths(child as Record<string, unknown>, path));
+		} else {
+			paths.push(path);
+		}
+	}
+	return paths;
+}
+
+function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], value: unknown): boolean {
+	return (
+		(definition.type === "boolean" && typeof value === "boolean") ||
+		(definition.type === "string" && typeof value === "string") ||
+		(definition.type === "number" &&
+			typeof value === "number" &&
+			Number.isFinite(value) &&
+			(!("validate" in definition) || !definition.validate || definition.validate(value))) ||
+		(definition.type === "enum" &&
+			typeof value === "string" &&
+			(definition.values as readonly string[]).includes(value)) ||
+		(definition.type === "array" && Array.isArray(value)) ||
+		(definition.type === "record" && !!value && typeof value === "object" && !Array.isArray(value))
+	);
+}
+
+/** Coerce supported scalar legacy values and report unknown or invalid settings without dropping them. */
+export function reconcileSettingsSchema(raw: Record<string, unknown>): {
+	settings: Record<string, unknown>;
+	report: SettingsSchemaReport;
+} {
+	const settings = structuredClone(raw);
+	const issues: SettingsSchemaIssue[] = [];
+	const knownPaths = new Set(Object.keys(SETTINGS_SCHEMA));
+	for (const path of schemaPaths(settings)) {
+		if (path === "configSchemaVersion" || knownPaths.has(path)) continue;
+		if (![...knownPaths].some(known => known.startsWith(`${path}.`))) {
+			issues.push({ path, kind: "unknown", detail: "Setting is not recognized by this version." });
+		}
+	}
+	for (const path of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
+		const value = schemaValueAtPath(settings, path);
+		if (value === undefined) continue;
+		const definition = SETTINGS_SCHEMA[path];
+		let next = value;
+		if (definition.type === "boolean" && (value === "true" || value === "false")) next = value === "true";
+		if (
+			definition.type === "number" &&
+			typeof value === "string" &&
+			value.trim() !== "" &&
+			Number.isFinite(Number(value))
+		) {
+			next = Number(value);
+		}
+		if (next !== value) {
+			schemaSetAtPath(settings, path, next);
+			issues.push({ path, kind: "coerced", detail: `Coerced ${typeof value} to ${definition.type}.` });
+		}
+		if (!validSettingValue(definition, next))
+			issues.push({ path, kind: "invalid", detail: `Expected ${definition.type}.` });
+		if (
+			definition.type === "record" &&
+			"valueSchema" in definition &&
+			definition.valueSchema &&
+			validSettingValue(definition, next)
+		) {
+			for (const [key, entry] of Object.entries(next as Record<string, unknown>)) {
+				if (
+					definition.valueSchema.type === "model-selector-value" &&
+					!(typeof entry === "string" || (Array.isArray(entry) && entry.every(item => typeof item === "string")))
+				) {
+					issues.push({ path: `${path}.${key}`, kind: "invalid", detail: "Expected model-selector-value." });
+				}
+			}
+		}
+	}
+	return { settings, report: { issues, valid: !issues.some(issue => issue.kind === "invalid") } };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

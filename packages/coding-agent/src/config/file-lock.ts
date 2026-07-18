@@ -68,7 +68,10 @@ async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
 		const info = JSON.parse(content) as Partial<LockInfo>;
 		if (
 			typeof info.pid !== "number" ||
+			!Number.isInteger(info.pid) ||
+			info.pid <= 0 ||
 			typeof info.timestamp !== "number" ||
+			!Number.isFinite(info.timestamp) ||
 			(info.start_time !== undefined && (typeof info.start_time !== "string" || !info.start_time))
 		) {
 			return null;

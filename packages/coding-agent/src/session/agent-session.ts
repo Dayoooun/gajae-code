@@ -161,6 +161,7 @@ import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append
 import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
+import type { CasReceipt } from "../config/atomic-yaml-patch";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	isAuthenticated,
@@ -181,8 +182,9 @@ import {
 } from "../config/model-resolver";
 import { normalizeModelSelectorValue } from "../config/model-selector-value";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
-import type { GlobalDefaultModelRoleCommit, Settings, SkillsSettings } from "../config/settings";
+import type { Settings, SkillsSettings } from "../config/settings";
 import { onAppendOnlyModeChanged } from "../config/settings";
+import type { SettingPath } from "../config/settings-schema";
 import { getDefault } from "../config/settings-schema";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { loadCapability } from "../discovery";
@@ -8953,10 +8955,10 @@ export class AgentSession {
 	}
 
 	async #restoreDefaultModelSelectionCommit(
-		commit: GlobalDefaultModelRoleCommit,
+		commit: CasReceipt,
 	): Promise<{ readonly stage: DefaultModelSelectionRollbackStage; readonly message: string } | undefined> {
 		try {
-			if (await this.settings.restoreGlobalDefaultModelRoleIfCurrent(commit)) return undefined;
+			if ((await commit.restore()).status === "restored") return undefined;
 			return {
 				stage: "durable",
 				message: "A newer default selection prevented durable recovery.",
@@ -8994,7 +8996,7 @@ export class AgentSession {
 	async #throwDefaultModelSelectionRecovery(
 		error: Error,
 		stage: DefaultModelSelectionStage,
-		commit: GlobalDefaultModelRoleCommit,
+		commit: CasReceipt,
 	): Promise<never> {
 		const sessionFailure = await this.#discardDefaultModelSelectionStage(stage);
 		const durableFailure = await this.#restoreDefaultModelSelectionCommit(commit);
@@ -9060,6 +9062,8 @@ export class AgentSession {
 		thinkingLevel: ThinkingLevel | undefined,
 	): Promise<DefaultModelSelectionResult> {
 		return this.#withSessionAdmission("selection", async () => {
+			const expectedSessionId = this.sessionId;
+
 			if (thinkingLevel === ThinkingLevel.Inherit) {
 				throw new Error("Default model selection cannot inherit a thinking level");
 			}
@@ -9075,19 +9079,25 @@ export class AgentSession {
 			await this.waitForIdle();
 			await this.sessionManager.flush();
 			await this.#waitForAdmittedBaseSystemPromptRebuilds();
+			if (this.sessionId !== expectedSessionId) {
+				throw new Error("Session changed while selecting model");
+			}
 			const expectedMutationRevision = this.#defaultModelSelectionMutationRevision;
 			const preparedSystemPrompt = await this.#prepareDefaultModelSelectionPrompt(model);
+			if (this.sessionId !== expectedSessionId) {
+				throw new Error("Session changed while selecting model");
+			}
 			const stage = await this.sessionManager.stageDefaultModelSelection(
 				`${model.provider}/${model.id}`,
 				effectiveLevel,
 				{ appendThinkingLevel: true },
 			);
-			let durableCommit: GlobalDefaultModelRoleCommit;
+			let durableCommit: CasReceipt;
 			try {
-				durableCommit = await this.settings.setGlobalModelRoleAndFlush(
-					"default",
-					formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel),
-				);
+				const selector = formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel);
+				durableCommit = await this.settings.commitAtomicBatchWithCurrent(() => [
+					{ path: "modelRoles.default" as SettingPath, op: "set", value: selector },
+				]);
 			} catch (error) {
 				await this.sessionManager.discardDefaultModelSelectionStage(stage);
 				throw error;
