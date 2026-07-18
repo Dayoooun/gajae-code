@@ -130,7 +130,7 @@ describe("G5 gjc state receipts", () => {
 describe("workflow receipt path contract", () => {
 	it("uses session-layout receipt paths for every workflow mode", async () => {
 		await withTempCwd(async cwd => {
-			const sessionId = "receipt/session.id";
+			const sessionId = "receipt-session.id";
 			for (const skill of ["deep-interview", "ralplan", "ultragoal", "team"] as const) {
 				const result = await runNativeStateCommand(
 					[
