@@ -26,6 +26,16 @@ import {
 } from "../src/session/default-model-selection";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
+async function defaultSelectorFromBuild(
+	build: Parameters<Settings["commitAtomicBatchWithCurrent"]>[0],
+): Promise<unknown> {
+	const patches = await build({});
+	const patch = patches.find(candidate => candidate.path === "modelRoles" && candidate.op === "set");
+	return patch?.op === "set" && patch.value && typeof patch.value === "object"
+		? (patch.value as Record<string, unknown>).default
+		: undefined;
+}
+
 const INITIAL_MODEL: Model = {
 	id: "initial",
 	name: "Initial",
@@ -336,10 +346,10 @@ describe("AgentSession durable default model selection", () => {
 			await originalWaitForIdle();
 		});
 		const durableAttempted = Promise.withResolvers<"durable">();
-		const originalDurableCommit = settings.setGlobalModelRoleAndFlush.bind(settings);
-		const durableCommit = vi.spyOn(settings, "setGlobalModelRoleAndFlush").mockImplementation(async (...args) => {
+		const originalDurableCommit = settings.commitAtomicBatchWithCurrent.bind(settings);
+		const durableCommit = vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockImplementation(async build => {
 			durableAttempted.resolve("durable");
-			return originalDurableCommit(...args);
+			return originalDurableCommit(build);
 		});
 
 		// When
@@ -544,13 +554,13 @@ describe("AgentSession durable default model selection", () => {
 		const lastModel = { ...targetModel(), id: "last" };
 		const firstDurableCommitEntered = Promise.withResolvers<void>();
 		const releaseFirstDurableCommit = Promise.withResolvers<void>();
-		const originalDurableCommit = settings.setGlobalModelRoleAndFlush.bind(settings);
-		vi.spyOn(settings, "setGlobalModelRoleAndFlush").mockImplementation(async (role, selector) => {
-			if (selector === "target-provider/first:low") {
+		const originalDurableCommit = settings.commitAtomicBatchWithCurrent.bind(settings);
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockImplementation(async build => {
+			if ((await defaultSelectorFromBuild(build)) === "target-provider/first:low") {
 				firstDurableCommitEntered.resolve();
 				await releaseFirstDurableCommit.promise;
 			}
-			return originalDurableCommit(role, selector);
+			return originalDurableCommit(build);
 		});
 		const lastPreflightEntered = Promise.withResolvers<void>();
 		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
@@ -908,7 +918,7 @@ describe("AgentSession durable default model selection", () => {
 
 	it("does not apply the live selection when the durable commit fails", async () => {
 		// Given
-		vi.spyOn(settings, "setGlobalModelRoleAndFlush").mockRejectedValue(new Error("durable write failed"));
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValue(new Error("durable write failed"));
 		const liveApply = vi.spyOn(session, "setModelTemporary");
 
 		// When
@@ -935,9 +945,9 @@ describe("AgentSession durable default model selection", () => {
 
 	it("does not overwrite a newer direct thinking mutation after durable selection commit", async () => {
 		// Given
-		const originalDurableCommit = settings.setGlobalModelRoleAndFlush.bind(settings);
-		vi.spyOn(settings, "setGlobalModelRoleAndFlush").mockImplementation(async (role, selector) => {
-			const commit = await originalDurableCommit(role, selector);
+		const originalDurableCommit = settings.commitAtomicBatchWithCurrent.bind(settings);
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockImplementation(async build => {
+			const commit = await originalDurableCommit(build);
 			session.setThinkingLevel(Effort.Medium);
 			return commit;
 		});
@@ -1005,9 +1015,9 @@ describe("AgentSession durable default model selection", () => {
 
 	it("preserves a newer direct transcript mutation when an older selection stage is stale", async () => {
 		// Given
-		const originalDurableCommit = settings.setGlobalModelRoleAndFlush.bind(settings);
-		vi.spyOn(settings, "setGlobalModelRoleAndFlush").mockImplementation(async (role, selector) => {
-			const commit = await originalDurableCommit(role, selector);
+		const originalDurableCommit = settings.commitAtomicBatchWithCurrent.bind(settings);
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockImplementation(async build => {
+			const commit = await originalDurableCommit(build);
 			sessionManager.appendMessage({ role: "user", content: "newer direct mutation", timestamp: Date.now() });
 			return commit;
 		});
@@ -1072,7 +1082,7 @@ describe("AgentSession durable default model selection", () => {
 		const priorModel = session.model;
 		const priorThinkingLevel = session.thinkingLevel;
 		const setModel = vi.spyOn(session.agent, "setModel");
-		vi.spyOn(settings, "setGlobalModelRoleAndFlush").mockRejectedValue(durableError);
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValue(durableError);
 
 		// When
 		const selection = session.setDefaultModelSelection(targetModel(), Effort.High);
@@ -1090,8 +1100,8 @@ describe("AgentSession durable default model selection", () => {
 	it("continues the selection queue after a rejected operation", async () => {
 		// Given
 		const successfulModel = { ...targetModel(), id: "after-failure" };
-		const originalDurableCommit = settings.setGlobalModelRoleAndFlush.bind(settings);
-		vi.spyOn(settings, "setGlobalModelRoleAndFlush")
+		const originalDurableCommit = settings.commitAtomicBatchWithCurrent.bind(settings);
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent")
 			.mockImplementation(originalDurableCommit)
 			.mockRejectedValueOnce(new Error("durable write failed"));
 
@@ -1403,12 +1413,12 @@ describe("AgentSession durable default model selection", () => {
 			thinkingLevel: Effort.Low,
 		});
 		const priorModelRoles = { default: "initial-provider/initial:low", planner: "planner/model:medium" };
-		const originalDurableCommit = settings.setGlobalModelRoleAndFlush.bind(settings);
+		const originalDurableCommit = settings.commitAtomicBatchWithCurrent.bind(settings);
 		settings.set("modelRoles", priorModelRoles);
 		persistentManager.appendMessage({ role: "user", content: "persisted transcript", timestamp: Date.now() });
 		await persistentManager.rewriteEntries();
-		vi.spyOn(settings, "setGlobalModelRoleAndFlush").mockImplementation(async (role, selector) => {
-			const commit = await originalDurableCommit(role, selector);
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockImplementation(async build => {
+			const commit = await originalDurableCommit(build);
 			persistentManager.appendMessage({ role: "user", content: "newer transcript mutation", timestamp: Date.now() });
 			return commit;
 		});
@@ -1546,7 +1556,7 @@ describe("AgentSession durable default model selection", () => {
 		const restorePath = "/private/sessions/default-selection.json";
 		const restoreToken = "durable-restore-token";
 		const rollbackError = new Error(`durable rollback failed at ${restorePath} with token ${restoreToken}`);
-		vi.spyOn(settings, "restoreGlobalDefaultModelRoleIfCurrent").mockRejectedValue(rollbackError);
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValue(rollbackError);
 		failDefaultSelectionPromotion(sessionManager, liveApplyError);
 		const rollbackWarning = vi.spyOn(logger, "warn");
 
