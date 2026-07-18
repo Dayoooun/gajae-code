@@ -1,35 +1,105 @@
 {
-  "schemaVersion": 1,
-  "issue": 2383,
-  "status": "pass",
-  "evidenceType": "deterministic-simulated-three-turn-provider-payload-integration",
-  "source": {
-    "url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
-    "retrievedAt": "2026-07-16",
-    "codeCommit": "2797773e",
-    "inputFixtureSha256": "c3c387e9ff2904f5a4fa73cd6bf4cd8a8711da052ef24720aa57d1bb2d80848c"
-  },
-  "capturedAnchors": {
-    "before": [
-      "tools[0]",
-      "system[0]",
-      "messages[2].content[0]",
-      "messages[3].content[0]"
-    ],
-    "proposed": [
-      "tools[0]",
-      "system[0]",
-      "messages[1].content[0]",
-      "messages[3].content[0]"
-    ]
-  },
-  "derivedMetrics": {
-    "estimator": "floor(utf8Bytes/4)",
-    "beforeSharedCachedPrefixBytes": 0,
-    "beforeSharedCachedPrefixTokens": 0,
-    "proposedSharedCachedPrefixBytes": 537,
-    "proposedSharedCachedPrefixTokens": 134
-  },
-  "method": "Two provider-built payloads use the same three-turn fixture except for the tool-result text. A cache breakpoint is counted only when the entire JSON serialization through that breakpoint is byte-identical across both payloads. Tokens are the deterministic floor of UTF-8 serialized-prefix bytes divided by four.",
-  "testCommand": "bun test packages/ai/test/anthropic-cache-eval.integration.test.ts"
+	"schemaVersion": 2,
+	"issue": 2383,
+	"status": "pass",
+	"evidenceType": "deterministic-simulated-three-turn-provider-payload-integration",
+	"source": {
+		"url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
+		"retrievedAt": "2026-07-16",
+		"codeCommit": "018d4476a79aa833b1cd67544d8fcde13d8ed5d0",
+		"inputFixtureSha256": "0e5406fa6c37d8b176dfacff1ff5173892249b735cc91ff8887a4db3a109bc62"
+	},
+	"derivationCommands": [
+		"git log --merges -1 --format=%H",
+		"WRITE_ARCHITECTURE_2383_EVAL=1 bun test packages/ai/test/anthropic-cache-eval.integration.test.ts",
+		"bun test packages/ai/test/anthropic-cache-eval.integration.test.ts"
+	],
+	"capturedAnchors": {
+		"oldPlacement": [
+			"tools[0]",
+			"system[0]",
+			"messages[2].content[0]",
+			"messages[3].content[0]"
+		],
+		"newPlacement": [
+			"tools[0]",
+			"system[0]",
+			"messages[1].content[0]",
+			"messages[3].content[0]"
+		]
+	},
+	"payloads": {
+		"oldPlacement": [
+			{
+				"sha256": "fff4477c77f05636a8c5bf402e4f4c5c39720bc1a97b5aeb80d95aca27afb501",
+				"breakpoints": {
+					"tools[0]": "83aaba556bc09176e48a7ff6982f92a3308d8ec3f869ac2962e641b70da91f2b",
+					"system[0]": "fe3a3070994f1787d158a45c578961443a6dced62eb0665c5f44413d7841cba3",
+					"messages[2].content[0]": "8b35e2f37bcba04541cef1e0bf7cf101067f95138ab1451f6830384e0e82c7d3",
+					"messages[3].content[0]": "87f215f26933eef978067b99b620f16e7bd2b1cf15a6d9ca8b2a3d9aa1acff7f"
+				}
+			},
+			{
+				"sha256": "47f2560a0b89edaebf991915ae6300463fc1a411e3cbddd2865a888c535e4010",
+				"breakpoints": {
+					"tools[0]": "83aaba556bc09176e48a7ff6982f92a3308d8ec3f869ac2962e641b70da91f2b",
+					"system[0]": "fe3a3070994f1787d158a45c578961443a6dced62eb0665c5f44413d7841cba3",
+					"messages[2].content[0]": "14be8a4790743069cee7508adc1c8a3379961d80898c397271a1646c4e717474",
+					"messages[3].content[0]": "d5849393c929fe0499e9eed52a3ab278fef027315458f0eed1cfda8bb2126e1f"
+				}
+			},
+			{
+				"sha256": "85af4bc6eb1e62081ae3079eeb1d1b034fae25ddb5ddd0f573f4eb40afb75cc8",
+				"breakpoints": {
+					"tools[0]": "83aaba556bc09176e48a7ff6982f92a3308d8ec3f869ac2962e641b70da91f2b",
+					"system[0]": "fe3a3070994f1787d158a45c578961443a6dced62eb0665c5f44413d7841cba3",
+					"messages[2].content[0]": "7b8414d92b642139c45569d5c4fe117b848871528b9f9ecfaa5809149eb8032f",
+					"messages[3].content[0]": "4f813eae4d2963f973317996c943fc1fe423bacc0dc6ee460110c21792edc893"
+				}
+			}
+		],
+		"newPlacement": [
+			{
+				"sha256": "9d2d41afecea19d89d44ce37554ede44207f89825749d4caa3922938c83b4358",
+				"breakpoints": {
+					"tools[0]": "83aaba556bc09176e48a7ff6982f92a3308d8ec3f869ac2962e641b70da91f2b",
+					"system[0]": "fe3a3070994f1787d158a45c578961443a6dced62eb0665c5f44413d7841cba3",
+					"messages[1].content[0]": "22c03943a11e98459d39c603ae6b503b2bf23b0200f9da49e3b3c943963b86f3",
+					"messages[3].content[0]": "2c67fa84723c4b83fdcbfb6434092c9f487adf7a9928b0c33bce4397a94aa888"
+				}
+			},
+			{
+				"sha256": "3d32dc9cc7bb4fd84433baf64514bb60e0dfee8c76fb3efb6192fb025a6cc0f5",
+				"breakpoints": {
+					"tools[0]": "83aaba556bc09176e48a7ff6982f92a3308d8ec3f869ac2962e641b70da91f2b",
+					"system[0]": "fe3a3070994f1787d158a45c578961443a6dced62eb0665c5f44413d7841cba3",
+					"messages[1].content[0]": "22c03943a11e98459d39c603ae6b503b2bf23b0200f9da49e3b3c943963b86f3",
+					"messages[3].content[0]": "8d04def1677c4b58f29484e37bad17816cd26a3710aca05939170206902f77bd"
+				}
+			},
+			{
+				"sha256": "3f5f757e0a36ac2f0ff3e6229220342c7ff05806a8f409d28c7ad78a8500166e",
+				"breakpoints": {
+					"tools[0]": "83aaba556bc09176e48a7ff6982f92a3308d8ec3f869ac2962e641b70da91f2b",
+					"system[0]": "fe3a3070994f1787d158a45c578961443a6dced62eb0665c5f44413d7841cba3",
+					"messages[1].content[0]": "22c03943a11e98459d39c603ae6b503b2bf23b0200f9da49e3b3c943963b86f3",
+					"messages[3].content[0]": "022dbfacd5e75a2626602588b43a51e325a743ed84a358e2538e1baa38f6f7a1"
+				}
+			}
+		]
+	},
+	"threeTurnCacheReadInputTokens": {
+		"oldPlacement": [
+			0,
+			84,
+			84
+		],
+		"newPlacement": [
+			0,
+			134,
+			134
+		]
+	},
+	"method": "Each turn is a real streamAnthropic onPayload request constructed from the same fixture with a distinct tool-result value. For each placement, the simulator retains every cache_control breakpoint input from preceding turns and reports the largest byte-identical retained breakpoint as floor(UTF-8 bytes / 4) cache_read_input_tokens. The old placement moves the provider-generated assistant marker to the tool-result block; the new placement is the provider-generated payload unchanged.",
+	"testCommand": "bun test packages/ai/test/anthropic-cache-eval.integration.test.ts"
 }
