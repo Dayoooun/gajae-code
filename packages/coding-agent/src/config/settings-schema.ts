@@ -656,16 +656,6 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"tools.preAdmissionArtifactSpill": {
-		type: "boolean",
-		default: false,
-		ui: {
-			tab: "tools",
-			label: "Pre-admission artifact spill",
-			description:
-				"Experimental opt-in: save oversized tool results as artifacts before they enter provider context, leaving a deterministic head, tail, digest, and artifact URI inline",
-		},
-	},
-
 	"tools.preAdmissionArtifactSpill": {
 		type: "boolean",
 		default: false,
