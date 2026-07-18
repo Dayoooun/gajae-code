@@ -190,7 +190,8 @@ export declare class NotificationServer {
   pushFrame(frameJson: string): void
   /**
    * Broadcast a TypeScript-constructed turn frame without re-parsing JSON.
-   * External frames must continue through [`Self::push_frame`] for serde validation.
+   * External frames must continue through [`Self::push_frame`] for serde
+   * validation.
    */
   pushTurnStreamUnchecked(sessionId: string, phase: string, text: string, finalAnswer?: boolean | undefined | null, messageRef?: string | undefined | null): void
   /**
@@ -198,7 +199,10 @@ export declare class NotificationServer {
    * base64 wire field only in Rust.
    */
   pushFileAttachmentUnchecked(sessionId: string, name: string, mime: string | undefined | null, data: Buffer, caption?: string | undefined | null): void
-  /** Return counters guarding the known-good frame crossing against regressions. */
+  /**
+   * Return counters guarding the known-good frame crossing against
+   * regressions.
+   */
   knownGoodFrameStats(): KnownGoodFrameStats
   /** Send a validated, bounded JSON envelope to one connected v3 SDK client. */
   sendTo(connectionId: string, json: string): void
