@@ -3254,7 +3254,6 @@ const SESSION_LIST_TRAILING_PATCH_BYTES = 4096;
 // folded on the next natural full rewrite. Keeping this bounded preserves the
 // O(SESSION_LIST_PREFIX_BYTES) listing cost that SESSION_LIST_PREFIX_BYTES exists for.
 const SESSION_LIST_TRAILING_PATCH_SCAN_CAP = SESSION_LIST_TRAILING_PATCH_BYTES * 4;
-
 const SESSION_LIST_PARALLEL_THRESHOLD = 64;
 const SESSION_LIST_MAX_WORKERS = 16;
 const sessionListPrefixDecoder = new TextDecoder("utf-8", { fatal: false });
@@ -5047,7 +5046,6 @@ export class SessionManager {
 			await writer.write(persistedRecord);
 		});
 	}
-
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.#sessionFile) return;
 		if (this.#persistError) throw this.#persistError;
@@ -6690,6 +6688,7 @@ export class SessionManager {
 			await manager.close();
 			return { kind: "error", reason: "identity-mismatch" };
 		}
+		await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 		writeTerminalBreadcrumb(manager.cwd, sessionPath);
 		await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 		return { kind: "opened", manager };
