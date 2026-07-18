@@ -19,7 +19,7 @@ import {
 	writeReport,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
-import { buildWorkerCommand } from "./team-launch";
+import { buildWorkerCommand, startGjcTeamLaunch } from "./team-launch";
 import {
 	listTeamMailbox,
 	markTeamMailboxMessage,
@@ -2540,173 +2540,40 @@ async function integrateGjcWorkerCommits(
 	return integrationByWorker;
 }
 
-async function initializeStateDirs(dir: string, workers: GjcTeamWorker[]): Promise<void> {
-	// Empty mailbox directories are runtime state, so they must exist before messages arrive.
-	await fs.mkdir(path.join(dir, "mailbox"), { recursive: true });
-	for (const worker of workers) {
-		await fs.mkdir(mailboxDirPath(dir, worker.id), { recursive: true });
-		await writeJsonFile(mailboxPath(dir, worker.id), { messages: [] });
-		await writeJsonFile(path.join(workerDir(dir, worker.id), "status.json"), {
-			state: "idle",
-			updated_at: now(),
-		});
-		await writeJsonFile(workerLifecyclePath(dir, worker.id), {
-			worker: worker.id,
-			lifecycle_state: "starting",
-			worker_status_state: "idle",
-			updated_at: now(),
-		} satisfies GjcTeamWorkerLifecycle);
-		await writeJsonFile(path.join(workerDir(dir, worker.id), "heartbeat.json"), {
-			pid: 0,
-			last_turn_at: now(),
-			turn_count: 0,
-			alive: true,
-		});
-	}
-	// Empty leader mailbox directory is runtime state, so it must exist before messages arrive.
-	await fs.mkdir(mailboxDirPath(dir, "leader-fixed"), { recursive: true });
-	await writeJsonFile(mailboxPath(dir, "leader-fixed"), { messages: [] });
-}
-
 export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTeamSnapshot> {
-	const cwd = options.cwd ?? process.cwd();
-	const env = options.env ?? process.env;
-	if (!Number.isInteger(options.workerCount) || options.workerCount < 1 || options.workerCount > GJC_TEAM_MAX_WORKERS)
-		throw new Error(`invalid_team_worker_count:${options.workerCount}:expected_1_${GJC_TEAM_MAX_WORKERS}`);
-	const workerCliPlan = resolveGjcTeamWorkerCliPlan(options.workerCount, env);
-	const stateRoot = resolveGjcTeamStateRoot(cwd, env);
-	const teamName = sanitizeName(options.teamName ?? makeTeamName(options.task, env));
-	const displayName = sanitizeName(options.teamName ?? options.task).slice(0, 30) || teamName;
-	const dir = teamDir(stateRoot, teamName);
-	const createdAt = now();
-	const worktreeMode = resolveDefaultWorktreeMode(options.worktreeMode);
-	const platform = options.platform ?? process.platform;
-	const tmuxBinary = resolveGjcTmuxBinary({ env, platform });
-	const tmuxCommand = tmuxBinary.command;
-	const tmuxContext = options.dryRun
-		? {
-				sessionName: "dry-run",
-				windowIndex: "0",
-				leaderPaneId: "%dry-run-leader",
-				target: "dry-run:0",
-			}
-		: readCurrentTmuxLeaderContext(tmuxCommand, env);
-	const initialWorkers = buildWorkers(options.workerCount, options.agentType, stateRoot);
-	const initialTasks = buildInitialTasks(options.task, initialWorkers);
-	const workers: GjcTeamWorker[] = [];
-	try {
-		for (const worker of initialWorkers)
-			workers.push(
-				options.dryRun
-					? worker
-					: await ensureWorkerWorktree(cwd, dir, teamName, worker, worktreeMode, platform, tmuxBinary.isPsmux),
-			);
-	} catch (error) {
-		await rollbackCreatedWorktrees(workers);
-		throw error;
-	}
-	const config: GjcTeamConfig = {
-		team_name: teamName,
-		display_name: displayName,
-		requested_name: options.teamName ?? displayName,
-		task: options.task,
-		agent_type: options.agentType,
-		worker_count: options.workerCount,
-		max_workers: GJC_TEAM_MAX_WORKERS,
-		state_root: stateRoot,
-		worker_command: resolveGjcWorkerCommand(cwd, env),
-		worker_cli_plan: workerCliPlan,
-		tmux_command: tmuxCommand,
-		tmux_session: tmuxContext.sessionName,
-		tmux_session_name: tmuxContext.sessionName,
-		tmux_target: tmuxContext.target,
-		workspace_mode: worktreeMode.enabled ? "worktree" : "direct",
-		dry_run: options.dryRun ?? false,
-		leader: {
-			session_id: env.GJC_SESSION_ID ?? env.CODEX_SESSION_ID ?? "",
-			pane_id: tmuxContext.leaderPaneId,
-			cwd,
+	return startGjcTeamLaunch(
+		{
+			maxWorkers: GJC_TEAM_MAX_WORKERS,
+			resolveWorkerCliPlan: resolveGjcTeamWorkerCliPlan,
+			resolveStateRoot: resolveGjcTeamStateRoot,
+			sanitizeName,
+			makeTeamName,
+			teamDir,
+			resolveDefaultWorktreeMode,
+			resolveTmuxBinary: resolveGjcTmuxBinary,
+			readTmuxLeaderContext: readCurrentTmuxLeaderContext,
+			buildWorkers,
+			buildInitialTasks,
+			ensureWorkerWorktree,
+			rollbackCreatedWorktrees,
+			resolveWorkerCommand: resolveGjcWorkerCommand,
+			mailboxDirPath,
+			mailboxPath,
+			workerDir,
+			workerLifecyclePath,
+			writeJson: writeJsonFile,
+			now,
+			writePhase,
+			writeTask,
+			appendEvent,
+			appendTelemetry,
+			startTmuxSession,
+			killWorkerPanes,
+			writeWorkerLifecycleForConfig,
+			readSnapshot: readGjcTeamSnapshot,
 		},
-		leader_cwd: cwd,
-		team_state_root: stateRoot,
-		workers,
-		created_at: createdAt,
-		updated_at: createdAt,
-	};
-	await initializeStateDirs(dir, config.workers);
-	await writeJsonFile(path.join(dir, "config.json"), config);
-	await writeJsonFile(path.join(dir, "manifest.v2.json"), {
-		version: 2,
-		team_name: config.team_name,
-		display_name: config.display_name,
-		requested_name: config.requested_name,
-		tmux_session: config.tmux_session,
-		tmux_session_name: config.tmux_session_name,
-		tmux_target: config.tmux_target,
-		worker_command: config.worker_command,
-		worker_cli_plan: config.worker_cli_plan,
-		tmux_command: config.tmux_command,
-		leader: config.leader,
-		workers: config.workers,
-		workspace_mode: config.workspace_mode,
-		dry_run: config.dry_run,
-		created_at: createdAt,
-		updated_at: createdAt,
-	});
-	await writePhase(dir, "starting");
-	for (const task of initialTasks) await writeTask(dir, task);
-	await appendEvent(dir, {
-		type: "team_started",
-		message: options.dryRun
-			? "Created native gjc team dry-run state without starting tmux workers"
-			: "Started native gjc team runtime",
-		data: {
-			worker_count: options.workerCount,
-			agent_type: options.agentType,
-			workspace_mode: config.workspace_mode,
-			dry_run: config.dry_run,
-		},
-	});
-	await appendTelemetry(dir, {
-		type: "team_runtime",
-		message: options.dryRun ? "Native gjc team dry-run state initialized" : "Native gjc team runtime initialized",
-		data: {
-			state_root: stateRoot,
-			worker_command: config.worker_command,
-			worker_cli_plan: workerCliPlan,
-			workspace_mode: config.workspace_mode,
-			dry_run: config.dry_run,
-		},
-	});
-	let tmuxWorkers: GjcTeamWorker[];
-	try {
-		tmuxWorkers = await startTmuxSession(config, dir, options.dryRun ?? false, env);
-	} catch (error) {
-		await writePhase(dir, "failed");
-		await appendEvent(dir, {
-			type: "team_start_failed",
-			message: error instanceof Error ? error.message : String(error),
-		});
-		killWorkerPanes(config);
-		await rollbackCreatedWorktrees(config.workers);
-		throw error;
-	}
-	const runningConfig = {
-		...config,
-		workers: tmuxWorkers.map(worker => ({
-			...worker,
-			status: "idle" as const,
-			last_heartbeat: now(),
-		})),
-		updated_at: now(),
-	};
-	await writeJsonFile(path.join(dir, "config.json"), runningConfig);
-	await writeWorkerLifecycleForConfig(dir, runningConfig, "starting", worker => ({
-		pane_id: worker.pane_id,
-		started_at: runningConfig.created_at,
-	}));
-	await writePhase(dir, "running");
-	return readGjcTeamSnapshot(teamName, cwd, env);
+		options,
+	);
 }
 
 export async function readGjcTeamSnapshot(
