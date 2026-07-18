@@ -1,3 +1,12 @@
+import {
+	canonicalArgsKey,
+	classifyToolOutcome,
+	decideTimeoutHold,
+	toResultText,
+	turnTimeoutFingerprint,
+	type TimeoutToolOutcome,
+} from "../../goals/continuation-timeout-guard";
+
 import { consumePendingGoalModeRequest } from "../../gjc-runtime/goal-mode-request";
 import { type GoalModeState, normalizeGoal } from "../../goals/state";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
@@ -50,6 +59,13 @@ export class GoalModeController {
 	#turnHadToolCalls = false;
 	#continuationTurnInFlight = false;
 	#suppressNextContinuation = false;
+	#goalTurnToolStarts = new Map<string, { toolName: string; argsKey: string }>();
+	#goalTurnOutcomes: TimeoutToolOutcome[] = [];
+	#goalTurnUnpaired = false;
+	#goalTurnSnapshotKey: string | undefined;
+	#goalHeldSnapshotKey: string | undefined;
+	#goalTimeoutFingerprint: string | undefined;
+	#goalIdenticalTimeoutStreak = 0;
 
 	constructor(private readonly ctx: GoalModeControllerContext) {}
 
@@ -112,22 +128,45 @@ export class GoalModeController {
 	}
 
 	onUserSubmission(): void {
-		this.#suppressNextContinuation = false;
+		this.#resetContinuationSuppression();
 	}
 
 	async handleSessionEvent(event: AgentSessionEvent): Promise<void> {
 		if (event.type === "agent_start") {
 			this.#turnHadToolCalls = false;
+			this.#goalTurnToolStarts.clear();
+			this.#goalTurnOutcomes = [];
+			this.#goalTurnUnpaired = false;
+			const goal = this.ctx.session.getGoalModeState()?.goal;
+			this.#goalTurnSnapshotKey = goal ? `${goal.id}\u0000${goal.objective}` : undefined;
 			this.cancelContinuation();
 			return;
 		}
 		if (event.type === "tool_execution_start") {
 			this.#turnHadToolCalls = true;
-			if (!this.#continuationTurnInFlight) this.#suppressNextContinuation = false;
+			this.#goalTurnToolStarts.set(event.toolCallId, {
+				toolName: event.toolName,
+				argsKey: canonicalArgsKey(event.args),
+			});
+			if (!this.#continuationTurnInFlight) this.#resetContinuationSuppression();
+			return;
+		}
+		if (event.type === "tool_execution_end") {
+			const start = this.#goalTurnToolStarts.get(event.toolCallId);
+			if (!start) {
+				this.#turnHadToolCalls = true;
+				this.#goalTurnUnpaired = true;
+			} else {
+				this.#goalTurnOutcomes.push({
+					...start,
+					kind: classifyToolOutcome(event.isError, toResultText(event.result)),
+				});
+				this.#goalTurnToolStarts.delete(event.toolCallId);
+			}
 			return;
 		}
 		if (event.type === "message_start" && event.message.role === "user" && !event.message.synthetic) {
-			this.#suppressNextContinuation = false;
+			this.#resetContinuationSuppression();
 			return;
 		}
 		if (event.type === "goal_updated") {
@@ -135,17 +174,52 @@ export class GoalModeController {
 				await this.exit({ reason: "dropped", silent: true });
 				return;
 			}
+			const goal = event.state?.goal;
+			const snapshotKey = goal ? `${goal.id}\u0000${goal.objective}` : undefined;
+			if (this.#goalHeldSnapshotKey !== undefined && this.#goalHeldSnapshotKey !== snapshotKey)
+				this.#resetContinuationSuppression();
 			if (event.state?.enabled && !this.#previousTools) this.#previousTools = this.ctx.session.getActiveToolNames();
 			this.#enabled = event.state?.enabled === true;
 			this.#paused = event.state?.enabled !== true && event.state?.goal?.status === "paused";
-			if (!event.state?.enabled) this.cancelContinuation();
+			if (this.#enabled || this.#paused) this.ctx.modeGate.enter("goal");
+			else this.ctx.modeGate.exit("goal");
+			if (!event.state?.enabled) {
+				this.#resetContinuationSuppression();
+				this.cancelContinuation();
+			}
 			this.#updateStatus();
 			return;
 		}
 		if (event.type !== "agent_end") return;
 		if (this.#continuationTurnInFlight) {
 			this.#suppressNextContinuation = !this.#turnHadToolCalls;
+			const fingerprint =
+				this.#goalTurnToolStarts.size > 0 || this.#goalTurnUnpaired
+					? null
+					: turnTimeoutFingerprint(this.#goalTurnOutcomes);
+			const decision = decideTimeoutHold(
+				{
+					heldSnapshotKey: this.#goalHeldSnapshotKey,
+					fingerprint: this.#goalTimeoutFingerprint,
+					streak: this.#goalIdenticalTimeoutStreak,
+				},
+				{ snapshotKey: this.#goalTurnSnapshotKey ?? "", fingerprint },
+			);
+			if (fingerprint === null) this.#resetTimeoutHold();
+			else {
+				this.#goalHeldSnapshotKey = decision.next.heldSnapshotKey;
+				this.#goalTimeoutFingerprint = decision.next.fingerprint;
+				this.#goalIdenticalTimeoutStreak = decision.next.streak;
+			}
+			if (decision.hold) {
+				this.#suppressNextContinuation = true;
+				this.ctx.showStatus(
+					`Goal paused for attention: repeated identical timeout from ${this.#goalTurnOutcomes[0]?.toolName ?? "tool"}. Send a message to continue.`,
+				);
+			}
 			this.#continuationTurnInFlight = false;
+		} else {
+			this.#resetTimeoutHold();
 		}
 		if (this.ctx.session.getGoalModeState()?.mode === "exiting") {
 			await this.exit({ reason: "completed", silent: true });
@@ -224,7 +298,7 @@ export class GoalModeController {
 		await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])]);
 		this.ctx.session.setGoalModeState(state);
 		this.#enabled = true;
-		this.#suppressNextContinuation = false;
+		this.#resetContinuationSuppression();
 		this.#updateStatus();
 		if (this.ctx.session.isStreaming) await this.ctx.session.sendGoalModeContext({ deliverAs: "steer" });
 		if (!options.silent) this.ctx.showStatus(options.resume ? "Goal mode resumed." : "Goal mode enabled.");
@@ -254,6 +328,7 @@ export class GoalModeController {
 		this.#paused = options?.paused ?? false;
 		this.#previousTools = undefined;
 		this.#continuationTurnInFlight = false;
+		this.#resetContinuationSuppression();
 		this.cancelContinuation();
 		if (!this.#paused) this.ctx.modeGate.exit("goal");
 		this.#updateStatus();
@@ -278,6 +353,21 @@ export class GoalModeController {
 		this.ctx.updateGoalModeStatus(
 			this.#enabled || this.#paused ? { enabled: this.#enabled, paused: this.#paused } : undefined,
 		);
+	}
+
+	#resetTimeoutHold(): void {
+		this.#goalTurnToolStarts.clear();
+		this.#goalTurnOutcomes = [];
+		this.#goalTurnUnpaired = false;
+		this.#goalTurnSnapshotKey = undefined;
+		this.#goalHeldSnapshotKey = undefined;
+		this.#goalTimeoutFingerprint = undefined;
+		this.#goalIdenticalTimeoutStreak = 0;
+	}
+
+	#resetContinuationSuppression(): void {
+		this.#suppressNextContinuation = false;
+		this.#resetTimeoutHold();
 	}
 
 	async #dispatchSubcommand(sub: GoalSubcommand, rest: string): Promise<void> {
@@ -351,7 +441,7 @@ export class GoalModeController {
 
 	async #startFromObjective(objective: string): Promise<void> {
 		await this.enter({ objective, silent: true });
-		this.#suppressNextContinuation = false;
+		this.#resetContinuationSuppression();
 		this.ctx.inputCallback?.(this.ctx.startPendingSubmission({ text: objective }));
 	}
 
@@ -360,7 +450,7 @@ export class GoalModeController {
 		this.ctx.session.setGoalModeState(state);
 		this.#enabled = true;
 		this.#paused = false;
-		this.#suppressNextContinuation = false;
+		this.#resetContinuationSuppression();
 		this.#updateStatus();
 		if (this.ctx.session.isStreaming) await this.ctx.session.sendGoalModeContext({ deliverAs: "steer" });
 		this.ctx.inputCallback?.(this.ctx.startPendingSubmission({ text: objective }));

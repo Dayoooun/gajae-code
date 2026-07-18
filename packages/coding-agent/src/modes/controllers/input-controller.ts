@@ -36,7 +36,7 @@ interface Expandable {
 	setManuallyExpanded?(expanded: boolean): void;
 }
 
-const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
+export const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
 export const BACKGROUND_FOLD_DOUBLE_PRESS_MS = 750;
 
 const DRAFT_CLEAR_DOUBLE_ESCAPE_WINDOW_MS = 800;

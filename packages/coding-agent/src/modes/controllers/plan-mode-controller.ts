@@ -27,9 +27,10 @@ import {
 } from "../components/plan-preview-overlay";
 import { getMarkdownTheme, theme } from "../theme/theme";
 import type { SubmittedUserInput } from "../types";
+import { INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS } from "./input-controller";
 import type { ModeGate } from "./mode-gate";
 
-const ABORT_TIMEOUT_MS = 2_000;
+const ABORT_TIMEOUT_MS = INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS;
 
 type PlanModeControllerContext = {
 	readonly session: AgentSession;

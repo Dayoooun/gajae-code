@@ -174,6 +174,21 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.mode.planModeController.enabled).toBe(false);
 	});
 
+	it("refuses /plan after a goal tool creates an active goal", async () => {
+		await harness.mode.init();
+		harness.mode.ui.stop();
+		const goalTool = new GoalTool(harness.toolSession);
+		await goalTool.execute("call-create", { op: "create", objective: "Tool-created goal" });
+		await harness.session.waitForIdle();
+		const showWarning = vi.spyOn(harness.mode, "showWarning");
+
+		await harness.mode.planModeController.handleCommand();
+
+		expect(harness.mode.goalModeController.enabled).toBe(true);
+		expect(showWarning).toHaveBeenCalledWith("Exit goal mode first.");
+		expect(harness.mode.planModeController.enabled).toBe(false);
+	});
+
 	it("rejects a new /goal objective while paused", async () => {
 		await harness.mode.goalModeController.handleCommand("Ship the release");
 		vi.spyOn(harness.mode, "showHookSelector").mockResolvedValue("Pause");
