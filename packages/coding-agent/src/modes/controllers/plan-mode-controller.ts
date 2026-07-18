@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { AgentToolResult, ThinkingLevel } from "@gajae-code/agent-core";
 import type { CompactionOutcome } from "@gajae-code/agent-core/compaction";
 import { type Model, modelsAreEqual } from "@gajae-code/ai";
-import { Container, Markdown, Spacer, Text, type KeyId } from "@gajae-code/tui";
+import { Container, type KeyId, Markdown, Spacer, Text } from "@gajae-code/tui";
 import { isEnoent, prompt } from "@gajae-code/utils";
 import { resolveLocalUrlToPath } from "../../internal-urls";
 import { humanizePlanTitle, type PlanApprovalDetails, resolvePlanTitle } from "../../plan-mode/approved-plan";
@@ -19,14 +19,14 @@ import { ToolError } from "../../tools/tool-errors";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { DynamicBorder } from "../components/dynamic-border";
-import { getMarkdownTheme, theme } from "../theme/theme";
-import type { SubmittedUserInput } from "../types";
 import {
-	planSnapshotHash,
-	serializePlanReviewComments,
 	type PlanPreviewOptions,
 	type PlanPreviewResult,
+	planSnapshotHash,
+	serializePlanReviewComments,
 } from "../components/plan-preview-overlay";
+import { getMarkdownTheme, theme } from "../theme/theme";
+import type { SubmittedUserInput } from "../types";
 import type { ModeGate } from "./mode-gate";
 
 const ABORT_TIMEOUT_MS = 2_000;

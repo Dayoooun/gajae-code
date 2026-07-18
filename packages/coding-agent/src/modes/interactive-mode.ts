@@ -29,7 +29,6 @@ import type { CompactOptions } from "../extensibility/extensions/types";
 import { resolveSkillSlashCommands, type Skill } from "../extensibility/skills";
 import { BUILTIN_SLASH_COMMANDS, loadSlashCommands } from "../extensibility/slash-commands";
 import { getLspStartupWarningMessage, LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
-import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
 import {
 	createStarReminderBeforeAgentStartContributor,
 	scheduleLaunchStarReminderAfterFirstRender,
@@ -40,7 +39,6 @@ import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import { getRecentSessions, getSessionMessageEntryId } from "../session/session-manager";
-import { formatDuration } from "../slash-commands/helpers/format";
 import type { LspStartupServerInfo } from "../tools";
 import { formatPhaseDisplayName } from "../tools/todo-write";
 import type { EventBus } from "../utils/event-bus";
@@ -62,7 +60,6 @@ import {
 	isPetCapabilityProbePending,
 	warnWhenPetCapabilitySettled,
 } from "./components/pet-capability";
-import { planSnapshotHash, serializePlanReviewComments } from "./components/plan-preview-overlay";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import { StatusLineComponent } from "./components/tool-status-header";
 import {
@@ -91,19 +88,12 @@ import { shouldShowExtensionCommand } from "./slash-command-visibility";
 import { TasksAggregator } from "./tasks-aggregator";
 import { type ShimmerPalette, shimmerSegments, shimmerText } from "./theme/shimmer";
 import type { Theme } from "./theme/theme";
-import {
-	getEditorTheme,
-	getMarkdownTheme,
-	getSymbolTheme,
-	onTerminalAppearanceChange,
-	onThemeChange,
-	theme,
-} from "./theme/theme";
+import { getEditorTheme, getSymbolTheme, onTerminalAppearanceChange, onThemeChange, theme } from "./theme/theme";
 import { type RegisterTranscriptItem, TranscriptItemRegistry, transcriptItemId } from "./transcript-item-registry";
 import {
-	canApplyComposerSubmission,
 	type CompactionQueuedMessage,
 	type ComposerSubmissionOptions,
+	canApplyComposerSubmission,
 	type InteractiveModeContext,
 	type IrcArrivalSnapshot,
 	type SubmittedUserInput,
@@ -302,44 +292,6 @@ export class InteractiveMode implements InteractiveModeContext {
 	isBashNoContext = false;
 	toolOutputExpanded = false;
 	todoExpanded = false;
-	get planModeEnabled(): boolean {
-		return this.#planModeController.enabled;
-	}
-
-	set planModeEnabled(enabled: boolean) {
-		this.#planModeController.setEnabledForCompatibility(enabled);
-	}
-
-	get planModePaused(): boolean {
-		return this.#planModeController.paused;
-	}
-
-	set planModePaused(paused: boolean) {
-		this.#planModeController.setPausedForCompatibility(paused);
-	}
-
-	get goalModeEnabled(): boolean {
-		return this.#goalModeController.enabled;
-	}
-
-	set goalModeEnabled(enabled: boolean) {
-		this.#goalModeController.setEnabledForCompatibility(enabled);
-	}
-
-	get goalModePaused(): boolean {
-		return this.#goalModeController.paused;
-	}
-
-	set goalModePaused(paused: boolean) {
-		this.#goalModeController.setPausedForCompatibility(paused);
-	}
-	get planModePlanFilePath(): string | undefined {
-		return this.#planModeController.planFilePath;
-	}
-
-	set planModePlanFilePath(planFilePath: string | undefined) {
-		this.#planModeController.setPlanFilePathForCompatibility(planFilePath);
-	}
 	todoPhases: TodoPhase[] = [];
 	hideThinkingBlock = false;
 	pendingImages: ImageContent[] = [];
@@ -445,7 +397,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.session = session;
 		this.sessionManager = session.sessionManager;
 		this.session.setSdkPlanModeHandler(async on => {
-			if (on && (this.goalModeEnabled || this.goalModePaused)) {
+			if (on && (this.#goalModeController.enabled || this.#goalModeController.paused)) {
 				throw Object.assign(new Error("mode.plan.set could not enter plan mode while goal mode is active."), {
 					code: "conflict",
 				});
@@ -454,8 +406,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			else await this.#planModeController.exit();
 			const state = this.session.getPlanModeState();
 			const applied = on
-				? this.planModeEnabled && state?.enabled === true
-				: !this.planModeEnabled && !this.planModePaused && state === undefined;
+				? this.#planModeController.enabled && state?.enabled === true
+				: !this.#planModeController.enabled && !this.#planModeController.paused && state === undefined;
 			if (!applied) {
 				throw Object.assign(
 					new Error(`mode.plan.set could not ${on ? "enter" : "exit"} plan mode in the current lifecycle state.`),
@@ -485,7 +437,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			sessionManager: this.sessionManager,
 			modeGate: this.#modeGate,
 			get planModeActive() {
-				return thisMode.planModeEnabled || thisMode.planModePaused;
+				return thisMode.#planModeController.enabled || thisMode.#planModeController.paused;
 			},
 			get inputCallback() {
 				return thisMode.onInputCallback;
@@ -1297,8 +1249,8 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#updateGoalModeStatus(): void {
 		const status =
-			this.goalModeEnabled || this.goalModePaused
-				? { enabled: this.goalModeEnabled, paused: this.goalModePaused }
+			this.#goalModeController.enabled || this.#goalModeController.paused
+				? { enabled: this.#goalModeController.enabled, paused: this.#goalModeController.paused }
 				: undefined;
 		this.statusLine.setGoalModeStatus(status);
 		this.updateEditorChrome();
@@ -1314,23 +1266,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		const sessionContext = this.sessionManager.buildSessionContext();
 		if (await this.#goalModeController.restoreFromSession(sessionContext)) return;
 		await this.#planModeController.restoreFromSession(sessionContext);
-	}
-
-	/** Apply any deferred plan-mode model switch after the current stream ends. */
-	async flushPendingModelSwitch(): Promise<void> {
-		await this.#planModeController.flushPendingModelSwitch();
-	}
-
-	async handlePlanModeCommand(initialPrompt?: string): Promise<void> {
-		await this.#planModeController.handleCommand(initialPrompt);
-	}
-
-	async handleGoalModeCommand(rest?: string): Promise<void> {
-		await this.#goalModeController.handleCommand(rest);
-	}
-
-	async handlePlanApproval(details: PlanApprovalDetails): Promise<void> {
-		await this.#planModeController.handleApproval(details);
 	}
 
 	stop(): void {

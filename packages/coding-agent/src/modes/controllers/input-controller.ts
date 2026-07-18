@@ -155,7 +155,7 @@ export class InputController {
 			case "app.session.fork":
 				return this.ctx.session.messages.length > 0;
 			case "app.plan.toggle":
-				return this.ctx.planModeEnabled && !this.ctx.goalModeEnabled;
+				return this.ctx.planModeController.enabled && !this.ctx.goalModeController.enabled;
 			case "app.history.search":
 				return (this.ctx.historyStorage?.getRecent(1).length ?? 0) > 0;
 			case "app.stt.toggle":
@@ -167,7 +167,9 @@ export class InputController {
 				return getUserMessageViewportAnchorIds(this.ctx.session.messages).length > 0;
 			case "app.mode.cycle":
 				return (
-					Boolean(this.ctx.settings.get("plan.enabled")) && !this.ctx.goalModeEnabled && !this.ctx.goalModePaused
+					Boolean(this.ctx.settings.get("plan.enabled")) &&
+					!this.ctx.goalModeController.enabled &&
+					!this.ctx.goalModeController.paused
 				);
 			case "app.queue.togglePane":
 				return true;
