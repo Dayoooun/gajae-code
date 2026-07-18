@@ -18,10 +18,12 @@ use std::{
 
 use gjc_sdk::{
 	ActionIdentity, ActionNeeded, ClientMessage, ControlServerConfig, ControlServerHandle,
-	LifecycleClientMessage, LifecycleServerMessage, ReplyAnswer, ServerConfig, ServerHandle, ServerMessage,
-	Verbosity,
+	LifecycleClientMessage, LifecycleServerMessage, ReplyAnswer, ServerConfig, ServerHandle,
+	ServerMessage, Verbosity,
 	actions::RetireIfUnclaimed,
-	protocol::{FileAttachment, SessionReady, TurnPhase, TurnStream, decode_workflow_gate_action_needed},
+	protocol::{
+		FileAttachment, SessionReady, TurnPhase, TurnStream, decode_workflow_gate_action_needed,
+	},
 	start_control,
 };
 use napi::{
@@ -174,19 +176,19 @@ type NegotiatedCapabilitiesFn = ThreadsafeFunction<(String, Vec<String>)>;
 /// In-process notification server handle exposed to TypeScript.
 #[napi]
 pub struct NotificationServer {
-	config:                     Mutex<Option<ServerConfig>>,
-	handle:                     Mutex<Option<ServerHandle>>,
+	config: Mutex<Option<ServerConfig>>,
+	handle: Mutex<Option<ServerHandle>>,
 	/// The one current presentation that may be retired only by its exact lease.
 	/// This is private routing state, never workflow-gate authority.
-	arbitrated_presentation:             Mutex<Option<ActionIdentity>>,
-	on_reply:                            Mutex<Option<ThreadsafeFunction<ReplyEvent>>>,
-	on_inbound:                          Mutex<Option<ThreadsafeFunction<InboundEvent>>>,
-	on_frame:                            Mutex<Option<ThreadsafeFunction<SdkFrameEvent>>>,
-	on_negotiated_capabilities:          Mutex<Option<NegotiatedCapabilitiesFn>>,
-	on_connection_close:                 Mutex<Option<ThreadsafeFunction<String>>>,
-	pump_tasks:                          Mutex<Vec<tokio::task::JoinHandle<()>>>,
-	stop_wait:                           tokio::sync::Mutex<()>,
-	known_good_turn_stream_frames:       AtomicU64,
+	arbitrated_presentation: Mutex<Option<ActionIdentity>>,
+	on_reply: Mutex<Option<ThreadsafeFunction<ReplyEvent>>>,
+	on_inbound: Mutex<Option<ThreadsafeFunction<InboundEvent>>>,
+	on_frame: Mutex<Option<ThreadsafeFunction<SdkFrameEvent>>>,
+	on_negotiated_capabilities: Mutex<Option<NegotiatedCapabilitiesFn>>,
+	on_connection_close: Mutex<Option<ThreadsafeFunction<String>>>,
+	pump_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+	stop_wait: tokio::sync::Mutex<()>,
+	known_good_turn_stream_frames: AtomicU64,
 	turn_stream_serde_validation_parses: AtomicU64,
 	file_attachment_base64_chars:        AtomicU64,
 }
@@ -195,7 +197,7 @@ pub struct NotificationServer {
 #[napi(object)]
 pub struct KnownGoodFrameStats {
 	/// Frames constructed as `TurnStream` without parsing a JSON string.
-	pub known_good_turn_stream_frames: f64,
+	pub known_good_turn_stream_frames:       f64,
 	/// JSON serde parses of externally supplied `turn_stream` frames.
 	pub turn_stream_serde_validation_parses: f64,
 	/// Base64 characters encoded in Rust for `file_attachment` frames (the JS
@@ -223,17 +225,17 @@ impl NotificationServer {
 		// TS always owns gate resolution, so the core forwards replies.
 		config.forward_replies = true;
 		Self {
-			config:                             Mutex::new(Some(config)),
-			handle:                             Mutex::new(None),
-			arbitrated_presentation:             Mutex::new(None),
-			on_reply:                            Mutex::new(None),
-			on_inbound:                          Mutex::new(None),
-			on_frame:                            Mutex::new(None),
-			on_negotiated_capabilities:          Mutex::new(None),
-			on_connection_close:                 Mutex::new(None),
-			pump_tasks:                          Mutex::new(Vec::new()),
-			stop_wait:                           tokio::sync::Mutex::new(()),
-			known_good_turn_stream_frames:       AtomicU64::new(0),
+			config: Mutex::new(Some(config)),
+			handle: Mutex::new(None),
+			arbitrated_presentation: Mutex::new(None),
+			on_reply: Mutex::new(None),
+			on_inbound: Mutex::new(None),
+			on_frame: Mutex::new(None),
+			on_negotiated_capabilities: Mutex::new(None),
+			on_connection_close: Mutex::new(None),
+			pump_tasks: Mutex::new(Vec::new()),
+			stop_wait: tokio::sync::Mutex::new(()),
+			known_good_turn_stream_frames: AtomicU64::new(0),
 			turn_stream_serde_validation_parses: AtomicU64::new(0),
 			file_attachment_base64_chars:        AtomicU64::new(0),
 		}
@@ -570,7 +572,8 @@ impl NotificationServer {
 	}
 
 	/// Broadcast a TypeScript-constructed turn frame without re-parsing JSON.
-	/// External frames must continue through [`Self::push_frame`] for serde validation.
+	/// External frames must continue through [`Self::push_frame`] for serde
+	/// validation.
 	#[napi]
 	pub fn push_turn_stream_unchecked(
 		&self,
@@ -623,7 +626,8 @@ impl NotificationServer {
 			.map_err(|error| Error::from_reason(error.to_string()))
 	}
 
-	/// Return counters guarding the known-good frame crossing against regressions.
+	/// Return counters guarding the known-good frame crossing against
+	/// regressions.
 	#[napi]
 	#[must_use]
 	pub fn known_good_frame_stats(&self) -> KnownGoodFrameStats {
