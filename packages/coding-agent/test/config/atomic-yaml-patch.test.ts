@@ -4,11 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
 import {
-	type AtomicYamlPatch,
 	AtomicYamlConflictError,
-	atomicYamlPathHash,
+	type AtomicYamlPatch,
 	AtomicYamlReplaceError,
 	applyAtomicYamlPatches,
+	atomicYamlPathHash,
 } from "../../src/config/atomic-yaml-patch";
 
 const temporaryDirectories: string[] = [];

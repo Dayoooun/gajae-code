@@ -180,10 +180,10 @@ import {
 	type ScopedModelSelection,
 } from "../config/model-resolver";
 import { normalizeModelSelectorValue } from "../config/model-selector-value";
-import type { SettingPath } from "../config/settings-schema";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import type { Settings, SkillsSettings } from "../config/settings";
 import { onAppendOnlyModeChanged } from "../config/settings";
+import type { SettingPath } from "../config/settings-schema";
 import { getDefault } from "../config/settings-schema";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { loadCapability } from "../discovery";
