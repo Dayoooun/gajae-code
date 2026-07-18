@@ -656,7 +656,6 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"tools.preAdmissionArtifactSpill": {
-	"tools.preAdmissionArtifactSpill": {
 		type: "boolean",
 		default: false,
 		ui: {
