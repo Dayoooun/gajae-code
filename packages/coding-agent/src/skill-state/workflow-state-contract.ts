@@ -1,4 +1,5 @@
-import { activeSnapshotPath, modeStatePath } from "../gjc-runtime/session-layout";
+import * as path from "node:path";
+import { activeSnapshotPath, assertNonEmptyGjcSessionId, modeStatePath } from "../gjc-runtime/session-layout";
 import { CANONICAL_GJC_WORKFLOW_SKILLS, type CanonicalGjcWorkflowSkill, SKILL_ACTIVE_STATE_FILE } from "./active-state";
 import { WORKFLOW_STATE_RECEIPT_FRESH_MS, WORKFLOW_STATE_RECEIPT_VERSION } from "./workflow-state-version";
 
@@ -54,15 +55,18 @@ export interface AuditEntry {
 export function workflowModeStateFileName(skill: CanonicalGjcWorkflowSkill): string {
 	return `${skill}-state.json`;
 }
+
 export function buildWorkflowStateReceipt(input: {
 	cwd: string;
 	skill: CanonicalGjcWorkflowSkill;
 	owner: WorkflowStateMutationOwner;
 	command: string;
-	sessionId?: string;
+	sessionId: string;
 	nowIso?: string;
 	mutationId?: string;
 }): WorkflowStateReceipt {
+	assertNonEmptyGjcSessionId(input.sessionId, "buildWorkflowStateReceipt");
+	const cwd = path.resolve(input.cwd);
 	const mutatedAt = input.nowIso ?? new Date().toISOString();
 	const freshUntil = new Date(Date.parse(mutatedAt) + WORKFLOW_STATE_RECEIPT_FRESH_MS).toISOString();
 	return {
@@ -70,8 +74,8 @@ export function buildWorkflowStateReceipt(input: {
 		skill: input.skill,
 		owner: input.owner,
 		command: input.command,
-		state_path: activeSnapshotPath(input.cwd, input.sessionId ?? "default"),
-		storage_path: modeStatePath(input.cwd, input.sessionId ?? "default", input.skill),
+		state_path: activeSnapshotPath(cwd, input.sessionId),
+		storage_path: modeStatePath(cwd, input.sessionId, input.skill),
 		mutated_at: mutatedAt,
 		fresh_until: freshUntil,
 		status: "fresh",

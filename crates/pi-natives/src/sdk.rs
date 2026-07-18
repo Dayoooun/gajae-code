@@ -11,14 +11,19 @@
 //! Call order: construct, [`NotificationServer::on_reply`] (optional), then
 //! [`NotificationServer::start`]. `on_reply` must be registered before `start`.
 
-use std::path::PathBuf;
+use std::{
+	path::PathBuf,
+	sync::atomic::{AtomicU64, Ordering},
+};
 
 use gjc_sdk::{
 	ActionIdentity, ActionNeeded, ClientMessage, ControlServerConfig, ControlServerHandle,
 	LifecycleClientMessage, LifecycleServerMessage, ReplyAnswer, ServerConfig, ServerHandle,
 	ServerMessage, Verbosity,
 	actions::RetireIfUnclaimed,
-	protocol::{SessionReady, decode_workflow_gate_action_needed},
+	protocol::{
+		FileAttachment, SessionReady, TurnPhase, TurnStream, decode_workflow_gate_action_needed,
+	},
 	start_control,
 };
 use napi::{
@@ -28,6 +33,9 @@ use napi::{
 use napi_derive::napi;
 use parking_lot::Mutex;
 
+fn saturating_increment(counter: &AtomicU64) {
+	let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1));
+}
 /// Bound endpoint info returned from [`NotificationServer::start`].
 #[napi(object)]
 pub struct NotificationEndpoint {
@@ -168,18 +176,33 @@ type NegotiatedCapabilitiesFn = ThreadsafeFunction<(String, Vec<String>)>;
 /// In-process notification server handle exposed to TypeScript.
 #[napi]
 pub struct NotificationServer {
-	config:                     Mutex<Option<ServerConfig>>,
-	handle:                     Mutex<Option<ServerHandle>>,
+	config: Mutex<Option<ServerConfig>>,
+	handle: Mutex<Option<ServerHandle>>,
 	/// The one current presentation that may be retired only by its exact lease.
 	/// This is private routing state, never workflow-gate authority.
-	arbitrated_presentation:    Mutex<Option<ActionIdentity>>,
-	on_reply:                   Mutex<Option<ThreadsafeFunction<ReplyEvent>>>,
-	on_inbound:                 Mutex<Option<ThreadsafeFunction<InboundEvent>>>,
-	on_frame:                   Mutex<Option<ThreadsafeFunction<SdkFrameEvent>>>,
+	arbitrated_presentation: Mutex<Option<ActionIdentity>>,
+	on_reply: Mutex<Option<ThreadsafeFunction<ReplyEvent>>>,
+	on_inbound: Mutex<Option<ThreadsafeFunction<InboundEvent>>>,
+	on_frame: Mutex<Option<ThreadsafeFunction<SdkFrameEvent>>>,
 	on_negotiated_capabilities: Mutex<Option<NegotiatedCapabilitiesFn>>,
-	on_connection_close:        Mutex<Option<ThreadsafeFunction<String>>>,
-	pump_tasks:                 Mutex<Vec<tokio::task::JoinHandle<()>>>,
-	stop_wait:                  tokio::sync::Mutex<()>,
+	on_connection_close: Mutex<Option<ThreadsafeFunction<String>>>,
+	pump_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+	stop_wait: tokio::sync::Mutex<()>,
+	known_good_turn_stream_frames: AtomicU64,
+	turn_stream_serde_validation_parses: AtomicU64,
+	file_attachment_base64_chars: AtomicU64,
+}
+
+/// Observable counters for the internal known-good N-API frame lane.
+#[napi(object)]
+pub struct KnownGoodFrameStats {
+	/// Frames constructed as `TurnStream` without parsing a JSON string.
+	pub known_good_turn_stream_frames:       f64,
+	/// JSON serde parses of externally supplied `turn_stream` frames.
+	pub turn_stream_serde_validation_parses: f64,
+	/// Base64 characters encoded in Rust for `file_attachment` frames (the JS
+	/// side crosses raw `Buffer` bytes and never allocates the base64 string).
+	pub file_attachment_rust_base64_chars:   f64,
 }
 
 #[napi]
@@ -202,16 +225,19 @@ impl NotificationServer {
 		// TS always owns gate resolution, so the core forwards replies.
 		config.forward_replies = true;
 		Self {
-			config:                     Mutex::new(Some(config)),
-			handle:                     Mutex::new(None),
-			arbitrated_presentation:    Mutex::new(None),
-			on_reply:                   Mutex::new(None),
-			on_inbound:                 Mutex::new(None),
-			on_frame:                   Mutex::new(None),
+			config: Mutex::new(Some(config)),
+			handle: Mutex::new(None),
+			arbitrated_presentation: Mutex::new(None),
+			on_reply: Mutex::new(None),
+			on_inbound: Mutex::new(None),
+			on_frame: Mutex::new(None),
 			on_negotiated_capabilities: Mutex::new(None),
-			on_connection_close:        Mutex::new(None),
-			pump_tasks:                 Mutex::new(Vec::new()),
-			stop_wait:                  tokio::sync::Mutex::new(()),
+			on_connection_close: Mutex::new(None),
+			pump_tasks: Mutex::new(Vec::new()),
+			stop_wait: tokio::sync::Mutex::new(()),
+			known_good_turn_stream_frames: AtomicU64::new(0),
+			turn_stream_serde_validation_parses: AtomicU64::new(0),
+			file_attachment_base64_chars: AtomicU64::new(0),
 		}
 	}
 
@@ -537,9 +563,86 @@ impl NotificationServer {
 		// N-API `index.d.ts` signature/docs remain byte-stable for issue #2029.
 		let msg: ServerMessage = serde_json::from_str(&frame_json)
 			.map_err(|e| Error::from_reason(format!("invalid frame json: {e}")))?;
+		if matches!(msg, ServerMessage::TurnStream(_)) {
+			saturating_increment(&self.turn_stream_serde_validation_parses);
+		}
 		self
 			.with_handle(|h| h.push_frame(msg))?
 			.map_err(|error| Error::from_reason(error.to_string()))
+	}
+
+	/// Broadcast a TypeScript-constructed turn frame without re-parsing JSON.
+	/// External frames must continue through [`Self::push_frame`] for serde
+	/// validation.
+	#[napi]
+	pub fn push_turn_stream_unchecked(
+		&self,
+		session_id: String,
+		phase: String,
+		text: String,
+		final_answer: Option<bool>,
+		message_ref: Option<String>,
+	) -> Result<()> {
+		let phase = match phase.as_str() {
+			"live" => TurnPhase::Live,
+			"finalized" => TurnPhase::Finalized,
+			_ => return Err(Error::from_reason("invalid turn stream phase")),
+		};
+		saturating_increment(&self.known_good_turn_stream_frames);
+		self
+			.with_handle(|h| {
+				h.push_frame(ServerMessage::TurnStream(TurnStream {
+					session_id,
+					phase,
+					text,
+					final_answer,
+					message_ref,
+				}))
+			})?
+			.map_err(|error| Error::from_reason(error.to_string()))
+	}
+
+	/// Broadcast a file attachment from raw N-API bytes, encoding the unchanged
+	/// base64 wire field only in Rust.
+	#[napi]
+	pub fn push_file_attachment_unchecked(
+		&self,
+		session_id: String,
+		name: String,
+		mime: Option<String>,
+		data: Buffer,
+		caption: Option<String>,
+	) -> Result<()> {
+		self
+			.with_handle(|h| {
+				h.push_frame(ServerMessage::FileAttachment(FileAttachment {
+					session_id,
+					name,
+					mime,
+					data: encode_base64(&data, &self.file_attachment_base64_chars),
+					caption,
+				}))
+			})?
+			.map_err(|error| Error::from_reason(error.to_string()))
+	}
+
+	/// Return counters guarding the known-good frame crossing against
+	/// regressions.
+	#[napi]
+	#[must_use]
+	pub fn known_good_frame_stats(&self) -> KnownGoodFrameStats {
+		let known_good_turn_stream_frames =
+			self.known_good_turn_stream_frames.load(Ordering::Relaxed);
+		let turn_stream_serde_validation_parses = self
+			.turn_stream_serde_validation_parses
+			.load(Ordering::Relaxed);
+		let file_attachment_rust_base64_chars =
+			self.file_attachment_base64_chars.load(Ordering::Relaxed);
+		KnownGoodFrameStats {
+			known_good_turn_stream_frames:       known_good_turn_stream_frames as f64,
+			turn_stream_serde_validation_parses: turn_stream_serde_validation_parses as f64,
+			file_attachment_rust_base64_chars:   file_attachment_rust_base64_chars as f64,
+		}
 	}
 
 	/// Send a validated, bounded JSON envelope to one connected v3 SDK client.
@@ -1126,4 +1229,30 @@ fn parse_reason(reason: Option<&str>) -> gjc_sdk::RejectReason {
 		Some("unauthorized") => RejectReason::Unauthorized,
 		_ => RejectReason::InvalidAnswer,
 	}
+}
+
+/// Encode bytes for the unchanged JSON WebSocket wire schema without allocating
+/// a JavaScript base64 string at the N-API boundary.
+fn encode_base64(bytes: &[u8], chars_counter: &AtomicU64) -> String {
+	const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+	for chunk in bytes.chunks(3) {
+		let first = chunk[0];
+		let second = *chunk.get(1).unwrap_or(&0);
+		let third = *chunk.get(2).unwrap_or(&0);
+		encoded.push(char::from(TABLE[usize::from(first >> 2)]));
+		encoded.push(char::from(TABLE[usize::from((first & 0b0000_0011) << 4 | second >> 4)]));
+		encoded.push(if chunk.len() > 1 {
+			char::from(TABLE[usize::from((second & 0b0000_1111) << 2 | third >> 6)])
+		} else {
+			'='
+		});
+		encoded.push(if chunk.len() > 2 {
+			char::from(TABLE[usize::from(third & 0b0011_1111)])
+		} else {
+			'='
+		});
+	}
+	chars_counter.fetch_add(encoded.len() as u64, Ordering::Relaxed);
+	encoded
 }

@@ -29,8 +29,8 @@ import type { PetMode } from "./components/gajae-pet-widget";
 import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
-import type { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
+import type { StatusLineComponent } from "./components/tool-status-header";
 import type { IrcObservationLedger } from "./irc-observation-ledger";
 import type { OAuthManualInputManager } from "./oauth-manual-input";
 import type { Theme } from "./theme/theme";
@@ -298,6 +298,8 @@ export interface InteractiveModeContext {
 		isAuto?: boolean,
 	): Promise<CompactionOutcome>;
 	openInBrowser(urlOrPath: string): void;
+	/** Resolved source of truth for slash autocomplete and command palette entries. */
+	getSlashCommands?(): readonly SlashCommand[];
 	refreshSlashCommandState(cwd?: string): Promise<void>;
 
 	// Selector handling
@@ -319,6 +321,7 @@ export interface InteractiveModeContext {
 	showUserMessageSelector(): void;
 	showTreeSelector(): void;
 	showSessionSelector(): void;
+	showSessionsDashboard(): void;
 	handleResumeSession(sessionPath: string): Promise<void>;
 	handleSessionDeleteCommand(): Promise<void>;
 	showOAuthSelector(mode: "login" | "logout", providerId?: string, options?: OAuthSelectorOptions): Promise<void>;
@@ -326,6 +329,10 @@ export interface InteractiveModeContext {
 	showDebugSelector(): void;
 	showSessionObserver(): void;
 	showJobsOverlay(): void;
+	showTasksPane(): void;
+	showTranscriptViewer(): void;
+	isTranscriptViewerOpen(): boolean;
+	refreshTranscriptViewer(): void;
 	resetObserverRegistry(): void;
 
 	// Input handling

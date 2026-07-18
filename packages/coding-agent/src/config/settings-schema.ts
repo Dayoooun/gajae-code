@@ -278,7 +278,11 @@ export const SETTINGS_SCHEMA = {
 
 	// Notifications (shared daemon with Telegram/Discord/Slack presentation adapters)
 	"notifications.enabled": { type: "boolean", default: false },
-	"notifications.telegram.botToken": { type: "string", default: undefined },
+	"notifications.telegram.botToken": {
+		type: "string",
+		default: undefined,
+		validate: (value: unknown) => typeof value === "string",
+	},
 	"notifications.telegram.chatId": { type: "string", default: undefined },
 	"notifications.telegram.activation": { type: "record", default: {} as Record<string, unknown> },
 	"notifications.telegram.rich.enabled": {
@@ -649,6 +653,16 @@ export const SETTINGS_SCHEMA = {
 				{ value: "500", label: "500 KB", description: "~125K tokens" },
 				{ value: "1000", label: "1 MB", description: "~250K tokens" },
 			],
+		},
+	},
+	"tools.preAdmissionArtifactSpill": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			label: "Pre-admission artifact spill",
+			description:
+				"Experimental opt-in: save oversized tool results as artifacts before they enter provider context, leaving a deterministic head, tail, digest, and artifact URI inline",
 		},
 	},
 
@@ -1156,7 +1170,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "model",
 			label: "Max Retry Delay",
 			description:
-				"Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows).",
+				"Maximum wait between retries, in ms. Legacy retries clamp provider Retry-After hints to this value; managed fallback honors typed Retry-After hints even when they exceed it.",
 		},
 	},
 	"retry.requestMaxRetries": {
@@ -1203,6 +1217,15 @@ export const SETTINGS_SCHEMA = {
 	// Interaction
 	// ────────────────────────────────────────────────────────────────────────
 
+	"mouse.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			label: "Mouse Support",
+			description: "Enable SGR mouse wheel scrolling and overlay row selection. Disabled in tmux and screen.",
+		},
+	},
 	// Conversation flow
 	steeringMode: {
 		type: "enum",
@@ -2763,6 +2786,15 @@ export const SETTINGS_SCHEMA = {
 	// Tasks
 	// ────────────────────────────────────────────────────────────────────────
 
+	"tasksPane.defaultVisible": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			label: "Tasks Pane Visible By Default",
+			description: "Open the unified tasks pane when the interactive UI starts",
+		},
+	},
 	// Plan mode
 	"plan.enabled": {
 		type: "boolean",

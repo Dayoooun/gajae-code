@@ -46,12 +46,19 @@ describe("planTasks command shape (issue #622)", () => {
 });
 
 describe("dev-ci canonical-plan workflow contract", () => {
-	test("binds the canonical plan to its checked-out source and validates it before aggregate decisions", async () => {
+	test("binds canonical artifacts to the run so attempt-2 consumers reuse attempt-1 producers safely", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		expect(workflow.match(/ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/g)).toHaveLength(5);
 		expect(workflow.match(/Verify checked-out source head/g)).toHaveLength(5);
-		expect(workflow).toContain("name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}");
-		expect(workflow.match(/\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/g)).toHaveLength(8);
+		expect(workflow).toContain("name: dev-affected-plan-${{ github.run_id }}");
+		expect(workflow).toContain("name: dev-affected-native-${{ github.run_id }}");
+		expect(workflow).toContain("name: dev-affected-shard-${{ github.run_id }}-${{ strategy.job-index }}");
+		expect(workflow).toContain("pattern: dev-affected-shard-${{ github.run_id }}-*");
+		expect(workflow).not.toContain("github.run_attempt");
+		expect(workflow.match(/overwrite: true/g)).toHaveLength(3);
+		expect(workflow.match(/dev-affected-plan-\$\{\{ github\.run_id \}\}/g)).toHaveLength(4);
+		expect(workflow.match(/dev-affected-native-\$\{\{ github\.run_id \}\}/g)).toHaveLength(2);
+		expect(workflow.match(/dev-affected-shard-\$\{\{ github\.run_id \}\}/g)).toHaveLength(2);
 		expect(workflow).toContain("include-hidden-files: true");
 		expect(workflow.match(/include-hidden-files: true/g)).toHaveLength(2);
 		expect(workflow).toContain("CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}");
@@ -218,13 +225,13 @@ describe("describeTasks matrix emission", () => {
 		}
 	});
 
-	test("full-workspace root-check uses the bounded CI command without native artifacts", () => {
+	test("full-workspace root-check downloads the native artifact used by generated checks", () => {
 		const entries = describeTasks(planTasks(["tsconfig.json"], packages));
 		const nativeBuild = entries.find(entry => entry.key === "native-linux-x64");
 		const rootCheck = entries.find(entry => entry.key === "root-check");
 
 		expect(nativeBuild?.nativeBuild).toBe(true);
-		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: false, nativeBuild: false });
+		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
 	test("rust tasks are flagged rust and need no native addon", () => {
@@ -671,6 +678,10 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).toContain("test:@gajae-code/coding-agent:shard-1-of-8");
 		expect(keys).not.toContain("test:packages/coding-agent/test/sdk/index.test.ts");
 		expect(keys).not.toContain("test:packages/coding-agent/test/other/index.test.ts");
+		expect(describeTasks(tasks).find(entry => entry.key === "check:@gajae-code/coding-agent")).toMatchObject({
+			native: true,
+			nativeBuild: false,
+		});
 	});
 
 	test("a deleted test path is not scheduled as a runnable test shard", () => {
@@ -772,6 +783,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			"packages/coding-agent/scripts/build-sdk-package-smoke.ts",
 		]);
 		expect(describeTasks(tasks).find(task => task.key === "bridge-client-sdk-package-smoke")?.native).toBe(true);
+		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
 	});
 
 	test("release evidence source changes select contract, dry-run, and focused evidence coverage once", () => {
@@ -791,14 +803,14 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).toContain("wrapper-version");
 	});
 
-	test("root-level codeish fallback uses the bounded CI command without native artifacts", () => {
+	test("root-level codeish fallback plans the native artifact required by the bounded check", () => {
 		const tasks = targeted(["scripts/unmapped-tool.ts"]);
 		const keys = tasks.map(task => task.key);
 		expect(keys).toContain("root-check");
-		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual([]);
+		expect(keys).toContain("native-linux-x64");
 
 		const rootCheck = describeTasks(tasks).find(entry => entry.key === "root-check");
-		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: false, nativeBuild: false });
+		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
 	test("docs/changelog-only changes plan nothing expensive", () => {
@@ -864,14 +876,14 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		expect(tasks.find(task => task.key === "test:scripts/release-evidence.test.ts")?.command).toEqual(["bun", "test", "scripts/release-evidence.test.ts"]);
 	});
 
-	test("tooling-script root-check uses the bounded CI command without native artifacts", () => {
+	test("tooling-script root-check marks the bounded check as a native consumer", () => {
 		const tasks = planTasks(["scripts/unmapped-tool.ts"], [codingAgent]);
 		const keys = tasks.map(task => task.key);
 		expect(keys).toContain("root-check");
 		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual([]);
 
 		const rootCheck = describeTasks(tasks).find(entry => entry.key === "root-check");
-		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: false, nativeBuild: false });
+		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
 	test("push mode selects the bridge-client SDK package smoke exactly once for package and SDK client changes", () => {
@@ -886,6 +898,7 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 			"packages/coding-agent/scripts/build-sdk-package-smoke.ts",
 		]);
 		expect(describeTasks(tasks).find(task => task.key === "bridge-client-sdk-package-smoke")?.native).toBe(true);
+		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
 		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
 		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
 	});

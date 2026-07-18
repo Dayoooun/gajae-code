@@ -1,4 +1,4 @@
-export type FallbackTriggerClass = "rate_limit" | "quota" | "auth" | "server" | "other";
+export type FallbackTriggerClass = "rate_limit" | "quota" | "auth" | "server" | "unknown" | "other";
 
 export interface FallbackTrigger {
 	class: FallbackTriggerClass;
@@ -20,7 +20,12 @@ export type TransportHeaders = Headers | Record<string, string | undefined>;
 export interface TransportFailureFacts {
 	kind: "transport";
 	status?: number;
+	/** Canonical provider error code used for fallback classification. */
 	providerCode?: string;
+	/** Anthropic's typed `error.type`, preserved separately at the transport boundary. */
+	anthropicErrorType?: string;
+	/** OpenAI's typed `error.code`, preserved separately at the transport boundary. */
+	openaiErrorCode?: string;
 	headers?: Record<string, string>;
 }
 
@@ -150,12 +155,14 @@ export function transportFailureFacts(
 		finiteStatus(propertyOf(value, "status")) ??
 		finiteStatus(propertyOf(response, "status")) ??
 		finiteStatus(propertyOf(capturedResponse, "status"));
+	const anthropicErrorType = stringValue(propertyOf(nestedError, "type")) ?? stringValue(propertyOf(value, "type"));
+	const openaiErrorCode =
+		stringValue(propertyOf(value, "openaiErrorCode")) ?? stringValue(propertyOf(nestedError, "code"));
 	const providerCode =
 		stringValue(propertyOf(value, "providerCode")) ??
+		openaiErrorCode ??
 		stringValue(propertyOf(value, "code")) ??
-		stringValue(propertyOf(nestedError, "code")) ??
-		stringValue(propertyOf(value, "type")) ??
-		stringValue(propertyOf(nestedError, "type"));
+		anthropicErrorType;
 	const errorHeaders = propertyOf(value, "headers");
 	const responseHeaders = propertyOf(response, "headers");
 	const capturedHeaders = propertyOf(capturedResponse, "headers");
@@ -177,11 +184,12 @@ export function transportFailureFacts(
 		headers === undefined &&
 		!isQuotaCode(normalizedCode) &&
 		!isAuthCode(normalizedCode) &&
-		!isRateLimitCode(normalizedCode)
+		!isRateLimitCode(normalizedCode) &&
+		!isContextOverflowCode(normalizedCode)
 	) {
 		return undefined;
 	}
-	return { kind: "transport", status, providerCode, headers };
+	return { kind: "transport", status, providerCode, anthropicErrorType, openaiErrorCode, headers };
 }
 
 function headersOf(headers: TransportHeaders | undefined): Headers | undefined {
@@ -203,6 +211,9 @@ function parseRetryAfterMilliseconds(value: string | null): number | undefined {
 	return Number.isFinite(milliseconds) && milliseconds >= 0 ? Math.round(milliseconds) : undefined;
 }
 
+function isContextOverflowCode(code: string | undefined): boolean {
+	return code === "context_length_exceeded";
+}
 function isQuotaCode(code: string | undefined): boolean {
 	return (
 		code === "insufficient_quota" ||
@@ -244,7 +255,7 @@ export function classifyFallbackTrigger(
 	const retryAfterMs =
 		parseRetryAfterMilliseconds(headers?.get("retry-after-ms") ?? null) ??
 		parseRetryAfterSeconds(headers?.get("retry-after") ?? null);
-	const code = facts.providerCode?.toLowerCase();
+	const code = (facts.openaiErrorCode ?? facts.anthropicErrorType ?? facts.providerCode)?.toLowerCase();
 	const triggerClass: FallbackTriggerClass = isQuotaCode(code)
 		? "quota"
 		: facts.status === 401 || facts.status === 403 || isAuthCode(code)

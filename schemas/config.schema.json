@@ -443,6 +443,11 @@
 					"description": "Tool output above this size is saved as an artifact; tail is kept inline",
 					"default": 50
 				},
+				"preAdmissionArtifactSpill": {
+					"type": "boolean",
+					"description": "Experimental opt-in: save oversized tool results as artifacts before they enter provider context, leaving a deterministic head, tail, digest, and artifact URI inline",
+					"default": false
+				},
 				"readArtifactSpillThreshold": {
 					"type": "number",
 					"description": "Advanced opt-in only: combined-size cap for `read` output across all requested ranges. Above this the full output is saved as an artifact and a bounded head+tail snippet is kept inline. Live layofflabs/gpt-5.5 medium evidence on 2026-07-07 found no token savings and a lower cache-hit rate at 50 KB, so normal coding sessions should leave this Off unless intentionally measuring large-read behavior.",
@@ -837,7 +842,7 @@
 				},
 				"maxDelayMs": {
 					"type": "number",
-					"description": "Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows).",
+					"description": "Maximum wait between retries, in ms. Legacy retries clamp provider Retry-After hints to this value; managed fallback honors typed Retry-After hints even when they exceed it.",
 					"default": 300000
 				},
 				"requestMaxRetries": {
@@ -863,6 +868,17 @@
 					],
 					"description": "When to return to the primary model after a fallback",
 					"default": "cooldown-expiry"
+				}
+			},
+			"additionalProperties": false
+		},
+		"mouse": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable SGR mouse wheel scrolling and overlay row selection. Disabled in tmux and screen.",
+					"default": false
 				}
 			},
 			"additionalProperties": false
@@ -2138,6 +2154,17 @@
 				"notificationDebounceMs": {
 					"type": "number",
 					"default": 500
+				}
+			},
+			"additionalProperties": false
+		},
+		"tasksPane": {
+			"type": "object",
+			"properties": {
+				"defaultVisible": {
+					"type": "boolean",
+					"description": "Open the unified tasks pane when the interactive UI starts",
+					"default": false
 				}
 			},
 			"additionalProperties": false

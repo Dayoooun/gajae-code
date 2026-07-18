@@ -138,6 +138,55 @@ function getPrunedToolResultContent(message: ToolResultMessage): (TextContent | 
 	return [{ type: "text", text }];
 }
 
+export const PRE_ADMISSION_ARTIFACT_SPILL_HEAD_BYTES = 4096;
+export const PRE_ADMISSION_ARTIFACT_SPILL_TAIL_BYTES = 4096;
+
+function utf8Prefix(text: string, maxBytes: number): string {
+	if (Buffer.byteLength(text, "utf-8") <= maxBytes) return text;
+	let bytes = 0;
+	let end = 0;
+	for (const character of text) {
+		const characterBytes = Buffer.byteLength(character, "utf-8");
+		if (bytes + characterBytes > maxBytes) break;
+		bytes += characterBytes;
+		end += character.length;
+	}
+	return text.slice(0, end);
+}
+
+function utf8Suffix(text: string, maxBytes: number): string {
+	if (Buffer.byteLength(text, "utf-8") <= maxBytes) return text;
+	let bytes = 0;
+	let retainedStart = text.length;
+	for (let index = text.length; index > 0; ) {
+		let characterStart = --index;
+		const codeUnit = text.charCodeAt(characterStart);
+		if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff && characterStart > 0) characterStart--;
+		const character = text.slice(characterStart, index + 1);
+		const characterBytes = Buffer.byteLength(character, "utf-8");
+		if (bytes + characterBytes > maxBytes) break;
+		bytes += characterBytes;
+		retainedStart = characterStart;
+		index = characterStart;
+	}
+	return text.slice(retainedStart);
+}
+
+/**
+ * Build the deterministic inline receipt for a tool result saved before the
+ * next provider context is constructed. Byte boundaries never split UTF-8
+ * code points, so head/tail recovery remains readable for emoji and CJK text.
+ */
+export function createPreAdmissionArtifactSpillPreview(fullText: string, artifactId: string, digest: string): string {
+	const totalBytes = Buffer.byteLength(fullText, "utf-8");
+	const head = utf8Prefix(fullText, PRE_ADMISSION_ARTIFACT_SPILL_HEAD_BYTES);
+	const tail = utf8Suffix(fullText, PRE_ADMISSION_ARTIFACT_SPILL_TAIL_BYTES);
+	const retainedBytes = Buffer.byteLength(head, "utf-8") + Buffer.byteLength(tail, "utf-8");
+	const omittedBytes = Math.max(0, totalBytes - retainedBytes);
+	const receipt = `[${omittedBytes} bytes omitted; sha256:${digest}; full output: artifact://${artifactId}]`;
+	return `${head}\n\n${receipt}\n\n${tail}`;
+}
+
 /**
  * Message type for bash executions via the ! command.
  */

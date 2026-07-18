@@ -2249,11 +2249,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (!obfuscator?.hasSecrets()) return converted;
 			return obfuscateMessages(obfuscator, converted);
 		};
-		const transformContext = extensionRunner
-			? async (messages: AgentMessage[], _signal?: AbortSignal) => {
-					return await extensionRunner.emitContext(messages);
-				}
-			: undefined;
+		const transformContext = async (messages: AgentMessage[], _signal?: AbortSignal) => {
+			// External Agent events dispatch listeners without awaiting them. The
+			// session-owned barrier makes any pre-admission artifact transformation
+			// visible before this provider context is normalized.
+			await session?.awaitPendingContextTransformations();
+			return extensionRunner ? await extensionRunner.emitContext(messages) : messages;
+		};
 		const onPayload = extensionRunner
 			? async (payload: unknown, _model?: Model) => {
 					return await extensionRunner.emitBeforeProviderRequest(payload);
