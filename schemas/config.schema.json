@@ -443,6 +443,11 @@
 					"description": "Tool output above this size is saved as an artifact; tail is kept inline",
 					"default": 50
 				},
+				"preAdmissionArtifactSpill": {
+					"type": "boolean",
+					"description": "Experimental opt-in: save oversized tool results as artifacts before they enter provider context, leaving a deterministic head, tail, digest, and artifact URI inline",
+					"default": false
+				},
 				"readArtifactSpillThreshold": {
 					"type": "number",
 					"description": "Advanced opt-in only: combined-size cap for `read` output across all requested ranges. Above this the full output is saved as an artifact and a bounded head+tail snippet is kept inline. Live layofflabs/gpt-5.5 medium evidence on 2026-07-07 found no token savings and a lower cache-hit rate at 50 KB, so normal coding sessions should leave this Off unless intentionally measuring large-read behavior.",

@@ -84,6 +84,7 @@ import type {
 	TextContent,
 	ToolCall,
 	ToolChoice,
+	ToolResultMessage,
 	TransportFailureFacts,
 	Usage,
 	UsageReport,
@@ -351,6 +352,7 @@ import {
 	type CompactionSummaryMessage,
 	type CustomMessage,
 	convertToLlm,
+	createPreAdmissionArtifactSpillPreview,
 	type FileMentionMessage,
 	type PythonExecutionMessage,
 	readPendingDisplayTag,
@@ -2059,7 +2061,9 @@ export class AgentSession {
 		});
 		this.agent.setOnBeforeYield(() => this.yieldQueue.flush("streaming"));
 		this.agent.setMaintainContext((context, lifecycle) =>
-			this.#trackMidRunMaintenance(this.#runMidRunMaintenance(context, lifecycle)),
+			this.#trackMidRunMaintenance(
+				this.awaitPendingContextTransformations().then(() => this.#runMidRunMaintenance(context, lifecycle)),
+			),
 		);
 		this.#convertToLlm = config.convertToLlm ?? convertToLlm;
 		this.#rebuildSystemPrompt = config.rebuildSystemPrompt;
@@ -2846,6 +2850,72 @@ export class AgentSession {
 
 	// Track last assistant message for auto-compaction check
 	#lastAssistantMessage: AssistantMessage | undefined = undefined;
+	// Provider context construction must wait for this chain. Agent event listeners
+	// are synchronous dispatch only; their async work cannot otherwise gate the
+	// next tool-result provider request.
+	#pendingContextTransformations: Promise<void> = Promise.resolve();
+
+	async #spillOversizedToolResultBeforeAdmission(message: ToolResultMessage): Promise<void> {
+		if (!this.settings.get("tools.preAdmissionArtifactSpill")) return;
+
+		const textParts = message.content.flatMap(block => (block.type === "text" ? [block.text] : []));
+		if (textParts.length === 0) return;
+		const fullText = textParts.join("\n");
+		const contextWindow = this.model?.contextWindow;
+		const thresholdTokens = Math.min(
+			8_000,
+			contextWindow && contextWindow > 0 ? Math.floor(contextWindow * 0.05) : 8_000,
+		);
+		if (thresholdTokens <= 0 || estimateTextTokensHeuristic(fullText) <= thresholdTokens) return;
+
+		try {
+			const artifact = await this.sessionManager.allocateArtifactPath("tool-result");
+			if (!artifact.id || !artifact.path) return;
+			await Bun.write(artifact.path, fullText);
+			const digest = crypto.createHash("sha256").update(fullText).digest("hex");
+			const preview = createPreAdmissionArtifactSpillPreview(fullText, artifact.id, digest);
+			const spillMeta = outputMeta()
+				.truncationFromText(preview, {
+					direction: "middle",
+					totalLines: fullText.split("\n").length,
+					totalBytes: Buffer.byteLength(fullText, "utf-8"),
+					artifactId: artifact.id,
+				})
+				.get();
+			const existingDetails = message.details;
+			const detailRecord =
+				existingDetails && typeof existingDetails === "object" ? (existingDetails as Record<string, unknown>) : {};
+			const existingMeta =
+				detailRecord.meta && typeof detailRecord.meta === "object"
+					? (detailRecord.meta as Record<string, unknown>)
+					: {};
+			message.details = { ...detailRecord, meta: { ...existingMeta, ...spillMeta } };
+			message.content = [
+				...message.content.filter((block): block is ImageContent => block.type === "image"),
+				{ type: "text", text: preview },
+			];
+		} catch (error) {
+			logger.warn("Failed to spill oversized tool result before context admission", {
+				toolName: message.toolName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	#queuePreAdmissionArtifactSpill(message: ToolResultMessage): Promise<void> {
+		const spill = this.#pendingContextTransformations.then(() =>
+			this.#spillOversizedToolResultBeforeAdmission(message),
+		);
+		this.#pendingContextTransformations = spill.catch(error => {
+			logger.warn("Pre-admission artifact spill barrier failed", { error: String(error) });
+		});
+		return spill;
+	}
+
+	/** Await all transformations queued by externally emitted tool results. */
+	async awaitPendingContextTransformations(): Promise<void> {
+		await this.#pendingContextTransformations;
+	}
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	#handleAgentEvent = async (event: AgentEvent): Promise<void> => {
@@ -2853,6 +2923,11 @@ export class AgentSession {
 		// concurrently delivered agent_end cannot start post-turn maintenance first.
 		if (event.type === "tool_execution_end" && event.toolName === "yield" && !event.isError) {
 			this.#lastSuccessfulYieldToolCallId = event.toolCallId;
+		}
+		if (event.type === "message_end" && event.message.role === "toolResult") {
+			// Register synchronously so Agent.transformContext sees the barrier even
+			// when the event dispatcher does not await this listener.
+			await this.#queuePreAdmissionArtifactSpill(event.message);
 		}
 
 		// Agent listeners run synchronously, but this handler yields while emitting

@@ -638,6 +638,9 @@ mod platform {
 	}
 
 	#[cfg(target_os = "macos")]
+	const ACL_FIRST_ENTRY: libc::c_int = 0;
+
+	#[cfg(target_os = "macos")]
 	fn clear_extended_acl(file: &File) -> Result<(), NativeOwnerOnlySecurityResult> {
 		// SAFETY: this creates an owned ACL allocation for the requested entry count.
 		let acl = unsafe { acl_init(1) };
@@ -662,17 +665,25 @@ mod platform {
 		// SAFETY: the file descriptor is live; the returned ACL is freed exactly once.
 		let acl = unsafe { acl_get_fd(file.as_raw_fd()) };
 		if acl.is_null() {
+			// On macOS `acl_get_fd` returns NULL with errno ENOENT when the file has no
+			// extended ACL; that is the common case, not a failure.
+			if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+				return Ok(false);
+			}
 			return Err(NativeOwnerOnlySecurityResult::failure("acl_unavailable"));
 		}
 		let mut entry = std::ptr::null_mut();
 		// SAFETY: the ACL allocation is live and `entry` is a writable output pointer.
-		let result = unsafe { acl_get_entry(acl, 0, &mut entry) };
+		let result = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
 		// SAFETY: this owns the ACL allocation from the preceding ACL API and frees it
 		// once.
 		unsafe { acl_free(acl) };
+		// Unlike Linux, macOS `acl_get_entry` returns 0 when it hands back an entry and
+		// -1 once no entries remain, so a first-entry success means the file carries an
+		// extended ACL.
 		match result {
-			0 => Ok(false),
-			1 => Ok(true),
+			0 => Ok(true),
+			-1 => Ok(false),
 			_ => Err(NativeOwnerOnlySecurityResult::failure("acl_unavailable")),
 		}
 	}

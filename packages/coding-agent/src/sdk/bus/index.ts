@@ -979,7 +979,26 @@ function pushSessionFrame(
 	frame: { type: string; [key: string]: unknown },
 ): void {
 	runtime.host.emitEvent({ kind: frame.type, payload: frame });
+	if (frame.type === "turn_stream") {
+		runtime.server.pushTurnStreamUnchecked(
+			String(frame.sessionId),
+			frame.phase === "live" ? "live" : "finalized",
+			String(frame.text),
+			typeof frame.finalAnswer === "boolean" ? frame.finalAnswer : undefined,
+			typeof frame.messageRef === "string" ? frame.messageRef : undefined,
+		);
+		return;
+	}
 	runtime.server.pushFrame(JSON.stringify(frame));
+}
+
+function pushFileAttachment(
+	runtime: Pick<SessionRuntime, "server" | "host">,
+	frame: { type: "file_attachment"; sessionId: string; name: string; mime?: string; caption?: string },
+	data: Buffer,
+): void {
+	runtime.host.emitEvent({ kind: frame.type, payload: { ...frame, data: data.toString("base64") } });
+	runtime.server.pushFileAttachmentUnchecked(frame.sessionId, frame.name, frame.mime, data, frame.caption);
 }
 
 /** Agent lifecycle is SDK session truth, independent of optional chat delivery. */
@@ -3554,13 +3573,16 @@ export function createNotificationsExtension(
 					if (runtime.redact) return { ok: false, error: TELEGRAM_FILE_REDACTION_ERROR };
 					try {
 						const data = await fs.promises.readFile(file.path);
-						pushSessionFrame(runtime, {
-							type: "file_attachment",
-							sessionId: runtime.id,
-							name: path.basename(file.path),
-							data: data.toString("base64"),
-							caption: file.caption,
-						});
+						pushFileAttachment(
+							runtime,
+							{
+								type: "file_attachment",
+								sessionId: runtime.id,
+								name: path.basename(file.path),
+								caption: file.caption,
+							},
+							data,
+						);
 						return { ok: true };
 					} catch (e) {
 						return { ok: false, error: e instanceof Error ? e.message : String(e) };

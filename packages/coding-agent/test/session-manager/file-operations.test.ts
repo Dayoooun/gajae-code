@@ -134,7 +134,13 @@ describe("getRecentSessions", () => {
 
 	it("replays trailing header patches for transcripts larger than the listing prefix", async () => {
 		const file = path.join(tempDir, "patched-large.jsonl");
-		const header = { type: "session", id: "patched-large", timestamp: "2025-01-01T00:00:00Z", cwd: "/stale" };
+		const header = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: "patched-large",
+			timestamp: "2025-01-01T00:00:00Z",
+			cwd: "/stale",
+		};
 		const largeMessage = {
 			type: "message",
 			id: "message",
@@ -151,6 +157,35 @@ describe("getRecentSessions", () => {
 		const [session] = await getRecentSessions(tempDir);
 
 		expect(session?.name).toBe("Patched title");
+	});
+
+	it("ignores trailing v4 header patches when listing legacy transcripts", async () => {
+		const file = path.join(tempDir, "legacy-patched-large.jsonl");
+		const records = [
+			{
+				type: "session",
+				version: 3,
+				id: "legacy-patched-large",
+				timestamp: "2025-01-01T00:00:00Z",
+				cwd: "/legacy",
+				title: "Legacy title",
+			},
+			{
+				type: "message",
+				id: "message",
+				parentId: null,
+				timestamp: "2025-01-01T00:00:01Z",
+				message: { role: "user", content: "x".repeat(5_000), timestamp: 1 },
+			},
+			{ type: "header_patch", patch: { title: "Invalid v4 title", cwd: "/invalid-v4-cwd" } },
+		];
+		fs.writeFileSync(file, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+
+		const [recent] = await getRecentSessions(tempDir);
+		const [listed] = await SessionManager.list("/legacy", tempDir);
+
+		expect(recent?.name).toBe("Legacy title");
+		expect(listed).toMatchObject({ id: "legacy-patched-large", title: "Legacy title", cwd: "/legacy" });
 	});
 
 	it("replays oversized and separated strict header patches in both listing paths", async () => {
@@ -189,6 +224,50 @@ describe("getRecentSessions", () => {
 
 		expect(recent?.name).toBe(title);
 		expect(listed).toMatchObject({ id: "patched-oversized", title, cwd: "/patched-cwd" });
+	});
+
+	it("bounds the trailing patch scan to a constant tail budget", async () => {
+		// The lister must stay O(prefix + bounded tail) even when a transcript
+		// contains no header patches at all (the common case) or when the only
+		// patch is buried deeper than the scan cap (16KB tail budget).
+		const mkRecords = (id: string, withBuriedPatch: boolean) => {
+			const records: unknown[] = [
+				{
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					id,
+					timestamp: "2025-01-01T00:00:00Z",
+					cwd: "/tmp",
+					title: "Original",
+				},
+			];
+			if (withBuriedPatch) records.push({ type: "header_patch", patch: { title: "Buried title" } });
+			for (let index = 0; index < 12; index++) {
+				records.push({
+					type: "message",
+					id: `m${index}`,
+					parentId: index === 0 ? null : `m${index - 1}`,
+					timestamp: "2025-01-01T00:00:01Z",
+					message: { role: "user", content: "z".repeat(5_000), timestamp: index + 1 },
+				});
+			}
+			return records;
+		};
+
+		const buried = path.join(tempDir, "buried-patch.jsonl");
+		fs.writeFileSync(
+			buried,
+			`${mkRecords("buried-patch", true)
+				.map(record => JSON.stringify(record))
+				.join("\n")}\n`,
+		);
+
+		const [session] = await getRecentSessions(tempDir);
+
+		// The buried patch sits more than 16KB before EOF, past the bounded tail
+		// budget: the lister must fall back to the line-1 header instead of
+		// scanning the whole transcript.
+		expect(session?.name).toBe("Original");
 	});
 });
 

@@ -188,6 +188,22 @@ export declare class NotificationServer {
    * Fails if not started or `frame_json` is not a valid `ServerMessage`.
    */
   pushFrame(frameJson: string): void
+  /**
+   * Broadcast a TypeScript-constructed turn frame without re-parsing JSON.
+   * External frames must continue through [`Self::push_frame`] for serde
+   * validation.
+   */
+  pushTurnStreamUnchecked(sessionId: string, phase: string, text: string, finalAnswer?: boolean | undefined | null, messageRef?: string | undefined | null): void
+  /**
+   * Broadcast a file attachment from raw N-API bytes, encoding the unchanged
+   * base64 wire field only in Rust.
+   */
+  pushFileAttachmentUnchecked(sessionId: string, name: string, mime: string | undefined | null, data: Buffer, caption?: string | undefined | null): void
+  /**
+   * Return counters guarding the known-good frame crossing against
+   * regressions.
+   */
+  knownGoodFrameStats(): KnownGoodFrameStats
   /** Send a validated, bounded JSON envelope to one connected v3 SDK client. */
   sendTo(connectionId: string, json: string): void
   /**
@@ -1246,6 +1262,19 @@ export declare enum KeyEventType {
   Repeat = 2,
   /** Key release event. */
   Release = 3
+}
+
+/** Observable counters for the internal known-good N-API frame lane. */
+export interface KnownGoodFrameStats {
+  /** Frames constructed as `TurnStream` without parsing a JSON string. */
+  knownGoodTurnStreamFrames: number
+  /** JSON serde parses of externally supplied `turn_stream` frames. */
+  turnStreamSerdeValidationParses: number
+  /**
+   * Base64 characters encoded in Rust for `file_attachment` frames (the JS
+   * side crosses raw `Buffer` bytes and never allocates the base64 string).
+   */
+  fileAttachmentRustBase64Chars: number
 }
 
 /** A lifecycle request forwarded to the TypeScript daemon for orchestration. */

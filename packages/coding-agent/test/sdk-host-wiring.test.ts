@@ -31,6 +31,7 @@ import type { InteractiveModeContext } from "../src/modes/types";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { createNotificationsExtension, PresentationArbiter } from "../src/sdk/bus";
+import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { SessionSdkHost } from "../src/sdk/host";
 import {
 	attachLifecycleStartupCapability,
@@ -808,6 +809,76 @@ test("/notify on fences teardown and permits a later same-ID replacement runtime
 		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
 	} finally {
 		prototype.start = startServer;
+	}
+});
+
+test("SDK host replays file attachment data as base64 while passing raw bytes to N-API", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-file-replay-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-file-replay-${Date.now()}`;
+	const bytes = Buffer.from([0, 1, 2, 253, 254, 255]);
+	const attachmentPath = path.join(cwd, "replay.bin");
+	fs.writeFileSync(attachmentPath, bytes);
+	process.env.GJC_NOTIFICATIONS = "1";
+	const handlers = start(context(cwd, sessionId));
+	const nativePrototype = NotificationServer.prototype as unknown as {
+		pushFileAttachmentUnchecked?: (
+			sessionId: string,
+			name: string,
+			mime: string | undefined,
+			data: Buffer,
+			caption: string | undefined,
+		) => void;
+	};
+	const originalPushFileAttachmentUnchecked = nativePrototype.pushFileAttachmentUnchecked;
+	let nativeData: Buffer | undefined;
+	nativePrototype.pushFileAttachmentUnchecked = (_sessionId, _name, _mime, data) => {
+		nativeData = data;
+	};
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		await waitFor(() => getTelegramFileSink(sessionId) !== undefined, "file attachment sink");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+
+		await expect(getTelegramFileSink(sessionId)!({ path: attachmentPath })).resolves.toEqual({ ok: true });
+		await waitFor(() => nativeData !== undefined, "raw N-API file attachment");
+		expect(nativeData).toBeInstanceOf(Buffer);
+		expect(nativeData).toEqual(bytes);
+
+		socket.send(JSON.stringify({ type: "event_replay", id: "file-replay", sinceGeneration: 1, sinceSeq: 0 }));
+		await waitFor(
+			() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "file-replay"),
+			"file replay",
+		);
+		const replay = frames.find(frame => frame.type === "event_replay_result" && frame.id === "file-replay");
+		expect(replay?.events).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					payload: expect.objectContaining({
+						type: "file_attachment",
+						sessionId,
+						name: "replay.bin",
+						data: bytes.toString("base64"),
+					}),
+				}),
+			]),
+		);
+	} finally {
+		if (originalPushFileAttachmentUnchecked) {
+			nativePrototype.pushFileAttachmentUnchecked = originalPushFileAttachmentUnchecked;
+		} else {
+			delete nativePrototype.pushFileAttachmentUnchecked;
+		}
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, context(cwd, sessionId));
 	}
 });
 
