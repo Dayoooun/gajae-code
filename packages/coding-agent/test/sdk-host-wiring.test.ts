@@ -15,12 +15,18 @@ import type {
 	ExtensionUIContext,
 } from "../src/extensibility/extensions/types";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
+import { buildAskGateAnswerSchema as buildDeepInterviewAskGateAnswerSchema } from "../src/modes/shared/agent-wire/deep-interview-gate";
 import {
 	BrokerWorkflowGateEmitter,
 	FileGateStore,
 	MemoryGateStore,
 	type WorkflowGateEmitter,
 } from "../src/modes/shared/agent-wire/workflow-gate-broker";
+import {
+	buildAskGateAnswerSchema,
+	buildAskGateStageState,
+	validateAskGateStageState,
+} from "../src/modes/shared/agent-wire/workflow-gate-types";
 import type { InteractiveModeContext } from "../src/modes/types";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionIndex } from "../src/sdk/broker/session-index";
@@ -194,6 +200,15 @@ function context(
 		clearContext: async () => true,
 	};
 }
+
+test("shared ask-gate schema and stage-state authority preserves generic producer inputs", () => {
+	const labels = Array.from({ length: 33 }, (_, index) => (index === 32 ? "option-0" : `option-${index}`));
+	const question = { id: "generic-ask", multi: true, allowEmpty: false };
+	expect(buildAskGateAnswerSchema(question, labels)).toEqual(buildDeepInterviewAskGateAnswerSchema(question, labels));
+	const state = buildAskGateStageState(question, labels);
+	expect(() => validateAskGateStageState(state)).not.toThrow();
+	expect(state.options).toEqual(labels);
+});
 
 test("lifecycle startup production secret collection redacts before normalization and truncation", () => {
 	const bare = "bare-secret-value";
@@ -437,6 +452,33 @@ test("lifecycle startup settles failure when native callback registration throws
 		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`))).toBe(false);
 	} finally {
 		hook.mockRestore();
+	}
+});
+
+test("lifecycle startup reports an actionable error when native capability registration is missing", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-missing-capability-callback-"));
+	dirs.push(cwd);
+	const capability = new SdkStartupCapability();
+	const prototype = NotificationServer.prototype as unknown as { onNegotiatedCapabilities?: unknown };
+	const original = prototype.onNegotiatedCapabilities;
+	try {
+		prototype.onNegotiatedCapabilities = undefined;
+		start(context(cwd, "missing-capability-callback"), undefined, () => {}, false, new Map(), {
+			startupCapability: capability,
+			lifecycleRequired: true,
+		});
+		const result = await capability.promise;
+		expect(result).toMatchObject({
+			status: "failed",
+			failure: { phase: "startup", reason: "failed" },
+		});
+		if (result.status === "failed") {
+			expect(result.failure.message).toContain("onNegotiatedCapabilities");
+			expect(result.failure.message).toContain("out of date");
+		}
+		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", "missing-capability-callback.json"))).toBe(false);
+	} finally {
+		prototype.onNegotiatedCapabilities = original;
 	}
 });
 
@@ -2642,6 +2684,39 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 		error: { code: "invalid_input", message: "config.patch rejects secret fields at the SDK host." },
 	});
 	expect(configWrites).toEqual([]);
+});
+
+test("Q12 records the runtime-turn correlation before a workflow gate is exposed", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-q12-runtime-turn-"));
+	dirs.push(cwd);
+	const emitter = new BrokerWorkflowGateEmitter("q12-runtime-turn", new FileGateStore(path.join(cwd, "gates.json")));
+	const detachTerminalController = emitter.registerGateTerminalController!({
+		completeGateInteractions: () => "not_published",
+		cancelGateInteractions: () => {},
+	});
+	try {
+		emitter.setRuntimeTurnProvider?.(() => "runtime-turn-2550");
+		const advance = emitter.emitGate({
+			stage: "deep-interview",
+			kind: "question",
+			schema: { type: "string", enum: ["continue"] },
+		});
+		const records = emitter.listWorkflowGateQueryRecords!();
+		expect(records).toHaveLength(1);
+		expect(records[0]).toMatchObject({
+			id: expect.stringMatching(/^pending:/),
+			tag: "pending",
+			runtime_turn_id: "runtime-turn-2550",
+		});
+		await emitter.resolveGate!({
+			gate_id: records[0]!.gate_id,
+			answer: "continue",
+			idempotency_key: "q12-runtime-turn",
+		});
+		expect(await advance).toBe("continue");
+	} finally {
+		detachTerminalController();
+	}
 });
 
 test("SDK host discovers, answers, and advances a durable workflow gate", async () => {
