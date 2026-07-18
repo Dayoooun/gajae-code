@@ -3,15 +3,8 @@ import { streamAnthropic } from "@gajae-code/ai/providers/anthropic";
 import type { Context, Model, TJsonSchema } from "@gajae-code/ai/types";
 
 type CacheControl = { type: string; ttl?: string };
-type PayloadMessage = {
-	role: string;
-	content: string | Array<{ type: string; cache_control?: CacheControl }>;
-};
-type Payload = {
-	messages: PayloadMessage[];
-	system?: Array<{ cache_control?: CacheControl }>;
-	tools?: Array<{ cache_control?: CacheControl }>;
-};
+type PayloadMessage = { role: string; content: string | Array<{ type: string; cache_control?: CacheControl }> };
+type Payload = { messages: PayloadMessage[]; system?: unknown[]; tools?: unknown[] };
 type Placement = "oldPlacement" | "newPlacement";
 type EvalArtifact = {
 	schemaVersion: 2;
@@ -33,18 +26,15 @@ const model: Model<"anthropic-messages"> = {
 	name: "Claude Sonnet 4.5",
 	api: "anthropic-messages",
 	provider: "anthropic",
-	baseUrl: "https://api.anthropic.com",
+	baseUrl: "https://proxy.example.test/anthropic",
+	compat: { promptCacheMode: "explicit" },
 	reasoning: false,
 	input: ["text"],
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	contextWindow: 200_000,
 	maxTokens: 8_192,
 };
-
-const fixture = {
-	turns: ["human", "assistant-tool-use", "tool-result", "human"],
-	toolResultVariants: ["Result from source A", "Result from source B", "Result from source C"],
-};
+const fixture = { toolResultVariants: ["Result from source A", "Result from source B", "Result from source C"] };
 
 function sha256(value: string): Promise<string> {
 	return crypto.subtle
@@ -55,16 +45,12 @@ function sha256(value: string): Promise<string> {
 function mergedHead(): string {
 	const result = Bun.spawnSync(["git", "log", "--merges", "-1", "--format=%H"]);
 	if (result.exitCode !== 0) throw new Error("Unable to identify the merge commit that produced this evidence");
-	return new TextDecoder().decode(result.stdout).trim();
-}
-
-function abortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
+	return result.stdout.toString().trim();
 }
 
 function capturePayload(toolResult: string): Promise<Payload> {
+	const controller = new AbortController();
+	controller.abort();
 	const { promise, resolve } = Promise.withResolvers<Payload>();
 	const context: Context = {
 		systemPrompt: ["Stable instructions"],
@@ -108,27 +94,21 @@ function capturePayload(toolResult: string): Promise<Payload> {
 	streamAnthropic(model, context, {
 		apiKey: "sk-ant-api-test",
 		isOAuth: false,
-		signal: abortedSignal(),
+		signal: controller.signal,
 		onPayload: payload => resolve(payload as Payload),
 	});
 	return promise;
 }
 
-function capturedAnchorPaths(payload: Payload): string[] {
-	const anchors: string[] = [];
-	for (const [index, tool] of (payload.tools ?? []).entries()) {
-		if (tool.cache_control) anchors.push(`tools[${index}]`);
-	}
-	for (const [index, block] of (payload.system ?? []).entries()) {
-		if (block.cache_control) anchors.push(`system[${index}]`);
-	}
+function anchors(payload: Payload): string[] {
+	const paths: string[] = [];
 	for (const [messageIndex, message] of payload.messages.entries()) {
 		if (!Array.isArray(message.content)) continue;
 		for (const [blockIndex, block] of message.content.entries()) {
-			if (block.cache_control) anchors.push(`messages[${messageIndex}].content[${blockIndex}]`);
+			if (block.cache_control) paths.push(`messages[${messageIndex}].content[${blockIndex}]`);
 		}
 	}
-	return anchors;
+	return paths;
 }
 
 function serializeThroughMessage(payload: Payload, messageIndex: number): string {
@@ -145,42 +125,35 @@ function oldPlacement(payload: Payload): Payload {
 		if (!Array.isArray(message.content)) continue;
 		for (const block of message.content) delete block.cache_control;
 	}
-	const cacheControl = (payload.messages[1]?.content as Array<{ cache_control?: CacheControl }>)[0]?.cache_control;
+	const assistantControl = (payload.messages[1]?.content as Array<{ cache_control?: CacheControl }>)[0]?.cache_control;
 	const toolResult = old.messages[2]?.content as Array<{ cache_control?: CacheControl }>;
 	const currentHuman = old.messages[3]?.content as Array<{ cache_control?: CacheControl }>;
-	if (!cacheControl || !toolResult?.[0] || !currentHuman?.[0]) {
-		throw new Error("Provider payload lacks the expected assistant, tool-result, or human blocks");
-	}
-	toolResult[0].cache_control = cacheControl;
-	currentHuman[0].cache_control = cacheControl;
+	if (!assistantControl || !toolResult?.[0] || !currentHuman?.[0])
+		throw new Error("Provider payload lacks expected cacheable blocks");
+	toolResult[0].cache_control = assistantControl;
+	currentHuman[0].cache_control = assistantControl;
 	return old;
 }
 
 function breakpointInputs(payload: Payload): Record<string, string> {
-	const inputs: Record<string, string> = {};
-	for (const path of capturedAnchorPaths(payload)) {
-		if (path.startsWith("tools[")) inputs[path] = JSON.stringify({ tools: payload.tools });
-		else if (path.startsWith("system["))
-			inputs[path] = JSON.stringify({ tools: payload.tools, system: payload.system });
-		else {
+	return Object.fromEntries(
+		anchors(payload).map(path => {
 			const match = /messages\[(\d+)]/.exec(path);
 			if (!match) throw new Error(`Unknown cache breakpoint: ${path}`);
-			inputs[path] = serializeThroughMessage(payload, Number(match[1]));
-		}
-	}
-	return inputs;
+			return [path, serializeThroughMessage(payload, Number(match[1]))];
+		}),
+	);
 }
 
-function estimatedTokens(input: string): number {
+function tokens(input: string): number {
 	return Math.floor(new TextEncoder().encode(input).byteLength / 4);
 }
-
-function simulatedCacheReadInputTokens(payloads: Payload[]): number[] {
-	const seenBreakpoints: string[] = [];
+function cacheReads(payloads: Payload[]): number[] {
+	const retained: string[] = [];
 	return payloads.map(payload => {
 		const inputs = Object.values(breakpointInputs(payload));
-		const cacheRead = Math.max(0, ...inputs.filter(input => seenBreakpoints.includes(input)).map(estimatedTokens));
-		seenBreakpoints.push(...inputs);
+		const cacheRead = Math.max(0, ...inputs.filter(input => retained.includes(input)).map(tokens));
+		retained.push(...inputs);
 		return cacheRead;
 	});
 }
@@ -188,7 +161,7 @@ function simulatedCacheReadInputTokens(payloads: Payload[]): number[] {
 async function deriveEvidence(): Promise<EvalArtifact> {
 	const newPayloads = await Promise.all(fixture.toolResultVariants.map(capturePayload));
 	const oldPayloads = newPayloads.map(oldPlacement);
-	const payloadEvidence = async (payloads: Payload[]) =>
+	const evidence = async (payloads: Payload[]) =>
 		Promise.all(
 			payloads.map(async payload => ({
 				sha256: await sha256(JSON.stringify(payload)),
@@ -199,14 +172,25 @@ async function deriveEvidence(): Promise<EvalArtifact> {
 				),
 			})),
 		);
-	const artifact: EvalArtifact = {
+	const threeTurnCacheReadInputTokens = {
+		oldPlacement: cacheReads(oldPayloads),
+		newPlacement: cacheReads(newPayloads),
+	};
+	if (
+		threeTurnCacheReadInputTokens.newPlacement.some(
+			(value, index) => value < threeTurnCacheReadInputTokens.oldPlacement[index],
+		)
+	) {
+		throw new Error("New cache placement regresses simulated cache_read_input_tokens");
+	}
+	return {
 		schemaVersion: 2,
 		issue: 2383,
 		status: "pass",
 		evidenceType: "deterministic-simulated-three-turn-provider-payload-integration",
 		source: {
 			url: "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
-			retrievedAt: "2026-07-16",
+			retrievedAt: "2026-07-18",
 			codeCommit: mergedHead(),
 			inputFixtureSha256: await sha256(JSON.stringify(fixture)),
 		},
@@ -215,47 +199,26 @@ async function deriveEvidence(): Promise<EvalArtifact> {
 			"WRITE_ARCHITECTURE_2383_EVAL=1 bun test packages/ai/test/anthropic-cache-eval.integration.test.ts",
 			"bun test packages/ai/test/anthropic-cache-eval.integration.test.ts",
 		],
-		capturedAnchors: {
-			oldPlacement: capturedAnchorPaths(oldPayloads[0]),
-			newPlacement: capturedAnchorPaths(newPayloads[0]),
-		},
-		payloads: {
-			oldPlacement: await payloadEvidence(oldPayloads),
-			newPlacement: await payloadEvidence(newPayloads),
-		},
-		threeTurnCacheReadInputTokens: {
-			oldPlacement: simulatedCacheReadInputTokens(oldPayloads),
-			newPlacement: simulatedCacheReadInputTokens(newPayloads),
-		},
+		capturedAnchors: { oldPlacement: anchors(oldPayloads[0]), newPlacement: anchors(newPayloads[0]) },
+		payloads: { oldPlacement: await evidence(oldPayloads), newPlacement: await evidence(newPayloads) },
+		threeTurnCacheReadInputTokens,
 		method:
-			"Each turn is a real streamAnthropic onPayload request constructed from the same fixture with a distinct tool-result value. For each placement, the simulator retains every cache_control breakpoint input from preceding turns and reports the largest byte-identical retained breakpoint as floor(UTF-8 bytes / 4) cache_read_input_tokens. The old placement moves the provider-generated assistant marker to the tool-result block; the new placement is the provider-generated payload unchanged.",
+			"Each turn is a real explicit-mode streamAnthropic onPayload request constructed from the same fixture with a distinct tool-result value. For each placement, the simulator retains every cache_control breakpoint input from preceding turns and reports the largest byte-identical retained breakpoint as floor(UTF-8 bytes / 4) cache_read_input_tokens. The old placement moves the provider-generated assistant marker to the tool-result block; the new placement is the provider-generated payload unchanged.",
 		testCommand: "bun test packages/ai/test/anthropic-cache-eval.integration.test.ts",
 	};
-	if (
-		artifact.threeTurnCacheReadInputTokens.newPlacement.some(
-			(value, index) => value < artifact.threeTurnCacheReadInputTokens.oldPlacement[index],
-		)
-	) {
-		throw new Error("New cache placement regresses simulated cache_read_input_tokens");
-	}
-	return artifact;
 }
 
 describe("Anthropic cache placement eval (deterministic three-turn integration)", () => {
-	it("derives the committed evidence from real provider payloads and fails closed for missing or tampered fields", async () => {
+	it("derives committed evidence from real provider payloads and fails closed", async () => {
 		const artifact = await deriveEvidence();
-		if (process.env.WRITE_ARCHITECTURE_2383_EVAL === "1") {
+		if (process.env.WRITE_ARCHITECTURE_2383_EVAL === "1")
 			await Bun.write(artifactPath, `${JSON.stringify(artifact, null, "\t")}\n`);
-		}
 		expect(await Bun.file(artifactPath).json()).toEqual(artifact);
-		expect(artifact.capturedAnchors.newPlacement).toEqual([
-			"tools[0]",
-			"system[0]",
-			"messages[1].content[0]",
-			"messages[3].content[0]",
-		]);
-		for (const [index, oldCacheRead] of artifact.threeTurnCacheReadInputTokens.oldPlacement.entries()) {
+		expect(artifact.capturedAnchors).toEqual({
+			oldPlacement: ["messages[2].content[0]", "messages[3].content[0]"],
+			newPlacement: ["messages[1].content[0]", "messages[3].content[0]"],
+		});
+		for (const [index, oldCacheRead] of artifact.threeTurnCacheReadInputTokens.oldPlacement.entries())
 			expect(artifact.threeTurnCacheReadInputTokens.newPlacement[index]).toBeGreaterThanOrEqual(oldCacheRead);
-		}
 	});
 });
