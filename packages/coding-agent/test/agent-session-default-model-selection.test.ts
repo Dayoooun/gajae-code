@@ -30,10 +30,10 @@ async function defaultSelectorFromBuild(
 	build: Parameters<Settings["commitAtomicBatchWithCurrent"]>[0],
 ): Promise<unknown> {
 	const patches = await build({});
-	const patch = patches.find(candidate => candidate.path === "modelRoles" && candidate.op === "set");
-	return patch?.op === "set" && patch.value && typeof patch.value === "object"
-		? (patch.value as Record<string, unknown>).default
-		: undefined;
+	const patch = patches.find(
+		candidate => candidate.path === ("modelRoles.default" as string) && candidate.op === "set",
+	);
+	return patch?.op === "set" ? patch.value : undefined;
 }
 
 const INITIAL_MODEL: Model = {
@@ -1556,7 +1556,11 @@ describe("AgentSession durable default model selection", () => {
 		const restorePath = "/private/sessions/default-selection.json";
 		const restoreToken = "durable-restore-token";
 		const rollbackError = new Error(`durable rollback failed at ${restorePath} with token ${restoreToken}`);
-		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValue(rollbackError);
+		const originalDurableCommit = settings.commitAtomicBatchWithCurrent.bind(settings);
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockImplementation(async build => {
+			const receipt = await originalDurableCommit(build);
+			return { ...receipt, restore: async () => Promise.reject(rollbackError) };
+		});
 		failDefaultSelectionPromotion(sessionManager, liveApplyError);
 		const rollbackWarning = vi.spyOn(logger, "warn");
 

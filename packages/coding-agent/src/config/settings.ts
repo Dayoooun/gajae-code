@@ -35,6 +35,7 @@ import {
 	type AtomicYamlPatch,
 	applyAtomicYamlPatches,
 	applyAtomicYamlPatchesWithCurrent,
+	atomicYamlPathHash,
 	type CasReceipt,
 	deleteByPath,
 	reserveAtomicYamlUpdateSlot,
@@ -137,6 +138,13 @@ const LOCAL_NOTIFICATION_SETTING_PATHS = new Set(
 function isNotificationSettingsPath(path: string): boolean {
 	return (
 		(path === "notifications" || path.startsWith("notifications.")) && !LOCAL_NOTIFICATION_SETTING_PATHS.has(path)
+	);
+}
+
+function isAtomicSettingsPath(path: string): boolean {
+	return (
+		Object.hasOwn(SETTINGS_SCHEMA, path) ||
+		(path.startsWith("modelRoles.") && path.split(".").every(segment => segment.length > 0))
 	);
 }
 
@@ -643,27 +651,63 @@ export class Settings implements NotificationSettingsReader {
 	 */
 	async commitAtomicBatch(patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> {
 		if (!this.#persist || !this.#configPath) {
+			const changes = new Map<string, { before: unknown; beforeHash: string; afterHash: string }>();
 			for (const patch of patches) {
-				if (!Object.hasOwn(SETTINGS_SCHEMA, patch.path)) {
+				if (!isAtomicSettingsPath(patch.path)) {
 					throw new Error(`Unknown setting path for atomic batch: ${patch.path}`);
 				}
 				if (patch.op === "set" && patch.value === undefined) {
 					throw new TypeError(`Settings set patch for ${patch.path} cannot carry undefined; use unset instead.`);
 				}
+				if (!changes.has(patch.path)) {
+					changes.set(patch.path, {
+						before: structuredClone(getByPath(this.#global, patch.path.split("."))),
+						beforeHash: atomicYamlPathHash(this.#global, patch.path),
+						afterHash: "",
+					});
+				}
 			}
 			for (const patch of patches) {
-				if (patch.op === "set") this.set(patch.path, patch.value as never);
-				else this.unset(patch.path);
+				if (patch.op === "set") setByPath(this.#global, patch.path.split("."), structuredClone(patch.value));
+				else deleteByPath(this.#global, patch.path.split("."));
 			}
-			return {
+			for (const [patchPath, change] of changes) {
+				change.afterHash = atomicYamlPathHash(this.#global, patchPath);
+			}
+			this.#rebuildMerged();
+			let discarded = false;
+			let receipt: CasReceipt;
+			receipt = {
 				revisions: [],
-				restore: async () => ({ status: "discarded" }),
-				discard: () => {},
+				discard: () => {
+					discarded = true;
+				},
+				restore: async () => {
+					if (discarded) return { status: "discarded" } as const;
+					const conflicts = [...changes].flatMap(([patchPath, change]) =>
+						atomicYamlPathHash(this.#global, patchPath) === change.afterHash ? [] : [patchPath],
+					);
+					if (conflicts.length > 0) return { status: "conflict", paths: conflicts } as const;
+					for (const [patchPath, change] of changes) {
+						if (change.beforeHash === atomicYamlPathHash({}, patchPath)) {
+							deleteByPath(this.#global, patchPath.split("."));
+						} else {
+							setByPath(this.#global, patchPath.split("."), structuredClone(change.before));
+						}
+					}
+					const modelRoles = rawSettingsRecord(this.#global.modelRoles);
+					if (changes.has("modelRoles.default") && modelRoles && Object.keys(modelRoles).length === 0) {
+						delete this.#global.modelRoles;
+					}
+					this.#rebuildMerged();
+					return { status: "restored", receipt } as const;
+				},
 			};
+			return receipt;
 		}
 
 		const durablePatches: AtomicYamlPatch[] = patches.map(patch => {
-			if (!Object.hasOwn(SETTINGS_SCHEMA, patch.path)) {
+			if (!isAtomicSettingsPath(patch.path)) {
 				throw new Error(`Unknown setting path for atomic batch: ${patch.path}`);
 			}
 			if (patch.op === "unset") return { path: patch.path, op: "unset" };
@@ -721,7 +765,7 @@ export class Settings implements NotificationSettingsReader {
 				async current => {
 					const patches = await buildPatches(structuredClone(current));
 					const durablePatches: AtomicYamlPatch[] = patches.map(patch => {
-						if (!Object.hasOwn(SETTINGS_SCHEMA, patch.path)) {
+						if (!isAtomicSettingsPath(patch.path)) {
 							throw new Error(`Unknown setting path for atomic batch: ${patch.path}`);
 						}
 						if (patch.op === "unset") return { path: patch.path, op: "unset" };
@@ -1608,11 +1652,11 @@ export class Settings implements NotificationSettingsReader {
 		});
 		if (applicable.length === 0) return;
 
-		const previous = new Map<SettingPath, SettingValue<SettingPath>>();
+		const previous = new Map<string, unknown>();
 		for (const patch of applicable) {
-			const settingPath = patch.path as SettingPath;
+			const settingPath = patch.path;
 			const revision = revisionsByPath.get(patch.path)!;
-			previous.set(settingPath, this.get(settingPath));
+			previous.set(settingPath, getByPath(this.#global, settingPath.split(".")));
 			if (patch.op === "set") {
 				setByPath(this.#global, settingPath.split("."), structuredClone(patch.value));
 			} else {
@@ -1625,6 +1669,14 @@ export class Settings implements NotificationSettingsReader {
 					}
 				}
 			}
+		}
+		const modelRoles = rawSettingsRecord(this.#global.modelRoles);
+		if (
+			applicable.some(patch => patch.path === "modelRoles.default" && patch.op === "unset") &&
+			modelRoles &&
+			Object.keys(modelRoles).length === 0
+		) {
+			delete this.#global.modelRoles;
 		}
 		this.#rebuildMerged();
 		for (const patch of applicable) {

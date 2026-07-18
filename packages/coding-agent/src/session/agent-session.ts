@@ -180,6 +180,7 @@ import {
 	type ScopedModelSelection,
 } from "../config/model-resolver";
 import { normalizeModelSelectorValue } from "../config/model-selector-value";
+import type { SettingPath } from "../config/settings-schema";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import type { Settings, SkillsSettings } from "../config/settings";
 import { onAppendOnlyModeChanged } from "../config/settings";
@@ -9013,14 +9014,9 @@ export class AgentSession {
 			let durableCommit: CasReceipt;
 			try {
 				const selector = formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel);
-				durableCommit = await this.settings.commitAtomicBatchWithCurrent(current => {
-					const modelRoles = current.modelRoles;
-					const roles =
-						modelRoles && typeof modelRoles === "object" && !Array.isArray(modelRoles)
-							? (modelRoles as Record<string, unknown>)
-							: {};
-					return [{ path: "modelRoles", op: "set", value: { ...roles, default: selector } }];
-				});
+				durableCommit = await this.settings.commitAtomicBatchWithCurrent(() => [
+					{ path: "modelRoles.default" as SettingPath, op: "set", value: selector },
+				]);
 			} catch (error) {
 				await this.sessionManager.discardDefaultModelSelectionStage(stage);
 				throw error;
