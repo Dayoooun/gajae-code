@@ -188,6 +188,7 @@ pub struct NotificationServer {
 	stop_wait:                           tokio::sync::Mutex<()>,
 	known_good_turn_stream_frames:       AtomicU64,
 	turn_stream_serde_validation_parses: AtomicU64,
+	file_attachment_base64_chars:        AtomicU64,
 }
 
 /// Observable counters for the internal known-good N-API frame lane.
@@ -197,6 +198,9 @@ pub struct KnownGoodFrameStats {
 	pub known_good_turn_stream_frames: f64,
 	/// JSON serde parses of externally supplied `turn_stream` frames.
 	pub turn_stream_serde_validation_parses: f64,
+	/// Base64 characters encoded in Rust for `file_attachment` frames (the JS
+	/// side crosses raw `Buffer` bytes and never allocates the base64 string).
+	pub file_attachment_rust_base64_chars: f64,
 }
 
 #[napi]
@@ -231,6 +235,7 @@ impl NotificationServer {
 			stop_wait:                           tokio::sync::Mutex::new(()),
 			known_good_turn_stream_frames:       AtomicU64::new(0),
 			turn_stream_serde_validation_parses: AtomicU64::new(0),
+			file_attachment_base64_chars:        AtomicU64::new(0),
 		}
 	}
 
@@ -557,7 +562,7 @@ impl NotificationServer {
 		let msg: ServerMessage = serde_json::from_str(&frame_json)
 			.map_err(|e| Error::from_reason(format!("invalid frame json: {e}")))?;
 		if matches!(msg, ServerMessage::TurnStream(_)) {
-		saturating_increment(&self.turn_stream_serde_validation_parses);
+			saturating_increment(&self.turn_stream_serde_validation_parses);
 		}
 		self
 			.with_handle(|h| h.push_frame(msg))?
@@ -611,7 +616,7 @@ impl NotificationServer {
 					session_id,
 					name,
 					mime,
-					data: encode_base64(&data),
+					data: encode_base64(&data, &self.file_attachment_base64_chars),
 					caption,
 				}))
 			})?
@@ -622,9 +627,15 @@ impl NotificationServer {
 	#[napi]
 	#[must_use]
 	pub fn known_good_frame_stats(&self) -> KnownGoodFrameStats {
+		let known_good_turn_stream_frames = self.known_good_turn_stream_frames.load(Ordering::Relaxed);
+		let turn_stream_serde_validation_parses =
+			self.turn_stream_serde_validation_parses.load(Ordering::Relaxed);
+		let file_attachment_rust_base64_chars =
+			self.file_attachment_base64_chars.load(Ordering::Relaxed);
 		KnownGoodFrameStats {
-			known_good_turn_stream_frames: self.known_good_turn_stream_frames.load(Ordering::Relaxed) as f64,
-			turn_stream_serde_validation_parses: self.turn_stream_serde_validation_parses.load(Ordering::Relaxed) as f64,
+			known_good_turn_stream_frames: known_good_turn_stream_frames as f64,
+			turn_stream_serde_validation_parses: turn_stream_serde_validation_parses as f64,
+			file_attachment_rust_base64_chars: file_attachment_rust_base64_chars as f64,
 		}
 	}
 
@@ -1216,7 +1227,7 @@ fn parse_reason(reason: Option<&str>) -> gjc_sdk::RejectReason {
 
 /// Encode bytes for the unchanged JSON WebSocket wire schema without allocating
 /// a JavaScript base64 string at the N-API boundary.
-fn encode_base64(bytes: &[u8]) -> String {
+fn encode_base64(bytes: &[u8], chars_counter: &AtomicU64) -> String {
 	const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 	let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
 	for chunk in bytes.chunks(3) {
@@ -1225,8 +1236,17 @@ fn encode_base64(bytes: &[u8]) -> String {
 		let third = *chunk.get(2).unwrap_or(&0);
 		encoded.push(char::from(TABLE[usize::from(first >> 2)]));
 		encoded.push(char::from(TABLE[usize::from((first & 0b0000_0011) << 4 | second >> 4)]));
-		encoded.push(if chunk.len() > 1 { char::from(TABLE[usize::from((second & 0b0000_1111) << 2 | third >> 6)]) } else { '=' });
-		encoded.push(if chunk.len() > 2 { char::from(TABLE[usize::from(third & 0b0011_1111)]) } else { '=' });
+		encoded.push(if chunk.len() > 1 {
+			char::from(TABLE[usize::from((second & 0b0000_1111) << 2 | third >> 6)])
+		} else {
+			'='
+		});
+		encoded.push(if chunk.len() > 2 {
+			char::from(TABLE[usize::from(third & 0b0011_1111)])
+		} else {
+			'='
+		});
 	}
+	chars_counter.fetch_add(encoded.len() as u64, Ordering::Relaxed);
 	encoded
 }

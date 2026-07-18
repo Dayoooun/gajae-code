@@ -1266,6 +1266,11 @@ export interface KnownGoodFrameStats {
   knownGoodTurnStreamFrames: number
   /** JSON serde parses of externally supplied `turn_stream` frames. */
   turnStreamSerdeValidationParses: number
+  /**
+   * Base64 characters encoded in Rust for `file_attachment` frames (the JS
+   * side crosses raw `Buffer` bytes and never allocates the base64 string).
+   */
+  fileAttachmentRustBase64Chars: number
 }
 
 /** A lifecycle request forwarded to the TypeScript daemon for orchestration. */
