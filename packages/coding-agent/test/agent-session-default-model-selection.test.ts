@@ -589,6 +589,24 @@ describe("AgentSession durable default model selection", () => {
 		expect(sessionManager.buildSessionContext().models.default).toBe("target-provider/last");
 	});
 
+	it("rejects a stale selection before it can mutate the successor session or durable default", async () => {
+		// Given
+		const originalWaitForIdle = session.waitForIdle.bind(session);
+		vi.spyOn(session, "waitForIdle").mockImplementation(async () => {
+			await originalWaitForIdle();
+			await sessionManager.newSession();
+		});
+
+		// When
+		const selection = session.setDefaultModelSelection(targetModel(), Effort.High);
+
+		// Then
+		await expect(selection).rejects.toThrow("Session changed while selecting model");
+		expect(settings.getGlobal("modelRoles")).toBeUndefined();
+		expect(session.model).toBe(INITIAL_MODEL);
+		expect(sessionManager.getEntries().filter(entry => entry.type === "model_change")).toEqual([]);
+	});
+
 	it("rejects inherit before settings or session mutation", async () => {
 		// Given
 		const entriesBefore = sessionManager.getEntries();

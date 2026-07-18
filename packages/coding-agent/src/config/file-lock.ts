@@ -31,8 +31,17 @@ async function writeLockInfo(lockPath: string): Promise<LockInfo> {
 
 async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
 	try {
-		const content = await fs.readFile(`${lockPath}/info`, "utf-8");
-		return JSON.parse(content) as LockInfo;
+		const parsed = JSON.parse(await fs.readFile(`${lockPath}/info`, "utf-8")) as Partial<LockInfo>;
+		const { pid, timestamp } = parsed;
+		if (
+			typeof pid !== "number" ||
+			!Number.isInteger(pid) ||
+			pid <= 0 ||
+			typeof timestamp !== "number" ||
+			!Number.isFinite(timestamp)
+		)
+			return null;
+		return { pid, timestamp };
 	} catch {
 		return null;
 	}

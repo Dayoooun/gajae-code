@@ -9064,6 +9064,8 @@ export class AgentSession {
 		thinkingLevel: ThinkingLevel | undefined,
 	): Promise<DefaultModelSelectionResult> {
 		return this.#withSessionAdmission("selection", async () => {
+			const expectedSessionId = this.sessionId;
+
 			if (thinkingLevel === ThinkingLevel.Inherit) {
 				throw new Error("Default model selection cannot inherit a thinking level");
 			}
@@ -9079,8 +9081,14 @@ export class AgentSession {
 			await this.waitForIdle();
 			await this.sessionManager.flush();
 			await this.#waitForAdmittedBaseSystemPromptRebuilds();
+			if (this.sessionId !== expectedSessionId) {
+				throw new Error("Session changed while selecting model");
+			}
 			const expectedMutationRevision = this.#defaultModelSelectionMutationRevision;
 			const preparedSystemPrompt = await this.#prepareDefaultModelSelectionPrompt(model);
+			if (this.sessionId !== expectedSessionId) {
+				throw new Error("Session changed while selecting model");
+			}
 			const stage = await this.sessionManager.stageDefaultModelSelection(
 				`${model.provider}/${model.id}`,
 				effectiveLevel,

@@ -350,6 +350,8 @@ export class Settings implements NotificationSettingsReader {
 	#legacyFallbackMigrationGlobalFingerprint: string | undefined;
 	#schemaReport: SettingsSchemaReport = { issues: [], valid: true };
 	#schemaMigrationPending = false;
+	/** A newer config schema must never be rewritten by legacy migrations. */
+	#futureSchemaVersion = false;
 
 	/** Whether to persist changes */
 	#persist: boolean;
@@ -873,6 +875,7 @@ export class Settings implements NotificationSettingsReader {
 			inMemory: !this.#persist,
 		});
 		cloned.#storage = this.#storage;
+		cloned.#futureSchemaVersion = this.#futureSchemaVersion;
 
 		cloned.#global = structuredClone(this.#global);
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
@@ -1103,6 +1106,11 @@ export class Settings implements NotificationSettingsReader {
 				return {};
 			}
 			const parsedRaw = parsed as RawSettings;
+			this.#futureSchemaVersion =
+				filePath === this.#configPath &&
+				typeof parsedRaw.configSchemaVersion === "number" &&
+				parsedRaw.configSchemaVersion > CONFIG_SCHEMA_VERSION;
+
 			const configSchemaVersion = parsedRaw.configSchemaVersion;
 			if (
 				filePath === this.#configPath &&
@@ -1151,13 +1159,15 @@ export class Settings implements NotificationSettingsReader {
 	async #normalizeAfterLoad(): Promise<void> {
 		this.#sanitizeModelSelectorRecords();
 		this.#rebuildMerged();
-		this.#legacyFallbackMigrationGlobalFingerprint = YAML.stringify(this.#global, null, 2);
-		this.#migrateRetryFallbackChains();
-		if (
-			!this.#modified.has("modelRoles") &&
-			![...this.#modified.keys()].some(path => path.startsWith("retry.fallback"))
-		) {
-			this.#legacyFallbackMigrationGlobalFingerprint = undefined;
+		if (!this.#futureSchemaVersion) {
+			this.#legacyFallbackMigrationGlobalFingerprint = YAML.stringify(this.#global, null, 2);
+			this.#migrateRetryFallbackChains();
+			if (
+				!this.#modified.has("modelRoles") &&
+				![...this.#modified.keys()].some(path => path.startsWith("retry.fallback"))
+			) {
+				this.#legacyFallbackMigrationGlobalFingerprint = undefined;
+			}
 		}
 		await this.flush();
 		this.#sanitizeModelSelectorRecords();

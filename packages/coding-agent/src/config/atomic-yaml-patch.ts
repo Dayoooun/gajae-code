@@ -179,6 +179,12 @@ export function deleteByPath(value: Record<string, unknown>, segments: readonly 
 }
 
 function stableValue(value: unknown): string {
+	if (typeof value === "number") {
+		if (Number.isNaN(value)) return "NaN";
+		if (value === Infinity) return "Infinity";
+		if (value === -Infinity) return "-Infinity";
+		if (Object.is(value, -0)) return "-0";
+	}
 	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined";
 	if (Array.isArray(value)) return `[${value.map(stableValue).join(",")}]`;
 	const object = value as Record<string, unknown>;
@@ -290,6 +296,7 @@ function createReceipt(
 		async restore(): Promise<CasRestoreResult> {
 			if (discarded) return { status: "discarded" };
 			return await enqueueAtomicYamlOperation(configPath, async canonicalPath => {
+				if (discarded) return { status: "discarded" };
 				return await withFileLock(canonicalPath, async () => {
 					const current = await readYaml(canonicalPath);
 					const conflicts = changes
