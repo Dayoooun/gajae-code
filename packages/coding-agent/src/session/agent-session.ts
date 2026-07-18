@@ -2059,7 +2059,9 @@ export class AgentSession {
 		});
 		this.agent.setOnBeforeYield(() => this.yieldQueue.flush("streaming"));
 		this.agent.setMaintainContext((context, lifecycle) =>
-			this.#trackMidRunMaintenance(this.#runMidRunMaintenance(context, lifecycle)),
+			this.#trackMidRunMaintenance(
+				this.awaitPendingContextTransformations().then(() => this.#runMidRunMaintenance(context, lifecycle)),
+			),
 		);
 		this.#convertToLlm = config.convertToLlm ?? convertToLlm;
 		this.#rebuildSystemPrompt = config.rebuildSystemPrompt;

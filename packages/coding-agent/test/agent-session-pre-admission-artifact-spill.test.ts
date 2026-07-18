@@ -8,6 +8,7 @@ import { getBundledModel } from "@gajae-code/ai/models";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { SETTINGS_SCHEMA } from "@gajae-code/coding-agent/config/settings-schema";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -26,7 +27,7 @@ describe("AgentSession pre-admission artifact spill", () => {
 		tempDir?.removeSync();
 	});
 
-	it("awaits delayed spill I/O before provider context construction and preserves resumed artifacts", async () => {
+	it("spills oversized UTF-8 tool results before provider admission and rehydrates byte-exactly", async () => {
 		tempDir = TempDir.createSync("@gjc-pre-admission-spill-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
@@ -141,5 +142,96 @@ describe("AgentSession pre-admission artifact spill", () => {
 				() => false,
 			),
 		).toBe(false);
+	});
+
+	it("preserves canonical tool-result bytes when pre-admission spilling is disabled by default", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic model");
+		const agent = new Agent({
+			initialState: {
+				model: { ...model, contextWindow: 200_000, maxTokens: 128_000 },
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+		});
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: {} as never,
+		});
+		const toolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "default-off",
+			toolName: "read",
+			content: [{ type: "text", text: "😀".repeat(20_000) }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		const expectedBytes = Buffer.from(JSON.stringify(toolResult));
+
+		agent.emitExternalEvent({ type: "message_end", message: toolResult });
+		await session.awaitPendingContextTransformations();
+		await Bun.sleep(0);
+
+		const persisted = sessionManager.getBranch().at(-1);
+		expect(persisted?.type).toBe("message");
+		if (persisted?.type !== "message") throw new Error("Expected persisted tool result");
+		expect(Buffer.from(JSON.stringify(persisted.message))).toEqual(expectedBytes);
+		expect(JSON.stringify(persisted.message)).not.toContain("artifact://");
+		expect(persisted.message).not.toHaveProperty("details");
+	});
+
+	it("defaults pre-admission spill off and preserves an explicit setting through the settings schema", () => {
+		expect(SETTINGS_SCHEMA["tools.preAdmissionArtifactSpill"].default).toBe(false);
+		expect(Settings.isolated().get("tools.preAdmissionArtifactSpill")).toBe(false);
+		expect(
+			Settings.isolated({ "tools.preAdmissionArtifactSpill": true }).get("tools.preAdmissionArtifactSpill"),
+		).toBe(true);
+	});
+
+	it("keeps the canonical inline tool result when artifact writing fails", async () => {
+		tempDir = TempDir.createSync("@gjc-pre-admission-spill-failure-");
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic model");
+		const agent = new Agent({
+			initialState: {
+				model: { ...model, contextWindow: 200_000, maxTokens: 128_000 },
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		(
+			sessionManager as unknown as { allocateArtifactPath: typeof sessionManager.allocateArtifactPath }
+		).allocateArtifactPath = async () => ({ id: "write-failure", path: tempDir!.path() });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "tools.preAdmissionArtifactSpill": true }),
+			modelRegistry: {} as never,
+		});
+		const fullText = "💥".repeat(30_000);
+		const toolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "write-failure",
+			toolName: "read",
+			content: [{ type: "text", text: fullText }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+
+		agent.emitExternalEvent({ type: "message_end", message: toolResult });
+		await session.awaitPendingContextTransformations();
+		await Bun.sleep(0);
+
+		const persisted = sessionManager.getBranch().at(-1);
+		expect(persisted?.type).toBe("message");
+		if (persisted?.type !== "message") throw new Error("Expected persisted tool result");
+		expect(persisted.message).toEqual(toolResult);
+		expect(JSON.stringify(persisted.message)).not.toContain("artifact://");
 	});
 });
