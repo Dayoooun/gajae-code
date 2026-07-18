@@ -1,13 +1,12 @@
+import { consumePendingGoalModeRequest } from "../../gjc-runtime/goal-mode-request";
 import {
 	canonicalArgsKey,
 	classifyToolOutcome,
 	decideTimeoutHold,
+	type TimeoutToolOutcome,
 	toResultText,
 	turnTimeoutFingerprint,
-	type TimeoutToolOutcome,
 } from "../../goals/continuation-timeout-guard";
-
-import { consumePendingGoalModeRequest } from "../../gjc-runtime/goal-mode-request";
 import { type GoalModeState, normalizeGoal } from "../../goals/state";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import type { SessionContext, SessionManager } from "../../session/session-manager";
