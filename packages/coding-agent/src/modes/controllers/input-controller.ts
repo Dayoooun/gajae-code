@@ -97,8 +97,8 @@ export class InputController {
 			"app.session.dashboard": () => this.ctx.showSessionsDashboard(),
 			"app.transcript.browse": () => this.ctx.showTranscriptViewer(),
 			"app.jobs.open": () => this.ctx.showJobsOverlay(),
-			"app.plan.toggle": () => this.ctx.handlePlanModeCommand(),
-			"app.mode.cycle": () => this.ctx.handlePlanModeCommand(),
+			"app.plan.toggle": () => this.ctx.planModeController.handleCommand(),
+			"app.mode.cycle": () => this.ctx.planModeController.handleCommand(),
 			"app.history.search": () => this.ctx.showHistorySearch(),
 			"app.stt.toggle": () => this.ctx.handleSTTToggle(),
 			"app.irc.sidebar.toggle": () => this.ctx.toggleIrcSidebar(),
@@ -619,7 +619,7 @@ export class InputController {
 			});
 		}
 
-		const togglePlanMode = () => this.ctx.handlePlanModeCommand();
+		const togglePlanMode = () => this.ctx.planModeController.handleCommand();
 		this.#registerCommandPaletteAction("app.plan.toggle", togglePlanMode);
 		for (const key of this.ctx.keybindings.getKeys("app.plan.toggle")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => {

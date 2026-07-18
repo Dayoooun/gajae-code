@@ -415,6 +415,15 @@ export class InteractiveMode implements InteractiveModeContext {
 	#observerRegistry: SessionObserverRegistry;
 	#transcriptRegistry = new TranscriptItemRegistry();
 
+	/** Direct controller capabilities for consumers that coordinate mode transitions. */
+	get planModeController(): PlanModeController {
+		return this.#planModeController;
+	}
+
+	get goalModeController(): GoalModeController {
+		return this.#goalModeController;
+	}
+
 	#jobsObserver?: JobsObserver;
 	#tasksAggregator?: TasksAggregator;
 	#eventBus?: EventBus;
@@ -1300,16 +1309,16 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#goalModeController.handleSessionEvent(event);
 	}
 
-	/** Apply any deferred plan-mode model switch after the current stream ends. */
-	async flushPendingModelSwitch(): Promise<void> {
-		await this.#planModeController.flushPendingModelSwitch();
-	}
-
 	/** Restore mode state from session entries on resume. */
 	async #restoreModeFromSession(): Promise<void> {
 		const sessionContext = this.sessionManager.buildSessionContext();
 		if (await this.#goalModeController.restoreFromSession(sessionContext)) return;
 		await this.#planModeController.restoreFromSession(sessionContext);
+	}
+
+	/** Apply any deferred plan-mode model switch after the current stream ends. */
+	async flushPendingModelSwitch(): Promise<void> {
+		await this.#planModeController.flushPendingModelSwitch();
 	}
 
 	async handlePlanModeCommand(initialPrompt?: string): Promise<void> {

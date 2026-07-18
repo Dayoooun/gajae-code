@@ -297,6 +297,7 @@ export interface InteractiveModeContext {
 		customInstructionsOrOptions?: string | CompactOptions,
 		isAuto?: boolean,
 	): Promise<CompactionOutcome>;
+
 	openInBrowser(urlOrPath: string): void;
 	/** Resolved source of truth for slash autocomplete and command palette entries. */
 	getSlashCommands?(): readonly SlashCommand[];
@@ -362,6 +363,11 @@ export interface InteractiveModeContext {
 		reason: "start" | "switch" | "branch" | "tree" | "shutdown",
 		previousSessionFile?: string,
 	): Promise<void>;
+	planModeController: Pick<
+		import("./controllers/plan-mode-controller").PlanModeController,
+		"handleCommand" | "handleApproval" | "flushPendingModelSwitch"
+	>;
+	goalModeController: Pick<import("./controllers/goal-mode-controller").GoalModeController, "handleCommand">;
 	setHookWidget(key: string, content: ExtensionWidgetContent, options?: ExtensionWidgetOptions): void;
 	setHookStatus(key: string, text: string | undefined): void;
 	showHookSelector(
