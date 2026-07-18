@@ -32,8 +32,6 @@ import type { NotificationSettingsReader, NotificationSettingsSnapshot } from ".
 import { AgentStorage } from "../session/agent-storage";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
 import {
-	AtomicYamlConflictError,
-	atomicYamlPathHash,
 	type AtomicYamlPatch,
 	applyAtomicYamlPatches,
 	applyAtomicYamlPatchesWithCurrent,
@@ -45,8 +43,8 @@ import {
 import { isModelSelectorValue, type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 
 import {
-	CONFIG_SCHEMA_VERSION,
 	type BashInterceptorRule,
+	CONFIG_SCHEMA_VERSION,
 	type GroupPrefix,
 	type GroupTypeMap,
 	getDefault,
@@ -76,10 +74,6 @@ type SettingsPatch = {
 	readonly generation: number;
 	readonly revision: number;
 	readonly modelRole?: string;
-	readonly modelRoleRevision?: number;
-	readonly configVersion?: string;
-	/** Durable default state observed before this default-role mutation. */
-	readonly expectedDefaultModelRoleHash?: string;
 	readonly legacyFallbackMigration?: boolean;
 };
 
@@ -99,13 +93,6 @@ type DurableBatchRevision = {
 export type SettingsAtomicPatch = { path: SettingPath; op: "set"; value: unknown } | { path: SettingPath; op: "unset" };
 export type SettingsAtomicReceipt = CasReceipt;
 
-export interface GlobalDefaultModelRoleCommit {
-	readonly previousDefault: ModelSelectorValue | undefined;
-	readonly previousModelRolesExisted: boolean;
-	readonly committedDefault: ModelSelectorValue | undefined;
-	readonly committedConfigVersion?: string;
-	readonly defaultRevision: number;
-}
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
 	cwd?: string;
@@ -115,6 +102,17 @@ export interface SettingsOptions {
 	inMemory?: boolean;
 	/** Initial overrides */
 	overrides?: Partial<Record<SettingPath, unknown>>;
+}
+
+function summarizeSettingsOptions(options: SettingsOptions | null): {
+	optionKeys: string[];
+	overrideKeys: string[];
+} {
+	if (!options) return { optionKeys: [], overrideKeys: [] };
+	return {
+		optionKeys: Object.keys(options).sort(),
+		overrideKeys: Object.keys(options.overrides ?? {}).sort(),
+	};
 }
 
 /** Additional layer setup for {@link Settings.isolated}. */
@@ -198,6 +196,14 @@ function stringArrayFromUnknown(value: unknown): string[] {
 	return [];
 }
 
+function normalizeSessionDirectoryMigration(raw: RawSettings): void {
+	const session = rawSettingsRecord(raw.session);
+	if (!session) return;
+	if (session.directoryMigration !== "copy-retain" && session.directoryMigration !== "disabled") {
+		delete session.directoryMigration;
+	}
+}
+
 function rawSettingsRecord(value: unknown): RawSettings | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	return value as RawSettings;
@@ -266,27 +272,6 @@ function resolvePathScopedStringArray(settingPath: SettingPath, value: unknown, 
 
 	return resolved;
 }
-type DefaultModelRoleOwnership = {
-	generation: number;
-	configVersion?: string;
-	defaultConfigVersion?: string;
-	defaultLineageKnown: boolean;
-};
-
-function readConfigVersion(filePath: string): string | undefined {
-	try {
-		const stat = fs.statSync(filePath, { bigint: true });
-		return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}`;
-	} catch (error) {
-		if (isEnoent(error)) return undefined;
-		throw error;
-	}
-}
-
-function defaultModelRoleFrom(raw: RawSettings): ModelSelectorValue | undefined {
-	const value = rawSettingsRecord(raw.modelRoles)?.default;
-	return isModelSelectorValue(value) ? (Array.isArray(value) ? [...value] : value) : undefined;
-}
 
 function setRawModelRole(
 	raw: RawSettings,
@@ -305,17 +290,6 @@ function setRawModelRole(
 		return;
 	}
 	raw.modelRoles = { ...roles, [role]: modelId };
-}
-
-function updateModelRolesPatch(
-	patch: SettingsPatch,
-	role: string,
-	modelId: ModelSelectorValue | undefined,
-	removeContainerWhenEmpty = false,
-): SettingsPatch {
-	const raw: RawSettings = { modelRoles: structuredClone(patch.value) };
-	setRawModelRole(raw, role, modelId, removeContainerWhenEmpty);
-	return { ...patch, value: raw.modelRoles };
 }
 
 function settingsPatchKey(patch: SettingsPatch): string {
@@ -358,12 +332,10 @@ export class Settings implements NotificationSettingsReader {
 	#nextGeneration = 0;
 	#pathRevisions = new Map<string, number>();
 	#nextRevision = 0;
-	#defaultModelRoleOwnership: DefaultModelRoleOwnership = { generation: 0, defaultLineageKnown: true };
 	/** Pending debounced ordinary save; its queue slot is reserved immediately. */
 	#saveTimer?: NodeJS.Timeout;
 	#savePromise?: Promise<void>;
 	#pendingSaveSlot?: PendingSaveSlot;
-	#globalModelRoleTail: Promise<void> = Promise.resolve();
 
 	/** Legacy fallback migration warnings emitted once per settings instance. */
 	#legacyFallbackMigrationWarnings = 0;
@@ -386,6 +358,7 @@ export class Settings implements NotificationSettingsReader {
 				setByPath(this.#overrides, key.split("."), structuredClone(value));
 			}
 		}
+		normalizeSessionDirectoryMigration(this.#overrides);
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -397,8 +370,17 @@ export class Settings implements NotificationSettingsReader {
 	 * Call once at startup before accessing `settings`.
 	 */
 	static init(options: SettingsOptions = {}): Promise<Settings> {
-		if (globalInstancePromise) return globalInstancePromise;
+		if (globalInstancePromise) {
+			if (JSON.stringify(options) !== JSON.stringify(globalInitOptions)) {
+				logger.warn("Settings.init called again with different options; reusing existing settings instance", {
+					initialOptions: summarizeSettingsOptions(globalInitOptions),
+					requestedOptions: summarizeSettingsOptions(options),
+				});
+			}
+			return globalInstancePromise;
+		}
 
+		globalInitOptions = structuredClone(options);
 		const instance = new Settings(options);
 		const promise = instance.#load();
 		globalInstancePromise = promise;
@@ -417,6 +399,15 @@ export class Settings implements NotificationSettingsReader {
 	}
 
 	/**
+	 * Load settings for an explicit workspace without changing the global singleton.
+	 * Managed-session policy resolution must be bound to the workspace being opened.
+	 */
+	static loadForScope(options: { cwd: string; agentDir?: string }): Promise<Settings> {
+		const instance = new Settings(options);
+		return instance.#load();
+	}
+
+	/**
 	 * Create an isolated instance for testing with explicit user/global settings.
 	 * Does not affect the global singleton.
 	 */
@@ -428,6 +419,7 @@ export class Settings implements NotificationSettingsReader {
 		for (const [key, value] of Object.entries(globalSettings)) {
 			setByPath(instance.#global, key.split("."), structuredClone(value));
 		}
+		normalizeSessionDirectoryMigration(instance.#global);
 
 		instance.#rebuildMerged();
 		return instance;
@@ -603,23 +595,14 @@ export class Settings implements NotificationSettingsReader {
 		this.#set(path, value, true);
 	}
 
-	#set<P extends SettingPath>(path: P, value: SettingValue<P>, defaultModelRoleMayHaveChanged: boolean): void {
+	#set<P extends SettingPath>(path: P, value: SettingValue<P>, _defaultModelRoleMayHaveChanged: boolean): void {
 		const prev = this.get(path);
 		const clonedValue = structuredClone(value);
-		let modelRoleRevision: number | undefined;
-		if (path === "modelRoles" && defaultModelRoleMayHaveChanged) {
-			this.#defaultModelRoleOwnership.generation += 1;
-			modelRoleRevision = this.#defaultModelRoleOwnership.generation;
-		}
 		const patch: SettingsPatch = {
 			path,
 			value: clonedValue,
 			generation: ++this.#nextGeneration,
 			revision: ++this.#nextRevision,
-			modelRoleRevision,
-			configVersion: this.#defaultModelRoleOwnership.configVersion,
-			expectedDefaultModelRoleHash:
-				path === "modelRoles" && defaultModelRoleMayHaveChanged ? this.#expectedDefaultModelRoleHash() : undefined,
 		};
 		setByPath(this.#global, path.split("."), structuredClone(clonedValue));
 		this.#pathRevisions.set(path, patch.revision);
@@ -638,19 +621,11 @@ export class Settings implements NotificationSettingsReader {
 	 */
 	unset<P extends SettingPath>(path: P): void {
 		const prev = this.get(path);
-		let modelRoleRevision: number | undefined;
-		if (path === "modelRoles") {
-			this.#defaultModelRoleOwnership.generation += 1;
-			modelRoleRevision = this.#defaultModelRoleOwnership.generation;
-		}
 		const patch: SettingsPatch = {
 			path,
 			value: undefined,
 			generation: ++this.#nextGeneration,
 			revision: ++this.#nextRevision,
-			modelRoleRevision,
-			configVersion: this.#defaultModelRoleOwnership.configVersion,
-			expectedDefaultModelRoleHash: path === "modelRoles" ? this.#expectedDefaultModelRoleHash() : undefined,
 		};
 		deleteByPath(this.#global, path.split("."));
 		this.#pathRevisions.set(path, patch.revision);
@@ -668,7 +643,23 @@ export class Settings implements NotificationSettingsReader {
 	 */
 	async commitAtomicBatch(patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> {
 		if (!this.#persist || !this.#configPath) {
-			throw new Error("commitAtomicBatch requires persistent Settings with a config.yml path.");
+			for (const patch of patches) {
+				if (!Object.hasOwn(SETTINGS_SCHEMA, patch.path)) {
+					throw new Error(`Unknown setting path for atomic batch: ${patch.path}`);
+				}
+				if (patch.op === "set" && patch.value === undefined) {
+					throw new TypeError(`Settings set patch for ${patch.path} cannot carry undefined; use unset instead.`);
+				}
+			}
+			for (const patch of patches) {
+				if (patch.op === "set") this.set(patch.path, patch.value as never);
+				else this.unset(patch.path);
+			}
+			return {
+				revisions: [],
+				restore: async () => ({ status: "discarded" }),
+				discard: () => {},
+			};
 		}
 
 		const durablePatches: AtomicYamlPatch[] = patches.map(patch => {
@@ -838,7 +829,6 @@ export class Settings implements NotificationSettingsReader {
 			inMemory: !this.#persist,
 		});
 		cloned.#storage = this.#storage;
-		cloned.#defaultModelRoleOwnership = this.#defaultModelRoleOwnership;
 
 		cloned.#global = structuredClone(this.#global);
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
@@ -935,11 +925,6 @@ export class Settings implements NotificationSettingsReader {
 	}
 
 	setGlobalModelRole(role: ModelRole | string, modelId: ModelSelectorValue | undefined): void {
-		let modelRoleRevision: number | undefined;
-		if (role === "default") {
-			this.#defaultModelRoleOwnership.generation += 1;
-			modelRoleRevision = this.#defaultModelRoleOwnership.generation;
-		}
 		const revision = ++this.#nextRevision;
 		const patch: SettingsPatch = {
 			path: "modelRoles",
@@ -947,9 +932,6 @@ export class Settings implements NotificationSettingsReader {
 			generation: ++this.#nextGeneration,
 			revision,
 			modelRole: role,
-			modelRoleRevision,
-			configVersion: this.#defaultModelRoleOwnership.configVersion,
-			expectedDefaultModelRoleHash: role === "default" ? this.#expectedDefaultModelRoleHash() : undefined,
 		};
 		setRawModelRole(this.#global, role, modelId);
 		this.#pathRevisions.set("modelRoles", revision);
@@ -958,188 +940,27 @@ export class Settings implements NotificationSettingsReader {
 		this.#queueSave();
 	}
 
-	setGlobalModelRoleAndFlush(
+	async setGlobalModelRoleAndFlush(
 		role: ModelRole | string,
 		modelId: ModelSelectorValue | undefined,
-	): Promise<GlobalDefaultModelRoleCommit> {
-		const transaction = this.#globalModelRoleTail.then(() => this.#commitGlobalModelRoleAndFlush(role, modelId));
-		this.#globalModelRoleTail = transaction.then(
-			() => undefined,
-			() => undefined,
-		);
-		return transaction;
+	): Promise<CasReceipt> {
+		return this.commitAtomicBatchWithCurrent(current => {
+			const roles = rawSettingsRecord(current.modelRoles) ?? {};
+			const next = { ...roles };
+			if (modelId === undefined) delete next[role];
+			else next[role] = modelId;
+			return [{ path: "modelRoles", op: "set", value: next }];
+		});
 	}
 
-	restoreGlobalDefaultModelRoleIfCurrent(commit: GlobalDefaultModelRoleCommit): Promise<boolean> {
-		const transaction = this.#globalModelRoleTail.then(() => this.#restoreGlobalDefaultModelRoleIfCurrent(commit));
-		this.#globalModelRoleTail = transaction.then(
-			() => undefined,
-			() => undefined,
-		);
-		return transaction;
+	async restoreGlobalDefaultModelRoleIfCurrent(commit: CasReceipt): Promise<boolean> {
+		return (await commit.restore()).status === "restored";
 	}
 
-	async #commitGlobalModelRoleAndFlush(
-		role: ModelRole | string,
-		modelId: ModelSelectorValue | undefined,
-	): Promise<GlobalDefaultModelRoleCommit> {
-		if (this.#persist) await this.flushOrThrow();
-		const previousDefault = defaultModelRoleFrom(this.#global);
-		const previousModelRolesExisted = Object.hasOwn(this.#global, "modelRoles");
-		const previousDefaultRevision = this.#defaultModelRoleOwnership.generation;
-		let defaultRevision = previousDefaultRevision;
-		if (role === "default") {
-			defaultRevision += 1;
-			this.#defaultModelRoleOwnership.generation = defaultRevision;
-		}
-		this.#setGlobalModelRoleInMemory(role, modelId, false, true);
-
-		if (!this.#persist || !this.#configPath) {
-			return {
-				previousDefault,
-				previousModelRolesExisted,
-				committedDefault: defaultModelRoleFrom(this.#global),
-				defaultRevision,
-				committedConfigVersion: undefined,
-			};
-		}
-
-		const expectedDefaultModelRoleHash =
-			role === "default" ? atomicYamlPathHash(this.#global, "modelRoles.default") : undefined;
-		let durableBeforeWrite: RawSettings | undefined;
-		let durableVersionBeforeWrite: string | undefined;
-		try {
-			const result = await reserveAtomicYamlUpdateSlot(this.#configPath, () => ({
-				apply: current => {
-					if (expectedDefaultModelRoleHash !== undefined) {
-						const actualHash = atomicYamlPathHash(current, "modelRoles.default");
-						if (actualHash !== expectedDefaultModelRoleHash) {
-							throw new AtomicYamlConflictError("modelRoles.default", expectedDefaultModelRoleHash, actualHash);
-						}
-					}
-					durableBeforeWrite = structuredClone(current);
-					durableVersionBeforeWrite = readConfigVersion(this.#configPath!);
-					const durablePreviousDefault = defaultModelRoleFrom(current);
-					const durablePreviousModelRolesExisted = Object.hasOwn(current, "modelRoles");
-					setRawModelRole(current, role, modelId);
-					return {
-						durablePreviousDefault,
-						durablePreviousModelRolesExisted,
-						committedDefault: defaultModelRoleFrom(current),
-						committedConfigVersion: undefined as string | undefined,
-						defaultRevision,
-					};
-				},
-				committed: (current, result) => {
-					const committedConfigVersion = readConfigVersion(this.#configPath!);
-					this.#replaceGlobalWithDurable(
-						current,
-						committedConfigVersion,
-						role === "default",
-						durableVersionBeforeWrite,
-					);
-					result.committedConfigVersion = committedConfigVersion;
-				},
-			}));
-			return {
-				previousDefault: result.durablePreviousDefault,
-				previousModelRolesExisted: result.durablePreviousModelRolesExisted,
-				committedDefault: result.committedDefault,
-				committedConfigVersion: result.committedConfigVersion,
-				defaultRevision: result.defaultRevision,
-			};
-		} catch (error) {
-			if (role === "default" && this.#defaultModelRoleOwnership.generation === defaultRevision) {
-				if (durableBeforeWrite) {
-					this.#replaceGlobalWithDurable(durableBeforeWrite, durableVersionBeforeWrite, false);
-				} else {
-					this.#setGlobalModelRoleInMemory("default", previousDefault, !previousModelRolesExisted, true);
-				}
-				this.#defaultModelRoleOwnership.generation = previousDefaultRevision;
-			}
-			throw error;
-		}
-	}
-
-	async #restoreGlobalDefaultModelRoleIfCurrent(commit: GlobalDefaultModelRoleCommit): Promise<boolean> {
-		if (this.#defaultModelRoleOwnership.generation !== commit.defaultRevision) return false;
-
-		if (!this.#persist || !this.#configPath) {
-			if (defaultModelRoleFrom(this.#global) !== commit.committedDefault) return false;
-			this.#setGlobalModelRoleInMemory("default", commit.previousDefault, !commit.previousModelRolesExisted);
-			this.#defaultModelRoleOwnership.generation += 1;
-			return true;
-		}
-
-		const restored = await reserveAtomicYamlUpdateSlot(this.#configPath, () => ({
-			apply: current => {
-				if (this.#defaultModelRoleOwnership.generation !== commit.defaultRevision) return false;
-				const currentConfigVersion = readConfigVersion(this.#configPath!);
-				if (defaultModelRoleFrom(current) !== commit.committedDefault) return false;
-				if (
-					commit.committedConfigVersion !== undefined &&
-					currentConfigVersion !== commit.committedConfigVersion &&
-					!(
-						this.#defaultModelRoleOwnership.defaultConfigVersion === commit.committedConfigVersion &&
-						this.#defaultModelRoleOwnership.defaultLineageKnown &&
-						this.#defaultModelRoleOwnership.configVersion === currentConfigVersion
-					)
-				) {
-					return false;
-				}
-				setRawModelRole(current, "default", commit.previousDefault, !commit.previousModelRolesExisted);
-				return { currentConfigVersion };
-			},
-			shouldWrite: result => result !== false,
-			committed: (current, result) => {
-				if (result === false) return;
-				const restoredConfigVersion = readConfigVersion(this.#configPath!);
-				this.#replaceGlobalWithDurable(current, restoredConfigVersion, true, result.currentConfigVersion);
-				this.#defaultModelRoleOwnership.generation += 1;
-			},
-		}));
-		if (!restored) return false;
-		await this.flushOrThrow();
-		return true;
-	}
-
-	#setGlobalModelRoleInMemory(
-		role: string,
-		modelId: ModelSelectorValue | undefined,
-		removeContainerWhenEmpty: boolean,
-		updatePendingPatch = false,
-	): void {
-		setRawModelRole(this.#global, role, modelId, removeContainerWhenEmpty);
-		if (updatePendingPatch) {
-			const rootPatch = this.#modified.get("modelRoles");
-			if (rootPatch) {
-				this.#modified.set("modelRoles", updateModelRolesPatch(rootPatch, role, modelId, removeContainerWhenEmpty));
-			}
-			const rolePatch = this.#modified.get(`modelRoles.${role}`);
-			if (rolePatch) {
-				this.#modified.set(`modelRoles.${role}`, { ...rolePatch, value: modelId });
-			}
-		}
-		this.#rebuildMerged();
-	}
-
-	#replaceGlobalWithDurable(
-		current: RawSettings,
-		configVersion?: string,
-		defaultChanged = false,
-		predecessorConfigVersion = configVersion,
-	): void {
+	#replaceGlobalWithDurable(current: RawSettings): void {
 		this.#global = current;
 		for (const patch of this.#pendingPatchesInGenerationOrder()) {
-			this.#applyPatchWithDefaultOwnership(this.#global, { ...patch, value: structuredClone(patch.value) });
-		}
-		const externalLineageBreak = predecessorConfigVersion !== this.#defaultModelRoleOwnership.configVersion;
-		this.#defaultModelRoleOwnership.configVersion = configVersion;
-		if (defaultChanged) {
-			this.#defaultModelRoleOwnership.defaultConfigVersion = configVersion;
-			this.#defaultModelRoleOwnership.defaultLineageKnown = true;
-		} else if (externalLineageBreak) {
-			this.#defaultModelRoleOwnership.defaultLineageKnown = false;
+			applySettingsPatch(this.#global, { ...patch, value: structuredClone(patch.value) });
 		}
 		this.#rebuildMerged();
 	}
@@ -1215,9 +1036,6 @@ export class Settings implements NotificationSettingsReader {
 			this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
 			await this.#migrateFromLegacy();
 			this.#global = await this.#loadYaml(this.#configPath!);
-			const configVersion = readConfigVersion(this.#configPath!);
-			this.#defaultModelRoleOwnership.configVersion = configVersion;
-			this.#defaultModelRoleOwnership.defaultConfigVersion = configVersion;
 		}
 		if (this.#schemaMigrationPending)
 			this.#recordLegacyFallbackMigrationPatch("configSchemaVersion", CONFIG_SCHEMA_VERSION);
@@ -1418,7 +1236,6 @@ export class Settings implements NotificationSettingsReader {
 			value: structuredClone(value),
 			generation: ++this.#nextGeneration,
 			revision,
-			configVersion: this.#defaultModelRoleOwnership.configVersion,
 			legacyFallbackMigration: true,
 		});
 	}
@@ -1508,6 +1325,7 @@ export class Settings implements NotificationSettingsReader {
 
 		// Migration registry v0 -> v1.
 		// queueMode -> steeringMode
+		normalizeSessionDirectoryMigration(raw);
 		if ("queueMode" in raw && !("steeringMode" in raw)) {
 			raw.steeringMode = raw.queueMode;
 			delete raw.queueMode;
@@ -1675,7 +1493,6 @@ export class Settings implements NotificationSettingsReader {
 
 		let captured: SettingsPatch[] = [];
 		let durableBeforeWrite: RawSettings | undefined;
-		let durableVersionBeforeWrite: string | undefined;
 		const save = reserveAtomicYamlUpdateSlot(this.#configPath, async () => {
 			await slot.wait;
 			slot.captured = true;
@@ -1690,8 +1507,6 @@ export class Settings implements NotificationSettingsReader {
 						this.#global = structuredClone(current);
 						this.#rebuildMerged();
 						if (getByPath(current, ["retry", "fallbackChains"]) !== undefined) {
-							this.#defaultModelRoleOwnership.configVersion = readConfigVersion(this.#configPath!);
-							this.#defaultModelRoleOwnership.defaultLineageKnown = false;
 							this.#migrateRetryFallbackChains();
 							captured = this.#pendingPatchesInGenerationOrder();
 						} else {
@@ -1703,64 +1518,19 @@ export class Settings implements NotificationSettingsReader {
 							captured = captured.filter(patch => !patch.legacyFallbackMigration);
 						}
 					}
-					const currentConfigVersion = readConfigVersion(this.#configPath!);
 					durableBeforeWrite = structuredClone(current);
-					durableVersionBeforeWrite = currentConfigVersion;
-					const externalLineageBreak = currentConfigVersion !== this.#defaultModelRoleOwnership.configVersion;
-					for (const patch of captured) {
-						if (patch.expectedDefaultModelRoleHash === undefined) continue;
-						const actualHash = atomicYamlPathHash(current, "modelRoles.default");
-						if (actualHash !== patch.expectedDefaultModelRoleHash) {
-							throw new AtomicYamlConflictError(
-								"modelRoles.default",
-								patch.expectedDefaultModelRoleHash,
-								actualHash,
-							);
-						}
-					}
-					const applicablePatches = captured.filter(
-						patch =>
-							!this.#isStaleDefaultModelRolePatch(patch, currentConfigVersion) || patch.modelRole !== "default",
-					);
-					const appliesDefault = applicablePatches.some(
-						patch =>
-							!this.#isStaleDefaultModelRolePatch(patch, currentConfigVersion) &&
-							(patch.modelRole === "default" || (patch.path === "modelRoles" && !patch.modelRole)),
-					);
-					for (const patch of applicablePatches) {
-						this.#applyPatchWithDefaultOwnership(current, patch, currentConfigVersion);
-					}
-					return { appliesDefault, externalLineageBreak, shouldWrite: applicablePatches.length > 0 };
+					for (const patch of captured) applySettingsPatch(current, patch);
+					return { shouldWrite: captured.length > 0 };
 				},
 				shouldWrite: result => result.shouldWrite,
-				committed: (current, result) => {
-					const savedConfigVersion = readConfigVersion(this.#configPath!);
-					this.#defaultModelRoleOwnership.configVersion = savedConfigVersion;
-					if (result.appliesDefault) {
-						this.#defaultModelRoleOwnership.defaultConfigVersion = savedConfigVersion;
-						this.#defaultModelRoleOwnership.defaultLineageKnown = true;
-					} else if (result.externalLineageBreak) {
-						this.#defaultModelRoleOwnership.defaultLineageKnown = false;
-					}
+				committed: current => {
 					for (const patch of captured) {
 						const key = settingsPatchKey(patch);
-						if (this.#modified.get(key)?.generation === patch.generation) {
-							this.#modified.delete(key);
-						}
+						if (this.#modified.get(key)?.generation === patch.generation) this.#modified.delete(key);
 					}
 					this.#global = current;
-					for (const [key, patch] of [...this.#modified].sort(
-						(left, right) => left[1].generation - right[1].generation,
-					)) {
-						if (this.#isStaleDefaultModelRolePatch(patch, savedConfigVersion) && patch.modelRole === "default") {
-							this.#modified.delete(key);
-							continue;
-						}
-						this.#applyPatchWithDefaultOwnership(
-							this.#global,
-							{ ...patch, value: structuredClone(patch.value) },
-							savedConfigVersion,
-						);
+					for (const patch of this.#pendingPatchesInGenerationOrder()) {
+						applySettingsPatch(this.#global, { ...patch, value: structuredClone(patch.value) });
 					}
 					this.#rebuildMerged();
 				},
@@ -1769,30 +1539,15 @@ export class Settings implements NotificationSettingsReader {
 		this.#savePromise = save;
 		void save.catch(error => {
 			logger.warn("Settings: background save failed", { error: String(error) });
-			let droppedStaleDefault = false;
 			for (const patch of captured) {
 				const key = settingsPatchKey(patch);
-				const currentPatch = this.#modified.get(key);
-				if (currentPatch?.generation !== patch.generation) continue;
-				if (
-					this.#isStaleDefaultModelRolePatch(patch, readConfigVersion(this.#configPath!)) &&
-					patch.modelRole === "default"
-				) {
-					this.#modified.delete(key);
-					droppedStaleDefault = true;
-				} else {
-					this.#modified.set(key, patch);
-				}
+				if (this.#modified.get(key)?.generation === patch.generation) this.#modified.set(key, patch);
 			}
-			if (droppedStaleDefault && durableBeforeWrite) {
-				setRawModelRole(
-					this.#global,
-					"default",
-					defaultModelRoleFrom(durableBeforeWrite),
-					!Object.hasOwn(durableBeforeWrite, "modelRoles"),
-				);
-				this.#defaultModelRoleOwnership.configVersion = durableVersionBeforeWrite;
-				this.#defaultModelRoleOwnership.defaultLineageKnown = false;
+			if (durableBeforeWrite) {
+				this.#global = durableBeforeWrite;
+				for (const patch of this.#pendingPatchesInGenerationOrder()) {
+					applySettingsPatch(this.#global, { ...patch, value: structuredClone(patch.value) });
+				}
 				this.#rebuildMerged();
 			}
 		});
@@ -1809,51 +1564,9 @@ export class Settings implements NotificationSettingsReader {
 		}, 100);
 	}
 
-	#expectedDefaultModelRoleHash(): string {
-		for (const patch of this.#modified.values()) {
-			if (patch.expectedDefaultModelRoleHash !== undefined) return patch.expectedDefaultModelRoleHash;
-		}
-		return atomicYamlPathHash(this.#global, "modelRoles.default");
-	}
-
-	#isStaleDefaultModelRolePatch(
-		patch: SettingsPatch,
-		currentConfigVersion = this.#defaultModelRoleOwnership.configVersion,
-	): boolean {
-		const changesDefault = patch.modelRole === "default" || (patch.path === "modelRoles" && !patch.modelRole);
-		const generationChanged =
-			patch.modelRoleRevision !== undefined &&
-			patch.modelRoleRevision !== this.#defaultModelRoleOwnership.generation;
-		const externalConfigChanged =
-			patch.configVersion !== currentConfigVersion &&
-			(this.#defaultModelRoleOwnership.configVersion !== currentConfigVersion ||
-				!this.#defaultModelRoleOwnership.defaultLineageKnown);
-		return changesDefault && (generationChanged || externalConfigChanged);
-	}
-
 	#pendingPatchesInGenerationOrder(): SettingsPatch[] {
 		return [...this.#modified.values()].sort((left, right) => left.generation - right.generation);
 	}
-
-	#applyPatchWithDefaultOwnership(
-		raw: RawSettings,
-		patch: SettingsPatch,
-		currentConfigVersion = this.#defaultModelRoleOwnership.configVersion,
-	): boolean {
-		if (!this.#isStaleDefaultModelRolePatch(patch, currentConfigVersion)) {
-			applySettingsPatch(raw, patch);
-			return true;
-		}
-		if (patch.modelRole === "default") return false;
-
-		const durableDefault = defaultModelRoleFrom(raw);
-		const roles = shallowModelSelectorRecord(patch.value);
-		if (durableDefault === undefined) delete roles.default;
-		else roles.default = durableDefault;
-		setByPath(raw, ["modelRoles"], roles);
-		return true;
-	}
-
 	#releasePendingSaveSlot(): void {
 		if (this.#saveTimer) {
 			clearTimeout(this.#saveTimer);
@@ -1923,8 +1636,7 @@ export class Settings implements NotificationSettingsReader {
 
 	async #refreshDurableSettings(): Promise<void> {
 		if (!this.#persist || !this.#configPath) return;
-		const current = await this.#loadYaml(this.#configPath);
-		this.#replaceGlobalWithDurable(current, readConfigVersion(this.#configPath), false);
+		this.#replaceGlobalWithDurable(await this.#loadYaml(this.#configPath));
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -2067,6 +1779,7 @@ export function onAppendOnlyModeChanged(cb: (value: string) => void): () => void
 
 let globalInstance: Settings | null = null;
 let globalInstancePromise: Promise<Settings> | null = null;
+let globalInitOptions: SettingsOptions | null = null;
 
 export function isSettingsInitialized(): boolean {
 	return globalInstance !== null;
@@ -2079,6 +1792,7 @@ export function isSettingsInitialized(): boolean {
 export function resetSettingsForTest(): void {
 	globalInstance = null;
 	globalInstancePromise = null;
+	globalInitOptions = null;
 }
 
 /**

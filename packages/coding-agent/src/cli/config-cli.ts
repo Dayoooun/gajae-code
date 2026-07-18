@@ -5,7 +5,10 @@
  * Uses the settings schema as the source of truth for available settings.
  */
 
+import * as fs from "node:fs/promises";
+import type * as path from "node:path";
 import { APP_NAME, getAgentDir } from "@gajae-code/utils";
+import { YAML } from "bun";
 import chalk from "chalk";
 import {
 	getDefault,
@@ -459,6 +462,57 @@ function handleDoctor(flags: { json?: boolean }): void {
 	for (const issue of report.issues) console.log(`${issue.kind}\t${issue.path}\t${issue.detail}`);
 }
 
+type ConfigDoctorReport = {
+	unknownKeys: string[];
+	invalidValues: Array<{ path: string; value: unknown }>;
+	legacyShapes: string[];
+};
+
+function flattenConfig(value: unknown, prefix = ""): Array<[string, unknown]> {
+	if (prefix && ALL_SETTING_PATHS.includes(prefix as SettingPath)) return [[prefix, value]];
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return prefix ? [[prefix, value]] : [];
+	return Object.entries(value).flatMap(([key, child]) => flattenConfig(child, prefix ? `${prefix}.${key}` : key));
+}
+
+function matchesSettingType(path: SettingPath, value: unknown): boolean {
+	const definition = SETTINGS_SCHEMA[path];
+	switch (definition.type) {
+		case "string":
+		case "enum":
+			return (
+				typeof value === "string" && (definition.type !== "enum" || getEnumValues(path)?.includes(value) === true)
+			);
+		case "number":
+			return typeof value === "number" && Number.isFinite(value);
+		case "boolean":
+			return typeof value === "boolean";
+		case "array":
+			return Array.isArray(value);
+		case "record":
+			return value !== null && typeof value === "object" && !Array.isArray(value);
+	}
+}
+
+export async function inspectConfigFile(configPath: string): Promise<ConfigDoctorReport> {
+	const report: ConfigDoctorReport = { unknownKeys: [], invalidValues: [], legacyShapes: [] };
+	try {
+		const raw = YAML.parse(await fs.readFile(configPath, "utf8"));
+		if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+			report.legacyShapes.push("config root is not a mapping");
+			return report;
+		}
+		for (const [settingPath, value] of flattenConfig(raw)) {
+			if (!ALL_SETTING_PATHS.includes(settingPath as SettingPath)) report.unknownKeys.push(settingPath);
+			else if (!matchesSettingType(settingPath as SettingPath, value))
+				report.invalidValues.push({ path: settingPath, value: redactConfigValue(settingPath, value) });
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+			report.legacyShapes.push(`unable to parse config: ${String(error)}`);
+	}
+	return report;
+}
+
 // =============================================================================
 // Help
 // =============================================================================
@@ -474,6 +528,7 @@ ${chalk.bold("Commands:")}
   doctor             Report unknown, invalid, and pending settings migrations
   path               Print the config directory path
   init-xdg           Initialize XDG Base Directory structure
+  doctor             Report unknown, invalid, and legacy config entries
 
 ${chalk.bold("Options:")}
   --json             Output as JSON
@@ -489,6 +544,7 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} config list --json
   ${APP_NAME} config get auth.broker.token --show-secrets
   ${APP_NAME} config init-xdg
+  ${APP_NAME} config doctor --json
 
 ${chalk.bold("Boolean Values:")}
   true, false, yes, no, on, off, 1, 0
