@@ -1806,8 +1806,10 @@ async function getSortedSessions(sessionDir: string, storage: SessionStorage): P
 					if (entries.length === 0) return;
 					const header = entries[0] as Record<string, unknown>;
 					if (header.type !== "session" || typeof header.id !== "string") return;
-					for (const patch of await readSessionListTrailingPatches(path, storage, buffer)) {
-						applySessionListHeaderPatch(header as unknown as SessionListHeader, patch);
+					if (header.version === CURRENT_SESSION_VERSION) {
+						for (const patch of await readSessionListTrailingPatches(path, storage, buffer)) {
+							applySessionListHeaderPatch(header as unknown as SessionListHeader, patch);
+						}
 					}
 					const mtime = storage.statSync(path).mtimeMs;
 					const firstPrompt = header.title ? undefined : extractFirstUserPrompt(entries);

@@ -159,6 +159,35 @@ describe("getRecentSessions", () => {
 		expect(session?.name).toBe("Patched title");
 	});
 
+	it("ignores trailing v4 header patches when listing legacy transcripts", async () => {
+		const file = path.join(tempDir, "legacy-patched-large.jsonl");
+		const records = [
+			{
+				type: "session",
+				version: 3,
+				id: "legacy-patched-large",
+				timestamp: "2025-01-01T00:00:00Z",
+				cwd: "/legacy",
+				title: "Legacy title",
+			},
+			{
+				type: "message",
+				id: "message",
+				parentId: null,
+				timestamp: "2025-01-01T00:00:01Z",
+				message: { role: "user", content: "x".repeat(5_000), timestamp: 1 },
+			},
+			{ type: "header_patch", patch: { title: "Invalid v4 title", cwd: "/invalid-v4-cwd" } },
+		];
+		fs.writeFileSync(file, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+
+		const [recent] = await getRecentSessions(tempDir);
+		const [listed] = await SessionManager.list("/legacy", tempDir);
+
+		expect(recent?.name).toBe("Legacy title");
+		expect(listed).toMatchObject({ id: "legacy-patched-large", title: "Legacy title", cwd: "/legacy" });
+	});
+
 	it("replays oversized and separated strict header patches in both listing paths", async () => {
 		const file = path.join(tempDir, "patched-oversized.jsonl");
 		const title = `Patched ${"title".repeat(1_200)}`;
