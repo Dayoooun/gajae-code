@@ -61,6 +61,14 @@ export class GoalModeController {
 		return this.#paused;
 	}
 
+	setEnabledForCompatibility(enabled: boolean): void {
+		this.#enabled = enabled;
+	}
+
+	setPausedForCompatibility(paused: boolean): void {
+		this.#paused = paused;
+	}
+
 	async beforeGetUserInput(): Promise<void> {
 		if (this.ctx.session.getGoalModeState()?.mode === "exiting") {
 			await this.exit({ reason: "completed", silent: true });

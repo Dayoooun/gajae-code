@@ -3,15 +3,10 @@ import * as path from "node:path";
 import type { AgentToolResult, ThinkingLevel } from "@gajae-code/agent-core";
 import type { CompactionOutcome } from "@gajae-code/agent-core/compaction";
 import { type Model, modelsAreEqual } from "@gajae-code/ai";
-import { Container, Markdown, Spacer, Text } from "@gajae-code/tui";
+import { Container, Markdown, Spacer, Text, type KeyId } from "@gajae-code/tui";
 import { isEnoent, prompt } from "@gajae-code/utils";
 import { resolveLocalUrlToPath } from "../../internal-urls";
-import {
-	humanizePlanTitle,
-	type PlanApprovalDetails,
-	renameApprovedPlanFile,
-	resolvePlanTitle,
-} from "../../plan-mode/approved-plan";
+import { humanizePlanTitle, type PlanApprovalDetails, resolvePlanTitle } from "../../plan-mode/approved-plan";
 import planModeApprovedPrompt from "../../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../../prompts/system/plan-mode-compact-instructions.md" with {
 	type: "text",
@@ -24,8 +19,14 @@ import { ToolError } from "../../tools/tool-errors";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { DynamicBorder } from "../components/dynamic-border";
-import { getMarkdownTheme } from "../theme/theme";
+import { getMarkdownTheme, theme } from "../theme/theme";
 import type { SubmittedUserInput } from "../types";
+import {
+	planSnapshotHash,
+	serializePlanReviewComments,
+	type PlanPreviewOptions,
+	type PlanPreviewResult,
+} from "../components/plan-preview-overlay";
 import type { ModeGate } from "./mode-gate";
 
 const ABORT_TIMEOUT_MS = 2_000;
@@ -37,6 +38,7 @@ type PlanModeControllerContext = {
 	readonly chatContainer: Container;
 	readonly inputCallback: ((input: SubmittedUserInput) => void) | undefined;
 	readonly externalEditorKey: string | undefined;
+	readonly externalEditorKeys: readonly KeyId[];
 	startPendingSubmission(input: { text: string }): SubmittedUserInput;
 	addChatChild(child: Container): void;
 	requestRender(full?: boolean): void;
@@ -46,11 +48,8 @@ type PlanModeControllerContext = {
 	showWarning(message: string): void;
 	showError(message: string): void;
 	showHookConfirm(title: string, message: string): Promise<boolean>;
-	showHookSelector(
-		title: string,
-		options: string[],
-		options2?: { helpText?: string; onExternalEditor?: () => void },
-	): Promise<string | undefined>;
+	showPlanPreview(content: string | null, options?: PlanPreviewOptions): Promise<PlanPreviewResult>;
+	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void>;
 	updatePlanModeStatus(status: { enabled: boolean; paused: boolean } | undefined): void;
 	handleClearCommand(): Promise<boolean>;
 	handleCompactCommand(instructions?: string): Promise<CompactionOutcome>;
@@ -68,6 +67,7 @@ export class PlanModeController {
 	#providerSessionScope: TemporaryProviderSessionScope | undefined;
 	#hasEntered = false;
 	#reviewContainer: Container | undefined;
+	#planApprovalDispatchPending = false;
 
 	constructor(private readonly ctx: PlanModeControllerContext) {}
 	get enabled(): boolean {
@@ -82,6 +82,10 @@ export class PlanModeController {
 
 	setEnabledForCompatibility(enabled: boolean): void {
 		this.#enabled = enabled;
+	}
+
+	setPausedForCompatibility(paused: boolean): void {
+		this.#paused = paused;
 	}
 
 	setPlanFilePathForCompatibility(planFilePath: string | undefined): void {
@@ -208,24 +212,44 @@ export class PlanModeController {
 		await this.ctx.session.abort({ timeoutMs: ABORT_TIMEOUT_MS });
 		const planFilePath = details.planFilePath || this.#planFilePath || "local://PLAN.md";
 		this.#planFilePath = planFilePath;
-		const planContent = await this.#readFile(planFilePath);
-		if (!planContent) return this.ctx.showError(`Plan file not found at ${planFilePath}`);
-		this.#renderPreview(planContent, true);
-		const choice = await this.ctx.showHookSelector(
-			"Plan mode - next step",
-			["Approve and execute", "Approve and compact context", "Approve and keep context", "Refine plan"],
-			{ helpText: this.#helpText(), onExternalEditor: () => void this.#openEditor(planFilePath) },
+		const review = await this.ctx.showPlanPreview(await this.#readFile(planFilePath), {
+			externalEditorKey: this.ctx.externalEditorKey,
+			externalEditorKeys: this.ctx.externalEditorKeys,
+			onExternalEditor: () => this.#openEditor(planFilePath),
+		});
+		if (!review.action) return;
+
+		const latestPlanContent = await this.#readFile(planFilePath);
+		if (review.snapshotHash !== planSnapshotHash(latestPlanContent ?? "")) {
+			this.ctx.showWarning(
+				"Plan changed while reviewing; comments and notes were discarded. Confirm the decision again.",
+			);
+			return this.handleApproval(details);
+		}
+		const commentBlock = serializePlanReviewComments(
+			latestPlanContent ?? "",
+			review.snapshotHash,
+			review.comments,
+			review.notes,
 		);
-		if (!choice?.startsWith("Approve")) return;
+		this.#renderPreview(
+			`## Plan approval audit\n\nDecision: ${review.action}\n\nPath: \`${planFilePath}\`\n\nSnapshot SHA-256: \`${review.snapshotHash}\`\n\n${latestPlanContent ?? "*(missing plan.md)*"}${commentBlock ? `\n\n${commentBlock}` : ""}`,
+			true,
+		);
+		if (review.action === "Refine plan") {
+			if (commentBlock)
+				await this.ctx.session.prompt(`${commentBlock}\n\nPlease refine the plan using these review comments.`);
+			return;
+		}
+		if (!latestPlanContent) return this.ctx.showError(`Plan file not found at ${planFilePath}`);
 		try {
-			const latest = await this.#readFile(planFilePath);
-			if (!latest) return this.ctx.showError(`Plan file not found at ${planFilePath}`);
-			await this.#approve(latest, {
+			await this.#approve(latestPlanContent, {
 				planFilePath,
 				finalPlanFilePath: details.finalPlanFilePath || planFilePath,
 				title: details.title,
-				preserveContext: choice !== "Approve and execute",
-				compactBeforeExecute: choice === "Approve and compact context",
+				preserveContext: review.action !== "Approve and execute",
+				compactBeforeExecute: review.action === "Approve and compact context",
+				reviewerComments: commentBlock,
 			});
 		} catch (error) {
 			this.ctx.showError(
@@ -313,13 +337,43 @@ export class PlanModeController {
 				})
 			: path.resolve(this.ctx.sessionManager.getCwd(), planFilePath);
 	}
+	async #finalizeApprovedPlan(planContent: string, planFilePath: string, finalPlanFilePath: string): Promise<void> {
+		if (!planFilePath.startsWith("local:") || !finalPlanFilePath.startsWith("local:"))
+			throw new Error("Approved plan source and destination paths must use the local: scheme.");
+		const sourcePath = this.#resolvePath(planFilePath);
+		const destinationPath = this.#resolvePath(finalPlanFilePath);
+		const temporaryPath = `${destinationPath}.approval-${crypto.randomUUID()}`;
+		try {
+			await fs.writeFile(temporaryPath, planContent, { encoding: "utf8", flag: "wx" });
+			if (sourcePath === destinationPath) await fs.rename(temporaryPath, destinationPath);
+			else {
+				try {
+					await fs.link(temporaryPath, destinationPath);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "EEXIST")
+						throw new Error(
+							`Plan destination already exists at ${finalPlanFilePath}. Choose a different title and submit the plan for approval again.`,
+						);
+					throw error;
+				}
+				await fs.unlink(temporaryPath);
+				await fs.unlink(sourcePath);
+			}
+			if (planSnapshotHash(await Bun.file(destinationPath).text()) !== planSnapshotHash(planContent))
+				throw new Error(
+					`Approved plan destination hash did not match the reviewed snapshot at ${finalPlanFilePath}.`,
+				);
+		} finally {
+			await fs.unlink(temporaryPath).catch(() => {});
+		}
+	}
 	#renderPreview(content: string, append = false): void {
 		const attached = this.#reviewContainer && this.ctx.chatContainer.children.includes(this.#reviewContainer);
 		const container = !append && attached ? this.#reviewContainer! : new Container();
 		container.clear();
 		container.addChild(new Spacer(1));
 		container.addChild(new DynamicBorder());
-		container.addChild(new Text("Plan Review", 1, 1));
+		container.addChild(new Text(theme.bold(theme.fg("accent", "Plan Review")), 1, 1));
 		container.addChild(new Spacer(1));
 		container.addChild(new Markdown(content, 1, 1, getMarkdownTheme()));
 		container.addChild(new DynamicBorder());
@@ -327,22 +381,20 @@ export class PlanModeController {
 		this.#reviewContainer = container;
 		this.ctx.requestRender();
 	}
-	#helpText(): string {
-		return this.ctx.externalEditorKey
-			? `up/down navigate  enter select  ${this.ctx.externalEditorKey.toLowerCase()} open in editor  esc cancel`
-			: "up/down navigate  enter select  esc cancel";
-	}
-	async #openEditor(planFilePath: string): Promise<void> {
+	async #openEditor(planFilePath: string): Promise<string | null> {
 		const command = getEditorCommand();
-		if (!command) return this.ctx.showWarning("No editor configured. Set $VISUAL or $EDITOR environment variable.");
+		if (!command) {
+			this.ctx.showWarning("No editor configured. Set $VISUAL or $EDITOR environment variable.");
+			return null;
+		}
 		const resolved = this.#resolvePath(planFilePath);
 		let text: string;
 		try {
 			text = await Bun.file(resolved).text();
 		} catch (error) {
-			return isEnoent(error)
-				? this.ctx.showError(`Plan file not found at ${planFilePath}`)
-				: this.ctx.showWarning(`Failed to open external editor: ${String(error)}`);
+			if (isEnoent(error)) this.ctx.showError(`Plan file not found at ${planFilePath}`);
+			else this.ctx.showWarning(`Failed to open external editor: ${String(error)}`);
+			return null;
 		}
 		let tty: fs.FileHandle | null = null;
 		try {
@@ -359,11 +411,12 @@ export class PlanModeController {
 			});
 			if (result !== null) {
 				await Bun.write(resolved, result);
-				this.#renderPreview(result);
 				this.ctx.showStatus("Plan updated in external editor.");
 			}
+			return result;
 		} catch (error) {
 			this.ctx.showWarning(`Failed to open external editor: ${String(error)}`);
+			return null;
 		} finally {
 			await tty?.close();
 			this.ctx.startUi();
@@ -378,18 +431,14 @@ export class PlanModeController {
 			title: string;
 			preserveContext: boolean;
 			compactBeforeExecute: boolean;
+			reviewerComments?: string;
 		},
 	): Promise<void> {
-		await renameApprovedPlanFile({
-			planFilePath: options.planFilePath,
-			finalPlanFilePath: options.finalPlanFilePath,
-			getArtifactsDir: () => this.ctx.sessionManager.getArtifactsDir(),
-			getSessionId: () => this.ctx.sessionManager.getSessionId(),
-		});
+		await this.#finalizeApprovedPlan(planContent, options.planFilePath, options.finalPlanFilePath);
 		const previousTools = this.#previousTools ?? this.ctx.session.getActiveToolNames();
+		if (options.compactBeforeExecute) this.ctx.session.markPlanCompactAbortPending();
 		let sessionSwitchCompleted = true;
 		let compactOutcome: CompactionOutcome | undefined;
-		if (options.compactBeforeExecute) this.ctx.session.markPlanCompactAbortPending();
 		try {
 			await this.exit({ silent: true });
 			if (!options.preserveContext) {
@@ -404,9 +453,16 @@ export class PlanModeController {
 					);
 			} else if (options.compactBeforeExecute) {
 				this.ctx.session.setPlanReferencePath(options.finalPlanFilePath);
-				compactOutcome = await this.ctx.handleCompactCommand(
-					prompt.render(planModeCompactInstructionsPrompt, { planFilePath: options.finalPlanFilePath }),
-				);
+				this.#planApprovalDispatchPending = true;
+				try {
+					compactOutcome = await this.ctx.handleCompactCommand(
+						prompt.render(planModeCompactInstructionsPrompt, { planFilePath: options.finalPlanFilePath }),
+					);
+				} catch (error) {
+					this.#planApprovalDispatchPending = false;
+					await this.ctx.flushCompactionQueue({ willRetry: false });
+					throw error;
+				}
 			}
 		} finally {
 			this.ctx.session.clearPlanCompactAbortPending();
@@ -417,10 +473,13 @@ export class PlanModeController {
 				"Plan approved, but the new session could not be created — execution was not dispatched.",
 			);
 		this.ctx.session.setPlanReferencePath(options.finalPlanFilePath);
-		if (compactOutcome === "cancelled")
+		if (compactOutcome === "cancelled") {
+			this.#planApprovalDispatchPending = false;
+			await this.ctx.flushCompactionQueue({ willRetry: false });
 			return this.ctx.showWarning(
 				"Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.",
 			);
+		}
 		const name = humanizePlanTitle(options.title);
 		if (
 			name &&
@@ -430,16 +489,24 @@ export class PlanModeController {
 			setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 			this.ctx.updateEditorChrome();
 		}
-		this.ctx.session.markPlanReferenceSent();
-		await this.ctx.session.prompt(
-			prompt.render(planModeApprovedPrompt, {
-				planContent,
-				finalPlanFilePath: options.finalPlanFilePath,
-				contextPreserved: options.preserveContext,
-				tools: this.ctx.session.getActiveToolNames(),
-			}),
-			{ synthetic: true },
-		);
+		try {
+			await this.ctx.session.prompt(
+				prompt.render(planModeApprovedPrompt, {
+					planContent,
+					finalPlanFilePath: options.finalPlanFilePath,
+					contextPreserved: options.preserveContext,
+					tools: this.ctx.session.getActiveToolNames(),
+					reviewerComments: options.reviewerComments,
+				}),
+				{ synthetic: true },
+			);
+			this.ctx.session.markPlanReferenceSent();
+		} finally {
+			if (this.#planApprovalDispatchPending) {
+				this.#planApprovalDispatchPending = false;
+				await this.ctx.flushCompactionQueue({ willRetry: false });
+			}
+		}
 	}
 	#updateStatus(): void {
 		this.ctx.updatePlanModeStatus(

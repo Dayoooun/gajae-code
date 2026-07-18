@@ -39,7 +39,8 @@ import type { NotificationSessionReconcileResult, NotificationSessionStatus } fr
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
-import { getRecentSessions } from "../session/session-manager";
+import { getRecentSessions, getSessionMessageEntryId } from "../session/session-manager";
+import { formatDuration } from "../slash-commands/helpers/format";
 import type { LspStartupServerInfo } from "../tools";
 import { formatPhaseDisplayName } from "../tools/todo-write";
 import type { EventBus } from "../utils/event-bus";
@@ -47,6 +48,7 @@ import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-colo
 import { popTerminalTitle, pushTerminalTitle, setSessionTerminalTitle } from "../utils/title-generator";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
+import type { CommandPaletteAction } from "./components/command-palette";
 import { CustomEditor } from "./components/custom-editor";
 import type { EvalExecutionComponent } from "./components/eval-execution";
 import { GajaePetWidget, type PetMode } from "./components/gajae-pet-widget";
@@ -60,8 +62,9 @@ import {
 	isPetCapabilityProbePending,
 	warnWhenPetCapabilitySettled,
 } from "./components/pet-capability";
-import { StatusLineComponent } from "./components/status-line";
+import { planSnapshotHash, serializePlanReviewComments } from "./components/plan-preview-overlay";
 import type { ToolExecutionHandle } from "./components/tool-execution";
+import { StatusLineComponent } from "./components/tool-status-header";
 import {
 	WelcomeComponent,
 	type WelcomeLogoMode,
@@ -85,17 +88,28 @@ import { OAuthManualInputManager } from "./oauth-manual-input";
 import { SessionObserverRegistry } from "./session-observer-registry";
 import { interruptHint } from "./shared";
 import { shouldShowExtensionCommand } from "./slash-command-visibility";
+import { TasksAggregator } from "./tasks-aggregator";
 import { type ShimmerPalette, shimmerSegments, shimmerText } from "./theme/shimmer";
 import type { Theme } from "./theme/theme";
-import { getEditorTheme, getSymbolTheme, onTerminalAppearanceChange, onThemeChange, theme } from "./theme/theme";
-import type {
-	CompactionQueuedMessage,
-	InteractiveModeContext,
-	IrcArrivalSnapshot,
-	SubmittedUserInput,
-	TodoItem,
-	TodoPhase,
-	TranscriptRebuildPolicy,
+import {
+	getEditorTheme,
+	getMarkdownTheme,
+	getSymbolTheme,
+	onTerminalAppearanceChange,
+	onThemeChange,
+	theme,
+} from "./theme/theme";
+import { type RegisterTranscriptItem, TranscriptItemRegistry, transcriptItemId } from "./transcript-item-registry";
+import {
+	canApplyComposerSubmission,
+	type CompactionQueuedMessage,
+	type ComposerSubmissionOptions,
+	type InteractiveModeContext,
+	type IrcArrivalSnapshot,
+	type SubmittedUserInput,
+	type TodoItem,
+	type TodoPhase,
+	type TranscriptRebuildPolicy,
 } from "./types";
 import type { ParsedIrcMessage } from "./utils/irc-message";
 import { addChatChild, prepareTranscriptRebuild, UiHelpers } from "./utils/ui-helpers";
@@ -299,12 +313,25 @@ export class InteractiveMode implements InteractiveModeContext {
 	get planModePaused(): boolean {
 		return this.#planModeController.paused;
 	}
+
+	set planModePaused(paused: boolean) {
+		this.#planModeController.setPausedForCompatibility(paused);
+	}
+
 	get goalModeEnabled(): boolean {
 		return this.#goalModeController.enabled;
 	}
 
+	set goalModeEnabled(enabled: boolean) {
+		this.#goalModeController.setEnabledForCompatibility(enabled);
+	}
+
 	get goalModePaused(): boolean {
 		return this.#goalModeController.paused;
+	}
+
+	set goalModePaused(paused: boolean) {
+		this.#goalModeController.setPausedForCompatibility(paused);
 	}
 	get planModePlanFilePath(): string | undefined {
 		return this.#planModeController.planFilePath;
@@ -358,6 +385,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	oauthManualInput: OAuthManualInputManager = new OAuthManualInputManager();
 
 	#baseSlashCommands: SlashCommand[] = [];
+	#resolvedSlashCommands: SlashCommand[] = [];
 	#baseReservedSlashCommandNames: Set<string> = new Set();
 	#cleanupUnsubscribe?: () => void;
 	#subprocessTeardownUnsubscribe?: () => void;
@@ -366,6 +394,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#petUnavailableWarningDisposer?: () => void;
 	readonly #version: string;
 	readonly #changelogMarkdown: string | undefined;
+
 	readonly lspServers: LspStartupServerInfo[] | undefined = undefined;
 	mcpManager?: import("../runtime-mcp").MCPManager;
 	readonly #toolUiContextSetter: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
@@ -384,7 +413,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	#sttController: SttModeController | undefined;
 	#resizeHandler?: () => void;
 	#observerRegistry: SessionObserverRegistry;
+	#transcriptRegistry = new TranscriptItemRegistry();
+
 	#jobsObserver?: JobsObserver;
+	#tasksAggregator?: TasksAggregator;
 	#eventBus?: EventBus;
 	#eventBusUnsubscribers: Array<() => void> = [];
 	#welcomeComponent?: WelcomeComponent;
@@ -403,6 +435,28 @@ export class InteractiveMode implements InteractiveModeContext {
 	) {
 		this.session = session;
 		this.sessionManager = session.sessionManager;
+		this.session.setSdkPlanModeHandler(async on => {
+			if (on && (this.goalModeEnabled || this.goalModePaused)) {
+				throw Object.assign(new Error("mode.plan.set could not enter plan mode while goal mode is active."), {
+					code: "conflict",
+				});
+			}
+			if (on) await this.#planModeController.enter();
+			else await this.#planModeController.exit();
+			const state = this.session.getPlanModeState();
+			const applied = on
+				? this.planModeEnabled && state?.enabled === true
+				: !this.planModeEnabled && !this.planModePaused && state === undefined;
+			if (!applied) {
+				throw Object.assign(
+					new Error(`mode.plan.set could not ${on ? "enter" : "exit"} plan mode in the current lifecycle state.`),
+					{
+						code: "conflict",
+					},
+				);
+			}
+			return state;
+		});
 		this.session.setRetainedMemorySampler(() => ({
 			tuiChatChildren: this.chatContainer.children.length,
 			tuiCachedRenderBytes: getRenderCacheRetainedBytes(),
@@ -458,6 +512,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			get externalEditorKey() {
 				return thisMode.keybindings.getDisplayString("app.editor.external");
 			},
+			get externalEditorKeys() {
+				return thisMode.keybindings.getKeys("app.editor.external");
+			},
 			startPendingSubmission: input => thisMode.startPendingSubmission(input),
 			addChatChild: child => addChatChild(thisMode, child),
 			requestRender: full => thisMode.ui.requestRender(full),
@@ -467,7 +524,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			showWarning: message => thisMode.showWarning(message),
 			showError: message => thisMode.showError(message),
 			showHookConfirm: (title, message) => thisMode.showHookConfirm(title, message),
-			showHookSelector: (title, options, dialogOptions) => thisMode.showHookSelector(title, options, dialogOptions),
+			showPlanPreview: (content, options) => thisMode.#selectorController.showPlanPreview(content, options),
+			flushCompactionQueue: options => thisMode.flushCompactionQueue(options),
 			updatePlanModeStatus: status => thisMode.#updatePlanModeStatus(status),
 			handleClearCommand: () => thisMode.handleClearCommand(),
 			handleCompactCommand: instructions => thisMode.handleCompactCommand(instructions),
@@ -481,7 +539,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			);
 		}
 
-		this.ui = new TUI(new ProcessTerminal(), settings.get("showHardwareCursor"));
+		this.ui = new TUI(new ProcessTerminal(), settings.get("showHardwareCursor"), {
+			enableMouse: settings.get("mouse.enabled"),
+		});
 		this.ui.setClearOnShrink(settings.get("clearOnShrink"));
 		this.chatContainer = new Container();
 		this.#ircSplitView = new IrcSplitViewComponent(this.chatContainer, this.ircLedger, () => theme);
@@ -518,7 +578,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.hookWidgetContainerBelow = new Container();
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor);
-		this.statusLine = new StatusLineComponent(session, { version: this.#version });
+		this.statusLine = new StatusLineComponent(session, { version: this.#version, focusDomain: "composer" });
 		this.statusLine.setAutoCompactEnabled(session.autoCompactionEnabled);
 
 		this.hideThinkingBlock = settings.get("hideThinkingBlock");
@@ -543,7 +603,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.#baseSlashCommands = [...BUILTIN_SLASH_COMMANDS, ...hookCommands, ...customCommands];
 		this.#baseReservedSlashCommandNames = new Set(this.#baseSlashCommands.map(command => command.name));
-		this.#rebuildSkillSlashCommands();
+		this.#resolvedSlashCommands = [...this.#baseSlashCommands, ...this.#rebuildSkillSlashCommands()];
 
 		this.#uiHelpers = new UiHelpers(this);
 		this.#btwController = new BtwController(this);
@@ -553,6 +613,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#todoCommandController = new TodoCommandController(this);
 		this.#selectorController = new SelectorController(this);
 		this.#inputController = new InputController(this);
+		this.statusLine.setActionRegistry(this.#inputController.actionRegistry, () => this.keybindings);
 		this.#observerRegistry = new SessionObserverRegistry();
 	}
 
@@ -705,6 +766,12 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.statusLine.setJobs(jobsObserver.getSnapshot());
 				this.ui.requestRender();
 			});
+			this.#tasksAggregator = new TasksAggregator(
+				jobManager,
+				jobsObserver,
+				this.#observerRegistry,
+				this.session.getAgentId(),
+			);
 		}
 
 		// Load initial todos
@@ -717,6 +784,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.updateEditorChrome();
 		this.#syncEditorMaxHeight();
 		this.isInitialized = true;
+		if (this.settings.get("tasksPane.defaultVisible")) this.showTasksPane();
 		this.#syncIrcSidebarAvailabilityFromSettings();
 		this.ui.requestRender(true);
 
@@ -795,6 +863,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.updateEditorChrome();
 	}
 
+	getSlashCommands(): readonly SlashCommand[] {
+		return this.#resolvedSlashCommands;
+	}
+
 	/** Reload slash commands and autocomplete for the provided working directory. */
 	async refreshSlashCommandState(cwd?: string): Promise<void> {
 		const basePath = cwd ?? this.sessionManager.getCwd();
@@ -806,9 +878,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			description: cmd.description,
 		}));
 		const skillCommands = this.#rebuildSkillSlashCommands(fileCommandNames);
-		const slashCommands = [...this.#baseSlashCommands, ...skillCommands];
+		this.#resolvedSlashCommands = [...this.#baseSlashCommands, ...skillCommands, ...fileSlashCommands];
 		const autocompleteProvider = this.#inputController.createAutocompleteProvider(
-			[...slashCommands, ...fileSlashCommands],
+			this.#resolvedSlashCommands,
 			basePath,
 		);
 		this.editor.setAutocompleteProvider(autocompleteProvider);
@@ -874,12 +946,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	startPendingSubmission(input: {
-		text: string;
-		images?: ImageContent[];
-		customType?: string;
-		display?: boolean;
-	}): SubmittedUserInput {
+	startPendingSubmission(
+		input: {
+			text: string;
+			images?: ImageContent[];
+			customType?: string;
+			display?: boolean;
+		},
+		options?: ComposerSubmissionOptions,
+	): SubmittedUserInput {
 		const submission: SubmittedUserInput = {
 			text: input.text,
 			images: input.images,
@@ -904,7 +979,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.optimisticUserMessageSignature = undefined;
 			this.#pendingSubmissionDispose = undefined;
 		}
-		this.editor.setText("");
+		if (canApplyComposerSubmission(options, this.editor)) {
+			this.editor.setText("");
+		}
 		this.ensureLoadingAnimation();
 		this.ui.requestRender();
 		return submission;
@@ -1271,6 +1348,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			unsubscribe();
 		}
 		this.#eventBusUnsubscribers = [];
+		this.#tasksAggregator?.dispose();
 		this.#observerRegistry.dispose();
 		this.#eventController.dispose();
 		this.statusLine.dispose();
@@ -1314,6 +1392,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#btwController.dispose();
 
 		// Emit shutdown event to hooks
+		this.session.setSdkPlanModeHandler(null);
 		await this.session.dispose();
 
 		if (this.isInitialized) {
@@ -1531,8 +1610,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#uiHelpers.updatePendingMessagesDisplay();
 	}
 
-	queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
-		this.#uiHelpers.queueCompactionMessage(text, mode);
+	queueCompactionMessage(text: string, mode: "steer" | "followUp", options?: ComposerSubmissionOptions): void {
+		this.#uiHelpers.queueCompactionMessage(text, mode, options);
 	}
 
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
@@ -1719,12 +1798,117 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController.showSessionObserver(this.#observerRegistry);
 	}
 
+	showSessionsDashboard(): void {
+		void this.#selectorController.showSessionsDashboard();
+	}
+
+	isTranscriptViewerOpen(): boolean {
+		return this.#selectorController.isTranscriptViewerOpen();
+	}
+	refreshTranscriptViewer(): void {
+		if (!this.isTranscriptViewerOpen()) return;
+		const identityMap = this.#rebuildTranscriptRegistry();
+		this.#selectorController.refreshTranscriptViewer(identityMap);
+	}
+	showTranscriptViewer(): void {
+		this.#rebuildTranscriptRegistry();
+		this.#selectorController.showTranscriptViewer(this.#transcriptRegistry);
+	}
+	#rebuildTranscriptRegistry(): ReadonlyMap<string, string> {
+		const toolResults = new Map<string, Extract<AgentMessage, { role: "toolResult" }>>();
+		for (const message of this.session.messages) {
+			if (message.role === "toolResult") toolResults.set(message.toolCallId, message);
+		}
+		const items: RegisterTranscriptItem[] = [];
+		const identityMap = new Map<string, string>();
+		for (const [messageIndex, message] of this.session.messages.entries()) {
+			const provisionalEntryId = transcriptItemId.stream(this.session.transcriptPromptGeneration, messageIndex);
+			const durableEntryId = getSessionMessageEntryId(message);
+			const entryId = durableEntryId ?? provisionalEntryId;
+			if (durableEntryId) {
+				if (message.role === "user" || message.role === "developer") {
+					identityMap.set(transcriptItemId.entry(provisionalEntryId), transcriptItemId.entry(durableEntryId));
+				} else if (message.role === "assistant") {
+					for (const [contentIndex] of message.content.entries()) {
+						identityMap.set(
+							transcriptItemId.assistantContent(provisionalEntryId, contentIndex),
+							transcriptItemId.assistantContent(durableEntryId, contentIndex),
+						);
+					}
+				}
+			}
+			if (message.role === "user" || message.role === "developer") {
+				const text =
+					typeof message.content === "string"
+						? message.content
+						: message.content
+								.filter(part => part.type === "text")
+								.map(part => part.text)
+								.join("\n");
+				if (text.trim())
+					items.push({
+						kind: "user",
+						source: { entryId, message },
+						getPayload: () => ({ text, metadata: { role: message.role }, source: message }),
+					});
+				continue;
+			}
+			if (message.role !== "assistant") continue;
+			for (const [contentIndex, content] of message.content.entries()) {
+				if (content.type === "thinking" && content.thinking.trim())
+					items.push({
+						kind: "assistant-thinking",
+						source: { entryId, contentIndex, content },
+						getPayload: () => ({ text: content.thinking, metadata: { entryId, contentIndex }, source: content }),
+					});
+				if (content.type === "text" && content.text.trim())
+					items.push({
+						kind: "assistant-text",
+						source: { entryId, contentIndex, content },
+						getPayload: () => ({ text: content.text, metadata: { entryId, contentIndex }, source: content }),
+					});
+				if (content.type === "toolCall") {
+					const result = toolResults.get(content.id);
+					const resultText =
+						result?.content
+							.filter(part => part.type === "text")
+							.map(part => part.text)
+							.join("\n") ?? "";
+					items.push({
+						kind: "tool",
+						source: { toolCallId: content.id, content, result },
+						getPayload: () => ({
+							text: resultText || JSON.stringify(content.arguments, null, 2),
+							metadata: {
+								name: content.name,
+								arguments: content.arguments,
+								intent: content.intent,
+								isError: result?.isError ?? false,
+							},
+							source: { content, result },
+						}),
+					});
+				}
+			}
+		}
+		this.#transcriptRegistry.rebuild(items);
+		return identityMap;
+	}
+
 	showJobsOverlay(): void {
 		if (!this.#jobsObserver) {
 			this.showStatus("Background jobs are unavailable in this session");
 			return;
 		}
 		this.#selectorController.showJobsOverlay(this.#jobsObserver);
+	}
+
+	showTasksPane(): void {
+		if (!this.#tasksAggregator) {
+			this.showStatus("Tasks are unavailable in this session");
+			return;
+		}
+		this.#selectorController.showTasksPane(this.#tasksAggregator);
 	}
 
 	resetObserverRegistry(): void {
@@ -1773,6 +1957,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	// Selector handling
+	showCommandPalette(
+		commands: SlashCommand[],
+		actions: CommandPaletteAction[],
+		executeSlashCommand: (name: string) => Promise<void>,
+	): void {
+		this.#selectorController.showCommandPalette(commands, actions, executeSlashCommand);
+	}
+
 	showSettingsSelector(): void {
 		this.#selectorController.showSettingsSelector();
 	}
