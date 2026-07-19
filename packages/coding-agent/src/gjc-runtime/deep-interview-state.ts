@@ -397,6 +397,50 @@ const MAX_INTENT_STATEMENT_LENGTH = 1_000;
 const MAX_INTENT_RATIONALE_LENGTH = 500;
 const MAX_INTENT_EVIDENCE_LENGTH = 80;
 
+// =============================================================================
+// Input validation: free-text field allowlist + size limits (ouroboros parity)
+// =============================================================================
+
+/**
+ * User-input fields that legitimately carry prose (goals, prompts, descriptions,
+ * answers). Shell metacharacters (`;`, `|`, `&`, backticks, `$()`) are valid prose
+ * here and must NOT be rejected as structural injection. Structural fields (ids,
+ * categories, hashes) stay strictly validated by their own guards.
+ */
+export const DEEP_INTERVIEW_FREETEXT_FIELDS: ReadonlySet<string> = new Set([
+	"initial_context",
+	"initial_idea",
+	"initial_context_summary",
+	"user_response",
+	"answer",
+	"goal",
+	"objective",
+	"prompt",
+	"description",
+	"statement",
+	"restated_goal",
+	"evidence",
+	"excerpt",
+]);
+
+/** DoS-prevention input size caps, mirroring ouroboros InputValidator. */
+export const MAX_INITIAL_CONTEXT_LENGTH = 50_000;
+export const MAX_USER_RESPONSE_LENGTH = 10_000;
+export const MAX_LLM_RESPONSE_LENGTH = 100_000;
+
+export function isDeepInterviewFreeTextField(name: string): boolean {
+	return DEEP_INTERVIEW_FREETEXT_FIELDS.has(name);
+}
+
+/**
+ * Assert a free-text input is within its size cap. Never inspects content for shell
+ * metacharacters — free-text fields accept prose verbatim; this only bounds length.
+ */
+export function assertDeepInterviewInputWithinLimit(value: string, max: number, fieldName = "input"): void {
+	if (typeof value !== "string") throw new Error(`${fieldName} must be a string`);
+	if (value.length > max) throw new Error(`${fieldName} exceeds max length ${max}`);
+}
+
 export interface DeepInterviewIntentItem {
 	id: string;
 	category: DeepInterviewIntentCategory;

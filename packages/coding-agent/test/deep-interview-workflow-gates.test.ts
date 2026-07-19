@@ -234,3 +234,78 @@ describe("questionToGate structured deep-interview metadata", () => {
 		expect(state.deep_interview_metadata).toBeUndefined();
 	});
 });
+
+describe("questionToGate confused_terms + references adapter context", () => {
+	it("threads bounded confused_terms and references into stage_state", () => {
+		const gate = questionToGate({
+			id: "q-adapter",
+			question: "Round 1 | Component: Intake | Targeting: Goal | Ambiguity: 50%\n\nWhat is the core entity?",
+			options: [{ label: "Task" }, { label: "Project" }],
+			deepInterview: {
+				round: 1,
+				component: "intake",
+				dimension: "goal",
+				ambiguity: 0.5,
+				confused_terms: ["idempotency", "backpressure"],
+				references: [
+					{
+						reference_id: "r1",
+						label: "RFC 42",
+						origin: "user",
+						url: "https://example.com/rfc42",
+						excerpt: "the contract; see $() note",
+					},
+				],
+			},
+		});
+		const state = gate.context?.stage_state as Record<string, unknown>;
+		expect(state.confused_terms).toEqual(["idempotency", "backpressure"]);
+		expect(Array.isArray(state.references)).toBe(true);
+		expect((state.references as Array<Record<string, unknown>>)[0]?.reference_id).toBe("r1");
+	});
+
+	it("omits adapter context when absent (unchanged behavior)", () => {
+		const gate = questionToGate({
+			id: "q-noadapter",
+			question: "Round 2 | Targeting: Constraints | Ambiguity: 40%",
+			options: [{ label: "x" }],
+			deepInterview: { round: 2, component: "intake", dimension: "constraints", ambiguity: 0.4 },
+		});
+		const state = gate.context?.stage_state as Record<string, unknown>;
+		expect(state.confused_terms).toBeUndefined();
+		expect(state.references).toBeUndefined();
+	});
+
+	it("rejects malformed confused_terms and references", () => {
+		expect(() =>
+			questionToGate({
+				id: "q-bad-terms",
+				question: "Round 1 | Ambiguity: 50%",
+				options: [{ label: "x" }],
+				deepInterview: {
+					round: 1,
+					component: "intake",
+					dimension: "goal",
+					ambiguity: 0.5,
+					confused_terms: [123 as unknown as string],
+				},
+			}),
+		).toThrow(/confused_terms/);
+		expect(() =>
+			questionToGate({
+				id: "q-bad-refs",
+				question: "Round 1 | Ambiguity: 50%",
+				options: [{ label: "x" }],
+				deepInterview: {
+					round: 1,
+					component: "intake",
+					dimension: "goal",
+					ambiguity: 0.5,
+					references: [
+						{ reference_id: "r1" } as unknown as { reference_id: string; label: string; origin: string },
+					],
+				},
+			}),
+		).toThrow(/references/);
+	});
+});

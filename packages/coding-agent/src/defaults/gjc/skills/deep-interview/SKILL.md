@@ -531,11 +531,15 @@ Then apply the self-proofread once to narrative status text, generated prose cel
 Update state in two phases. The `ask` answer is first recorded by the runtime as an `answered` shell. Scoring then enriches the same round record to `scored` with global scores, per-component `topology.components[].clarity_scores`, `topology.components[].weakest_dimension`, trigger metadata, established-facts changes, ontology snapshot, `topology.last_targeted_component_id`, `auto_researched_rounds`, `auto_answered_rounds`, and `architect_failures`. When `deepInterview` ask metadata is present, no manual per-round `gjc state write` is required for the answer shell; only scoring enrichment/state maintenance remains. When metadata is absent, use the legacy `gjc state write` path to persist the new round and never patch `.gjc/_session-{sessionid}/state` directly unless an explicit force override is active.
 Also recompute and persist `ambiguity_milestone` each round (detect band transitions for the Phase 3 panel), and persist `auto_answer_streak`, `refined_rounds`, `lateral_reviews`, and `lateral_panel_failures` alongside the existing fields.
 
-### Step 2f: Check Soft Limits
+### Step 2f: Check Tiered Confirmation Cadence
 
-- **Round 3+**: Allow early exit if user says "enough", "let's go", "build it"
-- **Round 10**: Show soft warning: "We're at 10 rounds. Current ambiguity: {score}%. Continue or proceed with current clarity?"
-- **Round 100**: Hard cap: "Maximum interview rounds reached. Proceeding with current clarity level ({score}%)."
+Confirmation cadence is tiered by round, adopted from ouroboros's ooo interview, while the hard safety cap is retained:
+
+- **Rounds 1-3 (auto-continue)**: minimum context gathering — proceed to the next question without a "continue?" prompt.
+- **Rounds 4-15 (ask to continue)**: after each round, ask "Continue, or proceed with current clarity ({score}%)?" so the user controls depth.
+- **Rounds 16+ (diminishing-returns warning)**: keep asking "Continue?" but prefix a diminishing-returns warning: "We're at {n} rounds (ambiguity: {score}%); each further round yields less. Continue or proceed?"
+- **Round 3+ early exit**: still allow immediate exit if the user says "enough", "let's go", "build it".
+- **Round 100 (hard cap)**: "Maximum interview rounds reached. Proceeding with current clarity level ({score}%)." The tiered cadence never removes this hard safety cap.
 
 ## Phase 3: Lateral Review Panel (milestone-triggered)
 
@@ -563,6 +567,24 @@ A transition occurs whenever the band changes versus the prior scored round — 
 **Ontology escalation:** if ambiguity stalls (same score ±0.05 for 3 rounds) or stays > 0.30 after 8 rounds, instruct the panel (especially `contrarian` + `architect`) to ask "What IS this, really?" — identify the core entity versus supporting views from the latest ontology snapshot before returning to feature questions.
 
 **Bookkeeping:** record each convened panel in `state.lateral_reviews` (round, milestone transition or pre-answer trigger, personas dispatched, findings folded). On panel spawn or validation failure, fall back silently to the normal generated question and increment `lateral_panel_failures`; do not expose tool noise unless it changes the next user-facing question. The panel is a prompt-budgeted assist layer — summarize oversized context before dispatch.
+
+### Per-question advisory fanout lanes (distinct from the milestone panel)
+
+Separate from the milestone-triggered lateral panel above, a lightweight **advisory fanout** may assist any single question the main session is about to synthesize or route — especially when the user is terse, uncertain, or would benefit from selectable options instead of another open-ended prompt. Adopted from ouroboros's ooo interview, the standard lanes are:
+
+- `code_context` — inspect repo-local facts and reuse existing exploration before asking the user.
+- `web_context` — browse/search only when current external facts genuinely affect the answer.
+- `ambiguity_contrarian` — find hidden assumptions, vague terms, missing decisions, and risky defaults.
+- `answer_simplifier` — turn the question into 2-3 easy choices or one concise draft answer.
+- `architecture_implications` — check whether the answer changes ownership, interfaces, rollout, or system shape.
+
+Advisory fanout is an assist layer, not a decision maker: it never replaces or delays the single user-facing question, never adds a second question, and never forwards a synthesized answer without the user's approval, edit, or explicit auto-confirm request. It differs from the milestone panel in trigger (per-question, not band-transition) and intent (help the human answer this one question). When both would fire on the same round, run the milestone panel and fold advisory lanes into the same single question. Runtimes without a parallel subagent primitive process lanes sequentially; on lane failure, fall back silently to the normal generated question.
+
+### Structured adapter context and input safety (confused_terms / references / FREETEXT_FIELDS)
+
+`confused_terms` and `references` are optional structured adapter context queued at interview start. They are **non-behavioral**: they MUST NOT alter the first question, are never inferred from vocabulary density, and glossary help is limited to explicitly-confused terms while references are used only for contrast questions. Referenced `url`/`excerpt` values are inert strings that are **never auto-fetched**. These fields ride the `ask` tool `deepInterview` metadata and are carried into the gate `stage_state` as bounded, optional values.
+
+Input safety: user-facing free-text fields (an allowlist including `initial_context`, `user_response`, `goal`, `prompt`, `description`, `statement`) legitimately carry prose with shell metacharacters (`;`, `|`, `&`, backticks, `$()`) and must not be rejected as injection; structural fields (ids, categories, hashes) stay strictly validated. Free-text inputs are bounded by DoS-prevention size caps (initial context 50KB, user response 10KB, LLM response 100KB) rather than by content inspection.
 
 ## Phase 4: Crystallize Spec
 
@@ -865,7 +887,7 @@ Why bad: 45% ambiguity means nearly half the requirements are unclear. The mathe
 
 <Escalation_And_Stop_Conditions>
 - **Hard cap at 100 rounds**: Proceed with whatever clarity exists, noting the risk
-- **Soft warning at 10 rounds**: Offer to continue or proceed
+- **Tiered confirmation cadence**: rounds 1-3 auto-continue, rounds 4-15 ask to continue, rounds 16+ ask with a diminishing-returns warning
 - **Early exit (round 3+)**: Allow with warning if ambiguity > threshold
 - **User says "stop", "cancel", "abort"**: Stop immediately, save state for resume
 - **Ambiguity stalls** (same score +-0.05 for 3 rounds): Activate Ontologist mode to reframe

@@ -1,9 +1,15 @@
 import { describe, expect, it } from "bun:test";
 import {
+	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewIntentReview,
 	createDeepInterviewIntentManifest,
+	DEEP_INTERVIEW_FREETEXT_FIELDS,
 	deepInterviewObservedIntentDigest,
 	deriveRoundKey,
+	isDeepInterviewFreeTextField,
+	MAX_INITIAL_CONTEXT_LENGTH,
+	MAX_LLM_RESPONSE_LENGTH,
+	MAX_USER_RESPONSE_LENGTH,
 	mergeDeepInterviewEnvelope,
 	mergeDeepInterviewRounds,
 	normalizeDeepInterviewEnvelope,
@@ -367,5 +373,40 @@ describe("deep-interview-state: intent contract", () => {
 			{ replace: true },
 		);
 		expect(preserved.state).toMatchObject({ intent_contract_required: true, intent_contract: locked, rounds: [] });
+	});
+});
+
+describe("deep-interview-state: free-text field allowlist + input size limits", () => {
+	it("marks prose fields as free-text and structural fields as not", () => {
+		expect(isDeepInterviewFreeTextField("initial_context")).toBe(true);
+		expect(isDeepInterviewFreeTextField("user_response")).toBe(true);
+		expect(isDeepInterviewFreeTextField("goal")).toBe(true);
+		expect(isDeepInterviewFreeTextField("id")).toBe(false);
+		expect(isDeepInterviewFreeTextField("category")).toBe(false);
+		expect(DEEP_INTERVIEW_FREETEXT_FIELDS.has("description")).toBe(true);
+	});
+
+	it("accepts shell metacharacters in free-text prose within the size cap", () => {
+		const prose = "run `git status`; echo $(pwd) | grep x && true";
+		expect(() => assertDeepInterviewInputWithinLimit(prose, MAX_USER_RESPONSE_LENGTH, "user_response")).not.toThrow();
+	});
+
+	it("enforces the size caps", () => {
+		expect(() =>
+			assertDeepInterviewInputWithinLimit(
+				"x".repeat(MAX_INITIAL_CONTEXT_LENGTH + 1),
+				MAX_INITIAL_CONTEXT_LENGTH,
+				"initial_context",
+			),
+		).toThrow(/exceeds max length/);
+		expect(() =>
+			assertDeepInterviewInputWithinLimit("x".repeat(MAX_USER_RESPONSE_LENGTH), MAX_USER_RESPONSE_LENGTH),
+		).not.toThrow();
+	});
+
+	it("pins the documented cap values", () => {
+		expect(MAX_INITIAL_CONTEXT_LENGTH).toBe(50_000);
+		expect(MAX_USER_RESPONSE_LENGTH).toBe(10_000);
+		expect(MAX_LLM_RESPONSE_LENGTH).toBe(100_000);
 	});
 });

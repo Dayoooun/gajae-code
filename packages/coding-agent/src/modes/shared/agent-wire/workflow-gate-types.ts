@@ -14,12 +14,28 @@ export type WorkflowGateKind = "question" | "approval" | "execution";
 /** "Other (type your own)" sentinel, mirroring the interactive ask tool. */
 export const GATE_OTHER_OPTION = "Other (type your own)";
 
+/**
+ * Structured adapter context queued at interview start. Non-behavioral:
+ * `confused_terms` and `references` MUST NOT alter the first question, are never
+ * inferred from vocabulary density, and referenced `url`/`excerpt` are inert
+ * strings that are never auto-fetched.
+ */
+export interface AskGateReference {
+	reference_id: string;
+	label: string;
+	origin: string;
+	url?: string;
+	excerpt?: string;
+}
+
 export interface AskGateDeepInterviewState {
 	round_id?: string;
 	round: number;
 	component: string;
 	dimension: string;
 	ambiguity: number;
+	confused_terms?: string[];
+	references?: AskGateReference[];
 }
 
 export interface AskGateStageStateInput {
@@ -38,6 +54,43 @@ export interface AskGateSchemaInput {
 
 function isBoundedAskGateString(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0 && new TextEncoder().encode(value).byteLength <= 256;
+}
+
+/** Max bytes for a longer inert reference string (url/excerpt); never fetched. */
+const MAX_ASK_GATE_LONG_STRING_BYTES = 2048;
+const MAX_ASK_GATE_CONFUSED_TERMS = 32;
+const MAX_ASK_GATE_REFERENCES = 32;
+
+function isBoundedAskGateLongString(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		new TextEncoder().encode(value).byteLength <= MAX_ASK_GATE_LONG_STRING_BYTES
+	);
+}
+
+function isValidAskGateConfusedTerms(value: unknown): value is string[] {
+	return Array.isArray(value) && value.length <= MAX_ASK_GATE_CONFUSED_TERMS && value.every(isBoundedAskGateString);
+}
+
+function isValidAskGateReference(value: unknown): boolean {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const ref = value as Record<string, unknown>;
+	const allowed = new Set(["reference_id", "label", "origin", "url", "excerpt"]);
+	if (Object.keys(ref).some(key => !allowed.has(key))) return false;
+	if (
+		!isBoundedAskGateString(ref.reference_id) ||
+		!isBoundedAskGateString(ref.label) ||
+		!isBoundedAskGateString(ref.origin)
+	)
+		return false;
+	if (ref.url !== undefined && !isBoundedAskGateLongString(ref.url)) return false;
+	if (ref.excerpt !== undefined && !isBoundedAskGateLongString(ref.excerpt)) return false;
+	return true;
+}
+
+function isValidAskGateReferences(value: unknown): boolean {
+	return Array.isArray(value) && value.length <= MAX_ASK_GATE_REFERENCES && value.every(isValidAskGateReference);
 }
 
 /** Rejects stage state that is not exactly compatible with the generic ask-gate producer. */
@@ -62,6 +115,8 @@ export function validateAskGateStageState(value: unknown): asserts value is Reco
 		"challenge_mode",
 		"ambiguity",
 		"topology_gate",
+		"confused_terms",
+		"references",
 	]);
 	if (Object.keys(state).some(key => !allowed.has(key))) throw new Error("ask gate stage_state has an unknown field");
 	if (
@@ -93,6 +148,10 @@ export function validateAskGateStageState(value: unknown): asserts value is Reco
 		throw new Error("ask gate stage_state has an invalid ambiguity");
 	if (state.topology_gate !== undefined && typeof state.topology_gate !== "boolean")
 		throw new Error("ask gate stage_state has an invalid topology flag");
+	if (state.confused_terms !== undefined && !isValidAskGateConfusedTerms(state.confused_terms))
+		throw new Error("ask gate stage_state has invalid confused_terms");
+	if (state.references !== undefined && !isValidAskGateReferences(state.references))
+		throw new Error("ask gate stage_state has invalid references");
 }
 
 /** Builds the canonical generic ask answer schema. */
@@ -176,6 +235,10 @@ export function buildAskGateStageState(input: AskGateStageStateInput, labels: st
 					dimension: input.deepInterview.dimension,
 					ambiguity: input.deepInterview.ambiguity,
 					...(input.deepInterview.round_id === undefined ? {} : { round_id: input.deepInterview.round_id }),
+					...(input.deepInterview.confused_terms === undefined
+						? {}
+						: { confused_terms: input.deepInterview.confused_terms }),
+					...(input.deepInterview.references === undefined ? {} : { references: input.deepInterview.references }),
 				}
 			: (input.fallbackState ?? {})),
 	};

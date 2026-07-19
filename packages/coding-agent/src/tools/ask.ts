@@ -116,6 +116,26 @@ const DeepInterviewMeta = z
 		component: z.string().min(1).max(128).describe("targeted topology component"),
 		dimension: z.string().min(1).max(128).describe("targeted clarity dimension"),
 		ambiguity: z.number().min(0).max(1).describe("ambiguity at ask time (0..1)"),
+		confused_terms: z
+			.array(z.string().min(1).max(256))
+			.max(32)
+			.describe("explicit terms the user does not understand; glossary help only, never inferred")
+			.optional(),
+		references: z
+			.array(
+				z
+					.object({
+						reference_id: z.string().min(1).max(256),
+						label: z.string().min(1).max(256),
+						origin: z.string().min(1).max(256),
+						url: z.string().min(1).max(2048).optional(),
+						excerpt: z.string().min(1).max(2048).optional(),
+					})
+					.strict(),
+			)
+			.max(32)
+			.describe("inert reference context for contrast questions only; url/excerpt are never auto-fetched")
+			.optional(),
 		intent_contract: DeepInterviewIntentContract.describe("Round-0 locked intent contract").optional(),
 		intent_review: DeepInterviewIntentReview.describe("Locked-intent reduction review").optional(),
 	})

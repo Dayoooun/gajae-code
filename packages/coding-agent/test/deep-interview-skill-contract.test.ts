@@ -147,3 +147,42 @@ describe("deep-interview ask clarification contract", () => {
 		expect(skill).toContain("must not be recorded as a round answer");
 	});
 });
+
+describe("deep-interview ouroboros ooo-interview parity port", () => {
+	it("documents the tiered confirmation cadence while keeping the hard cap (feature B)", () => {
+		expect(skill).toMatch(/Tiered Confirmation Cadence/i);
+		expect(skill).toMatch(/Rounds 1-3 \(auto-continue\)/i);
+		expect(skill).toMatch(/Rounds 4-15 \(ask to continue\)/i);
+		expect(skill).toMatch(/Rounds 16\+ \(diminishing-returns warning\)/i);
+		expect(skill).toMatch(/never removes this hard safety cap/i);
+		expect(skill).toContain("Round 100");
+	});
+
+	it("documents advisory fanout lanes distinct from the milestone panel (feature C)", () => {
+		expect(skill).toMatch(/advisory fanout/i);
+		expect(skill).toMatch(/distinct from the milestone panel/i);
+		for (const lane of [
+			"code_context",
+			"web_context",
+			"ambiguity_contrarian",
+			"answer_simplifier",
+			"architecture_implications",
+		])
+			expect(skill).toContain(lane);
+	});
+
+	it("documents the confused_terms/references non-behavioral contract (feature A)", () => {
+		expect(skill).toContain("confused_terms");
+		expect(skill).toContain("references");
+		expect(skill).toMatch(/MUST NOT alter the first question/i);
+		expect(skill).toMatch(/never auto-fetched/i);
+	});
+
+	it("documents the FREETEXT_FIELDS allowlist + input size caps (feature D)", () => {
+		expect(skill).toContain("FREETEXT_FIELDS");
+		expect(skill).toMatch(/shell metacharacters/i);
+		expect(skill).toMatch(/50KB/);
+		expect(skill).toMatch(/10KB/);
+		expect(skill).toMatch(/100KB/);
+	});
+});
