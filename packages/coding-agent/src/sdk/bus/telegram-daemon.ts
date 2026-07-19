@@ -1,4 +1,4 @@
-import { spawn as childProcessSpawn, spawnSync } from "node:child_process";
+import { spawn as childProcessSpawn } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -8,6 +8,7 @@ import { withFileLock } from "../../config/file-lock";
 import type { Settings } from "../../config/settings";
 import type { DaemonRuntimeInfo } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
+import { processIncarnation } from "../broker/process-incarnation";
 import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
 import { parseInThreadConfigCommand, parseRichToggleCommand, parseTelegramControlCommand } from "./config-commands";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
@@ -568,25 +569,7 @@ function isRecognizedLegacyGeneration(generation: number | undefined): boolean {
 
 /** Read the stable process-start identity used to reject recycled PIDs. */
 export function defaultTelegramDaemonPidIncarnation(pid: number): string | undefined {
-	if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
-	if (process.platform === "linux") {
-		try {
-			const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-			// Field 3 follows the closing command parenthesis. starttime is field 22,
-			// therefore index 19 in the remaining whitespace-delimited fields.
-			const afterCommand = stat.slice(stat.lastIndexOf(")") + 1).trim();
-			const startTime = afterCommand.split(/\s+/)[19];
-			return startTime ? `linux:${startTime}` : undefined;
-		} catch {
-			return undefined;
-		}
-	}
-	if (process.platform === "darwin") {
-		const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
-		const startedAt = result.status === 0 ? result.stdout.trim() : "";
-		return startedAt ? `darwin:${startedAt}` : undefined;
-	}
-	return undefined;
+	return processIncarnation(pid);
 }
 
 function hasMatchingPidIncarnation(input: {
@@ -664,8 +647,11 @@ export function isSignalableMatchingOwner(input: {
 	const { state } = input;
 	return Boolean(
 		isPhysicalMatchingOwner(input) &&
-			(isRecognizedLegacyGeneration(state?.generation) ||
-				(state?.generation === DAEMON_GENERATION &&
+			state &&
+			typeof state.incarnation === "string" &&
+			state.incarnation.length > 0 &&
+			(isRecognizedLegacyGeneration(state.generation) ||
+				(state.generation === DAEMON_GENERATION &&
 					state.ownershipPhase === "ready" &&
 					typeof state.acquisitionId === "string" &&
 					state.acquisitionId.length > 0)),
@@ -3235,12 +3221,16 @@ export class TelegramNotificationDaemon {
 	/**
 	 * A reload must not abandon final notifications or selected-ask acknowledgements
 	 * merely because SIGTERM woke the long poll. Drain through the same serialized
-	 * rate-limit path before releasing ownership; the attempt is bounded so a broken
-	 * transport cannot prevent a replacement forever.
+	 * rate-limit path before releasing ownership. A reachable backlog may need more
+	 * than a fixed retry window to refill, while failed sends are removed by the
+	 * best-effort flush itself.
 	 */
 	private async drainQueuedNotificationsOnShutdown(): Promise<void> {
-		const attempts = 200;
-		for (let attempt = 0; attempt < attempts && this.pool.pending > 0; attempt++) {
+		// Join work admitted before shutdown even when it has already left the pool.
+		// Without this, `pending === 0` can release ownership while its serialized
+		// Bot API effect is still in flight.
+		await this.flushChain;
+		while (this.pool.pending > 0) {
 			await this.flushPool();
 			if (this.pool.pending > 0) await this.runtime.sleep(25);
 		}

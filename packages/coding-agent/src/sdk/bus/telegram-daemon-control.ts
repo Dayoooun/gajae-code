@@ -255,21 +255,28 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 	}
 
 	/**
-	 * Wait until the captured pid is dead. Ownership-file movement is NOT treated
-	 * as quiescence here: only actual process death proves the old poller stopped,
-	 * which is what the no-409 invariant requires before spawning a fresh poller.
+	 * Wait until the captured process is gone or its PID is reused. Ownership-file
+	 * movement is NOT treated as quiescence here: only captured-process death or a
+	 * positive incarnation mismatch proves the old poller stopped, which is what
+	 * the no-409 invariant requires before spawning a fresh poller.
 	 */
-	private async waitForPidDeath(pid: number, timeoutMs: number): Promise<boolean> {
-		if (!this.pidAlive(pid)) return true;
+	private async waitForPidDeath(pid: number, incarnation: string | undefined, timeoutMs: number): Promise<boolean> {
+		if (this.isPidDeadOrReused(pid, incarnation)) return true;
 		const timeout = Math.max(timeoutMs, 0);
 		const waitStepMs = Math.max(this.waitStepMs, 1);
 		const deadline = this.now() + timeout;
 		const maxPolls = Math.ceil(timeout / waitStepMs);
 		for (let poll = 0; poll < maxPolls && this.now() < deadline; poll++) {
 			await this.sleep(waitStepMs);
-			if (!this.pidAlive(pid)) return true;
+			if (this.isPidDeadOrReused(pid, incarnation)) return true;
 		}
-		return !this.pidAlive(pid);
+		return this.isPidDeadOrReused(pid, incarnation);
+	}
+
+	private isPidDeadOrReused(pid: number, incarnation: string | undefined): boolean {
+		if (!this.pidAlive(pid)) return true;
+		const currentIncarnation = this.pidIncarnation(pid);
+		return incarnation !== undefined && currentIncarnation !== undefined && currentIncarnation !== incarnation;
 	}
 
 	private async signalCapturedOwner(
@@ -470,7 +477,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		// death through the normal path — waitForPidDeath returns immediately for a
 		// dead pid, so stop succeeds and reload proceeds to spawn the replacement.
 
-		let dead = await this.waitForPidDeath(oldPid, gracefulTimeoutMs);
+		let dead = await this.waitForPidDeath(oldPid, capturedOwner.incarnation, gracefulTimeoutMs);
 		if (!dead) {
 			// Old pid still alive after the cooperative SIGTERM. Inspect current ownership.
 			const current = await readDaemonState(this.settings, this.fsImpl);
@@ -528,7 +535,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 				// graceful timeout and this recheck ("already_gone") is confirmed dead by
 				// waitForPidDeath, while a real ownership change stays fenced.
 				if (killResult === "signaled" || killResult === "already_gone") {
-					dead = await this.waitForPidDeath(oldPid, killTimeoutMs);
+					dead = await this.waitForPidDeath(oldPid, capturedOwner.incarnation, killTimeoutMs);
 				}
 			}
 			if (!dead) {

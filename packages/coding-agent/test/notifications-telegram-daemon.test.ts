@@ -1058,7 +1058,7 @@ describe("telegram daemon", () => {
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		// Pre-upgrade daemon, still alive with a fresh heartbeat (so it is a fresh
 		// live owner that a version-only check would attach to).
-		writeLiveOwner(agentDir, { heartbeatAt: Date.now() });
+		writeLiveOwner(agentDir, { heartbeatAt: Date.now(), incarnation: "test:999" });
 		const paths = daemonPaths(agentDir);
 		const alive = new Set<number>([999, 4242]);
 		const signals: Array<[number, string]> = [];
@@ -1111,7 +1111,7 @@ describe("telegram daemon", () => {
 		const accountB = setPrivateAgentDir(settings(accountBDir), accountBDir);
 		await registerNotificationRoot({ settings: accountA, cwd: sharedCwd, sessionId: "a-session" });
 		await registerNotificationRoot({ settings: accountB, cwd: sharedCwd, sessionId: "b-session" });
-		writeLiveOwner(accountADir, { generation: 4, heartbeatAt: Date.now() });
+		writeLiveOwner(accountADir, { generation: 4, heartbeatAt: Date.now(), incarnation: "test:999" });
 		const bOwner = await acquireDaemonOwnership({
 			settings: accountB,
 			tokenFingerprint: "account-b",
@@ -1162,7 +1162,7 @@ describe("telegram daemon", () => {
 	test("detailed ensure reports reloaded only for the existing fresh-owner reloadRequired handoff", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
-		writeLiveOwner(agentDir, { heartbeatAt: Date.now() }); // Missing generation requests #2028 reload.
+		writeLiveOwner(agentDir, { heartbeatAt: Date.now(), incarnation: "test:999" }); // Missing generation requests #2028 reload.
 		const alive = new Set<number>([999, 4242]);
 		const signals: Array<[number, string]> = [];
 		const child = readyTelegramSpawnFixture({
@@ -6227,9 +6227,7 @@ test("SIGTERM drains a rate-limited final and selected acknowledgement before re
 					),
 				);
 			}
-			if (method === "sendMessage") {
-				lockPresentAtSend.push(fs.existsSync(daemonPaths(agentDir).lock));
-			}
+			if (method === "sendMessage") lockPresentAtSend.push(fs.existsSync(daemonPaths(agentDir).lock));
 			return { ok: true, result: { message_id: lockPresentAtSend.length } };
 		},
 	};
@@ -6243,20 +6241,41 @@ test("SIGTERM drains a rate-limited final and selected acknowledgement before re
 		chatId: "42",
 		botApi: bot,
 		now: () => now,
-		setTimeoutImpl: (() => 0) as any,
+		setTimeoutImpl: ((callback: () => void, delay?: number) => {
+			if (delay === 25) {
+				now += delay;
+				callback();
+			}
+			return 0;
+		}) as unknown as typeof setTimeout,
 	});
+	const daemonState = daemon as unknown as {
+		pool: {
+			tokens: number;
+			submit: (item: {
+				sessionId: string;
+				lane: "ask" | "finalized";
+				itemId?: string;
+				deadlineAt?: number;
+				payload: unknown;
+			}) => void;
+		};
+		selectedAckPending: Map<string, unknown>;
+	};
 	const session = {
 		sessionId: "S",
 		token: "tok",
 		ws: { readyState: WebSocket.OPEN, send() {} },
 		pending: new Map(),
 	};
-	(daemon as any).pool.tokens = 0;
-	(daemon as any).pool.submit({
-		sessionId: "S",
-		lane: "finalized",
-		payload: { send: { method: "sendMessage", lane: "finalized", text: "final before handoff" } },
-	});
+	daemonState.pool.tokens = 0;
+	for (let index = 0; index < 7; index++) {
+		daemonState.pool.submit({
+			sessionId: "S",
+			lane: "finalized",
+			payload: { send: { method: "sendMessage", lane: "finalized", text: `final ${index}` } },
+		});
+	}
 	const selectedAck = {
 		pendingKey: "selected",
 		cacheKey: "selected",
@@ -6264,23 +6283,84 @@ test("SIGTERM drains a rate-limited final and selected acknowledgement before re
 		commitKey: "commit",
 		followers: [],
 		session,
-		state: "queued",
+		state: "queued" as const,
 		itemId: "selected",
 	};
-	(daemon as any).selectedAckPending.set(selectedAck.pendingKey, selectedAck);
-	(daemon as any).pool.submit({
+	daemonState.selectedAckPending.set(selectedAck.pendingKey, selectedAck);
+	daemonState.pool.submit({
 		sessionId: "S",
 		lane: "ask",
 		itemId: "selected",
+		deadlineAt: 30_000,
 		payload: { selectedAck },
 	});
 	const run = daemon.run();
 	await pollStarted;
-	now = 1_000_000;
 	daemon.requestStop("signal");
 	await run;
-	expect(lockPresentAtSend).toEqual([true, true]);
-	expect((daemon as any).selectedAckPending.size).toBe(0);
+	expect(lockPresentAtSend).toHaveLength(8);
+	expect(lockPresentAtSend).toEqual(Array.from({ length: 8 }, () => true));
+	expect(daemonState.selectedAckPending.size).toBe(0);
+	expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
+});
+
+test("SIGTERM joins an admitted Bot API send before releasing ownership", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: "e60b05c186ca",
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "owner",
+	});
+	let markPollStarted!: () => void;
+	const pollStarted = new Promise<void>(resolve => {
+		markPollStarted = resolve;
+	});
+	let markSendStarted!: () => void;
+	const sendStarted = new Promise<void>(resolve => {
+		markSendStarted = resolve;
+	});
+	let resolveSend!: () => void;
+	const bot = {
+		call(method: string, _body: unknown, opts?: { signal?: AbortSignal }): Promise<unknown> {
+			if (method === "getUpdates") {
+				markPollStarted();
+				return new Promise((_resolve, reject) =>
+					opts?.signal?.addEventListener("abort", () =>
+						reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+					),
+				);
+			}
+			if (method === "sendMessage") {
+				markSendStarted();
+				return new Promise(resolve => {
+					resolveSend = () => resolve({ ok: true, result: { message_id: 1 } });
+				});
+			}
+			return Promise.resolve({ ok: true, result: {} });
+		},
+	};
+	class NoScan extends TelegramNotificationDaemon {
+		override async scanRoots(): Promise<void> {}
+	}
+	const daemon = new NoScan({ settings: s, ownerId: "owner", botToken: "tok", chatId: "42", botApi: bot });
+	const daemonState = daemon as unknown as {
+		pool: { submit: (item: { sessionId: string; lane: "finalized"; payload: unknown }) => void };
+	};
+	daemonState.pool.submit({
+		sessionId: "S",
+		lane: "finalized",
+		payload: { send: { method: "sendMessage", lane: "finalized", text: "final in flight" } },
+	});
+	const run = daemon.run();
+	await pollStarted;
+	daemon.requestStop("signal");
+	await sendStarted;
+	expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(true);
+	resolveSend();
+	await run;
 	expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
 });
 

@@ -27,7 +27,7 @@ type GuardManifest = { contractVersion: number; inventory: Inventory; digests: R
  * endpoint or provider generations: they do not replace daemon owners.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "d9448e0b492f1e71f88e788c05bf5765342427c4908a1f94aa4d948506d4898b";
+const PROTECTED_INVENTORY_SHA256 = "b91f76bcfba6e9d8ed1eb55360af44056edf76220f98d85ca89df0b231bb06f6";
 
 
 

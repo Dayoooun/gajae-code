@@ -1,4 +1,4 @@
-import { spawn as childProcessSpawn, spawnSync } from "node:child_process";
+import { spawn as childProcessSpawn } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -12,6 +12,7 @@ import type {
 	DaemonStatus,
 } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
+import { processIncarnation } from "../broker/process-incarnation";
 import { getNotificationConfig, isDiscordConfigured, isSlackConfigured } from "./config";
 
 export type ChatDaemonKind = "discord" | "slack";
@@ -83,6 +84,13 @@ function hasChatDaemonStatePid(value: unknown): value is { pid: number } {
 		Number.isSafeInteger((value as { pid: number }).pid) &&
 		(value as { pid: number }).pid > 0
 	);
+}
+
+function isDefinitelyStoppedOrReusedChatDaemonState(value: unknown, probe: ChatDaemonOwnershipProbe): boolean {
+	if (!hasSafeChatDaemonStateShape(value)) return false;
+	if (value.stoppedAt !== undefined || !probe.pidAlive(value.pid)) return true;
+	const currentIncarnation = probe.pidIncarnation(value.pid);
+	return currentIncarnation !== undefined && currentIncarnation !== value.incarnation;
 }
 
 export interface ChatDaemonControlRequest {
@@ -178,28 +186,6 @@ function defaultSignal(pid: number, signal: NodeJS.Signals): void {
 	try {
 		process.kill(pid, signal);
 	} catch {}
-}
-function defaultPidIncarnation(pid: number): string | undefined {
-	if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
-	if (process.platform === "linux") {
-		try {
-			const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-			return `linux:${
-				stat
-					.slice(stat.lastIndexOf(")") + 2)
-					.trim()
-					.split(/\s+/)[19]
-			}`;
-		} catch {
-			return undefined;
-		}
-	}
-	if (process.platform === "darwin") {
-		const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
-		const startedAt = result.status === 0 ? result.stdout.trim() : "";
-		return startedAt ? `darwin:${startedAt}` : undefined;
-	}
-	return undefined;
 }
 function runtimeInfo(execPath?: string): DaemonRuntimeInfo {
 	const rt = resolveGjcRuntimeSpawnInfo(execPath ?? process.execPath);
@@ -448,7 +434,7 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		);
 	}
 	private incarnation(pid: number): string | undefined {
-		return (this.deps.pidIncarnation ?? defaultPidIncarnation)(pid);
+		return (this.deps.pidIncarnation ?? processIncarnation)(pid);
 	}
 	private isDefinitelyStoppedState(state: ChatDaemonState | undefined): boolean {
 		if (!state || !hasSafeChatDaemonStateShape(state)) return false;
@@ -665,14 +651,15 @@ export async function acquireChatDaemonOwnership(input: {
 	const pid = input.pid ?? process.pid;
 	const probe: ChatDaemonOwnershipProbe = {
 		pidAlive: input.pidAlive ?? defaultPidAlive,
-		pidIncarnation: input.pidIncarnation ?? defaultPidIncarnation,
+		pidIncarnation: input.pidIncarnation ?? processIncarnation,
 	};
 	const incarnation = input.incarnation ?? probe.pidIncarnation(pid) ?? "unavailable";
 	await fs.promises.mkdir(paths.dir, { recursive: true, mode: 0o700 });
 	const existing = await readJson<unknown>(paths.state);
 	// A missing lock is not authority to overwrite an untrusted state file whose
-	// PID is live; that record may belong to an owner whose shape we cannot prove.
-	if (hasChatDaemonStatePid(existing) && probe.pidAlive(existing.pid)) return false;
+	// PID is live. Only a valid record that positively stopped or whose
+	// incarnation mismatches may be replaced despite a recycled numeric PID.
+	if (hasChatDaemonStatePid(existing) && !isDefinitelyStoppedOrReusedChatDaemonState(existing, probe)) return false;
 	if (!(await createChatDaemonOwnerLock(paths.lock, { pid, incarnation, createdAt: Date.now() }))) {
 		if (!(await reclaimChatDaemonOwnerLock(paths.lock, paths.state, probe))) return false;
 		if (!(await createChatDaemonOwnerLock(paths.lock, { pid, incarnation, createdAt: Date.now() }))) return false;
@@ -775,9 +762,15 @@ async function canReclaimChatDaemonOwnerLock(
 	probe: ChatDaemonOwnershipProbe,
 ): Promise<boolean> {
 	const state = await readJson<unknown>(stateFile);
-	// Do not reclaim a publication lock when even a malformed record names a live
-	// PID. Its provenance is ambiguous, so replacing it could start a second owner.
-	if (hasChatDaemonStatePid(state) && probe.pidAlive(state.pid)) return false;
+	// A malformed record with a live PID has ambiguous provenance. A valid record
+	// that explicitly stopped or whose incarnation no longer matches has no owner
+	// to protect, even when its numeric PID has been recycled.
+	if (
+		hasChatDaemonStatePid(state) &&
+		probe.pidAlive(state.pid) &&
+		!isDefinitelyStoppedOrReusedChatDaemonState(state, probe)
+	)
+		return false;
 	return await isStaleChatDaemonLock(lock, probe);
 }
 
