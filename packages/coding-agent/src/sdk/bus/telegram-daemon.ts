@@ -1,4 +1,4 @@
-import { spawn as childProcessSpawn } from "node:child_process";
+import { spawn as childProcessSpawn, spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -78,6 +78,8 @@ export type TelegramDaemonOwnershipPhase = "provisional" | "ready" | "retired";
 export interface DaemonState {
 	pid: number;
 	ownerId: string;
+	/** Stable process-start identity used to fence PID reuse. */
+	incarnation?: string;
 	/** Unique, durable identity for one ownership acquisition. */
 	acquisitionId?: string;
 	/** A provisional owner is physical-live but MUST NOT be attached as ready. */
@@ -118,6 +120,8 @@ export interface TelegramDaemonDeps {
 	now?: () => number;
 	pid?: number;
 	pidAlive?: (pid: number) => boolean;
+	/** Process-start identity; required to authorize current-generation owners. */
+	pidIncarnation?: (pid: number) => string | undefined;
 	spawn?: (
 		command: string,
 		args: string[],
@@ -346,6 +350,7 @@ async function writeJsonAtomic(fsImpl: TelegramDaemonFs, file: string, data: unk
 }
 
 async function tryOpenWx(fsImpl: TelegramDaemonFs, file: string): Promise<boolean> {
+	await ensureDir(fsImpl, path.dirname(file));
 	try {
 		const handle = await fsImpl.open(file, "wx", 0o600);
 		await handle.close();
@@ -358,6 +363,7 @@ async function tryOpenWx(fsImpl: TelegramDaemonFs, file: string): Promise<boolea
 
 interface NotificationRootRegistration {
 	root?: string;
+	managed: boolean;
 }
 
 async function readNotificationRootRegistration(input: {
@@ -366,11 +372,12 @@ async function readNotificationRootRegistration(input: {
 	fs?: TelegramDaemonFs;
 }): Promise<NotificationRootRegistration> {
 	const fsImpl = input.fs ?? nodeFs;
-	const current = await readJson<{ sessions?: Record<string, string> }>(
+	const current = await readJson<{ sessions?: Record<string, string>; managedRoots?: string[] }>(
 		fsImpl,
 		daemonPaths(input.settings.getAgentDir()).roots,
 	);
-	return { root: current?.sessions?.[input.sessionId] };
+	const root = current?.sessions?.[input.sessionId];
+	return { root, managed: root ? (current?.managedRoots ?? []).includes(root) : false };
 }
 
 /** Restore a session root only if this ensure operation still owns its registration. */
@@ -399,7 +406,11 @@ async function restoreNotificationRootRegistration(input: {
 			const referencedRoots = new Set(Object.values(sessions));
 			const roots = new Set(current.roots ?? []);
 			const managedRoots = new Set(current.managedRoots ?? []);
-			if (input.previous.root) roots.add(input.previous.root);
+			if (input.previous.root) {
+				roots.add(input.previous.root);
+				if (input.previous.managed) managedRoots.add(input.previous.root);
+				else managedRoots.delete(input.previous.root);
+			}
 			if (managedRoots.has(input.registeredRoot) && !referencedRoots.has(input.registeredRoot)) {
 				roots.delete(input.registeredRoot);
 				managedRoots.delete(input.registeredRoot);
@@ -543,13 +554,60 @@ export function hasSafeDaemonStateShape(state: DaemonState | undefined): state i
 			Array.isArray(state.roots) &&
 			state.roots.every(root => typeof root === "string") &&
 			state.version === DAEMON_VERSION &&
+			(state.incarnation === undefined || (typeof state.incarnation === "string" && state.incarnation.length > 0)) &&
 			(state.generation === undefined || (Number.isSafeInteger(state.generation) && state.generation > 0)) &&
 			(state.stoppedAt === undefined || Number.isSafeInteger(state.stoppedAt)),
 	);
 }
 
 function isRecognizedLegacyGeneration(generation: number | undefined): boolean {
-	return generation === undefined || (Number.isSafeInteger(generation) && generation <= 3);
+	return (
+		generation === undefined || (Number.isSafeInteger(generation) && generation > 0 && generation < DAEMON_GENERATION)
+	);
+}
+
+/** Read the stable process-start identity used to reject recycled PIDs. */
+export function defaultTelegramDaemonPidIncarnation(pid: number): string | undefined {
+	if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+	if (process.platform === "linux") {
+		try {
+			const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+			// Field 3 follows the closing command parenthesis. starttime is field 22,
+			// therefore index 19 in the remaining whitespace-delimited fields.
+			const afterCommand = stat.slice(stat.lastIndexOf(")") + 1).trim();
+			const startTime = afterCommand.split(/\s+/)[19];
+			return startTime ? `linux:${startTime}` : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+	if (process.platform === "darwin") {
+		const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
+		const startedAt = result.status === 0 ? result.stdout.trim() : "";
+		return startedAt ? `darwin:${startedAt}` : undefined;
+	}
+	return undefined;
+}
+
+function hasMatchingPidIncarnation(input: {
+	state: DaemonState;
+	pidIncarnation: (pid: number) => string | undefined;
+}): boolean {
+	if (input.state.incarnation === undefined) return isRecognizedLegacyGeneration(input.state.generation);
+	return input.pidIncarnation(input.state.pid) === input.state.incarnation;
+}
+
+export function isDefinitelyStoppedOrReusedOwner(input: {
+	state: DaemonState | undefined;
+	pidAlive: (pid: number) => boolean;
+	pidIncarnation: (pid: number) => string | undefined;
+}): boolean {
+	const { state } = input;
+	if (!state || !hasSafeDaemonStateShape(state) || state.stoppedAt !== undefined || !input.pidAlive(state.pid))
+		return true;
+	if (state.incarnation === undefined) return false;
+	const current = input.pidIncarnation(state.pid);
+	return current !== undefined && current !== state.incarnation;
 }
 
 function liveOwnerUsesDifferentIdentity(input: {
@@ -557,6 +615,7 @@ function liveOwnerUsesDifferentIdentity(input: {
 	tokenFingerprint: string;
 	chatId: string;
 	pidAlive: (pid: number) => boolean;
+	pidIncarnation?: (pid: number) => string | undefined;
 }): boolean {
 	const { state } = input;
 	return Boolean(
@@ -564,16 +623,21 @@ function liveOwnerUsesDifferentIdentity(input: {
 			hasSafeDaemonStateShape(state) &&
 			state.stoppedAt === undefined &&
 			!ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) &&
-			input.pidAlive(state.pid),
+			input.pidAlive(state.pid) &&
+			hasMatchingPidIncarnation({
+				state,
+				pidIncarnation: input.pidIncarnation ?? defaultTelegramDaemonPidIncarnation,
+			}),
 	);
 }
 
-/** True for a physically live owner with this configuration, including legacy generations. */
+/** True for a physically live owner with this configuration, including recognized legacy records. */
 export function isPhysicalMatchingOwner(input: {
 	state: DaemonState | undefined;
 	tokenFingerprint: string;
 	chatId: string;
 	pidAlive: (pid: number) => boolean;
+	pidIncarnation?: (pid: number) => string | undefined;
 }): boolean {
 	const { state } = input;
 	return Boolean(
@@ -581,7 +645,11 @@ export function isPhysicalMatchingOwner(input: {
 			hasSafeDaemonStateShape(state) &&
 			state.stoppedAt === undefined &&
 			ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) &&
-			input.pidAlive(state.pid),
+			input.pidAlive(state.pid) &&
+			hasMatchingPidIncarnation({
+				state,
+				pidIncarnation: input.pidIncarnation ?? defaultTelegramDaemonPidIncarnation,
+			}),
 	);
 }
 
@@ -591,6 +659,7 @@ export function isSignalableMatchingOwner(input: {
 	tokenFingerprint: string;
 	chatId: string;
 	pidAlive: (pid: number) => boolean;
+	pidIncarnation?: (pid: number) => string | undefined;
 }): boolean {
 	const { state } = input;
 	return Boolean(
@@ -609,16 +678,10 @@ export function isFreshLiveOwner(input: {
 	tokenFingerprint: string;
 	chatId: string;
 	pidAlive: (pid: number) => boolean;
+	pidIncarnation?: (pid: number) => string | undefined;
 }): boolean {
 	const { state } = input;
-	return Boolean(
-		state &&
-			hasSafeDaemonStateShape(state) &&
-			state.stoppedAt === undefined &&
-			ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) &&
-			input.now - state.heartbeatAt <= HEARTBEAT_TTL_MS &&
-			input.pidAlive(state.pid),
-	);
+	return Boolean(isPhysicalMatchingOwner(input) && state && input.now - state.heartbeatAt <= HEARTBEAT_TTL_MS);
 }
 
 /** True only when a physically live matching owner can serve this build's daemon lifecycle contract. */
@@ -628,6 +691,7 @@ export function isCurrentCompatibleOwner(input: {
 	tokenFingerprint: string;
 	chatId: string;
 	pidAlive: (pid: number) => boolean;
+	pidIncarnation?: (pid: number) => string | undefined;
 }): boolean {
 	const state = input.state;
 	return Boolean(
@@ -635,6 +699,7 @@ export function isCurrentCompatibleOwner(input: {
 			state?.ownershipPhase === "ready" &&
 			typeof state.acquisitionId === "string" &&
 			state.acquisitionId.length > 0 &&
+			typeof state.incarnation === "string" &&
 			Number.isSafeInteger(state.generation) &&
 			(state.generation as number) >= DAEMON_GENERATION,
 	);
@@ -649,6 +714,7 @@ export async function acquireDaemonOwnership(input: {
 	now?: () => number;
 	pid?: number;
 	pidAlive?: (pid: number) => boolean;
+	pidIncarnation?: (pid: number) => string | undefined;
 	randomId?: () => string;
 }): Promise<{
 	acquired: boolean;
@@ -664,6 +730,11 @@ export async function acquireDaemonOwnership(input: {
 	const now = input.now ?? Date.now;
 	const pid = input.pid ?? process.pid;
 	const pidAlive = input.pidAlive ?? defaultPidAlive;
+	const pidIncarnation = input.pidIncarnation ?? defaultTelegramDaemonPidIncarnation;
+	// Without a stable local process identity, the provisional reservation could
+	// later authorize a recycled PID. Refuse before creating a lock or state file.
+	const incarnation = pidIncarnation(pid);
+	if (!incarnation) return { acquired: false, blocked: true };
 	const paths = daemonPaths(input.settings.getAgentDir());
 	await ensureDir(fsImpl, paths.dir);
 	const ownerId = input.randomId?.() ?? `${pid}-${now().toString(36)}-${Math.random().toString(36).slice(2)}`;
@@ -685,6 +756,7 @@ export async function acquireDaemonOwnership(input: {
 			!pidAlive(state.pid)
 		)
 			return undefined;
+		if (isDefinitelyStoppedOrReusedOwner({ state, pidAlive, pidIncarnation })) return undefined;
 		if (
 			isCurrentCompatibleOwner({
 				state,
@@ -692,23 +764,14 @@ export async function acquireDaemonOwnership(input: {
 				tokenFingerprint: input.tokenFingerprint,
 				chatId: input.chatId,
 				pidAlive,
+				pidIncarnation,
 			})
 		)
 			return { acquired: false, attached: true };
 		// A physical owner that cannot prove current compatibility is never safe to
-		// attach. Legacy, stale, and malformed generations require a handoff;
-		// otherwise retain the explicit provisional classification.
-		if (
-			state.version !== DAEMON_VERSION ||
-			!isFreshLiveOwner({
-				state,
-				now: now(),
-				tokenFingerprint: input.tokenFingerprint,
-				chatId: input.chatId,
-				pidAlive,
-			}) ||
-			isRecognizedLegacyGeneration(state.generation)
-		)
+		// attach. Only a recognized legacy generation requires a handoff; a
+		// current/newer record without an exact incarnation remains provisional.
+		if (state.version !== DAEMON_VERSION || isRecognizedLegacyGeneration(state.generation))
 			return { acquired: false, attached: false, reloadRequired: true };
 		return { acquired: false, attached: false, provisional: true };
 	};
@@ -719,6 +782,7 @@ export async function acquireDaemonOwnership(input: {
 			tokenFingerprint: input.tokenFingerprint,
 			chatId: input.chatId,
 			pidAlive,
+			pidIncarnation,
 		})
 	) {
 		return { acquired: false, blocked: true, reason: "identity_mismatch" };
@@ -738,6 +802,7 @@ export async function acquireDaemonOwnership(input: {
 			roots,
 			version: DAEMON_VERSION,
 			generation: DAEMON_GENERATION,
+			incarnation,
 		} satisfies DaemonState);
 		return { acquired: true, ownerId, acquisitionId: ownerId };
 	}
@@ -748,6 +813,7 @@ export async function acquireDaemonOwnership(input: {
 			tokenFingerprint: input.tokenFingerprint,
 			chatId: input.chatId,
 			pidAlive,
+			pidIncarnation,
 		})
 	) {
 		return { acquired: false, blocked: true, reason: "identity_mismatch" };
@@ -766,11 +832,12 @@ export async function acquireDaemonOwnership(input: {
 				tokenFingerprint: input.tokenFingerprint,
 				chatId: input.chatId,
 				pidAlive,
+				pidIncarnation,
 			})
 		) {
 			return { acquired: false, blocked: true, reason: "identity_mismatch" };
 		}
-		if (rechecked && pidAlive(rechecked.pid)) {
+		if (rechecked && !isDefinitelyStoppedOrReusedOwner({ state: rechecked, pidAlive, pidIncarnation })) {
 			return { acquired: false, attached: false, provisional: true };
 		}
 		await fsImpl.unlink(paths.lock).catch(() => undefined);
@@ -787,6 +854,7 @@ export async function acquireDaemonOwnership(input: {
 			roots,
 			version: DAEMON_VERSION,
 			generation: DAEMON_GENERATION,
+			incarnation,
 		} satisfies DaemonState);
 		return { acquired: true, ownerId, acquisitionId: ownerId };
 	} finally {
@@ -802,6 +870,7 @@ export async function renewDaemonHeartbeat(input: {
 	now?: () => number;
 	pid?: number;
 	generation?: number;
+	incarnation?: string;
 	sleep?: (ms: number) => Promise<void>;
 	stealRetries?: number;
 	stealRetryDelayMs?: number;
@@ -828,6 +897,7 @@ export async function renewDaemonHeartbeat(input: {
 		const state = await readJson<DaemonState>(fsImpl, paths.state);
 		const pid = input.pid ?? state?.pid;
 		const generation = input.generation ?? state?.generation;
+		const incarnation = input.incarnation ?? defaultTelegramDaemonPidIncarnation(pid as number);
 		const canBindProvisionalPid = state?.ownershipPhase === "provisional" && state?.pid !== pid;
 		if (
 			!state ||
@@ -840,6 +910,9 @@ export async function renewDaemonHeartbeat(input: {
 			state.acquisitionId !== acquisitionId ||
 			(!canBindProvisionalPid && state.pid !== pid) ||
 			state.generation !== generation ||
+			typeof incarnation !== "string" ||
+			incarnation.length === 0 ||
+			(!canBindProvisionalPid && state.incarnation !== undefined && state.incarnation !== incarnation) ||
 			state.stoppedAt !== undefined ||
 			state.ownershipPhase === "retired"
 		)
@@ -848,6 +921,7 @@ export async function renewDaemonHeartbeat(input: {
 			...state,
 			pid,
 			ownershipPhase: "ready",
+			incarnation,
 			heartbeatAt: (input.now ?? Date.now)(),
 		});
 		return true;
@@ -935,6 +1009,7 @@ async function bindProvisionalDaemonPid(input: {
 	ownerId: string;
 	acquisitionId: string;
 	pid: number;
+	incarnation?: string;
 	fs?: TelegramDaemonFs;
 	sleep?: (ms: number) => Promise<void>;
 	stealRetries?: number;
@@ -962,7 +1037,9 @@ async function bindProvisionalDaemonPid(input: {
 			state.generation !== DAEMON_GENERATION
 		)
 			return false;
-		await writeJsonAtomic(fsImpl, paths.state, { ...state, pid: input.pid });
+		const incarnation = input.incarnation ?? defaultTelegramDaemonPidIncarnation(input.pid);
+		if (!incarnation) return false;
+		await writeJsonAtomic(fsImpl, paths.state, { ...state, pid: input.pid, incarnation });
 		return true;
 	} finally {
 		await fsImpl.unlink(paths.steal).catch(() => undefined);
@@ -980,6 +1057,7 @@ export async function waitForTelegramDaemonReady(input: {
 	fs?: TelegramDaemonFs;
 	now?: () => number;
 	pidAlive?: (pid: number) => boolean;
+	pidIncarnation?: (pid: number) => string | undefined;
 	sleep?: (ms: number) => Promise<void>;
 	waitStepMs?: number;
 	timeoutMs?: number;
@@ -1005,6 +1083,7 @@ export async function waitForTelegramDaemonReady(input: {
 				tokenFingerprint: input.tokenFingerprint,
 				chatId: input.chatId,
 				pidAlive,
+				pidIncarnation: input.pidIncarnation,
 			})
 		)
 			return true;
@@ -1024,6 +1103,7 @@ export async function confirmTelegramDaemonSpawn(input: {
 	fs?: TelegramDaemonFs;
 	now?: () => number;
 	pidAlive?: (pid: number) => boolean;
+	pidIncarnation?: (pid: number) => string | undefined;
 	sleep?: (ms: number) => Promise<void>;
 	waitStepMs?: number;
 	timeoutMs?: number;
@@ -1041,6 +1121,7 @@ export async function confirmTelegramDaemonSpawn(input: {
 		fs: input.fs,
 		now: input.now,
 		pidAlive: input.pidAlive,
+		pidIncarnation: input.pidIncarnation,
 		sleep: input.sleep,
 		waitStepMs: input.waitStepMs,
 		timeoutMs: input.timeoutMs,
@@ -1068,6 +1149,7 @@ export async function confirmTelegramDaemonSpawn(input: {
 			tokenFingerprint: input.tokenFingerprint,
 			chatId: input.chatId,
 			pidAlive: input.pidAlive ?? defaultPidAlive,
+			pidIncarnation: input.pidIncarnation,
 		}) &&
 		(state?.ownerId !== input.spawned.acquisition.ownerId ||
 			state.acquisitionId !== input.spawned.acquisition.acquisitionId ||
@@ -1090,6 +1172,7 @@ export async function releaseDaemonOwnership(input: {
 	acquisitionId?: string;
 	pid?: number;
 	generation?: number;
+	incarnation?: string;
 	fs?: TelegramDaemonFs;
 	now?: () => number;
 }): Promise<void> {
@@ -1101,11 +1184,13 @@ export async function releaseDaemonOwnership(input: {
 		const acquisitionId = input.acquisitionId ?? input.ownerId;
 		const pid = input.pid ?? state?.pid;
 		const generation = input.generation ?? state?.generation;
+		const incarnation = input.incarnation ?? defaultTelegramDaemonPidIncarnation(pid as number);
 		if (
 			state?.ownerId !== input.ownerId ||
 			state.acquisitionId !== acquisitionId ||
 			state.pid !== pid ||
 			state.generation !== generation ||
+			state.incarnation !== incarnation ||
 			!Number.isSafeInteger(generation)
 		)
 			return;
@@ -1241,6 +1326,7 @@ export async function spawnTelegramDaemonOwner(
 		now: deps.now,
 		pid: deps.pid,
 		pidAlive: deps.pidAlive,
+		pidIncarnation: deps.pidIncarnation,
 		randomId: deps.randomId,
 	});
 	if (!ownership.acquired) {
@@ -1293,6 +1379,7 @@ export async function spawnTelegramDaemonOwner(
 		ownerId: acquisition.ownerId,
 		acquisitionId: acquisition.acquisitionId,
 		pid,
+		incarnation: (deps.pidIncarnation ?? defaultTelegramDaemonPidIncarnation)(pid),
 		fs: deps.fs,
 		sleep: deps.sleep,
 	});
@@ -1332,6 +1419,7 @@ export async function ensureTelegramDaemonRunningDetailed(
 				fs: deps.fs,
 				now: deps.now,
 				pidAlive: deps.pidAlive,
+				pidIncarnation: deps.pidIncarnation,
 				sleep: deps.sleep,
 				waitStepMs: deps.waitStepMs,
 				timeoutMs: deps.readinessTimeoutMs,
@@ -1382,6 +1470,7 @@ export async function ensureTelegramDaemonRunningDetailed(
 			fs: deps.fs,
 			now: deps.now,
 			pidAlive: deps.pidAlive,
+			pidIncarnation: deps.pidIncarnation,
 			sleep: deps.sleep,
 			waitStepMs: deps.waitStepMs,
 			timeoutMs: deps.readinessTimeoutMs,
@@ -1420,6 +1509,7 @@ function telegramControllerDeps(deps: TelegramDaemonDeps): TelegramDaemonControl
 		fs: deps.fs,
 		now: deps.now,
 		pidAlive: deps.pidAlive,
+		pidIncarnation: deps.pidIncarnation,
 		sendSignal: deps.sendSignal,
 		spawn: deps.spawn,
 		execPath: deps.execPath,
@@ -1726,6 +1816,8 @@ export interface TelegramDaemonOptions {
 	idleTimeoutMs?: number;
 	scanIntervalMs?: number;
 	pid?: number;
+	/** Process-start probe used to fence heartbeat and release from a recycled PID. */
+	pidIncarnation?: (pid: number) => string | undefined;
 	/** Liveness probe for skipping dead-PID endpoint records in {@link TelegramNotificationDaemon.scanRoots}. */
 	pidAlive?: (pid: number) => boolean;
 	botApi?: BotApi;
@@ -1929,11 +2021,6 @@ export class TelegramNotificationDaemon {
 	 * ~25s getUpdates timeout. Safe to call from a signal handler.
 	 */
 	requestStop(_reason?: "reload" | "stop" | "signal"): void {
-		for (const item of new Set(this.selectedAckPending.values())) {
-			if (item.state === "queued") this.pool.removeById(item.itemId);
-			else item.controller?.abort();
-			this.finishSelectedAck(item, { status: "unknown", reason: "shutdown" });
-		}
 		this.runtime.requestStop();
 		this.running = false;
 	}
@@ -3145,6 +3232,20 @@ export class TelegramNotificationDaemon {
 		return next;
 	}
 
+	/**
+	 * A reload must not abandon final notifications or selected-ask acknowledgements
+	 * merely because SIGTERM woke the long poll. Drain through the same serialized
+	 * rate-limit path before releasing ownership; the attempt is bounded so a broken
+	 * transport cannot prevent a replacement forever.
+	 */
+	private async drainQueuedNotificationsOnShutdown(): Promise<void> {
+		const attempts = 200;
+		for (let attempt = 0; attempt < attempts && this.pool.pending > 0; attempt++) {
+			await this.flushPool();
+			if (this.pool.pending > 0) await this.runtime.sleep(25);
+		}
+	}
+
 	/** Drain the shared rate-limit pool and deliver each granted send to its topic. */
 	private async flushPoolInner(): Promise<void> {
 		const { granted: batch, expired } = this.pool.drainWithExpired();
@@ -4347,6 +4448,7 @@ export class TelegramNotificationDaemon {
 			fs: this.fsImpl,
 			now: this.opts.now,
 			pid: this.opts.pid ?? process.pid,
+			incarnation: (this.opts.pidIncarnation ?? defaultTelegramDaemonPidIncarnation)(this.opts.pid ?? process.pid),
 		});
 		if (!this.running) return;
 		this.runtime.start();
@@ -4375,6 +4477,9 @@ export class TelegramNotificationDaemon {
 						fs: this.fsImpl,
 						now: this.opts.now,
 						pid: this.opts.pid ?? process.pid,
+						incarnation: (this.opts.pidIncarnation ?? defaultTelegramDaemonPidIncarnation)(
+							this.opts.pid ?? process.pid,
+						),
 					}))
 				)
 					break;
@@ -4412,8 +4517,12 @@ export class TelegramNotificationDaemon {
 				await this.runtime.sleep(10);
 			}
 		} finally {
-			this.runtime.stop();
+			// Stop polling first, then drain the serialized outbound queue while this
+			// owner still holds the lock. Releasing before this point lets a replacement
+			// race a queued final/ask notification and lose it.
 			this.stopFlushTimer();
+			await this.drainQueuedNotificationsOnShutdown();
+			this.runtime.stop();
 			this.stopScanTimer();
 			this.stopTypingTimer();
 			this.stopLifecycleControl();
@@ -4430,6 +4539,9 @@ export class TelegramNotificationDaemon {
 				acquisitionId: this.opts.ownerId,
 				pid: this.opts.pid ?? process.pid,
 				generation: DAEMON_GENERATION,
+				incarnation: (this.opts.pidIncarnation ?? defaultTelegramDaemonPidIncarnation)(
+					this.opts.pid ?? process.pid,
+				),
 				fs: this.fsImpl,
 				now: this.opts.now,
 			});

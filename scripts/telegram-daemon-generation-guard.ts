@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 7;
+export const GUARD_CONTRACT_VERSION = 8;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
@@ -27,7 +27,7 @@ type GuardManifest = { contractVersion: number; inventory: Inventory; digests: R
  * endpoint or provider generations: they do not replace daemon owners.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "51040a791d28933beecb5dd8022fef427a7051dcc07d483d32a45168d243ea04";
+const PROTECTED_INVENTORY_SHA256 = "d9448e0b492f1e71f88e788c05bf5765342427c4908a1f94aa4d948506d4898b";
 
 
 
@@ -36,7 +36,7 @@ function inventoryHash(inventory: Inventory): string {
 }
 
 export function validateInventory(inventory: Inventory = protectedInventory): void {
-	if (GUARD_CONTRACT_VERSION !== 7) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
+	if (GUARD_CONTRACT_VERSION !== 8) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
 	for (const [family, files] of Object.entries(inventory)) {
 		for (const [file, symbols] of Object.entries(files)) {
 			if (!file || symbols.length === 0 || new Set(symbols).size !== symbols.length)
@@ -105,9 +105,11 @@ export async function writeManifest(target = path.join(root, manifestScript)): P
 	}
 }
 
-export async function validateCurrentTreeManifest(): Promise<void> {
+export async function validateCurrentTreeManifest(
+	expectedDigests: Record<string, string> = manifest.digests,
+): Promise<void> {
 	const actual = await manifestForCurrentTree();
-	const expected = JSON.stringify(Object.entries(manifest.digests).sort());
+	const expected = JSON.stringify(Object.entries(expectedDigests).sort());
 	if (JSON.stringify(Object.entries(actual.digests).sort()) !== expected)
 		throw new Error("telegram-daemon-generation-guard: semantic manifest declaration digests do not byte-match the current tree");
 }

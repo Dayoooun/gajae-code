@@ -27,6 +27,7 @@ import {
 	confirmTelegramDaemonSpawn,
 	type DaemonState,
 	daemonPaths,
+	defaultTelegramDaemonPidIncarnation,
 	hasSafeDaemonStateShape,
 	isCurrentCompatibleOwner,
 	isFreshLiveOwner,
@@ -102,6 +103,7 @@ export interface TelegramDaemonControlDeps {
 	fs?: TelegramDaemonFs;
 	now?: () => number;
 	pidAlive?: (pid: number) => boolean;
+	pidIncarnation?: (pid: number) => string | undefined;
 	sendSignal?: (pid: number, signal: NodeJS.Signals) => void;
 	spawn?: TelegramDaemonDeps["spawn"];
 	execPath?: string;
@@ -147,6 +149,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 	private readonly now: () => number;
 	private readonly pidAlive: (pid: number) => boolean;
 	private readonly sendSignal: (pid: number, signal: NodeJS.Signals) => void;
+	private readonly pidIncarnation: (pid: number) => string | undefined;
 	private readonly waitStepMs: number;
 
 	constructor(
@@ -157,6 +160,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		this.now = deps.now ?? Date.now;
 		this.pidAlive = deps.pidAlive ?? defaultPidAlive;
 		this.sendSignal = deps.sendSignal ?? defaultSendSignal;
+		this.pidIncarnation = deps.pidIncarnation ?? defaultTelegramDaemonPidIncarnation;
 		this.waitStepMs = deps.waitStepMs ?? DEFAULT_WAIT_STEP_MS;
 	}
 
@@ -188,6 +192,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 							tokenFingerprint: tokenFingerprint(cfg.botToken as string),
 							chatId: cfg.chatId as string,
 							pidAlive: this.pidAlive,
+							pidIncarnation: this.pidIncarnation,
 						})
 					? "running"
 					: "stale";
@@ -210,6 +215,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 			fs: this.deps.fs,
 			now: this.deps.now,
 			pidAlive: this.deps.pidAlive,
+			pidIncarnation: this.pidIncarnation,
 			pid: this.deps.ownerPid ?? process.ppid,
 			spawn: this.deps.spawn,
 			execPath: this.deps.execPath,
@@ -235,6 +241,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 			fs: this.fsImpl,
 			now: this.now,
 			pidAlive: this.pidAlive,
+			pidIncarnation: this.pidIncarnation,
 			sleep: this.deps.sleep,
 			waitStepMs: this.waitStepMs,
 			timeoutMs: this.deps.readinessTimeoutMs,
@@ -284,12 +291,21 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 			current.tokenFingerprint !== captured.tokenFingerprint ||
 			current.chatId !== captured.chatId ||
 			current.tokenFingerprint !== tokenFingerprint ||
-			current.chatId !== chatId
+			current.chatId !== chatId ||
+			current.incarnation !== captured.incarnation
 		)
 			return "ownership_changed";
 		// A matching captured owner that stopped or exited between the request and
 		// signal recheck has already completed the cooperative handoff.
-		if (!isSignalableMatchingOwner({ state: current, tokenFingerprint, chatId, pidAlive: this.pidAlive }))
+		if (
+			!isSignalableMatchingOwner({
+				state: current,
+				tokenFingerprint,
+				chatId,
+				pidAlive: this.pidAlive,
+				pidIncarnation: this.pidIncarnation,
+			})
+		)
 			return "already_gone";
 		this.sendSignal(captured.pid, signal);
 		return "signaled";
@@ -340,17 +356,42 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		const replaceableLiveOwner =
 			(action === "reload" &&
 				state !== undefined &&
-				isFreshLiveOwner({ state, now: this.now(), tokenFingerprint: fp, chatId, pidAlive: this.pidAlive }) &&
-				isSignalableMatchingOwner({ state, tokenFingerprint: fp, chatId, pidAlive: this.pidAlive })) ||
+				isFreshLiveOwner({
+					state,
+					now: this.now(),
+					tokenFingerprint: fp,
+					chatId,
+					pidAlive: this.pidAlive,
+					pidIncarnation: this.pidIncarnation,
+				}) &&
+				isSignalableMatchingOwner({
+					state,
+					tokenFingerprint: fp,
+					chatId,
+					pidAlive: this.pidAlive,
+					pidIncarnation: this.pidIncarnation,
+				})) ||
 			// A physically-live matching owner whose heartbeat is stale (hung) may be
 			// past-TTL yet still holding the poller. Autostart/generation-upgrade reloads
 			// stay conservative and refuse it, but an explicit `reload --force` must be
 			// able to signal and replace it rather than deadlock behind the live PID.
 			(opts.force === true &&
-				isSignalableMatchingOwner({ state, tokenFingerprint: fp, chatId, pidAlive: this.pidAlive }));
+				isSignalableMatchingOwner({
+					state,
+					tokenFingerprint: fp,
+					chatId,
+					pidAlive: this.pidAlive,
+					pidIncarnation: this.pidIncarnation,
+				}));
 		const stoppableLiveOwner =
 			action === "stop" &&
-			isSignalableMatchingOwner({ state, tokenFingerprint: fp, chatId, pidAlive: this.pidAlive });
+			isSignalableMatchingOwner({
+				state,
+				tokenFingerprint: fp,
+				chatId,
+				pidAlive: this.pidAlive,
+				pidIncarnation: this.pidIncarnation,
+			});
 		// A stale pre-generation owner may only be moved by reload; manual stop
 		// also targets a physically live matching legacy owner, but never spawns.
 		if (before.health !== "running" && !replaceableLiveOwner && !stoppableLiveOwner) {
@@ -388,7 +429,13 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		// Running owner: capture identity, request cooperative stop, signal, wait.
 		if (
 			!hasSafeDaemonStateShape(state) ||
-			!isSignalableMatchingOwner({ state, tokenFingerprint: fp, chatId, pidAlive: this.pidAlive })
+			!isSignalableMatchingOwner({
+				state,
+				tokenFingerprint: fp,
+				chatId,
+				pidAlive: this.pidAlive,
+				pidIncarnation: this.pidIncarnation,
+			})
 		) {
 			return this.result(
 				action,
@@ -436,6 +483,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 					tokenFingerprint: fp,
 					chatId,
 					pidAlive: this.pidAlive,
+					pidIncarnation: this.pidIncarnation,
 				});
 			if (changedToLiveOwner) {
 				await this.clearOwnRequest(requestId, oldOwnerId);
@@ -447,6 +495,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 						tokenFingerprint: fp,
 						chatId,
 						pidAlive: this.pidAlive,
+						pidIncarnation: this.pidIncarnation,
 					})
 				) {
 					return this.result(
@@ -512,6 +561,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 					tokenFingerprint: fp,
 					chatId,
 					pidAlive: this.pidAlive,
+					pidIncarnation: this.pidIncarnation,
 				})
 			) {
 				return this.result(

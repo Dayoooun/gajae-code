@@ -81,7 +81,7 @@ function freshState(extra: Partial<Record<string, unknown>> = {}): Record<string
 		version: 1,
 		acquisitionId: "old",
 		ownershipPhase: "ready",
-		generation: DAEMON_GENERATION,
+		generation: 3,
 		...extra,
 	};
 }
@@ -97,7 +97,9 @@ function readyTelegramSpawnFixture({
 }) {
 	let nextChildPid = firstChildPid;
 	let pending: { ownerId: string; pid: number } | undefined;
+	const pidIncarnation = (pid: number) => `test:${pid}`;
 	return {
+		pidIncarnation,
 		spawn: (command: string, args: string[]) => {
 			const ownerId = args[args.indexOf("--owner-id") + 1]!;
 			const pid = nextChildPid++;
@@ -113,6 +115,7 @@ function readyTelegramSpawnFixture({
 					ownerId: pending.ownerId,
 					acquisitionId: pending.ownerId,
 					pid: pending.pid,
+					incarnation: pidIncarnation(pending.pid),
 				}),
 			).toBe(true);
 		},
@@ -368,9 +371,12 @@ describe("TelegramDaemonController.status", () => {
 	test("reports running for a fresh live owner and stopped for a dead one", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
-		writeState(agentDir, freshState());
+		writeState(agentDir, freshState({ generation: DAEMON_GENERATION, incarnation: "stable" }));
 
-		const running = await new TelegramDaemonController(s, { pidAlive: () => true }).status();
+		const running = await new TelegramDaemonController(s, {
+			pidAlive: () => true,
+			pidIncarnation: () => "stable",
+		}).status();
 		expect(running.health).toBe("running");
 		expect(running.pid).toBe(999);
 		expect(running.ownerId).toBe("old");
@@ -384,7 +390,7 @@ describe("TelegramDaemonController.reload", () => {
 	test("cooperatively stops the old owner and spawns a fresh one", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
-		writeState(agentDir, freshState({ generation: DAEMON_GENERATION - 1 }));
+		writeState(agentDir, freshState());
 		fs.writeFileSync(daemonPaths(agentDir).lock, "");
 
 		const alive = new Set<number>([999, 4242]);
@@ -401,6 +407,7 @@ describe("TelegramDaemonController.reload", () => {
 		const ctrl = new TelegramDaemonController(s, {
 			ownerPid: 4242,
 			pidAlive: pid => alive.has(pid),
+			pidIncarnation: child.pidIncarnation,
 			sendSignal: (pid, sig) => {
 				signals.push([pid, sig]);
 				if (sig === "SIGTERM") alive.delete(999);
@@ -442,6 +449,7 @@ describe("TelegramDaemonController.reload", () => {
 		const ctrl = new TelegramDaemonController(s, {
 			ownerPid: 4242,
 			pidAlive: pid => alive.has(pid),
+			pidIncarnation: child.pidIncarnation,
 			sendSignal: (pid, sig) => {
 				signals.push([pid, sig]);
 				if (sig === "SIGKILL") alive.delete(999);
@@ -468,13 +476,22 @@ describe("TelegramDaemonController.reload", () => {
 		let mutated = false;
 		const ctrl = new TelegramDaemonController(s, {
 			pidAlive: pid => alive.has(pid),
+			pidIncarnation: pid => `pid-${pid}`,
 			// SIGTERM never kills 999 here; ownership changes underneath instead.
 			sendSignal: (pid, sig) => signals.push([pid, sig]),
 			spawn: () => ({ unref() {} }),
 			sleep: async () => {
 				if (!mutated) {
 					mutated = true;
-					writeState(agentDir, freshState({ ownerId: "newer", pid: 1000 }));
+					writeState(
+						agentDir,
+						freshState({
+							ownerId: "newer",
+							pid: 1000,
+							generation: DAEMON_GENERATION,
+							incarnation: "pid-1000",
+						}),
+					);
 				}
 			},
 			waitStepMs: 1,
@@ -584,6 +601,7 @@ describe("TelegramDaemonController.reload", () => {
 		const ctrl = new TelegramDaemonController(s, {
 			ownerPid: 4242,
 			pidAlive: pid => alive.has(pid),
+			pidIncarnation: child.pidIncarnation,
 			sendSignal: (_pid, sig) => {
 				if (sig === "SIGTERM") alive.delete(999);
 			},
@@ -624,6 +642,7 @@ describe("TelegramDaemonController.reload", () => {
 		});
 		const ctrl = new TelegramDaemonController(s, {
 			pidAlive: pid => pid === childPid,
+			pidIncarnation: child.pidIncarnation,
 			spawn: child.spawn,
 			sleep: child.sleep,
 		});
@@ -653,6 +672,7 @@ describe("TelegramDaemonController.reload", () => {
 		const ctrl = new TelegramDaemonController(s, {
 			ownerPid: 4242,
 			pidAlive: pid => alive.has(pid),
+			pidIncarnation: child.pidIncarnation,
 			sendSignal: (pid, sig) => {
 				signals.push([pid, sig]);
 				if (sig === "SIGTERM") alive.delete(999);
@@ -699,7 +719,7 @@ describe("renewDaemonHeartbeat steal-lock contention", () => {
 	test("recovers when the steal lock is briefly held then released (bind-vs-heartbeat race)", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
-		writeState(agentDir, freshState({ heartbeatAt: 1 }));
+		writeState(agentDir, freshState({ generation: DAEMON_GENERATION, incarnation: "test:999", heartbeatAt: 1 }));
 		const paths = daemonPaths(agentDir);
 		// A concurrent lifecycle op (e.g. bindProvisionalDaemonPid) holds the steal lock,
 		// releasing it after the first retry sleep.
@@ -711,6 +731,7 @@ describe("renewDaemonHeartbeat steal-lock contention", () => {
 			acquisitionId: "old",
 			pid: 999,
 			generation: DAEMON_GENERATION,
+			incarnation: "test:999",
 			now: () => 5_000,
 			stealRetries: 5,
 			stealRetryDelayMs: 1,
@@ -727,7 +748,7 @@ describe("renewDaemonHeartbeat steal-lock contention", () => {
 	test("reports failure when the steal lock stays held even if state is unchanged", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
-		writeState(agentDir, freshState({ heartbeatAt: 1 }));
+		writeState(agentDir, freshState({ generation: DAEMON_GENERATION, incarnation: "test:999", heartbeatAt: 1 }));
 		const paths = daemonPaths(agentDir);
 		fs.writeFileSync(paths.steal, ""); // never released
 		const ok = await renewDaemonHeartbeat({
@@ -736,6 +757,7 @@ describe("renewDaemonHeartbeat steal-lock contention", () => {
 			acquisitionId: "old",
 			pid: 999,
 			generation: DAEMON_GENERATION,
+			incarnation: "test:999",
 			stealRetries: 2,
 			stealRetryDelayMs: 1,
 			sleep: async () => undefined,
@@ -749,7 +771,15 @@ describe("renewDaemonHeartbeat steal-lock contention", () => {
 	test("reports ownership loss when the steal lock is held and ownership changed", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
-		writeState(agentDir, freshState({ ownerId: "successor", acquisitionId: "successor" }));
+		writeState(
+			agentDir,
+			freshState({
+				ownerId: "successor",
+				acquisitionId: "successor",
+				generation: DAEMON_GENERATION,
+				incarnation: "test:999",
+			}),
+		);
 		const paths = daemonPaths(agentDir);
 		fs.writeFileSync(paths.steal, "");
 		const ok = await renewDaemonHeartbeat({
@@ -758,6 +788,7 @@ describe("renewDaemonHeartbeat steal-lock contention", () => {
 			acquisitionId: "old",
 			pid: 999,
 			generation: DAEMON_GENERATION,
+			incarnation: "test:999",
 			stealRetries: 2,
 			stealRetryDelayMs: 1,
 			sleep: async () => undefined,
@@ -811,6 +842,7 @@ describe("cooperative handoff when the captured owner exits before the recheck",
 		const ctrl = new TelegramDaemonController(s, {
 			ownerPid: 4242,
 			pidAlive: pid => (pid === 999 ? ownerAlive : alive.has(pid)),
+			pidIncarnation: child.pidIncarnation,
 			randomId: () => {
 				ownerAlive = false;
 				return "req-reload";
@@ -832,6 +864,7 @@ describe("TelegramDaemonController captured-owner signal races", () => {
 		["different acquisition", () => freshState({ acquisitionId: "successor-acquisition" })],
 		["different PID", () => freshState({ pid: 1000 })],
 		["different generation", () => freshState({ generation: DAEMON_GENERATION + 1 })],
+		["different process incarnation", () => freshState({ incarnation: "successor-incarnation" })],
 	] as const) {
 		test(`does not SIGTERM after a ${name} mutation`, async () => {
 			const agentDir = tempAgentDir();
@@ -881,14 +914,22 @@ describe("TelegramDaemonController captured-owner signal races", () => {
 
 describe("TelegramDaemonController provisional launcher signal fencing", () => {
 	for (const action of ["stop", "reload"] as const) {
-		test(`${action} never signals a live generation-4 provisional launcher`, async () => {
+		test(`${action} never signals a live current-generation provisional launcher`, async () => {
 			const agentDir = tempAgentDir();
 			const s = settings(agentDir);
-			writeState(agentDir, freshState({ ownershipPhase: "provisional" }));
+			writeState(
+				agentDir,
+				freshState({
+					generation: DAEMON_GENERATION,
+					ownershipPhase: "provisional",
+					incarnation: "pid-999",
+				}),
+			);
 			fs.writeFileSync(daemonPaths(agentDir).lock, "");
 			const signals: NodeJS.Signals[] = [];
 			const result = await new TelegramDaemonController(s, {
 				pidAlive: pid => pid === 999,
+				pidIncarnation: pid => `pid-${pid}`,
 				sendSignal: (_pid, signal) => signals.push(signal),
 				spawn: () => {
 					throw new Error("provisional ownership must block spawning");
@@ -899,6 +940,23 @@ describe("TelegramDaemonController provisional launcher signal fencing", () => {
 			expect(signals).toEqual([]);
 		});
 	}
+});
+
+describe("TelegramDaemonController PID-incarnation fencing", () => {
+	test("never signals a matching state whose PID has been reused", async () => {
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		writeState(agentDir, freshState({ generation: DAEMON_GENERATION, incarnation: "original-incarnation" }));
+		fs.writeFileSync(daemonPaths(agentDir).lock, "");
+		const signals: NodeJS.Signals[] = [];
+		const result = await new TelegramDaemonController(s, {
+			pidAlive: pid => pid === 999,
+			pidIncarnation: () => "reused-incarnation",
+			sendSignal: (_pid, signal) => signals.push(signal),
+		}).stop();
+		expect(result.ok).toBe(true);
+		expect(signals).toEqual([]);
+	});
 });
 
 describe("TelegramDaemonController.stop", () => {
@@ -929,7 +987,7 @@ describe("TelegramDaemonController.stop", () => {
 	test("signals and proves death for a live matching legacy owner without spawning", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
-		writeState(agentDir, freshState({ generation: DAEMON_GENERATION - 1 }));
+		writeState(agentDir, freshState());
 		const alive = new Set<number>([999]);
 		let spawns = 0;
 		const signals: NodeJS.Signals[] = [];

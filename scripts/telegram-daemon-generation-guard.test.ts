@@ -7,7 +7,6 @@ import { assertGuardAuthority, currentTreeDigests, declaration, evaluate, GUARD_
 
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
-const stableEntries = (value: Record<string, string>) => JSON.stringify(Object.entries(value).sort());
 
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
@@ -184,7 +183,16 @@ describe("daemon generation release guard", () => {
 
 	test("protects the signal revalidation and provisional-PID binding predicates", () => {
 		const telegram = protectedInventory.telegram["packages/coding-agent/src/sdk/bus/telegram-daemon.ts"] ?? [];
-		expect(telegram).toEqual(expect.arrayContaining(["acquireTransitionLock", "bindProvisionalDaemonPid", "hasSafeDaemonStateShape", "isPhysicalMatchingOwner"]));
+		expect(telegram).toEqual(
+			expect.arrayContaining([
+				"acquireTransitionLock",
+				"bindProvisionalDaemonPid",
+				"hasSafeDaemonStateShape",
+				"defaultTelegramDaemonPidIncarnation",
+				"isDefinitelyStoppedOrReusedOwner",
+				"isPhysicalMatchingOwner",
+			]),
+		);
 	});
 
 	test("fails closed for malformed protected declarations", () => {
@@ -322,10 +330,12 @@ describe("daemon generation release guard", () => {
 		expect(() =>
 			validateManifest({ contractVersion: GUARD_CONTRACT_VERSION, inventory: protectedInventory, digests: { ...manifest.digests, [key]: "z".repeat(64) } }),
 		).toThrow("declaration digests must be exact");
-		// A stale (valid-format but wrong) digest set no longer matches the committed
-		// attestations that validateCurrentTreeManifest byte-compares against the tree.
+		// A valid-format substituted attestation must fail the same current-tree
+		// validation path used by CI, not merely differ from the committed object.
 		const stale = { ...digests, [key]: digests[key] === "0".repeat(64) ? "1".repeat(64) : "0".repeat(64) };
-		expect(stableEntries(stale)).not.toBe(stableEntries(digests));
+		await expect(validateCurrentTreeManifest(stale)).rejects.toThrow(
+			"semantic manifest declaration digests do not byte-match the current tree",
+		);
 	}, 20000);
 
 	test("writes a stable current-tree manifest atomically without changing the committed attestation", async () => {

@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "issue": 2278,
+  "branch": "fix/issue-2278-daemon-generation",
+  "surfaces": [
+    {
+      "id": "telegram-lifecycle",
+      "command": "bun test packages/coding-agent/test/notifications-telegram-daemon.test.ts",
+      "result": "passed",
+      "coverage": "stale/current/legacy ownership, generation handoff, PID incarnation, managed-root rollback, readiness and shutdown queue behavior"
+    },
+    {
+      "id": "daemon-controller",
+      "command": "bun test packages/coding-agent/test/daemon-control.test.ts",
+      "result": "passed",
+      "coverage": "captured-owner signal fencing, no-overlap replacement, provisional owners, PID reuse, stop/reload behavior"
+    },
+    {
+      "id": "generation-guard",
+      "command": "bun test scripts/telegram-daemon-generation-guard.test.ts",
+      "result": "passed",
+      "coverage": "semantic lifecycle inventory and current-tree digest enforcement"
+    },
+    {
+      "id": "compiled-daemon-process-smoke",
+      "command": "bun test packages/coding-agent/test/notifications-compiled-daemon-smoke.test.ts",
+      "result": "passed",
+      "coverage": "real child-process daemon startup, smoke lifecycle, and compiled/source worker entry behavior"
+    },
+    {
+      "id": "package-check",
+      "command": "bun --cwd=packages/coding-agent run check",
+      "result": "passed",
+      "coverage": "Biome, SDK canonicalization, TypeScript"
+    }
+  ],
+  "summary": "355 focused tests passed with 0 failures; package check and current-tree guard validation passed."
+}

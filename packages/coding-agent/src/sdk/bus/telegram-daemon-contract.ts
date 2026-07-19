@@ -11,4 +11,4 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * This intentionally changes only when daemon behavior or lifecycle semantics
  * require replacement; it is independent from the notification wire protocol.
  */
-export const DAEMON_GENERATION = 4;
+export const DAEMON_GENERATION = 5;
