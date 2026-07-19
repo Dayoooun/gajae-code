@@ -110,6 +110,7 @@ function start(
 	forwardPreflightCallbacks = false,
 	commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>(),
 	lifecycle?: { startupCapability: SdkStartupCapability; lifecycleRequired: true },
+	autoStart = true,
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
@@ -134,7 +135,7 @@ function start(
 		settings ??
 		(lifecycle ? ({ get: () => undefined, getAgentDir: () => ctx.cwd } as unknown as Settings) : undefined);
 	createNotificationsExtension(api, effectiveSettings ? { settings: effectiveSettings } : undefined);
-	void handlers.get("session_start")?.({ type: "session_start" }, ctx);
+	if (autoStart) void handlers.get("session_start")?.({ type: "session_start" }, ctx);
 	return handlers;
 }
 
@@ -519,6 +520,65 @@ test("lifecycle startup settles failure when native callback registration throws
 		hook.mockRestore();
 	}
 });
+
+test("session_start swallows startup plus owner-release failure without surfacing an extension error", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-startup-cleanup-double-failure-"));
+	dirs.push(cwd);
+	const sessionId = `startup-cleanup-double-failure-${Date.now()}`;
+	const serverStart = spyOn(NotificationServer.prototype, "start").mockRejectedValueOnce(
+		new Error("server start failed"),
+	);
+	const hostStop = spyOn(SessionSdkHost.prototype, "stop").mockRejectedValueOnce(new Error("host stop failed"));
+	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+	let restored = false;
+	try {
+		const sessionContext = context(cwd, sessionId);
+		const handlers = start(sessionContext, undefined, () => {}, false, new Map(), undefined, false);
+		const startupExt = {
+			path: "test-startup-ext",
+			handlers: new Map([
+				[
+					"session_start",
+					[
+						async () => {
+							await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
+						},
+					],
+				],
+			]),
+		};
+		const runner = new ExtensionRunner([startupExt as never], {} as never, cwd, {} as never, {} as never);
+		runner.initialize({} as never, {} as never);
+		const surfaced: Array<{ event: string }> = [];
+		runner.onError(error => surfaced.push(error));
+
+		await expect(runner.emit({ type: "session_start" })).resolves.toBeUndefined();
+		expect(surfaced).toEqual([]);
+		expect(serverStart).toHaveBeenCalledTimes(1);
+		expect(hostStop).toHaveBeenCalledTimes(2);
+		const breadcrumbs = errorSpy.mock.calls.map(args => String(args[0]));
+		expect(
+			breadcrumbs.some(
+				message =>
+					message.startsWith("notifications: SDK notification runtime cleanup failed: ") &&
+					message.includes(`SDK notification runtime ${sessionId} owner release failed`),
+			),
+		).toBe(true);
+
+		serverStart.mockRestore();
+		hostStop.mockRestore();
+		restored = true;
+		await expect(
+			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
+		).resolves.toBeUndefined();
+	} finally {
+		errorSpy.mockRestore();
+		if (!restored) {
+			serverStart.mockRestore();
+			hostStop.mockRestore();
+		}
+	}
+}, 60_000);
 
 test("lifecycle startup reports an actionable error when native capability registration is missing", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-missing-capability-callback-"));
