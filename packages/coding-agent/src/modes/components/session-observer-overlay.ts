@@ -8,8 +8,8 @@ import type { SessionMessageEntry } from "../../session/session-manager";
 import { parseSessionEntries } from "../../session/session-manager";
 import type { ObservableSession, SessionObserverRegistry } from "../session-observer-registry";
 import { theme } from "../theme/theme";
-import { type TranscriptViewerEntry, TranscriptViewerOverlay } from "./transcript-viewer-overlay";
 import { composeToolText } from "./tool-transcript-format";
+import { type TranscriptViewerEntry, TranscriptViewerOverlay } from "./transcript-viewer-overlay";
 
 /** Session-observer adapter. The shared viewer owns navigation and fold state. */
 export class SessionObserverOverlayComponent extends TranscriptViewerOverlay {
@@ -237,7 +237,6 @@ function entriesFromMessages(entries: readonly SessionMessageEntry[]): Transcrip
 	}
 	return output;
 }
-
 
 function truncateThinking(text: string, expanded: boolean): string {
 	const limit = expanded ? 4_000 : 200;

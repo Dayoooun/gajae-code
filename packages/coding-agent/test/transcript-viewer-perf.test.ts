@@ -1,11 +1,8 @@
 import { expect, test } from "bun:test";
+import { TOOL_RESULT_MAX_EXPANDED_LINES, toolDisplayText } from "../src/modes/components/tool-transcript-format";
 import { TranscriptViewerOverlay, transcriptViewerEntries } from "../src/modes/components/transcript-viewer-overlay";
-import {
-	TOOL_RESULT_MAX_EXPANDED_LINES,
-	toolDisplayText,
-} from "../src/modes/components/tool-transcript-format";
-import { TranscriptItemRegistry } from "../src/modes/transcript-item-registry";
 import { initTheme } from "../src/modes/theme/theme";
+import { TranscriptItemRegistry } from "../src/modes/transcript-item-registry";
 
 initTheme();
 const fields = (resultText: string) => ({
@@ -48,7 +45,10 @@ test("bounds expanded tool rendering independently of raw result size", () => {
 			source: "assistant",
 			getPayload: () => ({ text: assistantText, metadata: {}, source: "assistant" }),
 		});
-		const viewer = new TranscriptViewerOverlay({ getEntries: () => transcriptViewerEntries(registry), onClose: () => {} });
+		const viewer = new TranscriptViewerOverlay({
+			getEntries: () => transcriptViewerEntries(registry),
+			onClose: () => {},
+		});
 		viewer.handleInput(" ");
 		const rendered = viewer.render(80);
 		const toolHeader = rendered.findIndex(line => line.includes("[bash]"));
@@ -65,7 +65,8 @@ test("bounds expanded tool rendering independently of raw result size", () => {
 		expect(renderedOneThousand).toBeLessThanOrEqual(bound);
 
 		const maxLineWidth = 150;
-		const overWidthResult = (lines: number) => Array.from({ length: lines }, () => "x".repeat(maxLineWidth)).join("\n");
+		const overWidthResult = (lines: number) =>
+			Array.from({ length: lines }, () => "x".repeat(maxLineWidth)).join("\n");
 		const wrappedBound = bound * Math.ceil(maxLineWidth / 75);
 		const renderedOverWidthOneThousand = renderedToolContentLineCount(overWidthResult(1_000));
 		const renderedOverWidthOneHundredThousand = renderedToolContentLineCount(overWidthResult(100_000));

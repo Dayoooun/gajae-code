@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
-	MAX_TOOL_ARGS_CHARS,
 	composeToolCall,
 	composeToolResult,
 	composeToolText,
 	formatToolArgs,
+	MAX_TOOL_ARGS_CHARS,
 	TOOL_RESULT_MAX_EXPANDED_LINES,
 	toolDisplayText,
 } from "../src/modes/components/tool-transcript-format";
@@ -35,7 +35,14 @@ describe("tool transcript format", () => {
 	});
 
 	test("composes calls and canonical tool text", () => {
-		const fields = { name: "read", args: { path: "src/file.ts" }, intent: "Inspect file", resultText: "ok", isError: false, hasResult: true };
+		const fields = {
+			name: "read",
+			args: { path: "src/file.ts" },
+			intent: "Inspect file",
+			resultText: "ok",
+			isError: false,
+			hasResult: true,
+		};
 		expect(composeToolCall(fields)).toBe("path: src/file.ts\nInspect file");
 		expect(composeToolText(fields)).toBe("path: src/file.ts\nInspect file\nok");
 	});
@@ -45,7 +52,9 @@ describe("tool transcript format", () => {
 			name: "bash",
 			args: { command: "echo ok" },
 			intent: "Run command",
-			resultText: Array.from({ length: TOOL_RESULT_MAX_EXPANDED_LINES + 2 }, (_, index) => `line-${index}`).join("\n"),
+			resultText: Array.from({ length: TOOL_RESULT_MAX_EXPANDED_LINES + 2 }, (_, index) => `line-${index}`).join(
+				"\n",
+			),
 			isError: false,
 			hasResult: true,
 		};

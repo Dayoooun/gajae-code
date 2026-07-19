@@ -2,8 +2,13 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { composeToolResult, formatToolArgs, TOOL_RESULT_MAX_EXPANDED_LINES, toolDisplayText } from "../src/modes/components/tool-transcript-format";
 import { SessionObserverOverlayComponent } from "../src/modes/components/session-observer-overlay";
+import {
+	composeToolResult,
+	formatToolArgs,
+	TOOL_RESULT_MAX_EXPANDED_LINES,
+	toolDisplayText,
+} from "../src/modes/components/tool-transcript-format";
 import { TranscriptViewerOverlay, transcriptViewerEntries } from "../src/modes/components/transcript-viewer-overlay";
 import type { ObservableSession } from "../src/modes/session-observer-registry";
 import { initTheme } from "../src/modes/theme/theme";
@@ -41,7 +46,13 @@ function observerText(resultText: string, isError: boolean, hasResult = true): s
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "g001-observer-"));
 	try {
 		const now = new Date().toISOString();
-		const message = (id: string, value: object) => ({ type: "message", id, parentId: null, timestamp: now, message: value });
+		const message = (id: string, value: object) => ({
+			type: "message",
+			id,
+			parentId: null,
+			timestamp: now,
+			message: value,
+		});
 		const file = path.join(dir, "session.jsonl");
 		const messages = [
 			{ type: "session", version: 3, id: "session", timestamp: now },
@@ -63,11 +74,14 @@ function observerText(resultText: string, isError: boolean, hasResult = true): s
 				}),
 			);
 		fs.writeFileSync(file, `${messages.map(message => JSON.stringify(message)).join("\n")}\n`);
-		const overlay = new SessionObserverOverlayComponent(
-			observerRegistry({ id: "session", kind: "subagent", label: "Session", status: "active", sessionFile: file, lastUpdate: 1 }),
-			() => {},
-			["ctrl+s"],
-		);
+		const overlay = new SessionObserverOverlayComponent(observerRegistry({
+			id: "session",
+			kind: "subagent",
+			label: "Session",
+			status: "active",
+			sessionFile: file,
+			lastUpdate: 1,
+		}), () => {}, ["ctrl+s"]);
 		// The observer does not expose a clipboard seam; inspect its public rendered payload instead.
 		const rendered = overlay.render(200).join("\n");
 		return rendered
@@ -104,11 +118,18 @@ describe("G001 red-team: shared formatter and adapters", () => {
 
 	test("caps only expanded result source lines at exactly 100 and preserves every call line", () => {
 		const lineResult = (count: number) => Array.from({ length: count }, (_, index) => `line-${index}`).join("\n");
-		const manyCallLines = { ...fields(lineResult(100)), args: { command: "echo ok" }, name: "bash", intent: "intent-a\nintent-b\nintent-c" };
+		const manyCallLines = {
+			...fields(lineResult(100)),
+			args: { command: "echo ok" },
+			name: "bash",
+			intent: "intent-a\nintent-b\nintent-c",
+		};
 		const callLines = toolDisplayText(manyCallLines, false).split("\n");
 		expect(toolDisplayText(manyCallLines, false)).toBe(callLines.join("\n"));
 		expect(toolDisplayText(manyCallLines, true).split("\n")).toHaveLength(callLines.length + 100);
-		expect(toolDisplayText({ ...manyCallLines, resultText: lineResult(101) }, true).split("\n")).toHaveLength(callLines.length + 101);
+		expect(toolDisplayText({ ...manyCallLines, resultText: lineResult(101) }, true).split("\n")).toHaveLength(
+			callLines.length + 101,
+		);
 		expect(toolDisplayText({ ...manyCallLines, resultText: lineResult(101) }, true)).toEndWith("... 1 more lines");
 		const massive = toolDisplayText({ ...manyCallLines, resultText: lineResult(100_000) }, true);
 		expect(massive.split("\n")).toHaveLength(callLines.length + TOOL_RESULT_MAX_EXPANDED_LINES + 1);
@@ -147,10 +168,19 @@ describe("G001 red-team: shared formatter and adapters", () => {
 		const resultText = ["結果 漢字 😀", "\x1b]52;c;clipboard\x07", "\x1b[31mred\x1b[0m"]
 			.concat(Array.from({ length: 101 }, (_, index) => `行-${index}`))
 			.join("\n");
-		const registry = registryWithTool({ name: "bash", arguments: { command: "echo" }, resultText, isError: false, hasResult: true });
+		const registry = registryWithTool({
+			name: "bash",
+			arguments: { command: "echo" },
+			resultText,
+			isError: false,
+			hasResult: true,
+		});
 		const entry = transcriptViewerEntries(registry)[0];
 		expect(entry?.getDisplayText?.(true).split("\n")).toHaveLength(102);
-		const viewer = new TranscriptViewerOverlay({ getEntries: () => transcriptViewerEntries(registry), onClose: () => {} });
+		const viewer = new TranscriptViewerOverlay({
+			getEntries: () => transcriptViewerEntries(registry),
+			onClose: () => {},
+		});
 		viewer.handleInput(" ");
 		const rendered = viewer.render(120).join("\n");
 		expect(rendered).toContain("結果 漢字");

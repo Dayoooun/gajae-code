@@ -62,6 +62,7 @@ import {
 } from "./components/pet-capability";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import { StatusLineComponent } from "./components/tool-status-header";
+import { composeToolText } from "./components/tool-transcript-format";
 import {
 	WelcomeComponent,
 	type WelcomeLogoMode,
@@ -89,7 +90,6 @@ import { TasksAggregator } from "./tasks-aggregator";
 import { type ShimmerPalette, shimmerSegments, shimmerText } from "./theme/shimmer";
 import type { Theme } from "./theme/theme";
 import { getEditorTheme, getSymbolTheme, onTerminalAppearanceChange, onThemeChange, theme } from "./theme/theme";
-import { composeToolText } from "./components/tool-transcript-format";
 import { type RegisterTranscriptItem, TranscriptItemRegistry, transcriptItemId } from "./transcript-item-registry";
 import {
 	type CompactionQueuedMessage,

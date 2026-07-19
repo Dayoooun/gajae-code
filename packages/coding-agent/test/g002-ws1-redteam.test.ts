@@ -310,13 +310,9 @@ test("renders an unmatched observer tool call as pending instead of done", () =>
 				timestamp: Date.now(),
 			}),
 		]);
-		const overlay = new SessionObserverOverlayComponent(
-			observerRegistry([
-				{ id: "pending", kind: "subagent", label: "Pending", status: "active", sessionFile: file, lastUpdate: 1 },
-			]),
-			() => {},
-			["ctrl+s"],
-		);
+		const overlay = new SessionObserverOverlayComponent(observerRegistry([
+			{ id: "pending", kind: "subagent", label: "Pending", status: "active", sessionFile: file, lastUpdate: 1 },
+		]), () => {}, ["ctrl+s"]);
 		const rendered = overlay.render(100).join("\n");
 		expect(rendered).toContain("⏳ pending");
 		expect(rendered).not.toContain("✓ done");

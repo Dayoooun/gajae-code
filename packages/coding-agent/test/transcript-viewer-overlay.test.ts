@@ -276,8 +276,18 @@ test("renders tool names, state-aware folded display, and preserves neighboring 
 		},
 		source: id,
 	});
-	registry.register({ id: "tool:first", kind: "tool", source: "first", getPayload: () => toolPayload("first", "first result", false, true) });
-	registry.register({ id: "tool:second", kind: "tool", source: "second", getPayload: () => toolPayload("second", "", false, false) });
+	registry.register({
+		id: "tool:first",
+		kind: "tool",
+		source: "first",
+		getPayload: () => toolPayload("first", "first result", false, true),
+	});
+	registry.register({
+		id: "tool:second",
+		kind: "tool",
+		source: "second",
+		getPayload: () => toolPayload("second", "", false, false),
+	});
 	const entries = transcriptViewerEntries(registry);
 	expect(entries.map(entry => entry.label)).toEqual(["read", "read"]);
 	expect(entries[0]?.getDisplayText?.(false)).toBe("path: first.ts\nInspect file");
@@ -331,9 +341,16 @@ test("sanitizes tool results and leaves expanded assistant text uncapped", () =>
 		id: "assistant",
 		kind: "assistant-text",
 		source: "assistant",
-		getPayload: () => ({ text: Array.from({ length: 150 }, (_, index) => `assistant-${index}`).join("\n"), metadata: {}, source: "assistant" }),
+		getPayload: () => ({
+			text: Array.from({ length: 150 }, (_, index) => `assistant-${index}`).join("\n"),
+			metadata: {},
+			source: "assistant",
+		}),
 	});
-	const viewer = new TranscriptViewerOverlay({ getEntries: () => transcriptViewerEntries(registry), onClose: () => {} });
+	const viewer = new TranscriptViewerOverlay({
+		getEntries: () => transcriptViewerEntries(registry),
+		onClose: () => {},
+	});
 	viewer.handleInput(" ");
 	let rendered = viewer.render(100).join("\n");
 	expect(rendered).toContain("✗ safe");
