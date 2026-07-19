@@ -760,6 +760,7 @@ function liveOwnerUsesDifferentIdentity(input: {
 				state,
 				pidIncarnation: input.pidIncarnation ?? defaultTelegramDaemonPidIncarnation,
 			}) ||
+				state.incarnation === undefined ||
 				isUnfencedBaselineOwner(state)),
 	);
 }
@@ -2193,7 +2194,10 @@ class TelegramEffectSupervisor {
 
 	beginShutdown(): void {
 		this.#stopping = true;
-		this.#abort.abort("daemon_shutdown");
+	}
+
+	abortPending(): void {
+		this.#abort.abort("daemon_shutdown_deadline");
 	}
 
 	abortTerminal(): void {
@@ -5673,6 +5677,7 @@ export class TelegramNotificationDaemon {
 			const deadlineAt = Date.now() + BTW_SHUTDOWN_JOIN_MS;
 			const deadline = Promise.withResolvers<boolean>();
 			const deadlineTimer = setTimeout(() => {
+				this.effects.abortPending();
 				this.effects.abortTerminal();
 				deadline.resolve(false);
 			}, BTW_SHUTDOWN_JOIN_MS);

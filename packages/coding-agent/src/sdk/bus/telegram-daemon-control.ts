@@ -44,6 +44,7 @@ import {
 
 const nodeFs: TelegramDaemonFs = fs.promises as unknown as TelegramDaemonFs;
 const DEFAULT_GRACEFUL_TIMEOUT_MS = 8_000;
+const UNFENCED_COOPERATIVE_TIMEOUT_MS = 30_000;
 const DEFAULT_KILL_TIMEOUT_MS = 3_000;
 const DEFAULT_WAIT_STEP_MS = 25;
 
@@ -360,6 +361,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		const roots = before.roots ?? (await readDaemonRoots(this.settings, this.fsImpl));
 		const gracefulTimeoutMs = opts.gracefulTimeoutMs ?? DEFAULT_GRACEFUL_TIMEOUT_MS;
 		const killTimeoutMs = opts.killTimeoutMs ?? DEFAULT_KILL_TIMEOUT_MS;
+		const cooperativeTimeoutMs = opts.gracefulTimeoutMs ?? UNFENCED_COOPERATIVE_TIMEOUT_MS;
 
 		const state = await readDaemonState(this.settings, this.fsImpl);
 		// Current-generation records without complete PID provenance are never
@@ -388,7 +390,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 				{ version: 1, requestId, action, ownerId: state.ownerId, pid: state.pid, createdAt: this.now() },
 				this.fsImpl,
 			);
-			const dead = await this.waitForPidDeath(state.pid, state.incarnation, gracefulTimeoutMs);
+			const dead = await this.waitForPidDeath(state.pid, state.incarnation, cooperativeTimeoutMs);
 			await this.clearOwnRequest(requestId, state.ownerId);
 			if (!dead) {
 				return this.result(
