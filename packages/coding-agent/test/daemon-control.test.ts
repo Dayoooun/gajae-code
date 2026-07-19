@@ -534,7 +534,7 @@ describe("TelegramDaemonController.reload", () => {
 
 		const result = await ctrl.reload({ gracefulTimeoutMs: 2, force: true });
 		expect(result.ok).toBe(false);
-		expect(result.message).toContain("unfenced baseline daemon did not exit");
+		expect(result.message).toContain("unfenced daemon did not exit");
 		expect(signals).toEqual([]);
 		expect(spawnCalls).toBe(0);
 		expect(await readTelegramControlRequest(s)).toBeUndefined();
@@ -1031,34 +1031,38 @@ describe("TelegramDaemonController captured-owner signal races", () => {
 	});
 });
 
-describe("TelegramDaemonController provisional launcher signal fencing", () => {
-	for (const action of ["stop", "reload"] as const) {
-		test(`${action} never signals a live current-generation provisional launcher`, async () => {
-			const agentDir = tempAgentDir();
-			const s = settings(agentDir);
-			writeState(
-				agentDir,
-				freshState({
-					generation: DAEMON_GENERATION,
-					ownershipPhase: "provisional",
-					incarnation: "pid-999",
-				}),
-			);
-			fs.writeFileSync(daemonPaths(agentDir).lock, "");
-			const signals: NodeJS.Signals[] = [];
-			const result = await new TelegramDaemonController(s, {
-				pidAlive: pid => pid === 999,
-				pidIncarnation: pid => `pid-${pid}`,
-				sendSignal: (_pid, signal) => signals.push(signal),
-				spawn: () => {
-					throw new Error("provisional ownership must block spawning");
-				},
-			})[action]({ spawnIfStopped: false });
-
-			expect(result.ok).toBe(true);
-			expect(signals).toEqual([]);
-		});
-	}
+describe("TelegramDaemonController cooperative unfenced owner controls", () => {
+	test("stops an unfenced generation-5 owner cooperatively without spawning or signaling", async () => {
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		writeState(
+			agentDir,
+			freshState({
+				generation: DAEMON_GENERATION,
+				incarnation: undefined,
+				acquisitionId: undefined,
+				ownershipPhase: undefined,
+			}),
+		);
+		let alive = true;
+		const signals: NodeJS.Signals[] = [];
+		const result = await new TelegramDaemonController(s, {
+			pidAlive: pid => pid === 999 && alive,
+			pidIncarnation: pid => `pid-${pid}`,
+			sendSignal: (_pid, signal) => signals.push(signal),
+			sleep: async () => {
+				const request = await readTelegramControlRequest(s);
+				expect(request).toMatchObject({ action: "stop", ownerId: "old", pid: 999 });
+				alive = false;
+			},
+			spawn: () => {
+				throw new Error("stop must not spawn a replacement");
+			},
+		}).stop();
+		expect(result.ok).toBe(true);
+		expect(signals).toEqual([]);
+		expect(await readTelegramControlRequest(s)).toBeUndefined();
+	});
 });
 
 describe("TelegramDaemonController PID-incarnation fencing", () => {
@@ -1186,9 +1190,9 @@ describe("ChatDaemonController ownership safety", () => {
 			pidIncarnation: () => "reused",
 			sendSignal: (_pid, signal) => signals.push(signal),
 		});
-		expect((await controller.status()).health).toBe("stale");
+		expect((await controller.status()).health).toBe("stopped");
 		const result = await controller.stop();
-		expect(result.ok).toBe(false);
+		expect(result.ok).toBe(true);
 		expect(signals).toEqual([]);
 	});
 

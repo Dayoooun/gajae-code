@@ -1158,6 +1158,28 @@ describe("telegram daemon", () => {
 		expect(result).toEqual({ acquired: false, attached: false, reloadRequired: true });
 	});
 
+	test("#2028 blocks a live unfenced baseline with a different Telegram identity", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		writeLiveOwner(agentDir, {
+			generation: DAEMON_GENERATION,
+			incarnation: undefined,
+			acquisitionId: undefined,
+			ownershipPhase: undefined,
+			tokenFingerprint: "other-token",
+			chatId: "other-chat",
+		});
+		const result = await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "e60b05c186ca",
+			chatId: "42",
+			pidAlive: () => true,
+			pidIncarnation: () => "untrusted-for-signal",
+			now: () => 101,
+		});
+		expect(result).toEqual({ acquired: false, blocked: true, reason: "identity_mismatch" });
+	});
+
 	test("#2028 does not attach a PID-reused current-generation owner", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);

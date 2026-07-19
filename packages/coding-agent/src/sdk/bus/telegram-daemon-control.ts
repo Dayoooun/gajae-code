@@ -25,14 +25,15 @@ import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
 import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
 import {
 	confirmTelegramDaemonSpawn,
+	DAEMON_GENERATION,
 	type DaemonState,
 	daemonPaths,
 	defaultTelegramDaemonPidIncarnation,
 	hasSafeDaemonStateShape,
 	isCurrentCompatibleOwner,
+	isDefinitelyStoppedOrReusedOwner,
 	isFreshLiveOwner,
 	isSignalableMatchingOwner,
-	isUnfencedBaselineOwner,
 	readDaemonRoots,
 	readDaemonState,
 	spawnTelegramDaemonOwner,
@@ -361,17 +362,25 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		const killTimeoutMs = opts.killTimeoutMs ?? DEFAULT_KILL_TIMEOUT_MS;
 
 		const state = await readDaemonState(this.settings, this.fsImpl);
-		// The unfenced generation-5 baseline has no PID provenance, so it can never
-		// be signaled. Its daemon loop already understands owner-scoped control
-		// requests; wait for its cooperative exit, but fail closed if it remains live.
-		const unfencedBaselineOwner =
-			action === "reload" &&
-			isUnfencedBaselineOwner(state) &&
+		// Current-generation records without complete PID provenance are never
+		// signalable, but their owner loop understands owner-scoped controls. This
+		// includes the exact unfenced baseline and partially fenced records.
+		const cooperativeUnfencedOwner =
+			state !== undefined &&
+			hasSafeDaemonStateShape(state) &&
+			state.generation === DAEMON_GENERATION &&
 			state.stoppedAt === undefined &&
 			state.tokenFingerprint === fp &&
 			state.chatId === chatId &&
-			this.pidAlive(state.pid);
-		if (unfencedBaselineOwner) {
+			this.pidAlive(state.pid) &&
+			!isSignalableMatchingOwner({
+				state,
+				tokenFingerprint: fp,
+				chatId,
+				pidAlive: this.pidAlive,
+				pidIncarnation: this.pidIncarnation,
+			});
+		if (cooperativeUnfencedOwner) {
 			const requestId =
 				this.deps.randomId?.() ?? `${this.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 			await writeTelegramControlRequest(
@@ -379,18 +388,20 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 				{ version: 1, requestId, action, ownerId: state.ownerId, pid: state.pid, createdAt: this.now() },
 				this.fsImpl,
 			);
-			const dead = await this.waitForPidDeath(state.pid, undefined, gracefulTimeoutMs);
+			const dead = await this.waitForPidDeath(state.pid, state.incarnation, gracefulTimeoutMs);
 			await this.clearOwnRequest(requestId, state.ownerId);
 			if (!dead) {
 				return this.result(
 					action,
 					false,
-					"unfenced baseline daemon did not exit after its cooperative control request; refusing to spawn to avoid a Telegram 409 conflict",
+					"unfenced daemon did not exit after its cooperative control request; refusing to spawn to avoid a Telegram 409 conflict",
 					before,
 					await this.status(),
 					warnings,
 				);
 			}
+			if (action === "stop")
+				return this.result(action, true, "stopped unfenced telegram daemon", before, await this.status(), warnings);
 			const { spawned, ready } = await this.spawnAndWait(roots, fp, chatId);
 			warnings.push(...spawned.warnings);
 			const after = await this.status();
@@ -400,7 +411,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 					ready &&
 					after.health === "running",
 				ready
-					? `reloaded unfenced baseline telegram daemon (${spawned.result})`
+					? `reloaded unfenced telegram daemon (${spawned.result})`
 					: "telegram daemon did not become ready after spawning",
 				before,
 				after,
@@ -480,6 +491,10 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 			);
 		}
 
+		// The owner may exit after status() observed it live. Re-enter the stopped
+		// path, which can safely spawn only after this positive death observation.
+		if (isDefinitelyStoppedOrReusedOwner({ state, pidAlive: this.pidAlive, pidIncarnation: this.pidIncarnation }))
+			return this.stopOrReload(action, opts);
 		// Running owner: capture identity, request cooperative stop, signal, wait.
 		if (
 			!hasSafeDaemonStateShape(state) ||

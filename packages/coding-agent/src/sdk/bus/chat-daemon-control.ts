@@ -41,7 +41,8 @@ export interface ChatDaemonState {
 	startedAt: number;
 	heartbeatAt: number;
 	transportHealthy: boolean;
-	generation: number;
+	/** Generation-less records were written by pre-generation dev builds. */
+	generation?: number;
 	stoppedAt?: number;
 }
 
@@ -69,9 +70,8 @@ export function hasSafeChatDaemonStateShape(value: unknown): value is ChatDaemon
 		typeof state.heartbeatAt === "number" &&
 		Number.isFinite(state.heartbeatAt) &&
 		typeof state.transportHealthy === "boolean" &&
-		typeof state.generation === "number" &&
-		Number.isSafeInteger(state.generation) &&
-		state.generation >= 0 &&
+		(state.generation === undefined ||
+			(typeof state.generation === "number" && Number.isSafeInteger(state.generation) && state.generation >= 0)) &&
 		(state.stoppedAt === undefined || (typeof state.stoppedAt === "number" && Number.isFinite(state.stoppedAt)))
 	);
 }
@@ -486,7 +486,9 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		if (!hasSafeChatDaemonStateShape(state)) return "malformed";
 		if (this.isDefinitelyStoppedState(state)) return "stopped";
 		if (!identity || state.kind !== this.kind || state.identity !== identity) return "unauthorized";
-		return state.generation < chatDaemonGeneration(this.kind) ? "replaceable" : "compatible";
+		return state.generation === undefined || state.generation < chatDaemonGeneration(this.kind)
+			? "replaceable"
+			: "compatible";
 	}
 	private isCurrentCompatibleState(state: ChatDaemonState, identity: string): boolean {
 		return (

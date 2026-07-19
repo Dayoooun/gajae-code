@@ -756,10 +756,11 @@ function liveOwnerUsesDifferentIdentity(input: {
 			state.stoppedAt === undefined &&
 			!ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) &&
 			input.pidAlive(state.pid) &&
-			hasMatchingPidIncarnation({
+			(hasMatchingPidIncarnation({
 				state,
 				pidIncarnation: input.pidIncarnation ?? defaultTelegramDaemonPidIncarnation,
-			}),
+			}) ||
+				isUnfencedBaselineOwner(state)),
 	);
 }
 
@@ -1596,10 +1597,13 @@ export async function ensureTelegramDaemonRunningDetailed(
 		const provisional = await readDaemonState(input.settings, deps.fs);
 		if (
 			provisional?.ownerId &&
+			provisional.acquisitionId &&
+			validDaemonPid(provisional.pid) &&
 			(await waitForTelegramDaemonReady({
 				settings: input.settings,
 				ownerId: provisional.ownerId,
 				acquisitionId: provisional.acquisitionId,
+				pid: provisional.pid,
 				tokenFingerprint: fp,
 				chatId: cfg.chatId,
 				fs: deps.fs,
@@ -2150,6 +2154,7 @@ interface PendingBtwDelivery {
 class TelegramEffectSupervisor {
 	#stopping = false;
 	readonly #abort = new AbortController();
+	readonly #terminalAbort = new AbortController();
 	readonly #terminalContext = new AsyncLocalStorage<boolean>();
 	#terminalDepth = 0;
 	readonly #pending = new Set<Promise<unknown>>();
@@ -2165,6 +2170,8 @@ class TelegramEffectSupervisor {
 			return Promise.reject(Object.assign(new Error("Daemon is stopping"), { name: "AbortError" }));
 		const signal = terminal
 			? opts?.signal
+				? AbortSignal.any([this.#terminalAbort.signal, opts.signal])
+				: this.#terminalAbort.signal
 			: opts?.signal
 				? AbortSignal.any([this.#abort.signal, opts.signal])
 				: this.#abort.signal;
@@ -2187,6 +2194,10 @@ class TelegramEffectSupervisor {
 	beginShutdown(): void {
 		this.#stopping = true;
 		this.#abort.abort("daemon_shutdown");
+	}
+
+	abortTerminal(): void {
+		this.#terminalAbort.abort("daemon_shutdown_deadline");
 	}
 
 	allowTerminal<T>(effect: () => Promise<T>): Promise<T> {
@@ -3927,17 +3938,14 @@ export class TelegramNotificationDaemon {
 	 * than a fixed retry window to refill, while failed sends are removed by the
 	 * best-effort flush itself.
 	 */
-	private async drainQueuedNotificationsOnShutdown(): Promise<boolean> {
+	private async drainQueuedNotificationsOnShutdown(deadlineAt: number): Promise<boolean> {
 		// Join work admitted before shutdown even when it has already left the pool.
-		// Without this, `pending === 0` can release ownership while its serialized
-		// Bot API effect is still in flight. Bound retries so an exhausted rate
-		// limiter cannot keep a signal-driven process alive indefinitely; callers
-		// retain ownership when admitted work cannot settle in this window.
+		// The terminal deadline aborts hung Bot API calls; retaining ownership is safer
+		// than claiming quiescence when the deadline expires.
 		await this.flushChain;
-		const attempts = Math.max(Math.ceil(BTW_SHUTDOWN_JOIN_MS / 25), 1);
-		for (let attempt = 0; this.pool.pending > 0 && attempt < attempts; attempt++) {
+		while (this.pool.pending > 0 && this.runtime.now() < deadlineAt) {
 			await this.flushPool(true);
-			if (this.pool.pending > 0) await this.runtime.sleep(25);
+			if (this.pool.pending > 0 && this.runtime.now() < deadlineAt) await this.runtime.sleep(25);
 		}
 		return this.pool.pending === 0;
 	}
@@ -5662,9 +5670,18 @@ export class TelegramNotificationDaemon {
 			this.effects.beginShutdown();
 			let persisted = false;
 			let drained = false;
+			const deadlineAt = Date.now() + BTW_SHUTDOWN_JOIN_MS;
+			const deadline = Promise.withResolvers<boolean>();
+			const deadlineTimer = setTimeout(() => {
+				this.effects.abortTerminal();
+				deadline.resolve(false);
+			}, BTW_SHUTDOWN_JOIN_MS);
 			const shutdown = this.effects.allowTerminal(async () => {
-				await this.#drainBtwTurns();
-				drained = await this.drainQueuedNotificationsOnShutdown();
+				// Start both drains together so a hung /btw cannot postpone final/ask work.
+				const btwDrain = this.#drainBtwTurns();
+				const notificationDrain = this.drainQueuedNotificationsOnShutdown(deadlineAt);
+				await btwDrain;
+				drained = await notificationDrain;
 				this.runtime.stop();
 				this.stopOwnershipHeartbeatTimer();
 				this.stopFlushTimer();
@@ -5678,8 +5695,6 @@ export class TelegramNotificationDaemon {
 				await this.opts.control?.clear?.(this.opts.ownerId);
 				persisted = true;
 			});
-			const deadline = Promise.withResolvers<boolean>();
-			const deadlineTimer = setTimeout(() => deadline.resolve(false), BTW_SHUTDOWN_JOIN_MS);
 			const completed = await Promise.race([
 				shutdown.then(
 					() => true,
@@ -5691,7 +5706,7 @@ export class TelegramNotificationDaemon {
 				deadline.promise,
 			]);
 			clearTimeout(deadlineTimer);
-			const quiesced = completed && drained && (await this.effects.join(BTW_SHUTDOWN_JOIN_MS));
+			const quiesced = completed && drained && (await this.effects.join(Math.max(0, deadlineAt - Date.now())));
 			if (!quiesced || !persisted) {
 				logger.warn("notifications: shutdown was not durably quiesced; retaining daemon ownership");
 			} else {
