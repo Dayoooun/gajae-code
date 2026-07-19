@@ -364,6 +364,29 @@ export class TranscriptViewerOverlay extends Container {
 	}
 }
 
+type ToolTranscriptMetadata = {
+	name: string;
+	arguments: Record<string, unknown>;
+	intent?: unknown;
+	resultText: string;
+	isError: boolean;
+	hasResult: boolean;
+};
+
+function hasToolTranscriptMetadata(
+	metadata: Readonly<Record<string, unknown>>,
+): metadata is Readonly<ToolTranscriptMetadata> {
+	return (
+		typeof metadata.name === "string" &&
+		metadata.arguments !== null &&
+		typeof metadata.arguments === "object" &&
+		!Array.isArray(metadata.arguments) &&
+		typeof metadata.resultText === "string" &&
+		typeof metadata.isError === "boolean" &&
+		typeof metadata.hasResult === "boolean"
+	);
+}
+
 /** Main-session adapter over the registry's canonical payload resolver. */
 export function transcriptViewerEntries(registry: TranscriptItemRegistry): TranscriptViewerEntry[] {
 	return registry.items().flatMap(item => {
@@ -380,17 +403,18 @@ export function transcriptViewerEntries(registry: TranscriptItemRegistry): Trans
 						: item.kind === "user"
 							? "User"
 							: item.kind;
+		const toolMetadata = hasToolTranscriptMetadata(payload.metadata) ? payload.metadata : undefined;
 		const getDisplayText =
-			item.kind === "tool"
+			item.kind === "tool" && toolMetadata
 				? (expanded: boolean) =>
 						toolDisplayText(
 							{
-								name: String(payload.metadata.name ?? ""),
-								args: (payload.metadata.arguments ?? {}) as Record<string, unknown>,
-								intent: payload.metadata.intent as string | undefined,
-								resultText: String(payload.metadata.resultText ?? ""),
-								isError: Boolean(payload.metadata.isError),
-								hasResult: Boolean(payload.metadata.hasResult),
+								name: toolMetadata.name,
+								args: toolMetadata.arguments,
+								intent: typeof toolMetadata.intent === "string" ? toolMetadata.intent : undefined,
+								resultText: toolMetadata.resultText,
+								isError: toolMetadata.isError,
+								hasResult: toolMetadata.hasResult,
 							},
 							expanded,
 						)

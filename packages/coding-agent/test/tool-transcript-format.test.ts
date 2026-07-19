@@ -64,4 +64,38 @@ describe("tool transcript format", () => {
 		expect(expanded).not.toContain("line-100");
 		expect(expanded).toEndWith("... 2 more lines");
 	});
+	test("caps expanded results with bounded line storage while preserving line counts", () => {
+		const fields = {
+			name: "custom",
+			args: {},
+			intent: undefined,
+			isError: false,
+			hasResult: true,
+			resultText: "",
+		};
+		for (const lineCount of [99, 100, 101]) {
+			fields.resultText = Array.from({ length: lineCount }, (_, index) => `line-${index}`).join("\n");
+			const output = toolDisplayText(fields, true);
+			if (lineCount <= TOOL_RESULT_MAX_EXPANDED_LINES) expect(output).toContain(`line-${lineCount - 1}`);
+			else expect(output).not.toContain(`line-${TOOL_RESULT_MAX_EXPANDED_LINES}`);
+			expect(output.endsWith("... 1 more lines")).toBe(lineCount === 101);
+		}
+		fields.resultText = Array.from({ length: 100_000 }, (_, index) => `line-${index}`).join("\n");
+		const output = toolDisplayText(fields, true);
+		expect(output).toContain("line-99");
+		expect(output).not.toContain("line-100");
+		expect(output).toEndWith("... 99900 more lines");
+	});
+
+	test("preserves empty, error, pending, and trailing-newline result behavior", () => {
+		const base = { name: "custom", args: {}, intent: undefined };
+		expect(toolDisplayText({ ...base, resultText: "", isError: false, hasResult: true }, true)).toBe("✓ done");
+		expect(toolDisplayText({ ...base, resultText: "", isError: true, hasResult: true }, true)).toBe("✗ Error");
+		expect(toolDisplayText({ ...base, resultText: "ignored", isError: false, hasResult: false }, true)).toBe(
+			"⏳ pending",
+		);
+		expect(toolDisplayText({ ...base, resultText: "one\ntwo\n", isError: false, hasResult: true }, true)).toBe(
+			"one\ntwo",
+		);
+	});
 });

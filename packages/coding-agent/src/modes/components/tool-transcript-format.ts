@@ -47,12 +47,26 @@ export function composeToolText(fields: ToolTranscriptFields): string {
 	return [composeToolCall(fields), composeToolResult(fields)].filter(Boolean).join("\n");
 }
 
+/**
+ * Caps result output without allocating an array for every source line. The final
+ * line count still requires scanning the result so the omitted-line count is exact.
+ */
+function expandedToolResult(result: string): string {
+	let lineCount = 1;
+	let prefixEnd = result.length;
+	for (let index = 0; index < result.length; index++) {
+		if (result[index] !== "\n") continue;
+		if (lineCount === TOOL_RESULT_MAX_EXPANDED_LINES) prefixEnd = index;
+		lineCount += 1;
+	}
+	const prefix = result.slice(0, prefixEnd);
+	return lineCount > TOOL_RESULT_MAX_EXPANDED_LINES
+		? `${prefix}\n... ${lineCount - TOOL_RESULT_MAX_EXPANDED_LINES} more lines`
+		: prefix;
+}
+
 export function toolDisplayText(fields: ToolTranscriptFields, expanded: boolean): string {
 	const call = composeToolCall(fields);
 	if (!expanded) return call;
-	const resultLines = composeToolResult(fields).split("\n");
-	const shown = resultLines.slice(0, TOOL_RESULT_MAX_EXPANDED_LINES);
-	if (resultLines.length > TOOL_RESULT_MAX_EXPANDED_LINES)
-		shown.push(`... ${resultLines.length - TOOL_RESULT_MAX_EXPANDED_LINES} more lines`);
-	return [call, shown.join("\n")].filter(Boolean).join("\n");
+	return [call, expandedToolResult(composeToolResult(fields))].filter(Boolean).join("\n");
 }

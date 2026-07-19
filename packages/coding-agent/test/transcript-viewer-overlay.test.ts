@@ -319,6 +319,56 @@ test("renders tool names, state-aware folded display, and preserves neighboring 
 	expect(viewer.render(100).join("\n")).toContain("⏳ pending");
 });
 
+test("preserves legacy tool payload text until complete formatter metadata is available", () => {
+	const registry = new TranscriptItemRegistry();
+	registry.register({
+		id: "tool:legacy",
+		kind: "tool",
+		source: "legacy",
+		getPayload: () => ({ text: "legacy default payload", metadata: {}, source: "legacy" }),
+	});
+	registry.register({
+		id: "tool:partial",
+		kind: "tool",
+		source: "partial",
+		getPayload: () => ({
+			text: "partial legacy payload",
+			metadata: { name: "bash", arguments: { command: "echo partial" }, resultText: "partial result" },
+			source: "partial",
+		}),
+	});
+	registry.register({
+		id: "tool:open",
+		kind: "tool",
+		source: "open",
+		getPayload: () => ({
+			text: "open canonical payload",
+			metadata: {
+				name: "bash",
+				arguments: { command: "echo open" },
+				resultText: "",
+				isError: false,
+				hasResult: false,
+			},
+			source: "open",
+		}),
+	});
+	const entries = transcriptViewerEntries(registry);
+	expect(entries[0]?.getDisplayText).toBeUndefined();
+	expect(entries[1]?.getDisplayText).toBeUndefined();
+	expect(entries[2]?.getDisplayText?.(true)).toBe("echo open\n⏳ pending");
+
+	const viewer = new TranscriptViewerOverlay({
+		getEntries: () => transcriptViewerEntries(registry),
+		onClose: () => {},
+	});
+	viewer.handleInput(" ");
+	const rendered = viewer.render(100).join("\n");
+	expect(rendered).toContain("legacy default payload");
+	expect(rendered).toContain("partial legacy payload");
+	expect(rendered).not.toContain("partial result");
+});
+
 test("sanitizes tool results and leaves expanded assistant text uncapped", () => {
 	const registry = new TranscriptItemRegistry();
 	registry.register({

@@ -141,8 +141,8 @@ describe("G001 red-team: shared formatter and adapters", () => {
 		const incomplete = registryWithTool({ arguments: undefined, resultText: "", isError: false, hasResult: true });
 		const incompleteEntry = transcriptViewerEntries(incomplete)[0];
 		expect(incompleteEntry?.label).toBe("Tool");
-		expect(() => incompleteEntry?.getDisplayText?.(true)).not.toThrow();
-		expect(incompleteEntry?.getDisplayText?.(true)).toBe("✓ done");
+		expect(incompleteEntry?.payload.text).toBe("canonical payload");
+		expect(incompleteEntry?.getDisplayText).toBeUndefined();
 
 		const registry = new TranscriptItemRegistry();
 		registry.register({ id: "user", kind: "user", source: { text: "hello" } });
