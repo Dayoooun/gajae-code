@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Malformed selectors on internal read URLs now fail explicitly instead of silently falling back to an unbounded resource read.
+
 ## [0.11.3] - 2026-07-19
 
 ### Changed
