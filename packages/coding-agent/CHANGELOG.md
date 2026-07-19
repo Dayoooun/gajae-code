@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+- Added evidence-preserving recovery for legacy multi-writer SDK session-index corruption: `gjc gc` now diagnoses corrupt prefixes, `--repair-session-index` quarantines the original snapshot/log under the session-index lock before atomically restoring only the checksum-valid monotonic prefix, and append failures point operators to the explicit repair path (#2654).
 
 ## [0.11.3] - 2026-07-19
 
