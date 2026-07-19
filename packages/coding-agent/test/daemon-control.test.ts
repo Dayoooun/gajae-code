@@ -456,6 +456,90 @@ describe("TelegramDaemonController.reload", () => {
 		expect(await readTelegramControlRequest(s)).toBeUndefined();
 	});
 
+	test("migrates the unfenced generation-5 baseline cooperatively without PID signaling", async () => {
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		writeState(
+			agentDir,
+			freshState({
+				generation: DAEMON_GENERATION,
+				incarnation: undefined,
+				acquisitionId: undefined,
+				ownershipPhase: undefined,
+			}),
+		);
+		fs.writeFileSync(daemonPaths(agentDir).lock, "");
+		const alive = new Set<number>([999, 4242]);
+		const signals: Array<[number, string]> = [];
+		let oldAliveAtSpawn: boolean | undefined;
+		const child = readyTelegramSpawnFixture({
+			settings: s,
+			firstChildPid: 4248,
+			onSpawn: pid => {
+				oldAliveAtSpawn = alive.has(999);
+				alive.add(pid);
+			},
+		});
+		const ctrl = new TelegramDaemonController(s, {
+			ownerPid: 4242,
+			pidAlive: pid => alive.has(pid),
+			pidIncarnation: child.pidIncarnation,
+			sendSignal: (pid, signal) => signals.push([pid, signal]),
+			spawn: child.spawn,
+			sleep: async ms => {
+				if (alive.has(999)) {
+					expect(ms).toBeGreaterThan(0);
+					const request = await readTelegramControlRequest(s);
+					expect(request).toMatchObject({ action: "reload", ownerId: "old", pid: 999 });
+					alive.delete(999);
+					return;
+				}
+				await child.sleep();
+			},
+		});
+
+		const result = await ctrl.reload();
+		expect(result.ok).toBe(true);
+		expect(signals).toEqual([]);
+		expect(oldAliveAtSpawn).toBe(false);
+		expect(await readTelegramControlRequest(s)).toBeUndefined();
+	});
+
+	test("fails closed when the unfenced generation-5 baseline ignores its control request", async () => {
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		writeState(
+			agentDir,
+			freshState({
+				generation: DAEMON_GENERATION,
+				incarnation: undefined,
+				acquisitionId: undefined,
+				ownershipPhase: undefined,
+			}),
+		);
+		fs.writeFileSync(daemonPaths(agentDir).lock, "");
+		const signals: Array<[number, string]> = [];
+		let spawnCalls = 0;
+		const ctrl = new TelegramDaemonController(s, {
+			pidAlive: pid => pid === 999,
+			pidIncarnation: pid => `test:${pid}`,
+			sendSignal: (pid, signal) => signals.push([pid, signal]),
+			spawn: () => {
+				spawnCalls++;
+				return { unref() {} };
+			},
+			sleep: async () => undefined,
+			waitStepMs: 1,
+		});
+
+		const result = await ctrl.reload({ gracefulTimeoutMs: 2, force: true });
+		expect(result.ok).toBe(false);
+		expect(result.message).toContain("unfenced baseline daemon did not exit");
+		expect(signals).toEqual([]);
+		expect(spawnCalls).toBe(0);
+		expect(await readTelegramControlRequest(s)).toBeUndefined();
+	});
+
 	test("escalates to SIGKILL when the old owner ignores SIGTERM", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);

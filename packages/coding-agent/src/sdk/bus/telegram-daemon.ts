@@ -701,6 +701,21 @@ function isLegacyOrUnfencedOwner(state: DaemonState): boolean {
 	);
 }
 
+/**
+ * Generation-5 records written before PID fencing can still consume an
+ * owner-scoped control request, but their numeric PID is never signalable.
+ */
+export function isUnfencedBaselineOwner(state: DaemonState | undefined): state is DaemonState {
+	return Boolean(
+		state &&
+			hasSafeDaemonStateShape(state) &&
+			state.generation === DAEMON_GENERATION &&
+			state.incarnation === undefined &&
+			state.acquisitionId === undefined &&
+			state.ownershipPhase === undefined,
+	);
+}
+
 /** Read the stable process-start identity used to reject recycled PIDs. */
 export function defaultTelegramDaemonPidIncarnation(pid: number): string | undefined {
 	return processIncarnation(pid);

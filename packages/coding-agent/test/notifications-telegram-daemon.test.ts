@@ -47,6 +47,7 @@ import {
 } from "../src/sdk/bus/telegram-daemon";
 import { ownerPidFromOwnerId, runDaemonInternal, runDaemonSmoke } from "../src/sdk/bus/telegram-daemon-cli";
 import { NOTIFICATION_PROTOCOL_VERSION } from "../src/sdk/bus/telegram-daemon-contract";
+import { readTelegramControlRequest } from "../src/sdk/bus/telegram-daemon-control";
 
 const THREADED_FALLBACK_NOTICE =
 	"Flat Telegram private chat supports outbound notifications and inline ask buttons only. Enable Threaded Mode in @BotFather > Bot Settings > Threads Settings for free-text replies and session commands.";
@@ -1437,6 +1438,51 @@ describe("telegram daemon", () => {
 		expect(after.generation).toBe(DAEMON_GENERATION);
 		// The new session's root is persisted so the replacement daemon serves it.
 		expect(after.roots).toContain(path.join(cwd, ".gjc", "state"));
+	});
+
+	test("#2028 automatically migrates the unfenced generation-5 baseline through its control request", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		writeLiveOwner(agentDir, {
+			generation: DAEMON_GENERATION,
+			incarnation: undefined,
+			acquisitionId: undefined,
+			ownershipPhase: undefined,
+			heartbeatAt: Date.now(),
+		});
+		const alive = new Set<number>([999, 4242]);
+		const signals: Array<[number, string]> = [];
+		let oldAliveAtSpawn: boolean | undefined;
+		const child = readyTelegramSpawnFixture({
+			settings: s,
+			firstChildPid: 4249,
+			onSpawn: pid => {
+				oldAliveAtSpawn = alive.has(999);
+				alive.add(pid);
+			},
+		});
+		const result = await ensureTelegramDaemonRunningDetailed(
+			{ settings: s, cwd: path.join(agentDir, "new-session"), sessionId: "new-session" },
+			{
+				pid: 4242,
+				pidAlive: pid => alive.has(pid),
+				pidIncarnation: child.pidIncarnation,
+				sendSignal: (pid, signal) => signals.push([pid, signal]),
+				spawn: child.spawn,
+				sleep: async () => {
+					if (alive.has(999)) {
+						const request = await readTelegramControlRequest(s);
+						expect(request).toMatchObject({ action: "reload", ownerId: "old", pid: 999 });
+						alive.delete(999);
+						return;
+					}
+					await child.sleep();
+				},
+			},
+		);
+		expect(result).toBe("reloaded");
+		expect(signals).toEqual([]);
+		expect(oldAliveAtSpawn).toBe(false);
 	});
 
 	test("#2278 isolates account-owned daemon state, signals, and shared notification roots", async () => {
