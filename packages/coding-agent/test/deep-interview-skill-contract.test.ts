@@ -181,8 +181,8 @@ describe("deep-interview ouroboros ooo-interview parity port", () => {
 	it("documents the FREETEXT_FIELDS allowlist + input size caps (feature D)", () => {
 		expect(skill).toContain("FREETEXT_FIELDS");
 		expect(skill).toMatch(/shell metacharacters/i);
-		expect(skill).toMatch(/50KB/);
-		expect(skill).toMatch(/10KB/);
-		expect(skill).toMatch(/100KB/);
+		expect(skill).toMatch(/50,000/);
+		expect(skill).toMatch(/10,000/);
+		expect(skill).toMatch(/character-count/i);
 	});
 });

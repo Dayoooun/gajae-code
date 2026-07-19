@@ -36,6 +36,7 @@ import {
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { appendOrMergeDeepInterviewRound, syncDeepInterviewRecorderHud } from "../gjc-runtime/deep-interview-recorder";
 import { deepInterviewStatePath } from "../gjc-runtime/deep-interview-runtime";
+import { assertDeepInterviewInputWithinLimit, MAX_USER_RESPONSE_LENGTH } from "../gjc-runtime/deep-interview-state";
 import {
 	type AskGateQuestion,
 	gateAnswerToResult,
@@ -852,6 +853,8 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		customInput: string | undefined,
 	): Promise<void> {
 		const meta = q.deepInterview;
+		if (customInput !== undefined && (meta || isDeepInterviewAskQuestion(q.question)))
+			assertDeepInterviewInputWithinLimit(customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
 		if (!meta) return;
 		const cwd = this.session.cwd;
 		const sessionId = this.session.getSessionId?.() ?? undefined;

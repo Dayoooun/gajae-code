@@ -8,7 +8,6 @@ import {
 	deriveRoundKey,
 	isDeepInterviewFreeTextField,
 	MAX_INITIAL_CONTEXT_LENGTH,
-	MAX_LLM_RESPONSE_LENGTH,
 	MAX_USER_RESPONSE_LENGTH,
 	mergeDeepInterviewEnvelope,
 	mergeDeepInterviewRounds,
@@ -407,6 +406,5 @@ describe("deep-interview-state: free-text field allowlist + input size limits", 
 	it("pins the documented cap values", () => {
 		expect(MAX_INITIAL_CONTEXT_LENGTH).toBe(50_000);
 		expect(MAX_USER_RESPONSE_LENGTH).toBe(10_000);
-		expect(MAX_LLM_RESPONSE_LENGTH).toBe(100_000);
 	});
 });

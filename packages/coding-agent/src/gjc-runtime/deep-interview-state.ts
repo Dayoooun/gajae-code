@@ -423,10 +423,9 @@ export const DEEP_INTERVIEW_FREETEXT_FIELDS: ReadonlySet<string> = new Set([
 	"excerpt",
 ]);
 
-/** DoS-prevention input size caps, mirroring ouroboros InputValidator. */
+/** DoS-prevention character-count caps, matching ask-schema string-length semantics. */
 export const MAX_INITIAL_CONTEXT_LENGTH = 50_000;
 export const MAX_USER_RESPONSE_LENGTH = 10_000;
-export const MAX_LLM_RESPONSE_LENGTH = 100_000;
 
 export function isDeepInterviewFreeTextField(name: string): boolean {
 	return DEEP_INTERVIEW_FREETEXT_FIELDS.has(name);
@@ -439,6 +438,18 @@ export function isDeepInterviewFreeTextField(name: string): boolean {
 export function assertDeepInterviewInputWithinLimit(value: string, max: number, fieldName = "input"): void {
 	if (typeof value !== "string") throw new Error(`${fieldName} must be a string`);
 	if (value.length > max) throw new Error(`${fieldName} exceeds max length ${max}`);
+}
+
+/** Validate user-supplied initial context fields before a deep-interview envelope is persisted. */
+export function assertDeepInterviewEnvelopeInputLimits(envelope: Record<string, unknown>): void {
+	const state =
+		typeof envelope.state === "object" && envelope.state !== null && !Array.isArray(envelope.state)
+			? (envelope.state as Record<string, unknown>)
+			: {};
+	for (const field of ["initial_idea", "initial_context", "initial_context_summary"] as const) {
+		const value = state[field] ?? envelope[field];
+		if (value !== undefined) assertDeepInterviewInputWithinLimit(value as string, MAX_INITIAL_CONTEXT_LENGTH, field);
+	}
 }
 
 export interface DeepInterviewIntentItem {

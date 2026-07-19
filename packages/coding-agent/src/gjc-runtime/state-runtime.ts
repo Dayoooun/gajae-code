@@ -29,6 +29,7 @@ import {
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { applyAmbiguityFloorToEnvelope } from "./deep-interview-ambiguity";
 import {
+	assertDeepInterviewEnvelopeInputLimits,
 	assertDeepInterviewIntentManifest,
 	assertDeepInterviewIntentReview,
 	type DeepInterviewIntentManifest,
@@ -1157,6 +1158,7 @@ async function reconcileWorkflowSkillStateUnlocked(
 					unknown
 				>)
 			: mergeWithNullDelete(existingPayload, payload);
+	if (mode === "deep-interview") assertDeepInterviewEnvelopeInputLimits(merged);
 	merged.skill = mode;
 	merged.current_phase = trimmedPhase;
 	merged.active = active;
@@ -1360,6 +1362,11 @@ async function handleWrite(
 				merged = applyAmbiguityFloorToEnvelope(
 					mergeDeepInterviewEnvelope(existingPayload, payload, { replace: hasFlag(args, "--replace") }),
 				).envelope;
+				try {
+					assertDeepInterviewEnvelopeInputLimits(merged);
+				} catch (error) {
+					throw new StateCommandError(2, error instanceof Error ? error.message : String(error));
+				}
 			} else if (hasFlag(args, "--replace")) {
 				merged = { ...payload };
 			} else {

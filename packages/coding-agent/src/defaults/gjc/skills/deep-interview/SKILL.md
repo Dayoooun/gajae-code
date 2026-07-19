@@ -584,7 +584,7 @@ Advisory fanout is an assist layer, not a decision maker: it never replaces or d
 
 `confused_terms` and `references` are optional structured adapter context queued at interview start. They are **non-behavioral**: they MUST NOT alter the first question, are never inferred from vocabulary density, and glossary help is limited to explicitly-confused terms while references are used only for contrast questions. Referenced `url`/`excerpt` values are inert strings that are **never auto-fetched**. These fields ride the `ask` tool `deepInterview` metadata and are carried into the gate `stage_state` as bounded, optional values.
 
-Input safety: user-facing free-text fields (an allowlist including `initial_context`, `user_response`, `goal`, `prompt`, `description`, `statement`) legitimately carry prose with shell metacharacters (`;`, `|`, `&`, backticks, `$()`) and must not be rejected as injection; structural fields (ids, categories, hashes) stay strictly validated. Free-text inputs are bounded by DoS-prevention size caps (initial context 50KB, user response 10KB, LLM response 100KB) rather than by content inspection.
+Input safety: user-facing free-text fields (an allowlist including `initial_context`, `user_response`, `goal`, `prompt`, `description`, `statement`) legitimately carry prose with shell metacharacters (`;`, `|`, `&`, backticks, `$()`) and must not be rejected as injection; structural fields (ids, categories, hashes) stay strictly validated. Runtime-ingested initial context and user responses are bounded by character-count DoS caps (50,000 and 10,000 characters respectively) rather than by content inspection.
 
 ## Phase 4: Crystallize Spec
 
@@ -922,7 +922,7 @@ Optional settings in `.gjc/settings.json`:
     "deepInterview": {
       "ambiguityThreshold": <resolvedThreshold>,
       "maxRounds": 100,
-      "softWarningRounds": 10,
+      "softWarningRounds": 16,
       "minRoundsBeforeExit": 3,
       "enableChallengeAgents": true,
       "autoExecuteOnComplete": false,

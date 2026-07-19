@@ -8,6 +8,7 @@ import {
 } from "./deep-interview-ambiguity";
 import {
 	answerHash,
+	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewIntentManifest,
 	createDeepInterviewIntentManifest,
 	type DeepInterviewEstablishedFact,
@@ -17,6 +18,7 @@ import {
 	type DeepInterviewStateEnvelope,
 	type DeepInterviewTriggerMetadata,
 	deriveRoundKey,
+	MAX_USER_RESPONSE_LENGTH,
 	normalizeDeepInterviewEnvelope,
 	questionHash,
 	reviewDeepInterviewIntent,
@@ -426,6 +428,8 @@ export async function appendOrMergeDeepInterviewRound(
 	input: DeepInterviewAnswerInput,
 	options: { sessionId?: string } = {},
 ): Promise<{ action: AppendOrMergeAction; record: DeepInterviewRoundRecord; disputedFactIds?: string[] }> {
+	if (input.customInput !== undefined)
+		assertDeepInterviewInputWithinLimit(input.customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
 	const envelope = await readEnvelope(statePath);
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
 	const shell = buildAnswerShell({

@@ -336,6 +336,46 @@ describe("deep-interview structured metadata red-team", () => {
 		expect(askSchema.safeParse({ questions: [base] }).success).toBe(true);
 	});
 
+	it("accepts non-ASCII adapter metadata using the schema's character-count limits", () => {
+		const term = "한".repeat(256);
+		const longText = "한".repeat(2048);
+		const parsed = askSchema.safeParse({
+			questions: [
+				{
+					id: "q-korean-boundary",
+					question: "Q?",
+					options: [{ label: "A" }],
+					deepInterview: {
+						round_id: "한".repeat(128),
+						round: 1,
+						component: "한".repeat(128),
+						dimension: "한".repeat(128),
+						ambiguity: 0.5,
+						confused_terms: [term],
+						references: [{ reference_id: term, label: term, origin: term, url: longText, excerpt: longText }],
+					},
+				},
+			],
+		});
+
+		expect(parsed.success).toBe(true);
+	});
+
+	it("rejects non-ASCII deep-interview core metadata beyond 128 characters", () => {
+		const base = { id: "q-core-overflow", question: "Q?", options: [{ label: "A" }] };
+		for (const field of ["round_id", "component", "dimension"] as const) {
+			const deepInterview = {
+				round_id: "r1",
+				round: 1,
+				component: "c",
+				dimension: "goal",
+				ambiguity: 0.5,
+				[field]: "한".repeat(129),
+			};
+			expect(askSchema.safeParse({ questions: [{ ...base, deepInterview }] }).success).toBe(false);
+		}
+	});
+
 	describe("Round-0 locked intent contracts", () => {
 		const base = { id: "intent-q", question: "Confirm intent", options: [{ label: "Confirm" }] };
 		const validContract = {

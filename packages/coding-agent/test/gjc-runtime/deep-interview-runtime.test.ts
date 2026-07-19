@@ -5,6 +5,7 @@ import * as url from "node:url";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import {
 	createDeepInterviewIntentManifest,
+	MAX_INITIAL_CONTEXT_LENGTH,
 	reviewDeepInterviewIntent,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
@@ -452,6 +453,15 @@ describe("native gjc deep-interview runtime", () => {
 		expect(state.threshold_source).toBe("default");
 		expect(state.state.initial_idea).toBe("my vague idea");
 		expect(state.state.established_facts).toEqual([]);
+	});
+
+	it("rejects an oversized initial idea before seeding workflow state", async () => {
+		const root = await tempDir();
+		const result = await runNativeDeepInterviewCommand(["--json", "한".repeat(MAX_INITIAL_CONTEXT_LENGTH + 1)], root);
+
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("initial_idea exceeds max length");
+		await expect(fs.stat(modeStatePath(root, TEST_SESSION_ID, "deep-interview"))).rejects.toThrow();
 	});
 
 	it("runs an optional bounded trace pre-step before deep-interview questions", async () => {

@@ -12,6 +12,7 @@ import {
 	enrichDeepInterviewRoundScoring,
 	enrichRoundWithScoring,
 	ensureDeepInterviewStateShape,
+	MAX_USER_RESPONSE_LENGTH,
 	projectCompactState,
 	questionHash,
 	readDeepInterviewStateCompact,
@@ -299,6 +300,26 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 		const persisted = JSON.parse(await fs.readFile(statePath, "utf-8"));
 		expect(persisted.state.rounds).toHaveLength(1);
 		expect(persisted.skill).toBe("deep-interview");
+	});
+
+	it("rejects oversized custom input before durable round persistence", async () => {
+		const cwd = await tempDir();
+		const statePath = statePathFor(cwd);
+
+		await expect(
+			appendOrMergeDeepInterviewRound(
+				cwd,
+				statePath,
+				{
+					round: 1,
+					questionId: "q-oversized",
+					questionText: "Q?",
+					customInput: "한".repeat(MAX_USER_RESPONSE_LENGTH + 1),
+				},
+				{ sessionId: TEST_SESSION_ID },
+			),
+		).rejects.toThrow("user_response exceeds max length 10000");
+		await expect(fs.stat(statePath)).rejects.toThrow();
 	});
 
 	it("locks a canonical Round-0 contract to the recorder answer hash without retaining raw custom input", async () => {

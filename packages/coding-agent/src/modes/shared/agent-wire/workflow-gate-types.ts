@@ -50,38 +50,60 @@ export interface AskGateStageStateInput {
 export interface AskGateSchemaInput {
 	multi?: boolean;
 	allowEmpty?: boolean;
+	customMaxLength?: number;
 }
 
 function isBoundedAskGateString(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0 && new TextEncoder().encode(value).byteLength <= 256;
 }
 
-/** Max bytes for a longer inert reference string (url/excerpt); never fetched. */
-const MAX_ASK_GATE_LONG_STRING_BYTES = 2048;
+/** Max characters for adapter metadata identifiers and confused terms. */
+const MAX_ASK_GATE_ADAPTER_STRING_LENGTH = 256;
+const MAX_ASK_GATE_DEEP_INTERVIEW_STRING_LENGTH = 128;
+/** Max characters for a longer inert reference string (url/excerpt); never fetched. */
+const MAX_ASK_GATE_LONG_STRING_LENGTH = 2048;
 const MAX_ASK_GATE_CONFUSED_TERMS = 32;
 const MAX_ASK_GATE_REFERENCES = 32;
 
+function isBoundedAskGateAdapterString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && value.length <= MAX_ASK_GATE_ADAPTER_STRING_LENGTH;
+}
+
+function isBoundedAskGateDeepInterviewString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && value.length <= MAX_ASK_GATE_DEEP_INTERVIEW_STRING_LENGTH;
+}
+
 function isBoundedAskGateLongString(value: unknown): value is string {
-	return (
-		typeof value === "string" &&
-		value.length > 0 &&
-		new TextEncoder().encode(value).byteLength <= MAX_ASK_GATE_LONG_STRING_BYTES
-	);
+	return typeof value === "string" && value.length > 0 && value.length <= MAX_ASK_GATE_LONG_STRING_LENGTH;
+}
+
+function isDenseArray(value: unknown[]): boolean {
+	for (let index = 0; index < value.length; index++) if (!Object.hasOwn(value, index)) return false;
+	return true;
 }
 
 function isValidAskGateConfusedTerms(value: unknown): value is string[] {
-	return Array.isArray(value) && value.length <= MAX_ASK_GATE_CONFUSED_TERMS && value.every(isBoundedAskGateString);
+	return (
+		Array.isArray(value) &&
+		isDenseArray(value) &&
+		value.length <= MAX_ASK_GATE_CONFUSED_TERMS &&
+		value.every(isBoundedAskGateAdapterString)
+	);
 }
 
 function isValidAskGateReference(value: unknown): boolean {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== Object.prototype && prototype !== null) return false;
 	const ref = value as Record<string, unknown>;
 	const allowed = new Set(["reference_id", "label", "origin", "url", "excerpt"]);
 	if (Object.keys(ref).some(key => !allowed.has(key))) return false;
+	if (!Object.hasOwn(ref, "reference_id") || !Object.hasOwn(ref, "label") || !Object.hasOwn(ref, "origin"))
+		return false;
 	if (
-		!isBoundedAskGateString(ref.reference_id) ||
-		!isBoundedAskGateString(ref.label) ||
-		!isBoundedAskGateString(ref.origin)
+		!isBoundedAskGateAdapterString(ref.reference_id) ||
+		!isBoundedAskGateAdapterString(ref.label) ||
+		!isBoundedAskGateAdapterString(ref.origin)
 	)
 		return false;
 	if (ref.url !== undefined && !isBoundedAskGateLongString(ref.url)) return false;
@@ -90,7 +112,12 @@ function isValidAskGateReference(value: unknown): boolean {
 }
 
 function isValidAskGateReferences(value: unknown): boolean {
-	return Array.isArray(value) && value.length <= MAX_ASK_GATE_REFERENCES && value.every(isValidAskGateReference);
+	return (
+		Array.isArray(value) &&
+		isDenseArray(value) &&
+		value.length <= MAX_ASK_GATE_REFERENCES &&
+		value.every(isValidAskGateReference)
+	);
 }
 
 /** Rejects stage state that is not exactly compatible with the generic ask-gate producer. */
@@ -131,7 +158,10 @@ export function validateAskGateStageState(value: unknown): asserts value is Reco
 		throw new Error("ask gate stage_state has invalid required fields");
 	if (state.navigation_label !== undefined && state.navigation_label !== "Next" && state.navigation_label !== "Done")
 		throw new Error("ask gate stage_state has an invalid navigation label");
-	for (const key of ["round_id", "component", "dimension", "mode", "challenge_mode"])
+	for (const key of ["round_id", "component", "dimension"])
+		if (state[key] !== undefined && !isBoundedAskGateDeepInterviewString(state[key]))
+			throw new Error(`ask gate stage_state has an invalid ${key}`);
+	for (const key of ["mode", "challenge_mode"])
 		if (state[key] !== undefined && !isBoundedAskGateString(state[key]))
 			throw new Error(`ask gate stage_state has an invalid ${key}`);
 	if (state.deep_interview_metadata !== undefined && typeof state.deep_interview_metadata !== "boolean")
@@ -173,6 +203,7 @@ export function buildAskGateAnswerSchema(question: AskGateSchemaInput, labels: s
 			custom: {
 				type: "string",
 				minLength: 1,
+				...(question.customMaxLength === undefined ? {} : { maxLength: question.customMaxLength }),
 				pattern: "\\S",
 				description: "free-text answer; required when `other` is true",
 			},
@@ -201,7 +232,12 @@ export function buildAskGateAnswerSchema(question: AskGateSchemaInput, labels: s
 				properties: {
 					selected: selectedWithOther,
 					other: { const: true },
-					custom: { type: "string", minLength: 1, pattern: "\\S" },
+					custom: {
+						type: "string",
+						minLength: 1,
+						...(question.customMaxLength === undefined ? {} : { maxLength: question.customMaxLength }),
+						pattern: "\\S",
+					},
 					action: { const: "answer" },
 				},
 				required: ["selected", "other", "custom"],

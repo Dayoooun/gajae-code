@@ -358,6 +358,43 @@ describe("native gjc state runtime", () => {
 		expect(result.stderr).toContain("--input is not valid JSON");
 	});
 
+	it("rejects oversized deep-interview initial context without creating or changing state", async () => {
+		const root = await tempDir();
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		const oversizedCreate = await runNativeStateCommand(
+			[
+				"write",
+				"--input",
+				JSON.stringify({ state: { initial_idea: "한".repeat(50_001) } }),
+				"--mode",
+				"deep-interview",
+			],
+			root,
+		);
+		expect(oversizedCreate.status).toBe(2);
+		expect(oversizedCreate.stderr).toContain("initial_idea exceeds max length 50000");
+		await expect(fs.stat(statePath)).rejects.toThrow();
+
+		const valid = await runNativeStateCommand(
+			["write", "--input", JSON.stringify({ state: { initial_idea: "valid" } }), "--mode", "deep-interview"],
+			root,
+		);
+		expect(valid.status).toBe(0);
+		const before = await fs.readFile(statePath, "utf-8");
+		const oversizedUpdate = await runNativeStateCommand(
+			[
+				"write",
+				"--input",
+				JSON.stringify({ state: { initial_context: "한".repeat(50_001) } }),
+				"--mode",
+				"deep-interview",
+			],
+			root,
+		);
+		expect(oversizedUpdate.status).toBe(2);
+		expect(await fs.readFile(statePath, "utf-8")).toBe(before);
+	});
+
 	it("preserves both writers' disjoint keys under interleaved write calls", async () => {
 		const root = await tempDir();
 		await runNativeStateCommand(["write", "--input", JSON.stringify({ a: 1 }), "--mode", "deep-interview"], root);

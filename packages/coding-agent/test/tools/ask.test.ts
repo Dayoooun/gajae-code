@@ -458,6 +458,61 @@ describe("AskTool cancellation", () => {
 		expect(abort).not.toHaveBeenCalled();
 	});
 
+	it("rejects oversized deep-interview custom input before recorder persistence", async () => {
+		const appendSpy = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
+		const tool = new AskTool(createSession());
+		const oversized = "한".repeat(10_001);
+		const context = createContext({
+			select: async (_prompt, options, dialogOptions) => {
+				dialogOptions?.customInput?.onSubmit(oversized);
+				return options[2];
+			},
+		});
+
+		await expect(
+			tool.execute(
+				"call-oversized-deep-input",
+				{ questions: [singleDeepInterviewQuestion()] },
+				undefined,
+				undefined,
+				context,
+			),
+		).rejects.toThrow("user_response exceeds max length 10000");
+		expect(appendSpy).not.toHaveBeenCalled();
+	});
+
+	it("rejects oversized legacy formatted deep-interview input before tool output", async () => {
+		const appendSpy = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
+		const oversized = "한".repeat(10_001);
+		const tool = new AskTool(createSession());
+		const context = createContext({
+			select: async (_prompt, options, dialogOptions) => {
+				dialogOptions?.customInput?.onSubmit(oversized);
+				return options.find(option => option === dialogOptions?.customInput?.optionLabel);
+			},
+		});
+
+		await expect(
+			tool.execute(
+				"call-oversized-legacy-deep-input",
+				{
+					questions: [
+						{
+							id: "legacy-deep",
+							question:
+								"Round 1 | Component: Scope | Targeting: Constraints | Why now: unresolved boundary | Ambiguity: 42%\n\nWhat is the boundary?",
+							options: [{ label: "Known" }],
+						},
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			),
+		).rejects.toThrow("user_response exceeds max length 10000");
+		expect(appendSpy).not.toHaveBeenCalled();
+	});
+
 	it("does not enter custom input when timeout resolves to Other in multi-select", async () => {
 		const tool = new AskTool(
 			createSession({
