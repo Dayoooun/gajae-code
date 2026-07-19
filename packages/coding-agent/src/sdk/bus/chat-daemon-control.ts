@@ -55,7 +55,7 @@ export function isRecognizedLegacyGeneration(value: unknown): value is undefined
 }
 
 function hasProcessIncarnationAuthority(incarnation: unknown): incarnation is string {
-	return typeof incarnation === "string" && incarnation.length > 0 && incarnation !== "unavailable";
+	return typeof incarnation === "string" && isProcessIncarnation(incarnation);
 }
 
 function hasSafeChatDaemonOwnerShape(
@@ -767,11 +767,9 @@ async function acquireChatDaemonReclaimLock(
 	reclaimFile: string,
 	probe: ChatDaemonOwnershipProbe,
 ): Promise<{ close(): Promise<void> } | undefined> {
-	const owner: ChatDaemonOwnerLock = {
-		pid: process.pid,
-		incarnation: probe.pidIncarnation(process.pid) ?? "unavailable",
-		createdAt: Date.now(),
-	};
+	const incarnation = probe.pidIncarnation(process.pid);
+	if (!hasProcessIncarnationAuthority(incarnation)) return undefined;
+	const owner: ChatDaemonOwnerLock = { pid: process.pid, incarnation, createdAt: Date.now() };
 	if (await createChatDaemonOwnerLock(reclaimFile, owner)) return await fs.promises.open(reclaimFile, "r+");
 	if (!(await isStaleChatDaemonLock(reclaimFile, probe))) return undefined;
 	await fs.promises.unlink(reclaimFile).catch(() => undefined);
@@ -785,13 +783,10 @@ async function isStaleChatDaemonLock(lock: string, probe: ChatDaemonOwnershipPro
 		owner = JSON.parse(await fs.promises.readFile(lock, "utf8"));
 	} catch {}
 	if (isChatDaemonOwnerLock(owner)) {
+		if (!probe.pidAlive(owner.pid)) return true;
+		if (!hasProcessIncarnationAuthority(owner.incarnation)) return false;
 		const currentIncarnation = probe.pidIncarnation(owner.pid);
-		return (
-			!probe.pidAlive(owner.pid) ||
-			(owner.incarnation !== "unavailable" &&
-				(!isProcessIncarnation(owner.incarnation) ||
-					(currentIncarnation !== undefined && currentIncarnation !== owner.incarnation)))
-		);
+		return hasProcessIncarnationAuthority(currentIncarnation) && currentIncarnation !== owner.incarnation;
 	}
 	const stat = await fs.promises.stat(lock).catch(() => undefined);
 	return Boolean(stat && Date.now() - stat.mtimeMs >= UNPUBLISHED_OWNER_LOCK_STALE_MS);
@@ -837,17 +832,25 @@ export async function renewChatDaemonHeartbeat(input: {
 	pid?: number;
 	incarnation?: string;
 	transportHealthy: boolean;
+	pidAlive?: (pid: number) => boolean;
+	pidIncarnation?: (pid: number) => string | undefined;
 }): Promise<boolean> {
 	const paths = chatDaemonPaths(input.agentDir, input.kind);
+	const pidAlive = input.pidAlive ?? defaultPidAlive;
+	const pidIncarnation = input.pidIncarnation ?? defaultPidIncarnation;
 	return await withStateWriteLock(paths.state, async () => {
 		const state = await readJson<unknown>(paths.state);
 		if (!hasSafeChatDaemonStateShape(state)) return false;
 		const pid = input.pid ?? state.pid;
+		const currentIncarnation = pidIncarnation(pid);
 		if (
 			state.ownerId !== input.ownerId ||
 			pid !== state.pid ||
-			!input.incarnation ||
-			state.incarnation !== input.incarnation
+			!hasProcessIncarnationAuthority(input.incarnation) ||
+			state.incarnation !== input.incarnation ||
+			!pidAlive(pid) ||
+			!hasProcessIncarnationAuthority(currentIncarnation) ||
+			currentIncarnation !== input.incarnation
 		)
 			return false;
 		await writeJson(paths.state, { ...state, heartbeatAt: Date.now(), transportHealthy: input.transportHealthy });
@@ -868,13 +871,16 @@ export async function releaseChatDaemonOwnership(input: {
 	const pidIncarnation = input.pidIncarnation ?? defaultPidIncarnation;
 	await withStateWriteLock(paths.state, async () => {
 		const state = await readJson<unknown>(paths.state);
+		const currentIncarnation = pidIncarnation(input.pid);
 		if (
 			!hasSafeChatDaemonStateShape(state) ||
+			!hasProcessIncarnationAuthority(input.incarnation) ||
 			state.ownerId !== input.ownerId ||
 			state.pid !== input.pid ||
 			state.incarnation !== input.incarnation ||
 			!pidAlive(input.pid) ||
-			pidIncarnation(input.pid) !== input.incarnation
+			!hasProcessIncarnationAuthority(currentIncarnation) ||
+			currentIncarnation !== input.incarnation
 		)
 			return;
 		await writeJson(paths.state, { ...state, stoppedAt: Date.now(), transportHealthy: false });

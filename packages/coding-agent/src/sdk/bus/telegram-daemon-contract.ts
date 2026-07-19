@@ -15,6 +15,7 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * on every daemon-behavior change independent of the wire version.
  * Generation 5 introduced capability-gated tool activity. The durable
  * Telegram tool-activity delivery policy changes daemon behavior again, so
- * upgraded hosts must replace generation-5 owners before attaching.
+ * upgraded hosts must replace generation-5 owners before attaching. Owner-lock
+ * authority advances the operational generation to 6.
  */
 export const DAEMON_GENERATION = 6;

@@ -148,7 +148,6 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 	private readonly now: () => number;
 	private readonly pidAlive: (pid: number) => boolean;
 	private readonly sendSignal: (pid: number, signal: NodeJS.Signals) => void;
-	private readonly pidIncarnation: (pid: number) => string | undefined;
 	private readonly waitStepMs: number;
 
 	constructor(
@@ -159,7 +158,6 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		this.now = deps.now ?? Date.now;
 		this.pidAlive = deps.pidAlive ?? defaultPidAlive;
 		this.sendSignal = deps.sendSignal ?? defaultSendSignal;
-		this.pidIncarnation = deps.pidIncarnation ?? (() => undefined);
 		this.waitStepMs = deps.waitStepMs ?? DEFAULT_WAIT_STEP_MS;
 	}
 
@@ -457,7 +455,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 			this.fsImpl,
 		);
 		if ((await this.signalCapturedOwner(capturedOwner, fp, chatId, "SIGTERM")) === "ownership_changed") {
-			await this.clearOwnRequest(requestId, oldOwnerId);
+			await this.clearOwnRequest(requestId);
 			return this.result(
 				action,
 				false,
@@ -487,7 +485,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 					pidIncarnation: this.deps.pidIncarnation,
 				});
 			if (changedToLiveOwner) {
-				await this.clearOwnRequest(requestId, oldOwnerId);
+				await this.clearOwnRequest(requestId);
 				const after = await this.status();
 				if (!dead) {
 					return this.result(
@@ -513,7 +511,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 				}
 			}
 			if (!dead) {
-				await this.clearOwnRequest(requestId, oldOwnerId);
+				await this.clearOwnRequest(requestId);
 				const after = await this.status();
 				const message = opts.force
 					? "old daemon did not exit after SIGKILL; refusing to spawn to avoid a Telegram 409 conflict"
@@ -523,7 +521,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		}
 
 		// Old pid is dead: safe to clear our request and proceed.
-		await this.clearOwnRequest(requestId, oldOwnerId);
+		await this.clearOwnRequest(requestId);
 
 		if (action === "stop") {
 			const after = await this.status();
@@ -580,7 +578,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 	}
 
 	/** Clear only our exact control request; a successor request must survive. */
-	private async clearOwnRequest(requestId: string, _oldOwnerId: string): Promise<void> {
+	private async clearOwnRequest(requestId: string): Promise<void> {
 		const current = await readTelegramControlRequest(this.settings, this.fsImpl);
 		if (current?.requestId === requestId) await clearTelegramControlRequest(this.settings, requestId, this.fsImpl);
 	}

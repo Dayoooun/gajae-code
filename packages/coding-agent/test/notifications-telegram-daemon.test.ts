@@ -12,8 +12,8 @@ import {
 	TELEGRAM_MESSAGE_LIMIT,
 	TELEGRAM_PARSE_MODE,
 } from "../src/sdk/bus/html-format";
-import { RateLimitPool } from "../src/sdk/bus/rate-limit-pool";
 import { acquireDaemonTransitionLock } from "../src/sdk/bus/notification-service";
+import { RateLimitPool } from "../src/sdk/bus/rate-limit-pool";
 import { deliverRichWithFallback } from "../src/sdk/bus/rich-render";
 import {
 	acquireDaemonOwnership,
@@ -28,7 +28,6 @@ import {
 	endpointAuthorityDigest,
 	ensureTelegramDaemonRunning,
 	ensureTelegramDaemonRunningDetailed,
-	endpointAuthorityDigest,
 	isCurrentCompatibleOwner,
 	isFreshLiveOwner,
 	readDaemonState,
@@ -119,7 +118,7 @@ function readyTelegramSpawnFixture({
 					ownerId: pending.ownerId,
 					acquisitionId: pending.ownerId,
 					pid: pending.pid,
-					pidIncarnation: () => "stable",
+					pidIncarnation: () => "linux:100",
 					now,
 				}),
 			).toBe(true);
@@ -131,7 +130,7 @@ function readyTelegramSpawnFixture({
 					ownerId: pending.ownerId,
 					acquisitionId: pending.ownerId,
 					pid: pending.pid,
-					pidIncarnation: () => "stable",
+					pidIncarnation: () => "linux:100",
 					now,
 				});
 		},
@@ -380,7 +379,7 @@ describe("telegram daemon", () => {
 						spawn: child.spawn,
 						sleep: child.publishReady,
 						pidAlive: pid => pid === 111 || pid === 211,
-						pidIncarnation: () => "stable",
+						pidIncarnation: () => "linux:100",
 						pid: 111,
 					},
 				),
@@ -566,7 +565,7 @@ describe("telegram daemon", () => {
 				{
 					now: () => now,
 					pidAlive: pid => pid === 999,
-					pidIncarnation: () => "stable",
+					pidIncarnation: () => "linux:100",
 					sendSignal: () => undefined,
 					sleep: async () => {
 						now += 8_000;
@@ -695,7 +694,7 @@ describe("telegram daemon", () => {
 			paths.state,
 			JSON.stringify({
 				pid: 999,
-				incarnation: "stable",
+				incarnation: "linux:100",
 				ownerId: "old",
 				tokenFingerprint: "fp",
 				chatId: "42",
@@ -712,7 +711,7 @@ describe("telegram daemon", () => {
 					tokenFingerprint: "fp",
 					chatId: "42",
 					pidAlive: pid => pid !== 999,
-					pidIncarnation: () => "stable",
+					pidIncarnation: () => "linux:100",
 					pid: 222,
 				}),
 			),
@@ -738,6 +737,8 @@ describe("telegram daemon", () => {
 				pid: 222,
 				now: () => 30_000,
 				pidAlive: () => false,
+				pidIncarnation: () => "linux:101",
+
 				randomId: () => "successor",
 			}),
 		).resolves.toMatchObject({ acquired: true, ownerId: "successor" });
@@ -764,13 +765,15 @@ describe("telegram daemon", () => {
 		).resolves.toMatchObject({ acquired: true, ownerId: "successor" });
 		expect((await readDaemonState(s))?.pid).toBe(222);
 	});
-	test("does not replace a live initializer when the concurrent state is malformed", async () => {
+	test("keeps legacy PID-only live initializer artifacts blocked and unchanged", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
 		fs.mkdirSync(paths.dir, { recursive: true });
-		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, startedAt: 29_999 }));
-		fs.writeFileSync(paths.state, JSON.stringify({ pid: "invalid", tokenFingerprint: "fp", chatId: "42" }));
+		const lock = JSON.stringify({ pid: 111, startedAt: 29_999 });
+		const state = JSON.stringify({ pid: "invalid", tokenFingerprint: "fp", chatId: "42" });
+		fs.writeFileSync(paths.lock, lock);
+		fs.writeFileSync(paths.state, state);
 
 		await expect(
 			acquireDaemonOwnership({
@@ -780,9 +783,11 @@ describe("telegram daemon", () => {
 				pid: 222,
 				now: () => 30_000,
 				pidAlive: pid => pid === 111,
+				pidIncarnation: pid => (pid === 111 ? "linux:102" : "linux:101"),
 			}),
-		).resolves.toMatchObject({ acquired: false, attached: true });
-		expect(((await readDaemonState(s)) as unknown as { pid?: unknown })?.pid).toBe("invalid");
+		).resolves.toEqual({ acquired: false, attached: false, blocked: true });
+		expect(fs.readFileSync(paths.lock, "utf8")).toBe(lock);
+		expect(fs.readFileSync(paths.state, "utf8")).toBe(state);
 	});
 	test("stopped state with a retained lock is taken over even when its PID is live", async () => {
 		const agentDir = tempAgentDir();
@@ -814,6 +819,7 @@ describe("telegram daemon", () => {
 				pid: 222,
 				now: () => 30_000,
 				pidAlive: pid => pid === 111,
+				pidIncarnation: pid => (pid === 111 ? "linux:103" : "linux:101"),
 			}),
 		).resolves.toMatchObject({ acquired: true });
 	});
@@ -952,11 +958,16 @@ describe("telegram daemon", () => {
 				chatId: "42",
 				pid: 111,
 				now: () => 0,
+				pidIncarnation: () => "linux:111",
 				fs: crashingFs,
 			}),
 		).rejects.toThrow("simulated crash");
 		expect(fs.existsSync(paths.lock)).toBe(true);
-		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toEqual({ pid: 111, startedAt: 0 });
+		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toEqual({
+			pid: 111,
+			incarnation: "linux:111",
+			startedAt: 0,
+		});
 		expect(fs.existsSync(paths.state)).toBe(false);
 
 		expect(
@@ -967,26 +978,145 @@ describe("telegram daemon", () => {
 				pid: 222,
 				now: () => 30_000,
 				pidAlive: () => false,
+				pidIncarnation: () => "linux:222",
 			}),
 		).toMatchObject({ acquired: true });
 	});
-	test("metadata-bearing lock does not steal from a live initializer", async () => {
+	test("classifies a canonical live initializer without state as provisional", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
 		fs.mkdirSync(paths.dir, { recursive: true });
-		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, startedAt: 0 }));
+		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, incarnation: "linux:111", startedAt: 0 }));
 
-		expect(
-			await acquireDaemonOwnership({
+		await expect(
+			acquireDaemonOwnership({
 				settings: s,
 				tokenFingerprint: "fp",
 				chatId: "42",
 				pid: 222,
 				now: () => 30_000,
 				pidAlive: pid => pid === 111,
+				pidIncarnation: pid => (pid === 111 ? "linux:111" : "linux:222"),
 			}),
-		).toEqual({ acquired: false, attached: true });
+		).resolves.toEqual({ acquired: false, attached: false, provisional: true });
+	});
+	test("waits for a canonical initializer to publish ready state before registering its root", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		const cwd = path.join(agentDir, "concurrent-session");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, incarnation: "linux:111", startedAt: 100 }));
+		let published = false;
+
+		await expect(
+			ensureTelegramDaemonRunningDetailed(
+				{ settings: s, cwd, sessionId: "concurrent-session" },
+				{
+					pid: 222,
+					now: () => 100,
+					pidAlive: pid => pid === 111,
+					pidIncarnation: pid => (pid === 111 ? "linux:111" : "linux:222"),
+					readinessTimeoutMs: 25,
+					waitStepMs: 5,
+					sleep: async () => {
+						expect(fs.existsSync(paths.roots)).toBe(false);
+						if (published) return;
+						published = true;
+						fs.writeFileSync(
+							paths.state,
+							JSON.stringify({
+								pid: 111,
+								incarnation: "linux:111",
+								ownerId: "initializer",
+								acquisitionId: "initializer",
+								ownershipPhase: "ready",
+								tokenFingerprint: tokenFingerprint("123456:secret-token"),
+								chatId: "42",
+								startedAt: 100,
+								heartbeatAt: 100,
+								roots: [],
+								version: DAEMON_VERSION,
+								generation: DAEMON_GENERATION,
+							}),
+						);
+					},
+				},
+			),
+		).resolves.toBe("attached");
+		expect(published).toBe(true);
+		expect(JSON.parse(fs.readFileSync(paths.roots, "utf8"))).toMatchObject({
+			sessions: { "concurrent-session": expect.any(String) },
+		});
+	});
+	test("times out a canonical initializer that never publishes ready state without registering its root", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, incarnation: "linux:111", startedAt: 100 }));
+		let sleeps = 0;
+
+		await expect(
+			ensureTelegramDaemonRunningDetailed(
+				{ settings: s, cwd: path.join(agentDir, "timeout-session"), sessionId: "timeout-session" },
+				{
+					pid: 222,
+					now: () => 100,
+					pidAlive: pid => pid === 111,
+					pidIncarnation: pid => (pid === 111 ? "linux:111" : "linux:222"),
+					readinessTimeoutMs: 10,
+					waitStepMs: 5,
+					sleep: async () => {
+						sleeps++;
+					},
+				},
+			),
+		).resolves.toBe("blocked_identity");
+		expect(sleeps).toBe(2);
+		expect(fs.existsSync(paths.roots)).toBe(false);
+	});
+	test("blocks a live initializer lock when canonical provenance is unavailable", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		const lock = JSON.stringify({ pid: 111, incarnation: "linux:111", startedAt: 0 });
+		fs.writeFileSync(paths.lock, lock);
+
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 222,
+				pidAlive: pid => pid === 111,
+				pidIncarnation: pid => (pid === 111 ? undefined : "linux:222"),
+			}),
+		).resolves.toEqual({ acquired: false, attached: false, blocked: true });
+		expect(fs.readFileSync(paths.lock, "utf8")).toBe(lock);
+	});
+	test("reclaims a canonical initializer lock after PID reuse", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, incarnation: "linux:444", startedAt: 0 }));
+
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 222,
+				now: () => 30_000,
+				pidAlive: pid => pid === 111,
+				pidIncarnation: pid => (pid === 111 ? "linux:333" : "linux:222"),
+				ownerId: "successor",
+			}),
+		).resolves.toMatchObject({ acquired: true, ownerId: "successor" });
+		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toMatchObject({ pid: 222, incarnation: "linux:222" });
 	});
 
 	test("recovers a lock written before its owner state", async () => {
@@ -1003,14 +1133,14 @@ describe("telegram daemon", () => {
 				chatId: "42",
 				pid: 222,
 				pidAlive: () => true,
-				pidIncarnation: () => "stable",
+				pidIncarnation: () => "linux:100",
 				randomId: () => "recovered",
 			}),
 		).resolves.toMatchObject({ acquired: true, ownerId: "recovered" });
 		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({
 			ownerId: "recovered",
 			pid: 222,
-			incarnation: "stable",
+			incarnation: "linux:100",
 		});
 	});
 
@@ -1024,7 +1154,7 @@ describe("telegram daemon", () => {
 			paths.state,
 			JSON.stringify({
 				pid: 999,
-				incarnation: "stable",
+				incarnation: "linux:100",
 				ownerId: "old",
 				tokenFingerprint: "fp",
 				chatId: "42",
@@ -1042,7 +1172,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "fp",
 			chatId: "42",
 			pidAlive: () => true,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			now: () => 101,
 		});
 		expect(result).toEqual({ acquired: false, attached: true });
@@ -1058,7 +1188,7 @@ describe("telegram daemon", () => {
 			paths.state,
 			JSON.stringify({
 				pid: 999,
-				incarnation: "stable",
+				incarnation: "linux:100",
 				ownerId: "old",
 				tokenFingerprint: "old-fp",
 				chatId: "old-chat",
@@ -1086,7 +1216,7 @@ describe("telegram daemon", () => {
 			{
 				now: () => 101,
 				pidAlive: pid => pid === 999,
-				pidIncarnation: () => "stable",
+				pidIncarnation: () => "linux:100",
 				sendSignal: (pid, signal) => signals.push([pid, signal]),
 				fs: recordingFs,
 				spawn: () => {
@@ -1121,7 +1251,7 @@ describe("telegram daemon", () => {
 	function liveOwnerState(extra: Partial<DaemonState> = {}): DaemonState {
 		return {
 			pid: 999,
-			incarnation: "stable",
+			incarnation: "linux:100",
 			ownerId: "old",
 			tokenFingerprint: "e60b05c186ca",
 			chatId: "42",
@@ -1141,7 +1271,7 @@ describe("telegram daemon", () => {
 		fs.writeFileSync(paths.state, JSON.stringify(liveOwnerState(extra)));
 		fs.writeFileSync(paths.lock, "");
 	}
-	test("keeps the wire protocol at 3 while reload ownership uses generation 6", () => {
+	test("keeps the wire protocol at 3 while reload ownership and owner-lock authority use generation 6", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		expect(DAEMON_GENERATION).toBe(6);
 	});
@@ -1155,7 +1285,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "e60b05c186ca",
 			chatId: "42",
 			pidAlive: () => true,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			now: () => 101,
 		});
 		expect(result).toEqual({ acquired: false, attached: false, reloadRequired: true });
@@ -1169,6 +1299,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "e60b05c186ca",
 			chatId: "42",
 			pidAlive: () => true,
+			pidIncarnation: () => "linux:100",
 			now: () => Date.now(),
 		});
 		expect(result).toEqual({ acquired: false, attached: false, reloadRequired: true });
@@ -1196,7 +1327,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "e60b05c186ca",
 			chatId: "42",
 			pidAlive: (pid: number) => pid === 999,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			now: () => 101,
 		};
 		expect(await acquireDaemonOwnership(input)).toEqual({ acquired: false, attached: false, provisional: true });
@@ -1220,9 +1351,9 @@ describe("telegram daemon", () => {
 			version: 1,
 		};
 		for (const [name, pidAlive, pidIncarnation, expected] of [
-			["dead", () => false, () => "stable", true],
+			["dead", () => false, () => "linux:100", true],
 			["reused", () => true, () => undefined, false],
-			["static", () => true, () => "stable", false],
+			["static", () => true, () => "linux:100", false],
 		] as const) {
 			const agentDir = tempAgentDir();
 			const s = setPrivateAgentDir(settings(agentDir), agentDir);
@@ -1272,7 +1403,7 @@ describe("telegram daemon", () => {
 				pid: 222,
 				randomId: () => "reclaimed",
 				pidAlive: () => false,
-				pidIncarnation: () => "stable",
+				pidIncarnation: () => "linux:100",
 				now: () => 101,
 			}),
 		).toMatchObject({ acquired: true });
@@ -1305,7 +1436,7 @@ describe("telegram daemon", () => {
 				},
 				pid: 222,
 				pidAlive: () => false,
-				pidIncarnation: () => "stable",
+				pidIncarnation: () => "linux:100",
 				now: () => 100_000,
 				retries: 1,
 				retryDelayMs: 0,
@@ -1314,9 +1445,36 @@ describe("telegram daemon", () => {
 		).toBe(true);
 		expect(JSON.parse(fs.readFileSync(marker, "utf8"))).toEqual({
 			pid: 222,
-			incarnation: "stable",
+			incarnation: "linux:100",
 			createdAt: 100_000,
 		});
+	});
+	test("transition lock retains a live non-canonical owner", async () => {
+		const agentDir = tempAgentDir();
+		const marker = path.join(agentDir, "transition.steal");
+		const legacy = JSON.stringify({ pid: 999, incarnation: "darwin:Thu Jul 17 10:00:00 2025", createdAt: 1 });
+		fs.writeFileSync(marker, legacy);
+		const transitionFs = {
+			readFile: (file: string, encoding: "utf8") => fs.promises.readFile(file, encoding),
+			writeFile: (file: string, data: string, opts?: Parameters<typeof fs.promises.writeFile>[2]) =>
+				fs.promises.writeFile(file, data, opts),
+			unlink: (file: string) => fs.promises.unlink(file),
+			stat: async (file: string) => ({ mtimeMs: (await fs.promises.stat(file)).mtimeMs }),
+		};
+
+		expect(
+			await acquireDaemonTransitionLock({
+				fs: transitionFs,
+				path: marker,
+				createExclusive: async () => false,
+				pid: 222,
+				pidAlive: () => true,
+				pidIncarnation: () => "linux:222",
+				now: () => 100_000,
+				retries: 0,
+			}),
+		).toBe(false);
+		expect(fs.readFileSync(marker, "utf8")).toBe(legacy);
 	});
 
 	test("#2028 acquire attaches to a current-generation live owner (no reload)", async () => {
@@ -1328,7 +1486,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "e60b05c186ca",
 			chatId: "42",
 			pidAlive: () => true,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			now: () => 101,
 		});
 		expect(result).toEqual({ acquired: false, attached: true });
@@ -1343,7 +1501,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "e60b05c186ca",
 			chatId: "42",
 			pidAlive: () => true,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			now: () => 101,
 		});
 		expect(result).toEqual({ acquired: false, attached: false, provisional: true });
@@ -1364,7 +1522,7 @@ describe("telegram daemon", () => {
 			ownerId: "stale-owner",
 			acquisitionId: "stale-owner",
 			pid: 999,
-			incarnation: "stale-incarnation",
+			incarnation: "linux:104",
 			generation: DAEMON_GENERATION,
 		});
 
@@ -1374,7 +1532,7 @@ describe("telegram daemon", () => {
 				{
 					pid: 4242,
 					pidAlive: pid => pid === 999 || pid === 4243,
-					pidIncarnation: pid => (pid === 999 ? "replacement-incarnation" : "stable"),
+					pidIncarnation: pid => (pid === 999 ? "linux:105" : "linux:100"),
 					sendSignal: (pid, signal) => signals.push([pid, signal]),
 					spawn: child.spawn,
 					sleep: child.sleep,
@@ -1389,10 +1547,61 @@ describe("telegram daemon", () => {
 		expect(fs.existsSync(paths.lock)).toBe(true);
 		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({
 			pid: 4243,
-			incarnation: "stable",
+			incarnation: "linux:100",
 			generation: DAEMON_GENERATION,
 			ownershipPhase: "ready",
 		});
+	});
+	test("does not reclaim or attach a same-identity owner when PID provenance is unavailable", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION });
+		const stateBefore = fs.readFileSync(paths.state, "utf8");
+
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: tokenFingerprint("123456:secret-token"),
+				chatId: "42",
+				pid: 4242,
+				pidAlive: () => true,
+				pidIncarnation: pid => (pid === 999 ? undefined : "linux:100"),
+			}),
+		).resolves.toEqual({ acquired: false, attached: false, blocked: true });
+		expect(fs.existsSync(paths.lock)).toBe(true);
+		expect(fs.readFileSync(paths.state, "utf8")).toBe(stateBefore);
+	});
+	test("leaves complete live legacy ownership artifacts unchanged when provenance is non-canonical", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		writeLiveOwner(agentDir, {
+			incarnation: "darwin:Thu Jul 17 10:00:00 2025" as unknown as string,
+			generation: undefined,
+		});
+		fs.writeFileSync(paths.lock, "legacy-owner-lock");
+		fs.writeFileSync(
+			paths.steal,
+			JSON.stringify({ pid: 999, incarnation: "darwin:Thu Jul 17 10:00:00 2025", createdAt: 1 }),
+		);
+		const stateBefore = fs.readFileSync(paths.state, "utf8");
+		const lockBefore = fs.readFileSync(paths.lock, "utf8");
+		const transitionLockBefore = fs.readFileSync(paths.steal, "utf8");
+
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: tokenFingerprint("123456:secret-token"),
+				chatId: "42",
+				pid: 4242,
+				pidAlive: () => true,
+				pidIncarnation: () => "linux:4242",
+			}),
+		).resolves.toEqual({ acquired: false, attached: false, blocked: true });
+		expect(fs.readFileSync(paths.state, "utf8")).toBe(stateBefore);
+		expect(fs.readFileSync(paths.lock, "utf8")).toBe(lockBefore);
+		expect(fs.readFileSync(paths.steal, "utf8")).toBe(transitionLockBefore);
 	});
 
 	test("#2028 acquire does not downgrade a NEWER-generation live owner (attaches)", async () => {
@@ -1404,7 +1613,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "e60b05c186ca",
 			chatId: "42",
 			pidAlive: () => true,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			now: () => 101,
 		});
 		expect(result).toEqual({ acquired: false, attached: true });
@@ -1418,7 +1627,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "e60b05c186ca",
 			chatId: "42",
 			pid: 111,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			randomId: () => "owner",
 		});
 		expect(result).toMatchObject({ acquired: true, ownerId: "owner", acquisitionId: "owner" });
@@ -1438,7 +1647,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "e60b05c186ca",
 			chatId: "42",
 			pid: 111,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			randomId: () => "owner",
 		});
 		expect(
@@ -1447,7 +1656,7 @@ describe("telegram daemon", () => {
 				ownerId: "owner",
 				acquisitionId: "other",
 				pid: 111,
-				pidIncarnation: () => "stable",
+				pidIncarnation: () => "linux:100",
 			}),
 		).toBe(false);
 		expect(
@@ -1456,7 +1665,7 @@ describe("telegram daemon", () => {
 				ownerId: "owner",
 				acquisitionId: "owner",
 				pid: 111,
-				pidIncarnation: () => "stable",
+				pidIncarnation: () => "linux:100",
 			}),
 		).toBe(true);
 		expect(JSON.parse(fs.readFileSync(daemonPaths(agentDir).state, "utf8"))).toMatchObject({
@@ -1474,7 +1683,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "e60b05c186ca",
 			chatId: "42",
 			pid: 111,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			randomId: () => "owner",
 		});
 		const paths = daemonPaths(agentDir);
@@ -1486,7 +1695,7 @@ describe("telegram daemon", () => {
 				ownerId: "owner",
 				acquisitionId: "owner",
 				pid: 111,
-				pidIncarnation: () => "stable",
+				pidIncarnation: () => "linux:100",
 				stealRetries: 2,
 				stealRetryDelayMs: 0,
 				sleep: async () => undefined,
@@ -1503,7 +1712,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "e60b05c186ca",
 			chatId: "42",
 			pid: 111,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			randomId: () => "owner",
 		});
 		const paths = daemonPaths(agentDir);
@@ -1513,7 +1722,7 @@ describe("telegram daemon", () => {
 				settings: s,
 				ownerId: "owner",
 				pid: 111,
-				pidIncarnation: () => "stable",
+				pidIncarnation: () => "linux:100",
 				stealRetries: 0,
 			}),
 		).toBe(false);
@@ -1523,7 +1732,7 @@ describe("telegram daemon", () => {
 				settings: s,
 				ownerId: "owner",
 				pid: 111,
-				pidIncarnation: () => "stable",
+				pidIncarnation: () => "linux:100",
 				stealRetries: 1,
 				stealRetryDelayMs: 0,
 			}),
@@ -1538,7 +1747,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "e60b05c186ca",
 			chatId: "42",
 			pid: 111,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			randomId: () => "owner",
 		});
 		const paths = daemonPaths(agentDir);
@@ -1550,7 +1759,7 @@ describe("telegram daemon", () => {
 				ownerId: "owner",
 				acquisitionId: "owner",
 				pid: 111,
-				pidIncarnation: () => "stable",
+				pidIncarnation: () => "linux:100",
 				stealRetries: 1,
 				stealRetryDelayMs: 0,
 				sleep: async () => {
@@ -1575,7 +1784,7 @@ describe("telegram daemon", () => {
 				{
 					pid: 4242,
 					pidAlive: () => true,
-					pidIncarnation: () => "stable",
+					pidIncarnation: () => "linux:100",
 					sendSignal: (pid, signal) => signals.push([pid, signal]),
 					spawn: () => {
 						spawns++;
@@ -1637,7 +1846,7 @@ describe("telegram daemon", () => {
 			{
 				pid: 4242,
 				pidAlive: pid => alive.has(pid),
-				pidIncarnation: () => "stable",
+				pidIncarnation: () => "linux:100",
 				sendSignal: (pid, sig) => {
 					signals.push([pid, sig]);
 					if (sig === "SIGTERM") alive.delete(999);
@@ -1676,7 +1885,7 @@ describe("telegram daemon", () => {
 			{
 				pid: 4242,
 				pidAlive: pid => alive.has(pid),
-				pidIncarnation: () => "stable",
+				pidIncarnation: () => "linux:100",
 				sendSignal: (pid, signal) => {
 					signals.push([pid, signal]);
 					if (signal === "SIGTERM") alive.delete(999);
@@ -1730,7 +1939,7 @@ describe("telegram daemon", () => {
 				{
 					now: () => now,
 					pidAlive: pid => pid === 999,
-					pidIncarnation: () => "stable",
+					pidIncarnation: () => "linux:100",
 					sendSignal: () => undefined,
 					sleep: async () => {
 						now += 8_000;
@@ -1757,7 +1966,7 @@ describe("telegram daemon", () => {
 				{
 					now: () => now,
 					pidAlive: pid => pid === 999,
-					pidIncarnation: () => "stable",
+					pidIncarnation: () => "linux:100",
 					sendSignal: () => undefined,
 					sleep: async () => {
 						now += 8_000;
@@ -1787,7 +1996,7 @@ describe("telegram daemon", () => {
 					pid: 4242,
 					now: () => 100_000,
 					pidAlive: () => true,
-					pidIncarnation: () => "stable",
+					pidIncarnation: () => "linux:100",
 					sendSignal: (pid, signal) => signals.push([pid, signal]),
 					spawn: () => {
 						spawns++;
@@ -1803,7 +2012,8 @@ describe("telegram daemon", () => {
 	test("v0.10.2 generation 3 is physically live but requires a current-generation handoff", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
-		const legacyGeneration = DAEMON_GENERATION - 1;
+		const legacyGeneration = 3;
+
 		const state = liveOwnerState({ generation: legacyGeneration, heartbeatAt: 100 });
 		writeLiveOwner(agentDir, { generation: legacyGeneration, heartbeatAt: 100 });
 
@@ -1815,7 +2025,7 @@ describe("telegram daemon", () => {
 				tokenFingerprint: "e60b05c186ca",
 				chatId: "42",
 				pidAlive: pid => pid === 999,
-				pidIncarnation: () => "stable",
+				pidIncarnation: () => "linux:100",
 			}),
 		).toBe(true);
 		expect(
@@ -1825,7 +2035,7 @@ describe("telegram daemon", () => {
 				tokenFingerprint: "e60b05c186ca",
 				chatId: "42",
 				pidAlive: pid => pid === 999,
-				pidIncarnation: () => "stable",
+				pidIncarnation: () => "linux:100",
 			}),
 		).toBe(false);
 
@@ -1835,7 +2045,7 @@ describe("telegram daemon", () => {
 			chatId: "42",
 			now: () => 101,
 			pidAlive: pid => pid === 999,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 		});
 		expect(ownership).toEqual({ acquired: false, attached: false, reloadRequired: true });
 	});
@@ -1860,7 +2070,7 @@ describe("telegram daemon", () => {
 					pid: 4242,
 					now: () => now,
 					pidAlive: pid => pid === 4243,
-					pidIncarnation: () => "stable",
+					pidIncarnation: () => "linux:100",
 					spawn: child.spawn,
 					readinessTimeoutMs: 1,
 					waitStepMs: 1,
@@ -1893,7 +2103,7 @@ describe("telegram daemon", () => {
 			pid: 4242,
 			now: () => now,
 			pidAlive: (pid: number) => pid === 4244,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			spawn: (_command: string, args: string[]) => {
 				spawns++;
 				ownerId = args[args.indexOf("--owner-id") + 1]!;
@@ -1914,7 +2124,7 @@ describe("telegram daemon", () => {
 						ownerId,
 						acquisitionId: ownerId,
 						pid: 4244,
-						pidIncarnation: () => "stable",
+						pidIncarnation: () => "linux:100",
 						now: () => now,
 					});
 				}
@@ -1955,7 +2165,7 @@ describe("telegram daemon", () => {
 					pid: 4242,
 					now: () => now,
 					pidAlive: pid => pid === 4243,
-					pidIncarnation: () => "stable",
+					pidIncarnation: () => "linux:100",
 					spawn: (_command, args) => {
 						ownerId = args[args.indexOf("--owner-id") + 1]!;
 						fs.writeFileSync(paths.steal, "held");
@@ -1971,7 +2181,7 @@ describe("telegram daemon", () => {
 							ownerId,
 							acquisitionId: ownerId,
 							pid: 4243,
-							pidIncarnation: () => "stable",
+							pidIncarnation: () => "linux:100",
 							now: () => now,
 						});
 					},
@@ -1993,7 +2203,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "e60b05c186ca",
 			chatId: "42",
 			pid: 4242,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			randomId: () => "race-child",
 			now: () => now,
 		});
@@ -2015,7 +2225,7 @@ describe("telegram daemon", () => {
 			pid: 4242,
 			now: () => now,
 			pidAlive: pid => pid === 4243,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			waitStepMs: 1,
 			timeoutMs: 1,
 			sleep: async () => {
@@ -2025,7 +2235,7 @@ describe("telegram daemon", () => {
 					ownerId: "race-child",
 					acquisitionId: "race-child",
 					pid: 4243,
-					pidIncarnation: () => "stable",
+					pidIncarnation: () => "linux:100",
 					now: () => now,
 				});
 			},
@@ -2047,7 +2257,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "e60b05c186ca",
 			chatId: "42",
 			pid: 4242,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			randomId: () => "no-child-pid",
 			now: () => now,
 		});
@@ -2065,7 +2275,7 @@ describe("telegram daemon", () => {
 			pid: 4242,
 			now: () => now,
 			pidAlive: pid => pid === 4242,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			waitStepMs: 1,
 			timeoutMs: 1,
 			sleep: async () => {
@@ -2075,7 +2285,7 @@ describe("telegram daemon", () => {
 					ownerId: "no-child-pid",
 					acquisitionId: "no-child-pid",
 					pid: 4242,
-					pidIncarnation: () => "stable",
+					pidIncarnation: () => "linux:100",
 					now: () => now,
 				});
 			},
@@ -2098,7 +2308,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "e60b05c186ca",
 			chatId: "42",
 			pid: 4242,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			randomId: () => "exact-owner",
 			now: () => now,
 		});
@@ -2110,7 +2320,7 @@ describe("telegram daemon", () => {
 			chatId: "42",
 			now: () => now,
 			pidAlive: pid => pid === 4243,
-			pidIncarnation: pid => (pid === 4243 ? "child" : "stable"),
+			pidIncarnation: pid => (pid === 4243 ? "linux:106" : "linux:100"),
 			timeoutMs: 4,
 			waitStepMs: 1,
 			sleep: async () => {
@@ -2121,7 +2331,7 @@ describe("telegram daemon", () => {
 						ownerId: "wrong-owner",
 						acquisitionId: "exact-owner",
 						pid: 4243,
-						pidIncarnation: () => "stable",
+						pidIncarnation: () => "linux:100",
 						now: () => now,
 					}),
 				).toBe(false);
@@ -2131,7 +2341,7 @@ describe("telegram daemon", () => {
 						ownerId: "exact-owner",
 						acquisitionId: "wrong-acquisition",
 						pid: 4243,
-						pidIncarnation: () => "stable",
+						pidIncarnation: () => "linux:100",
 						now: () => now,
 					}),
 				).toBe(false);
@@ -2141,7 +2351,7 @@ describe("telegram daemon", () => {
 						ownerId: "exact-owner",
 						acquisitionId: "exact-owner",
 						pid: 4243,
-						pidIncarnation: () => "child",
+						pidIncarnation: () => "linux:106",
 						now: () => now,
 					}),
 				).toBe(true);
@@ -2152,7 +2362,7 @@ describe("telegram daemon", () => {
 			ownerId: "exact-owner",
 			acquisitionId: "exact-owner",
 			pid: 4243,
-			incarnation: "child",
+			incarnation: "linux:106",
 			generation: DAEMON_GENERATION,
 			ownershipPhase: "ready",
 		});
@@ -2174,7 +2384,7 @@ describe("telegram daemon", () => {
 				settings: s,
 				ownerId: "provisional",
 				pid: 4242,
-				pidIncarnation: () => "stable",
+				pidIncarnation: () => "linux:100",
 				now: () => 101,
 			}),
 		).resolves.toBe(false);
@@ -2201,7 +2411,7 @@ describe("telegram daemon", () => {
 			pid: 4242,
 			now: () => now,
 			pidAlive: (pid: number) => (pid === 4242 && provisionalAlive) || (pid === 4243 && replacementAlive),
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			spawn: (...args: Parameters<typeof child.spawn>) => {
 				spawns++;
 				return spawns === 1 ? { unref() {} } : child.spawn(...args);
@@ -2248,7 +2458,7 @@ describe("telegram daemon", () => {
 			{
 				pid: 4242,
 				pidAlive: () => true,
-				pidIncarnation: () => "stable",
+				pidIncarnation: () => "linux:100",
 				sendSignal: (pid, sig) => signals.push([pid, sig]),
 				sleep: async () => undefined,
 				spawn: () => {
@@ -2301,7 +2511,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: tokenFingerprint("123456:secret-token"),
 			chatId: "42",
 			pid: 111,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			randomId: () => "owner",
 			allowPidRebind: true,
 		});
@@ -2320,7 +2530,7 @@ describe("telegram daemon", () => {
 					tokenFingerprint: tokenFingerprint("123456:secret-token"),
 					chatId: "42",
 					pid: this.#options.pid!,
-					pidIncarnation: () => "stable",
+					pidIncarnation: () => "linux:100",
 				});
 			}
 		}
@@ -2348,6 +2558,8 @@ describe("telegram daemon", () => {
 				execPath: "/usr/local/bin/bun",
 				platform: "win32",
 				pid: 7132,
+				pidIncarnation: () => "linux:107",
+
 				randomId: () => "launch-token",
 				spawn: (_command, args) => {
 					spawnArgs = args;
@@ -2356,7 +2568,8 @@ describe("telegram daemon", () => {
 			},
 		);
 
-		expect(spawned).toMatchObject({ result: "owner_spawned", ownerId: "daemon-launch-token" });
+		expect(spawned).toMatchObject({ result: "owner_spawned", acquisition: { ownerId: "daemon-launch-token" } });
+
 		expect(spawnArgs).toEqual(expect.arrayContaining(["--owner-id", "daemon-launch-token"]));
 		expect(
 			await renewDaemonHeartbeat({
@@ -2365,6 +2578,7 @@ describe("telegram daemon", () => {
 				tokenFingerprint: "fp",
 				chatId: "42",
 				pid: 8123,
+				pidIncarnation: () => "linux:108",
 			}),
 		).toBe(true);
 		expect((await readDaemonState(s))?.pid).toBe(8123);
@@ -2375,6 +2589,7 @@ describe("telegram daemon", () => {
 				tokenFingerprint: "fp",
 				chatId: "42",
 				pid: 9123,
+				pidIncarnation: () => "linux:109",
 			}),
 		).toBe(false);
 		expect((await readDaemonState(s))?.pid).toBe(8123);
@@ -2389,6 +2604,7 @@ describe("telegram daemon", () => {
 			pid: 7132,
 			ownerId: "daemon-launch-token",
 			allowPidRebind: true,
+			pidIncarnation: () => "linux:107",
 		});
 
 		const [firstBound, secondBound] = await Promise.all([
@@ -2398,6 +2614,7 @@ describe("telegram daemon", () => {
 				tokenFingerprint: "fp",
 				chatId: "42",
 				pid: 8123,
+				pidIncarnation: () => "linux:108",
 			}),
 			renewDaemonHeartbeat({
 				settings: s,
@@ -2405,6 +2622,7 @@ describe("telegram daemon", () => {
 				tokenFingerprint: "fp",
 				chatId: "42",
 				pid: 9123,
+				pidIncarnation: () => "linux:109",
 			}),
 		]);
 
@@ -2421,6 +2639,7 @@ describe("telegram daemon", () => {
 			pid: 7132,
 			ownerId: "daemon-launch-token",
 			allowPidRebind: true,
+			pidIncarnation: () => "linux:100",
 		});
 
 		const [bound] = await Promise.all([
@@ -2430,6 +2649,7 @@ describe("telegram daemon", () => {
 				tokenFingerprint: "fp",
 				chatId: "42",
 				pid: 8123,
+				pidIncarnation: () => "linux:100",
 			}),
 			releaseDaemonOwnership({
 				settings: s,
@@ -2437,6 +2657,7 @@ describe("telegram daemon", () => {
 				tokenFingerprint: "fp",
 				chatId: "42",
 				pid: 7132,
+				pidIncarnation: () => "linux:100",
 			}),
 		]);
 		const state = await readDaemonState(s);
@@ -2458,6 +2679,8 @@ describe("telegram daemon", () => {
 				execPath: "/usr/local/bin/bun",
 				platform: "linux",
 				pid: 4242,
+				pidIncarnation: () => "linux:110",
+
 				randomId: () => "4242-nonce",
 				spawn: () => ({ unref() {} }),
 			},
@@ -2469,15 +2692,19 @@ describe("telegram daemon", () => {
 				execPath: "/opt/gjc/gjc",
 				platform: "win32",
 				pid: 5252,
+				pidIncarnation: () => "linux:111",
 				randomId: () => "5252-nonce",
 				spawn: () => ({ unref() {} }),
 			},
 		);
 
-		expect(source).toMatchObject({ result: "owner_spawned", ownerId: "4242-nonce" });
-		expect(compiled).toMatchObject({ result: "owner_spawned", ownerId: "5252-nonce" });
-		expect(ownerPidFromOwnerId(source.ownerId!)).toBe(4242);
-		expect(ownerPidFromOwnerId(compiled.ownerId!)).toBe(5252);
+		expect(source).toMatchObject({ result: "owner_spawned", acquisition: { ownerId: "4242-nonce" } });
+		expect(compiled).toMatchObject({ result: "owner_spawned", acquisition: { ownerId: "5252-nonce" } });
+		if (source.result !== "owner_spawned" || compiled.result !== "owner_spawned") {
+			throw new Error("expected both daemon launchers to acquire ownership");
+		}
+		expect(ownerPidFromOwnerId(source.acquisition.ownerId)).toBe(4242);
+		expect(ownerPidFromOwnerId(compiled.acquisition.ownerId)).toBe(5252);
 		expect(
 			await acquireDaemonOwnership({
 				settings: settings(sourceAgentDir),
@@ -2486,6 +2713,7 @@ describe("telegram daemon", () => {
 				pid: 4343,
 				randomId: () => "4343-replacement",
 				pidAlive: pid => pid !== 4242,
+				pidIncarnation: () => "linux:105",
 			}),
 		).toMatchObject({ acquired: true, ownerId: "4343-replacement" });
 	});
@@ -2499,9 +2727,10 @@ describe("telegram daemon", () => {
 			chatId: "42",
 			pid: 7132,
 			ownerId: "owner",
+			pidIncarnation: () => "linux:100",
 		});
 
-		// @ts-expect-error Heartbeats require the Telegram identity and daemon PID.
+		// Runtime callers that omit identity or PID cannot renew ownership.
 		expect(await renewDaemonHeartbeat({ settings: s, ownerId: "owner" })).toBe(false);
 		expect(await readDaemonState(s)).toMatchObject({ pid: 7132, heartbeatAt: expect.any(Number) });
 	});
@@ -2515,6 +2744,7 @@ describe("telegram daemon", () => {
 			chatId: "42",
 			pid: 7132,
 			ownerId: "daemon-launch-token",
+			pidIncarnation: () => "linux:100",
 		});
 
 		expect(
@@ -2524,6 +2754,7 @@ describe("telegram daemon", () => {
 				tokenFingerprint: "foreign-fp",
 				chatId: "42",
 				pid: 8123,
+				pidIncarnation: () => "linux:100",
 			}),
 		).toBe(false);
 		expect(
@@ -2533,6 +2764,7 @@ describe("telegram daemon", () => {
 				tokenFingerprint: "fp",
 				chatId: "foreign-chat",
 				pid: 8123,
+				pidIncarnation: () => "linux:100",
 			}),
 		).toBe(false);
 		expect((await readDaemonState(s))?.pid).toBe(7132);
@@ -2546,6 +2778,7 @@ describe("telegram daemon", () => {
 			chatId: "42",
 			pid: 7132,
 			ownerId: "owner",
+			pidIncarnation: () => "linux:100",
 		});
 
 		await releaseDaemonOwnership({
@@ -2554,6 +2787,7 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "fp",
 			chatId: "42",
 			pid: 8123,
+			pidIncarnation: () => "linux:100",
 		});
 
 		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(true);
@@ -5595,7 +5829,7 @@ test("ensureTelegramDaemonRunning spawns the daemon subcommand with owner-id and
 			spawn: child.spawn,
 			sleep: child.sleep,
 			pidAlive: () => true,
-			pidIncarnation: () => "stable",
+			pidIncarnation: () => "linux:100",
 			pid: 111,
 		},
 	);

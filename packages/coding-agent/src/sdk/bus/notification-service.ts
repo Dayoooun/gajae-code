@@ -11,13 +11,13 @@
  * touches a live owner's lock/state and never kills a process.
  */
 import * as crypto from "node:crypto";
-import * as fsSync from "node:fs";
 import type { WriteFileOptions } from "node:fs";
+import * as fsSync from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import type { Settings } from "../../config/settings";
-import { processIncarnation } from "../broker/process-incarnation";
+import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
 import {
 	getNotificationConfig,
 	isDiscordConfigured,
@@ -832,7 +832,7 @@ export async function acquireDaemonTransitionLock(input: {
 	const retries = Math.max(input.retries ?? 5, 0);
 	const retryDelayMs = Math.max(input.retryDelayMs ?? 20, 0);
 	const incarnation = input.pidIncarnation(input.pid);
-	if (!incarnation) return false;
+	if (!isProcessIncarnation(incarnation)) return false;
 	const owner: DaemonTransitionLock = { pid: input.pid, incarnation, createdAt: now() };
 	for (let attempt = 0; attempt <= retries; attempt++) {
 		if (await input.createExclusive(input.path)) {
@@ -850,8 +850,10 @@ export async function acquireDaemonTransitionLock(input: {
 			const currentIncarnation = input.pidIncarnation(current.pid);
 			if (
 				!input.pidAlive(current.pid) ||
-				(currentIncarnation !== undefined && currentIncarnation !== current.incarnation) ||
-				now() - current.createdAt >= TRANSITION_LOCK_STALE_MS
+				(isProcessIncarnation(current.incarnation) &&
+					isProcessIncarnation(currentIncarnation) &&
+					currentIncarnation !== current.incarnation) ||
+				(isProcessIncarnation(current.incarnation) && now() - current.createdAt >= TRANSITION_LOCK_STALE_MS)
 			)
 				await input.fs.unlink(input.path).catch(() => undefined);
 		} else {

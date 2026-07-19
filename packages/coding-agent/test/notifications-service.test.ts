@@ -2,8 +2,9 @@ import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { Settings } from "../src/config/settings";
-import { tokenFingerprint } from "../src/sdk/bus/config";
+import { getNotificationConfig, tokenFingerprint } from "../src/sdk/bus/config";
 import { daemonPaths } from "../src/sdk/bus/daemon-paths";
+import { ensureConfiguredProviderDaemons } from "../src/sdk/bus/index";
 import type {
 	NotificationEndpointFileIdentity,
 	NotificationExactUnlinkResult,
@@ -147,6 +148,52 @@ describe("notification-service status", () => {
 		expect(report.telegram.configured).toBe(true);
 		expect(text).toContain("redact: true");
 		expect(text).toContain(`telegram.fingerprint: ${tokenFingerprint(TOKEN)}`);
+	});
+});
+
+describe("configured chat daemon readiness", () => {
+	test("awaits every configured provider before startup can publish identity", async () => {
+		const settings = Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.discord.botToken": "discord-token",
+			"notifications.discord.applicationId": "app",
+			"notifications.discord.guildId": "guild",
+			"notifications.discord.parentChannelId": "channel",
+			"notifications.slack.botToken": "slack-bot-token",
+			"notifications.slack.appToken": "slack-app-token",
+			"notifications.slack.workspaceId": "workspace",
+			"notifications.slack.channelId": "channel",
+		});
+		const calls: string[] = [];
+
+		await ensureConfiguredProviderDaemons(settings, getNotificationConfig(settings), async provider => {
+			calls.push(provider);
+		});
+
+		expect(calls).toEqual(["discord", "slack"]);
+	});
+
+	test("propagates configured provider readiness failures instead of reporting startup success", async () => {
+		const settings = Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.discord.botToken": "discord-token",
+			"notifications.discord.applicationId": "app",
+			"notifications.discord.guildId": "guild",
+			"notifications.discord.parentChannelId": "channel",
+			"notifications.slack.botToken": "slack-bot-token",
+			"notifications.slack.appToken": "slack-app-token",
+			"notifications.slack.workspaceId": "workspace",
+			"notifications.slack.channelId": "channel",
+		});
+		const calls: string[] = [];
+
+		await expect(
+			ensureConfiguredProviderDaemons(settings, getNotificationConfig(settings), async provider => {
+				calls.push(provider);
+				if (provider === "discord") throw new Error("Discord gateway authentication failed");
+			}),
+		).rejects.toThrow("Discord gateway authentication failed");
+		expect(calls).toEqual(["discord"]);
 	});
 });
 

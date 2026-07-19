@@ -79,9 +79,9 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		const d = await workflow();
 		const affected = requiredJob(d, "affected");
 		expect(affected.needs).toContain("telegram-daemon-generation");
-		const aggregateStep = namedStep(affected, "Aggregate affected path validation shards");
-		expect(requiredEnvValue(aggregateStep, "CI_DEV_TELEGRAM_GUARD_RESULT")).toBe("${{ needs.telegram-daemon-generation.result }}");
-		expect(requiredEnvValue(aggregateStep, "CI_DEV_TELEGRAM_GUARD_REQUIRED")).toBe("${{ needs.affected-plan.outputs.relevant }}");
+		const aggregateStep = namedStep(affected, "Validate live affected aggregate");
+		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_GUARD_RESULT")).toBe("${{ needs.telegram-daemon-generation.result }}");
+		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_GUARD_REQUIRED")).toBe("${{ needs.affected-plan.outputs.relevant }}");
 		expect(aggregateStep.run).toContain("--validate-aggregate");
 	});
 
@@ -93,11 +93,12 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(condition).toContain("daemon-control.test.ts");
 		expect(condition).toContain("notifications-telegram-daemon.test.ts");
 		expect(condition).toContain("telegram-daemon");
-		const aggregateStep = namedStep(requiredJob(d, "affected"), "Aggregate affected path validation shards");
-		expect(requiredEnvValue(aggregateStep, "CI_DEV_TELEGRAM_WINDOWS_RESULT")).toBe("${{ needs.windows-telegram-daemon-safety.result }}");
-		expect(requiredEnvValue(aggregateStep, "CI_DEV_TELEGRAM_WINDOWS_REQUIRED")).toContain("chat-daemon-control.ts");
-		expect(requiredEnvValue(aggregateStep, "CI_DEV_TELEGRAM_WINDOWS_REQUIRED")).toContain("daemon-control.test.ts");
-		expect(requiredEnvValue(aggregateStep, "CI_DEV_TELEGRAM_WINDOWS_REQUIRED")).toContain("notifications-telegram-daemon.test.ts");
+		const affected = requiredJob(d, "affected");
+		const aggregateStep = namedStep(affected, "Validate live affected aggregate");
+		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_WINDOWS_RESULT")).toBe("${{ needs.windows-telegram-daemon-safety.result }}");
+		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_WINDOWS_REQUIRED")).toContain("chat-daemon-control.ts");
+		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_WINDOWS_REQUIRED")).toContain("daemon-control.test.ts");
+		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_WINDOWS_REQUIRED")).toContain("notifications-telegram-daemon.test.ts");
 		expect(aggregateStep.run).toContain("--validate-aggregate");
 		const windowsContract = namedStep(safety, "Run Windows daemon provenance safety contract");
 		expect(windowsContract.run).toContain("--test-name-pattern");
