@@ -10,7 +10,7 @@ import {
 	toolDisplayText,
 } from "../src/modes/components/tool-transcript-format";
 import { TranscriptViewerOverlay, transcriptViewerEntries } from "../src/modes/components/transcript-viewer-overlay";
-import type { ObservableSession } from "../src/modes/session-observer-registry";
+import type { ObservableSession, SessionObserverRegistry } from "../src/modes/session-observer-registry";
 import { initTheme } from "../src/modes/theme/theme";
 import { TranscriptItemRegistry } from "../src/modes/transcript-item-registry";
 
@@ -39,7 +39,7 @@ function observerRegistry(session: ObservableSession) {
 		onChange: () => () => {},
 		setMainSession: () => {},
 		getActiveSubagentCount: () => 1,
-	} as unknown as import("../src/modes/session-observer-registry").SessionObserverRegistry;
+	} as unknown as SessionObserverRegistry;
 }
 
 function observerText(resultText: string, isError: boolean, hasResult = true): string {
