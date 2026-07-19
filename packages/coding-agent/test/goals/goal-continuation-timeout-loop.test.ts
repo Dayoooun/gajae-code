@@ -91,7 +91,7 @@ async function createHarness(): Promise<Harness> {
 	const mode = new InteractiveMode(session, "test");
 	await mode.init();
 	mode.ui.stop();
-	await mode.handleGoalModeCommand("Prevent timeout loop");
+	await mode.goalModeController.handleCommand("Prevent timeout loop");
 	return {
 		tempDir,
 		authStorage,
@@ -117,7 +117,7 @@ async function runContinuation(
 	outcomes: Array<{ toolName: string; args: unknown; isError: boolean; result: unknown }>,
 	unpaired: "none" | "start" | "end" = "none",
 ): Promise<void> {
-	expect(harness.mode.goalModeEnabled).toBe(true);
+	expect(harness.mode.goalModeController.enabled).toBe(true);
 	expect(harness.session.settings.get("goal.continuationModes")).toContain("interactive");
 	const input = harness.mode.getUserInput();
 	await advanceGoalContinuation();
@@ -153,8 +153,7 @@ async function runContinuation(
 		});
 	}
 	harness.session.agent.emitExternalEvent({ type: "agent_end", messages: [] });
-	await flush();
-	await Bun.sleep(0);
+	await harness.session.waitForIdle();
 	harness.mode.finishPendingSubmission(submission);
 }
 
@@ -275,7 +274,7 @@ describe("goal continuation repeated timeout guard", () => {
 		harness.session.agent.emitExternalEvent({ type: "agent_start" });
 		continuationTimers = [];
 		harness.session.agent.emitExternalEvent({ type: "agent_end", messages: [] });
-		await flush();
+		await harness.session.waitForIdle();
 		await runContinuation(harness, [timeout()]);
 		const next = harness.mode.getUserInput();
 		await advanceGoalContinuation();

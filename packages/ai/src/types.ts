@@ -488,6 +488,9 @@ export interface ThinkingContent {
 	thinking: string;
 	thinkingSignature?: string; // e.g., for OpenAI responses, the reasoning item ID
 	itemId?: string; // item.id from output_item.added, used to match output_item.done
+	readonly provenance?: "summary" | "raw" | "mixed";
+	readonly summaryText?: string;
+	readonly rawText?: string;
 }
 
 export interface RedactedThinkingContent {
@@ -706,10 +709,17 @@ export type TSchema = ZodType | TJsonSchema;
 /** Resolve parameter types for tool execution / handlers. */
 export type Static<S> = S extends ZodType ? z.infer<S> : S extends { static: infer T } ? T : unknown;
 
+export type RawArgumentValidationResult =
+	| { outcome: "passthrough" }
+	| { outcome: "accept"; arguments: ToolCall["arguments"] }
+	| { outcome: "reject" };
+
 export interface Tool<TParameters extends TSchema = TSchema> {
 	name: string;
 	description: string;
 	parameters: TParameters;
+	/** Optional pre-coercion adapter for narrowly scoped raw argument recovery or rejection. */
+	rawArgumentValidation?: (arguments_: ToolCall["arguments"]) => RawArgumentValidationResult;
 	/** If true, tool is strictly typed and validated against the parameters schema before execution */
 	strict?: boolean;
 	/**
@@ -729,6 +739,13 @@ export interface Tool<TParameters extends TSchema = TSchema> {
 	 * calls route correctly. Absent for regular JSON function tools.
 	 */
 	customWireName?: string;
+	/**
+	 * Optional safe projection for tool arguments or results. Extensions use this
+	 * only for explicitly opt-in, display-safe summaries.
+	 */
+	safeSummary?: (kind: "args" | "result", value: unknown) => string | undefined;
+	/** Allowlisted argument/result field names for a safe fallback summary. */
+	safeSummaryFields?: { args?: string[]; result?: string[] };
 }
 
 export interface Context {
@@ -745,6 +762,9 @@ export type AssistantMessageEvent =
 	| { type: "thinking_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "thinking_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "thinking_end"; contentIndex: number; content: string; partial: AssistantMessage }
+	| { type: "reasoning_summary_start"; contentIndex: number; partial: AssistantMessage }
+	| { type: "reasoning_summary_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
+	| { type: "reasoning_summary_end"; contentIndex: number; content: string; partial: AssistantMessage }
 	| { type: "toolcall_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "toolcall_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall; partial: AssistantMessage }
@@ -889,6 +909,12 @@ export interface AnthropicCompat extends ToolChoiceCompat {
 	supportsForcedToolChoice?: boolean;
 	/** Whether long prompt-cache retention (`ttl: "1h"`) is supported. Default: true for canonical Anthropic API. */
 	supportsLongCacheRetention?: boolean;
+	/**
+	 * Prompt-cache transport accepted by this Anthropic-compatible endpoint.
+	 * Canonical Anthropic defaults to `"automatic"`; noncanonical endpoints default
+	 * to `"none"` and must explicitly opt into generated `"explicit"` markers.
+	 */
+	promptCacheMode?: "none" | "explicit" | "automatic";
 }
 
 /**

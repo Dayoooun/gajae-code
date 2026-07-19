@@ -12,6 +12,7 @@ import * as fs from "node:fs/promises";
 
 import * as path from "node:path";
 import { isCompiledBinary } from "@gajae-code/utils/env";
+import { parseLinuxProcStartTime } from "./linux-proc";
 
 export const TMUX_OWNER_ISOLATION_SCHEMA_VERSION = 1;
 export const TMUX_OWNER_ISOLATION_MAX_LINE_BYTES = 16 * 1024;
@@ -99,14 +100,7 @@ export function classifyCgroup(input: { platform: NodeJS.Platform; cgroupText?: 
 
 export function ownerProcessStartTime(platform: NodeJS.Platform, stat: string | null): string | null {
 	if (platform !== "linux") return "not_applicable";
-	if (!stat) return null;
-	const close = stat.lastIndexOf(")");
-	if (close < 0) return null;
-	const startTime = stat
-		.slice(close + 2)
-		.trim()
-		.split(/\s+/)[19];
-	return startTime && /^\d+$/.test(startTime) ? startTime : null;
+	return parseLinuxProcStartTime(stat);
 }
 
 export interface TmuxServerProof {
@@ -312,7 +306,7 @@ function validArgv(argv: unknown): argv is string[] {
 	);
 }
 
-function isSafeServerProof(
+export function isSafeServerProof(
 	server: TmuxServerProof,
 	platform: NodeJS.Platform = "linux",
 ): server is TmuxServerProof & {
@@ -329,6 +323,17 @@ function isSafeServerProof(
 		nonEmpty(server.startTime) &&
 		(server.cgroup?.classification === "safe" ||
 			(platform !== "linux" && server.cgroup?.classification === "not_applicable"))
+	);
+}
+
+/** Compares the stable identity fields of independently observed tmux servers. */
+export function sameServerIdentity(left: TmuxServerProof, right: TmuxServerProof): boolean {
+	return (
+		left.pid === right.pid &&
+		left.startTime === right.startTime &&
+		left.cgroup?.classification === right.cgroup?.classification &&
+		left.cgroup?.scope === right.cgroup?.scope &&
+		left.cgroup?.diagnostic === right.cgroup?.diagnostic
 	);
 }
 /**

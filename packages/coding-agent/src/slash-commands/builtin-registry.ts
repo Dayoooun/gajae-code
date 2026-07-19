@@ -18,12 +18,17 @@ import {
 	formatModelSelectorValue,
 	parseModelPattern,
 	parseModelString,
+	splitSelectorThinkingSuffix,
 } from "../config/model-resolver";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers.js";
 import { resolveMemoryBackend } from "../memory-backend";
 import { DynamicBorder } from "../modes/components/dynamic-border";
 import { theme } from "../modes/theme/theme";
-import type { InteractiveModeContext } from "../modes/types";
+import {
+	type ComposerSubmissionOptions,
+	canApplyComposerSubmission,
+	type InteractiveModeContext,
+} from "../modes/types";
 import {
 	buildNotificationStatusReport,
 	checkNotificationHealth,
@@ -62,7 +67,13 @@ import type {
 export type { BuiltinSlashCommand, SubcommandDef } from "./types";
 
 /** TUI-specific runtime accepted by `executeBuiltinSlashCommand`. */
-export type BuiltinSlashCommandRuntime = TuiSlashCommandRuntime;
+export type BuiltinSlashCommandRuntime = TuiSlashCommandRuntime & {
+	composer?: ComposerSubmissionOptions;
+};
+
+function canClearComposer(runtime: BuiltinSlashCommandRuntime): boolean {
+	return canApplyComposerSubmission(runtime.composer, runtime.ctx.editor);
+}
 
 const PET_COMMAND_OPTIONS: ReadonlyArray<{ name: string; mode: PetMode; description: string }> = [
 	{ name: "off", mode: "off", description: "Hide the pet" },
@@ -243,12 +254,9 @@ function parseModelCommandArgs(args: string): ParsedModelCommandArgs {
 
 function splitExplicitThinkingSelector(selector: string): { baseSelector: string; thinkingLevel?: ThinkingLevel } {
 	const trimmed = selector.trim();
-	const colonIndex = trimmed.lastIndexOf(":");
-	if (colonIndex === -1) {
-		return { baseSelector: trimmed };
-	}
-	const thinkingLevel = parseThinkingLevel(trimmed.slice(colonIndex + 1));
-	return thinkingLevel ? { baseSelector: trimmed.slice(0, colonIndex), thinkingLevel } : { baseSelector: trimmed };
+	const { selector: baseSelector, thinkingLevel } = splitSelectorThinkingSuffix(trimmed);
+	// Preserve the whole selector when the trailing suffix is not a valid thinking level.
+	return thinkingLevel ? { baseSelector, thinkingLevel } : { baseSelector: trimmed };
 }
 
 interface ModelCommandSelection {
@@ -625,7 +633,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			// — including the first-time `/goal set <objective>` case where goal
 			// mode was not yet active. A previous `wasGoalModeEnabled` guard dropped
 			// that first-time case from history (up/down-arrow recall).
-			await runtime.ctx.handleGoalModeCommand(command.args || undefined);
+			await runtime.ctx.goalModeController.handleCommand(command.args || undefined);
 			if (command.args) {
 				runtime.ctx.editor.addToHistory(command.text);
 			}
@@ -1049,6 +1057,20 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "transcript",
+		description: "Browse the current session transcript",
+		acpDescription: "Browse the current session transcript",
+		handle: async (_command, runtime) => {
+			await runtime.output("Transcript browsing is available in the interactive TUI.");
+			return commandConsumed();
+		},
+		handleTui: (_command, runtime) => {
+			if (runtime.ctx.isTranscriptViewerOpen()) return;
+			runtime.ctx.showTranscriptViewer();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "context",
 		description: "Show active context token usage breakdown",
 		acpDescription: "Show active context token usage breakdown",
@@ -1447,6 +1469,15 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "sessions",
+		priority: 91,
+		description: "Show all persisted sessions (read-only)",
+		handleTui: (_command, runtime) => {
+			runtime.ctx.showSessionsDashboard();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "btw",
 		description: "Ask an ephemeral side question using the current session context",
 		inlineHint: "<question>",
@@ -1688,7 +1719,9 @@ export async function executeBuiltinSlashCommand(
 		const diagnostic = formatUnknownBuiltinSlashCommandDiagnostic(parsed.name);
 		if (!diagnostic) return false;
 		runtime.ctx.showError(diagnostic);
-		runtime.ctx.editor.setText("");
+		if (canClearComposer(runtime)) {
+			runtime.ctx.editor.setText("");
+		}
 		return true;
 	}
 	if (parsed.args.length > 0 && !command.allowArgs) {
@@ -1703,7 +1736,9 @@ export async function executeBuiltinSlashCommand(
 		const ctx = runtime.ctx;
 		const adapted = toSlashCommandRuntime(runtime);
 		const result = await command.handle(parsed, adapted);
-		ctx.editor.setText("");
+		if (canClearComposer(runtime)) {
+			ctx.editor.setText("");
+		}
 		if (result && typeof result === "object" && "prompt" in result) return result.prompt;
 		return true;
 	}

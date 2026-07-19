@@ -12,7 +12,7 @@ import type {
 	DaemonStatus,
 } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
-import { processIncarnation } from "../broker/process-incarnation";
+import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
 import { getNotificationConfig, isDiscordConfigured, isSlackConfigured } from "./config";
 
 export type ChatDaemonKind = "discord" | "slack";
@@ -87,6 +87,13 @@ function hasChatDaemonStatePid(value: unknown): value is { pid: number } {
 }
 
 function isDefinitelyStoppedOrReusedChatDaemonState(value: unknown, probe: ChatDaemonOwnershipProbe): boolean {
+	// Pre-canonical Darwin locks used locale-dependent `ps lstart` output. Their
+	// invalid incarnation is positive evidence that the old owner is not fenced,
+	// even when the accompanying legacy state lacks newer required fields.
+	const legacyIncarnation = hasChatDaemonStatePid(value)
+		? (value as unknown as { incarnation?: unknown }).incarnation
+		: undefined;
+	if (typeof legacyIncarnation === "string" && !isProcessIncarnation(legacyIncarnation)) return true;
 	if (!hasSafeChatDaemonStateShape(value)) return false;
 	if (value.stoppedAt !== undefined || !probe.pidAlive(value.pid)) return true;
 	const currentIncarnation = probe.pidIncarnation(value.pid);
@@ -187,6 +194,7 @@ function defaultSignal(pid: number, signal: NodeJS.Signals): void {
 		process.kill(pid, signal);
 	} catch {}
 }
+
 function runtimeInfo(execPath?: string): DaemonRuntimeInfo {
 	const rt = resolveGjcRuntimeSpawnInfo(execPath ?? process.execPath);
 	return {
@@ -402,11 +410,15 @@ export class ChatDaemonController implements BuiltInDaemonController {
 			createdAt: Date.now(),
 		});
 		if (!(await this.signalIfOwner(state, "SIGTERM"))) return this.ownerChanged(action, requestId, before, warnings);
-		let dead = await this.waitForDeath(state.pid, opts.gracefulTimeoutMs ?? DEFAULT_GRACEFUL_TIMEOUT_MS);
+		let dead = await this.waitForDeath(
+			state.pid,
+			state.incarnation,
+			opts.gracefulTimeoutMs ?? DEFAULT_GRACEFUL_TIMEOUT_MS,
+		);
 		if (!dead && opts.force) {
 			if (!(await this.signalIfOwner(state, "SIGKILL")))
 				return this.ownerChanged(action, requestId, before, warnings);
-			dead = await this.waitForDeath(state.pid, opts.killTimeoutMs ?? DEFAULT_KILL_TIMEOUT_MS);
+			dead = await this.waitForDeath(state.pid, state.incarnation, opts.killTimeoutMs ?? DEFAULT_KILL_TIMEOUT_MS);
 		}
 		if (!dead) {
 			await clearChatDaemonControlRequest(this.settings.getAgentDir(), this.kind, requestId);
@@ -498,11 +510,11 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		try {
 			if (!(await this.signalIfOwner(state, "SIGTERM")))
 				throw new Error(`${this.kind} daemon ownership changed; refusing replacement`);
-			let dead = await this.waitForDeath(state.pid, DEFAULT_GRACEFUL_TIMEOUT_MS);
+			let dead = await this.waitForDeath(state.pid, state.incarnation, DEFAULT_GRACEFUL_TIMEOUT_MS);
 			if (!dead) {
 				if (!(await this.signalIfOwner(state, "SIGKILL")))
 					throw new Error(`${this.kind} daemon ownership changed; refusing replacement`);
-				dead = await this.waitForDeath(state.pid, DEFAULT_KILL_TIMEOUT_MS);
+				dead = await this.waitForDeath(state.pid, state.incarnation, DEFAULT_KILL_TIMEOUT_MS);
 			}
 			if (!dead) throw new Error(`Old ${this.kind} daemon did not exit before replacement`);
 		} finally {
@@ -563,9 +575,13 @@ export class ChatDaemonController implements BuiltInDaemonController {
 	): DaemonOperationResult {
 		return { kind: this.kind, action, ok, message, before, after, warnings };
 	}
-	private async waitForDeath(pid: number, timeout: number): Promise<boolean> {
+	private async waitForDeath(pid: number, incarnation: string, timeout: number): Promise<boolean> {
 		const until = Date.now() + timeout;
-		while (this.alive(pid) && Date.now() < until) await this.sleep(25);
+		while (this.alive(pid) && Date.now() < until) {
+			const currentIncarnation = this.incarnation(pid);
+			if (currentIncarnation !== undefined && currentIncarnation !== incarnation) return true;
+			await this.sleep(25);
+		}
 		return !this.alive(pid);
 	}
 	private sleep(ms: number): Promise<void> {
@@ -747,9 +763,9 @@ async function isStaleChatDaemonLock(lock: string, probe: ChatDaemonOwnershipPro
 		const currentIncarnation = probe.pidIncarnation(owner.pid);
 		return (
 			!probe.pidAlive(owner.pid) ||
-			(currentIncarnation !== undefined &&
-				owner.incarnation !== "unavailable" &&
-				currentIncarnation !== owner.incarnation)
+			(owner.incarnation !== "unavailable" &&
+				(!isProcessIncarnation(owner.incarnation) ||
+					(currentIncarnation !== undefined && currentIncarnation !== owner.incarnation)))
 		);
 	}
 	const stat = await fs.promises.stat(lock).catch(() => undefined);

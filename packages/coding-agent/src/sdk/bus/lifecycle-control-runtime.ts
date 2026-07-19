@@ -11,6 +11,8 @@ import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { NotificationControlServer as NativeNotificationControlServer } from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
+import { readLinuxProcStartTime } from "../../gjc-runtime/linux-proc";
 import { tmuxRuntimeSessionPath } from "../../gjc-runtime/session-layout";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
@@ -116,6 +118,20 @@ function isLifecycleErrorReason(value: unknown): value is LifecycleErrorReason {
 }
 
 /** Atomic + fsynced file-backed idempotency ledger store. */
+function hasNonDirectoryLedgerParent(idempotencyFile: string): boolean {
+	let parent = path.dirname(idempotencyFile);
+	while (true) {
+		try {
+			return !fs.statSync(parent).isDirectory();
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			const nextParent = path.dirname(parent);
+			if (nextParent === parent) return false;
+			parent = nextParent;
+		}
+	}
+}
+
 function ledgerReadError(error: unknown): Error {
 	const errorCode = (error as NodeJS.ErrnoException | undefined)?.code;
 	const code = typeof errorCode === "string" ? errorCode : "invalid";
@@ -181,27 +197,55 @@ function migrateLegacyLedger(doc: LedgerDoc): LedgerDoc {
 	return doc;
 }
 
+const LIFECYCLE_COMPATIBILITY_DIAGNOSTIC_LIMIT = 1;
+const LIFECYCLE_CONTROL_DIAGNOSTIC_LIMIT = 10;
+let lifecycleCompatibilityDiagnosticCount = 0;
+let lifecycleControlDiagnosticCount = 0;
+
 function isUnsupportedDirectorySyncError(error: unknown): boolean {
 	const code = (error as NodeJS.ErrnoException | undefined)?.code;
-	return code === "EINVAL" || code === "ENOTSUP" || code === "EOPNOTSUPP";
+	return (
+		code === "EINVAL" ||
+		code === "ENOTSUP" ||
+		code === "EOPNOTSUPP" ||
+		(process.platform === "win32" && code === "EPERM")
+	);
 }
 
-function recordDirectorySyncCompatibilityDiagnostic(): void {
+function recordBoundedLifecycleDiagnostic(message: string, compatibility = false): void {
+	if (compatibility) {
+		if (lifecycleCompatibilityDiagnosticCount >= LIFECYCLE_COMPATIBILITY_DIAGNOSTIC_LIMIT) return;
+		lifecycleCompatibilityDiagnosticCount++;
+	} else {
+		if (lifecycleControlDiagnosticCount >= LIFECYCLE_CONTROL_DIAGNOSTIC_LIMIT) return;
+		lifecycleControlDiagnosticCount++;
+	}
 	try {
-		process.stderr.write("gjc lifecycle ledger directory sync unsupported\n");
+		logger.warn(message);
 	} catch {
-		// Compatibility diagnostics must not alter ledger durability semantics.
+		// Diagnostics are best-effort and must not poison the lifecycle queue.
 	}
 }
 
 function fsyncLedgerParentDirectory(directory: string): void {
-	const dirFd = fs.openSync(directory, "r");
+	let dirFd: number;
+	try {
+		dirFd = fs.openSync(directory, "r");
+	} catch (error) {
+		if (process.platform === "win32" && isUnsupportedDirectorySyncError(error)) {
+			recordBoundedLifecycleDiagnostic("GJC lifecycle ledger directory sync unsupported", true);
+			return;
+		}
+		throw error;
+	}
+
 	let syncFailure: unknown;
 	let closeFailure: unknown;
 	try {
 		fs.fsyncSync(dirFd);
 	} catch (error) {
-		if (isUnsupportedDirectorySyncError(error)) recordDirectorySyncCompatibilityDiagnostic();
+		if (process.platform === "win32" && isUnsupportedDirectorySyncError(error))
+			recordBoundedLifecycleDiagnostic("GJC lifecycle ledger directory sync unsupported", true);
 		else syncFailure = error;
 	} finally {
 		try {
@@ -224,7 +268,16 @@ export function fileLedgerStore(idempotencyFile: string): LedgerStore {
 				contents = fs.readFileSync(idempotencyFile, "utf8");
 			} catch (error) {
 				const code = (error as NodeJS.ErrnoException).code;
-				if (code === "ENOENT") return { version: 1, entries: {} };
+				if (code === "ENOENT") {
+					let hasNonDirectoryParent: boolean;
+					try {
+						hasNonDirectoryParent = hasNonDirectoryLedgerParent(idempotencyFile);
+					} catch (parentError) {
+						throw ledgerReadError(parentError);
+					}
+					if (hasNonDirectoryParent) throw ledgerReadError({ code: "ENOTDIR" });
+					return { version: 1, entries: {} };
+				}
 				throw ledgerReadError(error);
 			}
 			try {
@@ -373,15 +426,11 @@ function lifecycleOwnerIsolationProbe(tmux: string, env: NodeJS.ProcessEnv): Own
 					cgroup: { classification: "not_applicable" },
 					sessionNames,
 				};
-			const [cgroupText, stat] = await Promise.all([
+			const [cgroupText, startTime] = await Promise.all([
 				fsPromises.readFile(`/proc/${pid}/cgroup`, "utf8").catch(() => null),
-				fsPromises.readFile(`/proc/${pid}/stat`, "utf8").catch(() => null),
+				readLinuxProcStartTime(pid),
 			]);
 			const cgroup = classifyCgroup({ platform: process.platform, cgroupText });
-			const startTime = stat
-				?.slice(stat.lastIndexOf(")") + 2)
-				.trim()
-				.split(/\s+/)[19];
 			if (!startTime) return { state: "unverifiable", pid, cgroup, sessionNames };
 			return {
 				state:
@@ -931,6 +980,8 @@ export function daemonCloseSession(
 export function daemonResumeSession(
 	env: NodeJS.ProcessEnv = process.env,
 	opts: {
+		agentDir?: string;
+		/** Explicit managed root for isolated tests. */
 		sessionsRoot?: string;
 		listSessions?: (env: NodeJS.ProcessEnv) => GjcTmuxSessionStatus[];
 		ownerIsolationProbe?: OwnerIsolationProbe;
@@ -971,21 +1022,28 @@ export function daemonResumeSession(
 		// blindly spawning `gjc --resume <prefix>` against a non-authoritative id.
 		let resumeId = target.sessionIdOrPrefix;
 		let resumeCwd = target.path;
-		if (opts.sessionsRoot) {
-			const saved = listRecentSessions({ sessionsRoot: opts.sessionsRoot, limit: 1000 });
-			const prefixed = saved.filter(
-				s => s.sessionId === target.sessionIdOrPrefix || s.sessionId.startsWith(target.sessionIdOrPrefix),
-			);
-			const exact = prefixed.filter(s => s.sessionId === target.sessionIdOrPrefix);
-			const resolved = exact.length > 0 ? exact : prefixed;
-			if (resolved.length === 0) return { notFound: true };
-			if (resolved.length > 1) {
-				return { ambiguous: resolved.map(s => ({ sessionId: s.sessionId, path: s.path })) };
-			}
-			const selected = resolved[0]!;
-			resumeId = selected.sessionId;
-			resumeCwd = selected.path;
+		if (!target.path && !opts.agentDir && !opts.sessionsRoot) return { notFound: true };
+		const recent = await listRecentSessions({
+			cwd: target.path ?? opts.agentDir ?? opts.sessionsRoot ?? "",
+			agentDir: opts.agentDir,
+			sessionsRoot: opts.sessionsRoot,
+			allWorkspaces: target.path === undefined,
+			limit: 1000,
+		});
+		if (recent.kind === "error") throw new Error(`gjc_lifecycle_saved_sessions_unavailable: ${recent.message}`);
+		const saved = recent.entries;
+		const prefixed = saved.filter(
+			s => s.sessionId === target.sessionIdOrPrefix || s.sessionId.startsWith(target.sessionIdOrPrefix),
+		);
+		const exact = prefixed.filter(s => s.sessionId === target.sessionIdOrPrefix);
+		const resolved = exact.length > 0 ? exact : prefixed;
+		if (resolved.length === 0) return { notFound: true };
+		if (resolved.length > 1) {
+			return { ambiguous: resolved.map(s => ({ sessionId: s.sessionId, path: s.path })) };
 		}
+		const selected = resolved[0]!;
+		resumeId = selected.sessionId;
+		resumeCwd = selected.path;
 		const resolvedResumeCwd = resumeCwd ? path.resolve(resumeCwd) : undefined;
 		const resumeCwdStat = resolvedResumeCwd ? fs.statSync(resolvedResumeCwd, { throwIfNoEntry: false }) : undefined;
 		if (typeof resolvedResumeCwd !== "string" || !resumeCwdStat?.isDirectory()) {
@@ -1139,11 +1197,7 @@ function lifecycleFailureResponse(requestId: unknown): SessionLifecycleResponse 
 }
 
 function recordLifecycleControlDiagnostic(): void {
-	try {
-		process.stderr.write("gjc lifecycle control request failed\n");
-	} catch {
-		// Diagnostics must not suppress the fixed wire failure response or recovery.
-	}
+	recordBoundedLifecycleDiagnostic("GJC lifecycle control request failed");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1267,6 +1321,8 @@ export function buildOrchestratorDeps(input: {
 	auditRedactionKey: Uint8Array;
 	/** Root of saved session histories (`<agentDir>/sessions`), for resume resolution. */
 	sessionsRoot?: string;
+	/** Agent directory used for readonly managed-session resume resolution. */
+	agentDir?: string;
 	env?: NodeJS.ProcessEnv;
 }): OrchestratorDeps {
 	if (input.auditRedactionKey.byteLength !== 32) throw new Error("invalid_audit_redaction_key");
@@ -1285,7 +1341,9 @@ export function buildOrchestratorDeps(input: {
 		},
 		spawnCreate: daemonSpawnCreate(env),
 		closeSession: daemonCloseSession(env),
-		resumeSession: daemonResumeSession(env, { sessionsRoot: input.sessionsRoot }),
+		resumeSession: daemonResumeSession(env, {
+			agentDir: input.agentDir ?? path.dirname(input.agentNotificationsDir),
+		}),
 	};
 }
 

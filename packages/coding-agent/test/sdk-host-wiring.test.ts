@@ -3,9 +3,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
-import { getBundledModel } from "@gajae-code/ai";
+import { closeModelCache, getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { NotificationServer } from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
@@ -15,16 +16,23 @@ import type {
 	ExtensionUIContext,
 } from "../src/extensibility/extensions/types";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
+import { buildAskGateAnswerSchema as buildDeepInterviewAskGateAnswerSchema } from "../src/modes/shared/agent-wire/deep-interview-gate";
 import {
 	BrokerWorkflowGateEmitter,
 	FileGateStore,
 	MemoryGateStore,
 	type WorkflowGateEmitter,
 } from "../src/modes/shared/agent-wire/workflow-gate-broker";
+import {
+	buildAskGateAnswerSchema,
+	buildAskGateStageState,
+	validateAskGateStageState,
+} from "../src/modes/shared/agent-wire/workflow-gate-types";
 import type { InteractiveModeContext } from "../src/modes/types";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { createNotificationsExtension, PresentationArbiter } from "../src/sdk/bus";
+import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { SessionSdkHost } from "../src/sdk/host";
 import {
 	attachLifecycleStartupCapability,
@@ -49,9 +57,14 @@ type SdkPermissionProvider =
 
 const dirs: string[] = [];
 const sockets: WebSocket[] = [];
-afterEach(() => {
-	for (const socket of sockets.splice(0)) socket.close();
-	for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+afterEach(async () => {
+	await Promise.all(sockets.splice(0).map(closeSocket));
+	for (const dir of dirs) await brokerOwnerForTest(dir)?.stop();
+	if (process.platform === "win32") {
+		Bun.gc(true);
+		await Bun.sleep(50);
+	}
+	for (const dir of dirs.splice(0)) await removeTempDir(dir);
 	delete process.env.GJC_SDK_DISABLE;
 	delete process.env.GJC_NOTIFICATIONS;
 	delete process.env.GJC_LIFECYCLE_TEST_TOKEN;
@@ -60,10 +73,33 @@ afterEach(() => {
 });
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = Date.now() + 4_000;
+	const deadline = Date.now() + 15_000;
 	while (!predicate()) {
 		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
 		await Bun.sleep(20);
+	}
+}
+
+async function closeSocket(socket: WebSocket): Promise<void> {
+	if (socket.readyState === WebSocket.CLOSED) return;
+	const { promise, resolve } = Promise.withResolvers<void>();
+	socket.addEventListener("close", () => resolve(), { once: true });
+	socket.close();
+	await Promise.race([promise, Bun.sleep(500)]);
+}
+
+async function removeTempDir(dir: string): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			await fs.promises.rm(dir, { recursive: true, force: true });
+			return;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (attempt >= 20 || (code !== "EBUSY" && code !== "EPERM" && code !== "EACCES" && code !== "ENOTEMPTY"))
+				throw error;
+			if (process.platform === "win32") Bun.gc(true);
+			await Bun.sleep(100);
+		}
 	}
 }
 
@@ -74,6 +110,7 @@ function start(
 	forwardPreflightCallbacks = false,
 	commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>(),
 	lifecycle?: { startupCapability: SdkStartupCapability; lifecycleRequired: true },
+	autoStart = true,
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
@@ -98,7 +135,7 @@ function start(
 		settings ??
 		(lifecycle ? ({ get: () => undefined, getAgentDir: () => ctx.cwd } as unknown as Settings) : undefined);
 	createNotificationsExtension(api, effectiveSettings ? { settings: effectiveSettings } : undefined);
-	void handlers.get("session_start")?.({ type: "session_start" }, ctx);
+	if (autoStart) void handlers.get("session_start")?.({ type: "session_start" }, ctx);
 	return handlers;
 }
 
@@ -195,6 +232,15 @@ function context(
 	};
 }
 
+test("shared ask-gate schema and stage-state authority preserves generic producer inputs", () => {
+	const labels = Array.from({ length: 33 }, (_, index) => (index === 32 ? "option-0" : `option-${index}`));
+	const question = { id: "generic-ask", multi: true, allowEmpty: false };
+	expect(buildAskGateAnswerSchema(question, labels)).toEqual(buildDeepInterviewAskGateAnswerSchema(question, labels));
+	const state = buildAskGateStageState(question, labels);
+	expect(() => validateAskGateStageState(state)).not.toThrow();
+	expect(state.options).toEqual(labels);
+});
+
 test("lifecycle startup production secret collection redacts before normalization and truncation", () => {
 	const bare = "bare-secret-value";
 	const overlap = "bare-secret-value-plus";
@@ -248,7 +294,7 @@ test("lifecycle SDK startup capability settles once and sanitizes public failure
 	expect(await started.promise).toEqual({ status: "started" });
 });
 
-test("lifecycle teardown rejects dual owner failures and retains exact retry authority", async () => {
+test("lifecycle teardown swallows dual owner failures without surfacing an extension error and retains exact retry authority", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-cleanup-proof-"));
 	dirs.push(cwd);
 	const sessionId = `cleanup-proof-${Date.now()}`;
@@ -259,6 +305,7 @@ test("lifecycle teardown rejects dual owner failures and retains exact retry aut
 	(NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait = async () => {
 		throw new Error("server stop failed");
 	};
+	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
 	let restored = false;
 	try {
 		const sessionContext = context(cwd, sessionId);
@@ -267,17 +314,40 @@ test("lifecycle teardown rejects dual owner failures and retains exact retry aut
 			lifecycleRequired: true,
 		});
 		await expect(capability.promise).resolves.toEqual({ status: "started" });
-		let failure: unknown;
-		try {
-			await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
-		} catch (error) {
-			failure = error;
-		}
-		expect(failure).toBeInstanceOf(AggregateError);
-		expect((failure as AggregateError).errors).toEqual([
-			expect.objectContaining({ message: "host stop failed" }),
-			expect.objectContaining({ message: "server stop failed" }),
-		]);
+
+		// Drive the production session_shutdown handler through a real ExtensionRunner
+		// so the onError seam proves the retained owner-release failure is NOT surfaced
+		// as an extension error (which the UI would render red).
+		const shutdownExt = {
+			path: "test-shutdown-ext",
+			handlers: new Map([
+				[
+					"session_shutdown",
+					[
+						async () => {
+							await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+						},
+					],
+				],
+			]),
+		};
+		const runner = new ExtensionRunner([shutdownExt as never], {} as never, cwd, {} as never, {} as never);
+		runner.initialize({} as never, {} as never);
+		const surfaced: Array<{ event: string }> = [];
+		runner.onError(error => surfaced.push(error));
+		await expect(runner.emit({ type: "session_shutdown" })).resolves.toBeUndefined();
+		expect(surfaced).toEqual([]);
+
+		// The failure is still recorded as a high-severity breadcrumb carrying the
+		// original owner-release identity, with the exact shared prefix.
+		const breadcrumbs = errorSpy.mock.calls.map(args => String(args[0]));
+		expect(
+			breadcrumbs.some(
+				message =>
+					message.startsWith("notifications: SDK notification runtime cleanup failed: ") &&
+					message.includes(`SDK notification runtime ${sessionId} owner release failed`),
+			),
+		).toBe(true);
 		expect(tracker.result).toEqual({
 			endpointGeneration: 1,
 			fenced: false,
@@ -300,12 +370,13 @@ test("lifecycle teardown rejects dual owner failures and retains exact retry aut
 			brokerRegistrationReleased: true,
 		});
 	} finally {
+		errorSpy.mockRestore();
 		if (!restored) {
 			stop.mockRestore();
 			(NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait = nativeStop;
 		}
 	}
-});
+}, 60_000);
 test("lifecycle cleanup fences same-id startup and preserves proven owner release across retry", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-cleanup-retry-"));
 	dirs.push(cwd);
@@ -323,6 +394,7 @@ test("lifecycle cleanup fences same-id startup and preserves proven owner releas
 		if (serverStopAttempts === 1) throw new Error("server stop failed");
 		await nativeStop.call(this);
 	};
+	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
 	try {
 		const sessionContext = context(cwd, sessionId);
 		const handlers = start(sessionContext, undefined, () => {}, false, new Map(), {
@@ -332,9 +404,17 @@ test("lifecycle cleanup fences same-id startup and preserves proven owner releas
 		await expect(capability.promise).resolves.toEqual({ status: "started" });
 		await expect(
 			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
-		).rejects.toBeInstanceOf(AggregateError);
+		).resolves.toBeUndefined();
 		expect(hostStop).toHaveBeenCalledTimes(1);
 		expect(tracker.result).toMatchObject({ fenced: false, hostStopped: false, brokerRegistrationReleased: true });
+		const breadcrumbs = errorSpy.mock.calls.map(args => String(args[0]));
+		expect(
+			breadcrumbs.some(
+				message =>
+					message.startsWith("notifications: SDK notification runtime cleanup failed: ") &&
+					message.includes(`SDK notification runtime ${sessionId} owner release failed`),
+			),
+		).toBe(true);
 
 		await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
 		expect(hostStop).toHaveBeenCalledTimes(1);
@@ -347,10 +427,11 @@ test("lifecycle cleanup fences same-id startup and preserves proven owner releas
 		expect(tracker.result).toMatchObject({ fenced: true, hostStopped: true, brokerRegistrationReleased: true });
 	} finally {
 		hostStop.mockRestore();
+		errorSpy.mockRestore();
 		serverStart.mockRestore();
 		(NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait = nativeStop;
 	}
-});
+}, 60_000);
 
 test("production SDK host starts exactly one instrumented server (no duplicate auto-host)", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-single-host-"));
@@ -371,7 +452,7 @@ test("production SDK host starts exactly one instrumented server (no duplicate a
 		serverStart.mockRestore();
 		await host?.stop();
 	}
-});
+}, 60_000);
 
 test("lifecycle session shutdown disposes the exact endpoint once", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-once-"));
@@ -394,7 +475,7 @@ test("lifecycle session shutdown disposes the exact endpoint once", async () => 
 	} finally {
 		stop.mockRestore();
 	}
-});
+}, 60_000);
 
 test("lifecycle rollback proof only fences the exact started endpoint generation", () => {
 	const tracker = new SdkStartupRollbackTracker();
@@ -437,6 +518,92 @@ test("lifecycle startup settles failure when native callback registration throws
 		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`))).toBe(false);
 	} finally {
 		hook.mockRestore();
+	}
+});
+
+test("session_start swallows startup plus owner-release failure without surfacing an extension error", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-startup-cleanup-double-failure-"));
+	dirs.push(cwd);
+	const sessionId = `startup-cleanup-double-failure-${Date.now()}`;
+	const serverStart = spyOn(NotificationServer.prototype, "start").mockRejectedValueOnce(
+		new Error("server start failed"),
+	);
+	const hostStop = spyOn(SessionSdkHost.prototype, "stop").mockRejectedValueOnce(new Error("host stop failed"));
+	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+	let restored = false;
+	try {
+		const sessionContext = context(cwd, sessionId);
+		const handlers = start(sessionContext, undefined, () => {}, false, new Map(), undefined, false);
+		const startupExt = {
+			path: "test-startup-ext",
+			handlers: new Map([
+				[
+					"session_start",
+					[
+						async () => {
+							await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
+						},
+					],
+				],
+			]),
+		};
+		const runner = new ExtensionRunner([startupExt as never], {} as never, cwd, {} as never, {} as never);
+		runner.initialize({} as never, {} as never);
+		const surfaced: Array<{ event: string }> = [];
+		runner.onError(error => surfaced.push(error));
+
+		await expect(runner.emit({ type: "session_start" })).resolves.toBeUndefined();
+		expect(surfaced).toEqual([]);
+		expect(serverStart).toHaveBeenCalledTimes(1);
+		expect(hostStop).toHaveBeenCalledTimes(2);
+		const breadcrumbs = errorSpy.mock.calls.map(args => String(args[0]));
+		expect(
+			breadcrumbs.some(
+				message =>
+					message.startsWith("notifications: SDK notification runtime cleanup failed: ") &&
+					message.includes(`SDK notification runtime ${sessionId} owner release failed`),
+			),
+		).toBe(true);
+
+		serverStart.mockRestore();
+		hostStop.mockRestore();
+		restored = true;
+		await expect(
+			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
+		).resolves.toBeUndefined();
+	} finally {
+		errorSpy.mockRestore();
+		if (!restored) {
+			serverStart.mockRestore();
+			hostStop.mockRestore();
+		}
+	}
+}, 60_000);
+
+test("lifecycle startup reports an actionable error when native capability registration is missing", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-missing-capability-callback-"));
+	dirs.push(cwd);
+	const capability = new SdkStartupCapability();
+	const prototype = NotificationServer.prototype as unknown as { onNegotiatedCapabilities?: unknown };
+	const original = prototype.onNegotiatedCapabilities;
+	try {
+		prototype.onNegotiatedCapabilities = undefined;
+		start(context(cwd, "missing-capability-callback"), undefined, () => {}, false, new Map(), {
+			startupCapability: capability,
+			lifecycleRequired: true,
+		});
+		const result = await capability.promise;
+		expect(result).toMatchObject({
+			status: "failed",
+			failure: { phase: "startup", reason: "failed" },
+		});
+		if (result.status === "failed") {
+			expect(result.failure.message).toContain("onNegotiatedCapabilities");
+			expect(result.failure.message).toContain("out of date");
+		}
+		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", "missing-capability-callback.json"))).toBe(false);
+	} finally {
+		prototype.onNegotiatedCapabilities = original;
 	}
 });
 
@@ -487,7 +654,7 @@ test("SDK broker registration records an absolute lifecycle scope", async () => 
 	} finally {
 		await brokerOwnerForTest(agentDir)?.stop();
 	}
-});
+}, 60_000);
 
 test("ExtensionRunner forwards SDK permission providers into its production context", () => {
 	let installed: SdkPermissionProvider;
@@ -766,6 +933,76 @@ test("/notify on fences teardown and permits a later same-ID replacement runtime
 		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
 	} finally {
 		prototype.start = startServer;
+	}
+});
+
+test("SDK host replays file attachment data as base64 while passing raw bytes to N-API", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-file-replay-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-file-replay-${Date.now()}`;
+	const bytes = Buffer.from([0, 1, 2, 253, 254, 255]);
+	const attachmentPath = path.join(cwd, "replay.bin");
+	fs.writeFileSync(attachmentPath, bytes);
+	process.env.GJC_NOTIFICATIONS = "1";
+	const handlers = start(context(cwd, sessionId));
+	const nativePrototype = NotificationServer.prototype as unknown as {
+		pushFileAttachmentUnchecked?: (
+			sessionId: string,
+			name: string,
+			mime: string | undefined,
+			data: Buffer,
+			caption: string | undefined,
+		) => void;
+	};
+	const originalPushFileAttachmentUnchecked = nativePrototype.pushFileAttachmentUnchecked;
+	let nativeData: Buffer | undefined;
+	nativePrototype.pushFileAttachmentUnchecked = (_sessionId, _name, _mime, data) => {
+		nativeData = data;
+	};
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		await waitFor(() => getTelegramFileSink(sessionId) !== undefined, "file attachment sink");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+
+		await expect(getTelegramFileSink(sessionId)!({ path: attachmentPath })).resolves.toEqual({ ok: true });
+		await waitFor(() => nativeData !== undefined, "raw N-API file attachment");
+		expect(nativeData).toBeInstanceOf(Buffer);
+		expect(nativeData).toEqual(bytes);
+
+		socket.send(JSON.stringify({ type: "event_replay", id: "file-replay", sinceGeneration: 1, sinceSeq: 0 }));
+		await waitFor(
+			() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "file-replay"),
+			"file replay",
+		);
+		const replay = frames.find(frame => frame.type === "event_replay_result" && frame.id === "file-replay");
+		expect(replay?.events).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					payload: expect.objectContaining({
+						type: "file_attachment",
+						sessionId,
+						name: "replay.bin",
+						data: bytes.toString("base64"),
+					}),
+				}),
+			]),
+		);
+	} finally {
+		if (originalPushFileAttachmentUnchecked) {
+			nativePrototype.pushFileAttachmentUnchecked = originalPushFileAttachmentUnchecked;
+		} else {
+			delete nativePrototype.pushFileAttachmentUnchecked;
+		}
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, context(cwd, sessionId));
 	}
 });
 
@@ -1839,6 +2076,105 @@ test("SDK session switches rotate endpoint authority before publishing the repla
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
 });
 
+for (const eventType of ["session_switch", "session_branch"] as const) {
+	test(`SDK ${eventType} rotation swallows a retained owner-release failure without surfacing an extension error`, async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-rotate-fail-${eventType}-`));
+		dirs.push(cwd);
+		const sessionA = `rotate-fail-a-${Date.now()}`;
+		const sessionB = `rotate-fail-b-${Date.now()}`;
+		let activeSessionId = sessionA;
+		const ctx = {
+			...context(cwd, sessionA),
+			sessionManager: {
+				getSessionId: () => activeSessionId,
+				getSessionName: () => "SDK rotate",
+				getUsageStatistics: () => ({
+					input: 1,
+					output: 2,
+					cacheRead: 0,
+					cacheWrite: 0,
+					premiumRequests: 0,
+					cost: 0,
+				}),
+			},
+		};
+		// Fail A's owner release exactly once so the rotate-time stopSession(prevId)
+		// throws the retained-retry AggregateError.
+		const stop = spyOn(SessionSdkHost.prototype, "stop").mockRejectedValueOnce(new Error("host stop failed"));
+		const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+		try {
+			const handlers = start(ctx);
+			const endpointAPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionA}.json`);
+			await waitFor(() => fs.existsSync(endpointAPath), "session A endpoint");
+
+			activeSessionId = sessionB;
+			// Drive the rotation handler through a real ExtensionRunner so the onError
+			// seam proves the swallowed failure is not surfaced as a red extension error.
+			const rotationExt = {
+				path: "test-rotation-ext",
+				handlers: new Map([
+					[
+						eventType,
+						[
+							async () => {
+								await handlers.get(eventType)!(
+									{
+										type: eventType,
+										reason: "new",
+										previousSessionFile: path.join(cwd, "sessions", `ts_${sessionA}.jsonl`),
+									},
+									ctx,
+								);
+							},
+						],
+					],
+				]),
+			};
+			const runner = new ExtensionRunner([rotationExt as never], {} as never, cwd, {} as never, {} as never);
+			runner.initialize({} as never, {} as never);
+			const surfaced: Array<{ event: string }> = [];
+			runner.onError(error => surfaced.push(error));
+			await expect(
+				runner.emit({
+					type: eventType,
+					reason: "new",
+					previousSessionFile: path.join(cwd, "sessions", `ts_${sessionA}.jsonl`),
+				} as never),
+			).resolves.toBeUndefined();
+			expect(surfaced).toEqual([]);
+
+			// Rotation still publishes B and retires A despite the swallowed failure.
+			const endpointBPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionB}.json`);
+			await waitFor(() => !fs.existsSync(endpointAPath) && fs.existsSync(endpointBPath), "rotated session endpoint");
+
+			// The failure is logged at error severity with the shared prefix and A's
+			// identity, never surfaced as a red extension error.
+			const breadcrumbs = errorSpy.mock.calls.map(args => String(args[0]));
+			expect(
+				breadcrumbs.some(
+					message =>
+						message.startsWith("notifications: SDK notification runtime cleanup failed: ") &&
+						message.includes(`SDK notification runtime ${sessionA} owner release failed`),
+				),
+			).toBe(true);
+
+			// With the mock restored, A's retained cleanup can still complete.
+			stop.mockRestore();
+			await expect(
+				handlers.get("session_shutdown")!(
+					{ type: "session_shutdown" },
+					{ ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => sessionA } },
+				),
+			).resolves.toBeUndefined();
+
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+		} finally {
+			stop.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+}
+
 test("SDK host binds session query and control seams and excludes uninstalled resources", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-bindings-"));
 	dirs.push(cwd);
@@ -2251,6 +2587,7 @@ test("Q17 returns resource_gone without an assistant and reads a completed persi
 		ok: true,
 		page: { items: ["Completed persisted reply"] },
 	});
+	await closeSocket(socket);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 	await agentSession.dispose();
 	await sessionManager.close();
@@ -2295,9 +2632,13 @@ test("Q17 returns resource_gone without an assistant and reads a completed persi
 		ok: true,
 		page: { items: ["Completed persisted reply"] },
 	});
+	await closeSocket(reopenedSocket);
 	await reopenedHandlers.get("session_shutdown")?.({ type: "session_shutdown" }, reopenedSessionContext);
 	await reopenedSessionManager.close();
 	authStorage.close();
+	closeModelCache(path.join(cwd, "models.db"));
+	handlers.clear();
+	reopenedHandlers.clear();
 });
 
 test("terminal shutdown removes session snapshot spills", async () => {
@@ -2642,6 +2983,39 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 		error: { code: "invalid_input", message: "config.patch rejects secret fields at the SDK host." },
 	});
 	expect(configWrites).toEqual([]);
+});
+
+test("Q12 records the runtime-turn correlation before a workflow gate is exposed", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-q12-runtime-turn-"));
+	dirs.push(cwd);
+	const emitter = new BrokerWorkflowGateEmitter("q12-runtime-turn", new FileGateStore(path.join(cwd, "gates.json")));
+	const detachTerminalController = emitter.registerGateTerminalController!({
+		completeGateInteractions: () => "not_published",
+		cancelGateInteractions: () => {},
+	});
+	try {
+		emitter.setRuntimeTurnProvider?.(() => "runtime-turn-2550");
+		const advance = emitter.emitGate({
+			stage: "deep-interview",
+			kind: "question",
+			schema: { type: "string", enum: ["continue"] },
+		});
+		const records = emitter.listWorkflowGateQueryRecords!();
+		expect(records).toHaveLength(1);
+		expect(records[0]).toMatchObject({
+			id: expect.stringMatching(/^pending:/),
+			tag: "pending",
+			runtime_turn_id: "runtime-turn-2550",
+		});
+		await emitter.resolveGate!({
+			gate_id: records[0]!.gate_id,
+			answer: "continue",
+			idempotency_key: "q12-runtime-turn",
+		});
+		expect(await advance).toBe("continue");
+	} finally {
+		detachTerminalController();
+	}
 });
 
 test("SDK host discovers, answers, and advances a durable workflow gate", async () => {

@@ -68,6 +68,13 @@
 			"argv": [
 				"bun",
 				"test",
+				"packages/coding-agent/test/notifications-ephemeral-host.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
 				"packages/coding-agent/test/notifications-file-redaction.test.ts"
 			]
 		},
@@ -208,6 +215,13 @@
 			"argv": [
 				"bun",
 				"test",
+				"packages/coding-agent/test/notifications-rich-document.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
 				"packages/coding-agent/test/notifications-rich-draft.test.ts"
 			]
 		},
@@ -257,6 +271,13 @@
 			"argv": [
 				"bun",
 				"test",
+				"packages/coding-agent/test/notifications-telegram-btw-e2e.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
 				"packages/coding-agent/test/notifications-telegram-daemon.test.ts"
 			]
 		},
@@ -279,6 +300,13 @@
 				"bun",
 				"test",
 				"packages/coding-agent/test/notifications-threaded-render.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/notifications-tool-activity.test.ts"
 			]
 		},
 		{

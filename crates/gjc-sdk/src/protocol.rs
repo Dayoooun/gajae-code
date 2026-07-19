@@ -9,7 +9,7 @@
 //! Field names are `camelCase` on the wire (matching the TypeScript extension),
 //! while the `type` discriminator values are `snake_case`.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeStruct};
 
 /// The kind of action that requires human attention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -436,6 +436,14 @@ pub enum ServerMessage {
 	AskSelectedAckCancel(AskSelectedAckCancel),
 	/// A controlled action could not be presented to this connection.
 	ActionUnavailable(ActionUnavailable),
+	/// A completed ephemeral side-question result, correlated to the inbound
+	/// request.
+	EphemeralTurnResult(EphemeralTurnResult),
+
+	/// A projected tool execution activity update.
+	ToolActivity(ToolActivity),
+	/// A finalized, provider-supplied reasoning summary.
+	ReasoningSummary(ReasoningSummary),
 
 	/// Forward-compat: an unrecognized frame type. Tolerated, never emitted.
 	#[serde(other)]
@@ -452,6 +460,11 @@ pub enum ClientMessage {
 	Hello(ClientHello),
 	/// An inbound free-text user message that injects/steers a turn.
 	UserMessage(UserMessage),
+	/// An ephemeral side question that uses session context without injecting a
+	/// turn.
+	EphemeralTurn(EphemeralTurn),
+	/// Cancels an ephemeral side question.
+	EphemeralTurnCancel(EphemeralTurnCancel),
 	/// An in-thread configuration command (verbosity/redact toggles).
 	ConfigCommand(ConfigCommand),
 	/// A deterministic transport control command from a client.
@@ -484,6 +497,17 @@ pub enum TurnPhase {
 	Live,
 	/// The clean, finalized turn output.
 	Finalized,
+}
+
+/// Phase of a projected tool execution activity update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolActivityPhase {
+	Started,
+	Completed,
+	Failed,
+	Cancelled,
+	Unknown,
 }
 
 /// One-time per-session identity header, pinned at thread creation.
@@ -550,6 +574,32 @@ pub struct TurnStream {
 	/// Opaque ref to coalesce live edits onto one rendered message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub message_ref:  Option<String>,
+}
+
+/// A projected tool execution activity update for a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolActivity {
+	pub session_id:     String,
+	pub tool_call_id:   String,
+	pub tool_name:      String,
+	pub phase:          ToolActivityPhase,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub args_summary:   Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub result_summary: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub is_error:       Option<bool>,
+}
+
+/// A finalized, provider-supplied reasoning summary for a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningSummary {
+	pub session_id: String,
+	pub text:       String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub turn_ref:   Option<String>,
 }
 
 /// An agent-produced image artifact for a session thread.
@@ -678,6 +728,294 @@ pub struct UserMessage {
 	/// Inline image attachments to forward as image content blocks.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub images:     Vec<InboundImage>,
+}
+/// An inbound ephemeral side question using current session context without
+/// persistence.
+const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
+fn validate_session_id(value: &str) -> Result<(), &'static str> {
+	if !(1..=512).contains(&value.len()) {
+		return Err("sessionId must be 1-512 UTF-8 bytes");
+	}
+	Ok(())
+}
+
+fn deserialize_session_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	let value = String::deserialize(deserializer)?;
+	validate_session_id(&value).map_err(serde::de::Error::custom)?;
+	Ok(value)
+}
+
+fn deserialize_question<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	let value = String::deserialize(deserializer)?;
+	if value.trim() != value || !(1..=4096).contains(&value.chars().count()) || value.len() > 16_384
+	{
+		return Err(serde::de::Error::custom(
+			"question must be trimmed, 1-4096 Unicode scalars, and at most 16384 UTF-8 bytes",
+		));
+	}
+	Ok(value)
+}
+
+fn deserialize_token<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	let value = String::deserialize(deserializer)?;
+	if !(1..=4096).contains(&value.len()) {
+		return Err(serde::de::Error::custom("token must be 1-4096 UTF-8 bytes"));
+	}
+	Ok(value)
+}
+
+fn validate_request_id(value: &str) -> Result<(), &'static str> {
+	let bytes = value.as_bytes();
+	let valid = bytes.len() == 40
+		&& &bytes[..4] == b"btw:"
+		&& [12, 17, 22, 27]
+			.into_iter()
+			.all(|index| bytes[index] == b'-')
+		&& bytes[18] == b'4'
+		&& matches!(bytes[23], b'8' | b'9' | b'a' | b'b')
+		&& bytes[4..].iter().enumerate().all(|(index, byte)| {
+			matches!(index, 8 | 13 | 18 | 23) || byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+		});
+	if !valid {
+		return Err("requestId must be `btw:` followed by a lowercase UUIDv4");
+	}
+	Ok(())
+}
+
+fn deserialize_request_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	let value = String::deserialize(deserializer)?;
+	validate_request_id(&value).map_err(serde::de::Error::custom)?;
+	Ok(value)
+}
+
+fn validate_update_id(value: i64) -> Result<(), &'static str> {
+	if !(0..=MAX_SAFE_INTEGER).contains(&value) {
+		return Err("updateId must be a nonnegative safe integer");
+	}
+	Ok(())
+}
+
+fn deserialize_update_id<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	let value = i64::deserialize(deserializer)?;
+	validate_update_id(value).map_err(serde::de::Error::custom)?;
+	Ok(value)
+}
+
+fn validate_message_id(value: i64) -> Result<(), &'static str> {
+	if !(1..=MAX_SAFE_INTEGER).contains(&value) {
+		return Err("messageId must be a positive safe Telegram integer");
+	}
+	Ok(())
+}
+
+fn deserialize_message_id<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	let value = i64::deserialize(deserializer)?;
+	validate_message_id(value).map_err(serde::de::Error::custom)?;
+	Ok(value)
+}
+
+fn validate_thread_id(value: &str) -> Result<(), &'static str> {
+	if value.is_empty()
+		|| !value.bytes().all(|byte| byte.is_ascii_digit())
+		|| value
+			.parse::<i64>()
+			.ok()
+			.is_none_or(|id| !(1..=MAX_SAFE_INTEGER).contains(&id))
+	{
+		return Err("threadId must be a positive decimal safe-integer string");
+	}
+	Ok(())
+}
+
+fn deserialize_thread_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	let value = String::deserialize(deserializer)?;
+	validate_thread_id(&value).map_err(serde::de::Error::custom)?;
+	Ok(value)
+}
+
+/// An inbound ephemeral side question using current session context without
+/// persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EphemeralTurn {
+	/// The session to query.
+	#[serde(deserialize_with = "deserialize_session_id")]
+	pub session_id: String,
+	/// The side question body.
+	#[serde(deserialize_with = "deserialize_question")]
+	pub question:   String,
+	/// The per-session token authorizing this client.
+	#[serde(deserialize_with = "deserialize_token")]
+	pub token:      String,
+	/// Client-generated request id, echoed in the terminal result.
+	#[serde(deserialize_with = "deserialize_request_id")]
+	pub request_id: String,
+	/// Telegram update id for inbound dedupe/idempotency.
+	#[serde(deserialize_with = "deserialize_update_id")]
+	pub update_id:  i64,
+	/// Originating Telegram message id.
+	#[serde(deserialize_with = "deserialize_message_id")]
+	pub message_id: i64,
+	/// Originating thread/topic id, where the reply must be delivered.
+	#[serde(deserialize_with = "deserialize_thread_id")]
+	pub thread_id:  String,
+}
+
+/// Why an ephemeral turn was cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EphemeralTurnCancelReason {
+	DaemonShutdown,
+}
+
+/// Cancels an ephemeral turn using its immutable correlation tuple.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EphemeralTurnCancel {
+	#[serde(deserialize_with = "deserialize_session_id")]
+	pub session_id: String,
+	#[serde(deserialize_with = "deserialize_token")]
+	pub token:      String,
+	#[serde(deserialize_with = "deserialize_request_id")]
+	pub request_id: String,
+	#[serde(deserialize_with = "deserialize_update_id")]
+	pub update_id:  i64,
+	#[serde(deserialize_with = "deserialize_message_id")]
+	pub message_id: i64,
+	#[serde(deserialize_with = "deserialize_thread_id")]
+	pub thread_id:  String,
+	pub reason:     EphemeralTurnCancelReason,
+}
+
+/// Terminal status for an ephemeral side question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EphemeralTurnStatus {
+	Ok,
+	Busy,
+	Timeout,
+	Cancelled,
+	SessionUnavailable,
+	Failed,
+}
+
+/// A terminal result for an [`EphemeralTurn`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EphemeralTurnResult {
+	/// The session that processed the question.
+	pub session_id: String,
+	/// Opaque request id from the corresponding [`EphemeralTurn`].
+	pub request_id: String,
+	/// Telegram update id from the corresponding request.
+	pub update_id:  i64,
+	/// Originating Telegram message id.
+	pub message_id: i64,
+	/// Originating thread/topic id.
+	pub thread_id:  String,
+	/// Terminal outcome.
+	pub status:     EphemeralTurnStatus,
+	/// Terminal response text, present only for successful results.
+	pub text:       Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawEphemeralTurnResult {
+	#[serde(deserialize_with = "deserialize_session_id")]
+	session_id: String,
+	#[serde(deserialize_with = "deserialize_request_id")]
+	request_id: String,
+	#[serde(deserialize_with = "deserialize_update_id")]
+	update_id:  i64,
+	#[serde(deserialize_with = "deserialize_message_id")]
+	message_id: i64,
+	#[serde(deserialize_with = "deserialize_thread_id")]
+	thread_id:  String,
+	status:     EphemeralTurnStatus,
+	text:       Option<String>,
+}
+
+const fn validate_ephemeral_turn_result(
+	status: EphemeralTurnStatus,
+	text: Option<&str>,
+) -> Result<(), &'static str> {
+	match (status, text) {
+		(EphemeralTurnStatus::Ok, Some(text)) if text.len() <= 262_144 => Ok(()),
+		(EphemeralTurnStatus::Ok, _) => {
+			Err("ok ephemeral_turn_result requires text no longer than 262144 UTF-8 bytes")
+		},
+		(_, None) => Ok(()),
+		_ => Err("non-ok ephemeral_turn_result must not include text"),
+	}
+}
+
+impl Serialize for EphemeralTurnResult {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		validate_session_id(&self.session_id).map_err(serde::ser::Error::custom)?;
+		validate_request_id(&self.request_id).map_err(serde::ser::Error::custom)?;
+		validate_update_id(self.update_id).map_err(serde::ser::Error::custom)?;
+		validate_message_id(self.message_id).map_err(serde::ser::Error::custom)?;
+		validate_thread_id(&self.thread_id).map_err(serde::ser::Error::custom)?;
+		validate_ephemeral_turn_result(self.status, self.text.as_deref())
+			.map_err(serde::ser::Error::custom)?;
+
+		let mut state = serializer
+			.serialize_struct("EphemeralTurnResult", if self.text.is_some() { 7 } else { 6 })?;
+		state.serialize_field("sessionId", &self.session_id)?;
+		state.serialize_field("requestId", &self.request_id)?;
+		state.serialize_field("updateId", &self.update_id)?;
+		state.serialize_field("messageId", &self.message_id)?;
+		state.serialize_field("threadId", &self.thread_id)?;
+		state.serialize_field("status", &self.status)?;
+		if let Some(text) = &self.text {
+			state.serialize_field("text", text)?;
+		}
+		state.end()
+	}
+}
+impl<'de> Deserialize<'de> for EphemeralTurnResult {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		let raw = RawEphemeralTurnResult::deserialize(deserializer)?;
+		validate_ephemeral_turn_result(raw.status, raw.text.as_deref())
+			.map_err(serde::de::Error::custom)?;
+		Ok(Self {
+			session_id: raw.session_id,
+			request_id: raw.request_id,
+			update_id:  raw.update_id,
+			message_id: raw.message_id,
+			thread_id:  raw.thread_id,
+			status:     raw.status,
+			text:       raw.text,
+		})
+	}
 }
 
 /// An in-thread configuration command (verbosity/redact toggles).
@@ -862,6 +1200,10 @@ pub mod capabilities {
 	pub const ASK_CONTROLS_V1: &str = "ask_controls_v1";
 	/// Correlated, origin-bound `Selected!` acknowledgement requests.
 	pub const ASK_SELECTED_ACK_V1: &str = "ask_selected_ack_v1";
+	/// Projected tool activity and finalized reasoning summary frames.
+	pub const TOOL_ACTIVITY_V1: &str = "tool_activity_v1";
+	/// Ephemeral side-turn request, cancellation, and terminal result frames.
+	pub const EPHEMERAL_TURN_V1: &str = "ephemeral_turn_v1";
 }
 
 #[cfg(test)]
@@ -1119,6 +1461,94 @@ mod tests {
 	}
 
 	#[test]
+	fn tool_activity_serializes_camelcase_snake_tag() {
+		let msg = ServerMessage::ToolActivity(ToolActivity {
+			session_id:     "sess-1".into(),
+			tool_call_id:   "call-1".into(),
+			tool_name:      "functions.read".into(),
+			phase:          ToolActivityPhase::Completed,
+			args_summary:   Some("path: protocol.rs".into()),
+			result_summary: Some("1488 lines".into()),
+			is_error:       Some(false),
+		});
+		let value = serde_json::to_value(&msg).unwrap();
+		assert_eq!(value["type"], "tool_activity");
+		assert_eq!(value["sessionId"], "sess-1");
+		assert_eq!(value["toolCallId"], "call-1");
+		assert_eq!(value["toolName"], "functions.read");
+		assert_eq!(value["phase"], "completed");
+		assert_eq!(value["argsSummary"], "path: protocol.rs");
+		assert_eq!(value["resultSummary"], "1488 lines");
+		assert_eq!(value["isError"], false);
+		assert_eq!(serde_json::from_value::<ServerMessage>(value).unwrap(), msg);
+	}
+
+	#[test]
+	fn reasoning_summary_round_trips() {
+		let msg = ServerMessage::ReasoningSummary(ReasoningSummary {
+			session_id: "sess-1".into(),
+			text:       "Provider summary".into(),
+			turn_ref:   Some("turn-1".into()),
+		});
+		let value = serde_json::to_value(&msg).unwrap();
+		assert_eq!(value["type"], "reasoning_summary");
+		assert_eq!(value["sessionId"], "sess-1");
+		assert_eq!(value["turnRef"], "turn-1");
+		assert_eq!(serde_json::from_value::<ServerMessage>(value).unwrap(), msg);
+	}
+
+	#[test]
+	fn tool_activity_phase_snake_case() {
+		for (phase, expected) in [
+			(ToolActivityPhase::Started, "started"),
+			(ToolActivityPhase::Completed, "completed"),
+			(ToolActivityPhase::Failed, "failed"),
+			(ToolActivityPhase::Cancelled, "cancelled"),
+			(ToolActivityPhase::Unknown, "unknown"),
+		] {
+			assert_eq!(serde_json::to_string(&phase).unwrap(), format!("\"{expected}\""));
+		}
+	}
+
+	#[test]
+	fn unknown_variant_remains_final_serde_other() {
+		let msg: ServerMessage =
+			serde_json::from_str(r#"{"type":"totally_unknown","payload":true}"#).unwrap();
+		assert_eq!(msg, ServerMessage::Unknown);
+	}
+
+	#[test]
+	fn server_message_variant_enumeration() {
+		// TODO(#2299 rebase): extend to include ephemeral_turn/ephemeral_turn_result.
+		let raw = r#"[
+			{"type":"tool_activity","sessionId":"sess-1","toolCallId":"call-1","toolName":"functions.read","phase":"started"},
+			{"type":"reasoning_summary","sessionId":"sess-1","text":"Provider summary","turnRef":"turn-1"},
+			{"type":"future_server_variant","payload":true}
+		]"#;
+		let messages: Vec<ServerMessage> = serde_json::from_str(raw).unwrap();
+		assert_eq!(messages, vec![
+			ServerMessage::ToolActivity(ToolActivity {
+				session_id:     "sess-1".into(),
+				tool_call_id:   "call-1".into(),
+				tool_name:      "functions.read".into(),
+				phase:          ToolActivityPhase::Started,
+				args_summary:   None,
+				result_summary: None,
+				is_error:       None,
+			}),
+			ServerMessage::ReasoningSummary(ReasoningSummary {
+				session_id: "sess-1".into(),
+				text:       "Provider summary".into(),
+				turn_ref:   Some("turn-1".into()),
+			}),
+			ServerMessage::Unknown,
+		],);
+		let round_tripped: Vec<ServerMessage> =
+			serde_json::from_str(&serde_json::to_string(&messages).unwrap()).unwrap();
+		assert_eq!(round_tripped, messages);
+	}
+
+	#[test]
 	fn image_attachment_serializes() {
 		let msg = ServerMessage::ImageAttachment(ImageAttachment {
 			session_id: "sess-1".into(),
@@ -1278,6 +1708,105 @@ mod tests {
 				assert_eq!(u.thread_id.as_deref(), Some("topic-9"));
 			},
 			other => panic!("expected user_message, got {other:?}"),
+		}
+	}
+	#[test]
+	fn ephemeral_turn_parses_as_distinct_inbound_frame() {
+		let raw = r#"{"type":"ephemeral_turn","sessionId":"s1","question":"what changed?","token":"t","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":42,"messageId":7,"threadId":"9"}"#;
+		let msg: ClientMessage = serde_json::from_str(raw).unwrap();
+		match msg {
+			ClientMessage::EphemeralTurn(turn) => {
+				assert_eq!(turn.session_id, "s1");
+				assert_eq!(turn.question, "what changed?");
+				assert_eq!(turn.request_id, "btw:123e4567-e89b-42d3-a456-426614174000");
+				assert_eq!(turn.update_id, 42);
+				assert_eq!(turn.message_id, 7);
+				assert_eq!(turn.thread_id, "9");
+			},
+			other => panic!("expected ephemeral_turn, got {other:?}"),
+		}
+	}
+	#[test]
+	fn ephemeral_turn_and_cancel_enforce_contract_bounds_and_fields() {
+		let valid = r#"{"type":"ephemeral_turn","sessionId":"s","question":"q","token":"t","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":0,"messageId":1,"threadId":"1"}"#;
+		assert!(serde_json::from_str::<ClientMessage>(valid).is_ok());
+
+		for raw in [
+			r#"{"type":"ephemeral_turn","sessionId":"","question":"q","token":"t","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":0,"messageId":1,"threadId":"1"}"#,
+			r#"{"type":"ephemeral_turn","sessionId":"s","question":" q","token":"t","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":0,"messageId":1,"threadId":"1"}"#,
+			r#"{"type":"ephemeral_turn","sessionId":"s","question":"q","token":"","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":0,"messageId":1,"threadId":"1"}"#,
+			r#"{"type":"ephemeral_turn","sessionId":"s","question":"q","token":"t","requestId":"btw:123e4567-e89b-12d3-a456-426614174000","updateId":0,"messageId":1,"threadId":"1"}"#,
+			r#"{"type":"ephemeral_turn","sessionId":"s","question":"q","token":"t","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":-1,"messageId":1,"threadId":"1"}"#,
+			r#"{"type":"ephemeral_turn","sessionId":"s","question":"q","token":"t","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":0,"messageId":0,"threadId":"1"}"#,
+			r#"{"type":"ephemeral_turn","sessionId":"s","question":"q","token":"t","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":0,"messageId":1,"threadId":"0"}"#,
+			r#"{"type":"ephemeral_turn","sessionId":"s","question":"q","token":"t","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":0,"messageId":1,"threadId":"1","unexpected":true}"#,
+		] {
+			assert!(serde_json::from_str::<ClientMessage>(raw).is_err(), "accepted {raw}");
+		}
+		let max_question = "x".repeat(4096);
+		let max_session = "s".repeat(512);
+		let max_token = "t".repeat(4096);
+		let boundary = format!(
+			r#"{{"type":"ephemeral_turn","sessionId":"{max_session}","question":"{max_question}","token":"{max_token}","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":9007199254740991,"messageId":9007199254740991,"threadId":"9007199254740991"}}"#
+		);
+		assert!(serde_json::from_str::<ClientMessage>(&boundary).is_ok());
+		let overlong_question = "x".repeat(4097);
+		let overlong = format!(
+			r#"{{"type":"ephemeral_turn","sessionId":"s","question":"{overlong_question}","token":"t","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":0,"messageId":1,"threadId":"1"}}"#
+		);
+		assert!(serde_json::from_str::<ClientMessage>(&overlong).is_err());
+
+		let cancel = r#"{"type":"ephemeral_turn_cancel","sessionId":"s","token":"t","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":0,"messageId":1,"threadId":"1","reason":"daemon_shutdown"}"#;
+		assert!(matches!(
+			serde_json::from_str::<ClientMessage>(cancel).unwrap(),
+			ClientMessage::EphemeralTurnCancel(_)
+		));
+		assert!(serde_json::from_str::<ClientMessage>(
+			r#"{"type":"ephemeral_turn_cancel","sessionId":"s","token":"t","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":0,"messageId":1,"threadId":"1","reason":"user_cancelled"}"#
+		).is_err());
+	}
+
+	#[test]
+	fn ephemeral_turn_result_requires_status_appropriate_text_and_tuple() {
+		let ok = r#"{"type":"ephemeral_turn_result","sessionId":"s","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":0,"messageId":1,"threadId":"1","status":"ok","text":"answer"}"#;
+		let busy = r#"{"type":"ephemeral_turn_result","sessionId":"s","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":0,"messageId":1,"threadId":"1","status":"busy"}"#;
+		assert!(serde_json::from_str::<ServerMessage>(ok).is_ok());
+		assert!(serde_json::from_str::<ServerMessage>(busy).is_ok());
+		for raw in [
+			r#"{"type":"ephemeral_turn_result","sessionId":"s","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":0,"messageId":1,"threadId":"1","status":"ok"}"#,
+			r#"{"type":"ephemeral_turn_result","sessionId":"s","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":0,"messageId":1,"threadId":"1","status":"busy","text":"no"}"#,
+			r#"{"type":"ephemeral_turn_result","sessionId":"s","requestId":"btw:123e4567-e89b-42d3-a456-426614174000","updateId":0,"messageId":1,"threadId":"1","status":"failed","extra":true}"#,
+		] {
+			assert!(serde_json::from_str::<ServerMessage>(raw).is_err(), "accepted {raw}");
+		}
+	}
+	#[test]
+	fn ephemeral_turn_result_serialization_enforces_tuple_bounds() {
+		let valid = EphemeralTurnResult {
+			session_id: "s".repeat(512),
+			request_id: "btw:123e4567-e89b-42d3-a456-426614174000".into(),
+			update_id:  MAX_SAFE_INTEGER,
+			message_id: MAX_SAFE_INTEGER,
+			thread_id:  MAX_SAFE_INTEGER.to_string(),
+			status:     EphemeralTurnStatus::Ok,
+			text:       Some("answer".into()),
+		};
+		assert!(serde_json::to_string(&valid).is_ok());
+
+		for invalid in [
+			EphemeralTurnResult { session_id: String::new(), ..valid.clone() },
+			EphemeralTurnResult {
+				request_id: "btw:123e4567-e89b-12d3-a456-426614174000".into(),
+				..valid.clone()
+			},
+			EphemeralTurnResult { update_id: -1, ..valid.clone() },
+			EphemeralTurnResult { update_id: MAX_SAFE_INTEGER + 1, ..valid.clone() },
+			EphemeralTurnResult { message_id: 0, ..valid.clone() },
+			EphemeralTurnResult { message_id: MAX_SAFE_INTEGER + 1, ..valid.clone() },
+			EphemeralTurnResult { thread_id: "0".into(), ..valid.clone() },
+			EphemeralTurnResult { status: EphemeralTurnStatus::Busy, ..valid.clone() },
+		] {
+			assert!(serde_json::to_string(&invalid).is_err(), "serialized {invalid:?}");
 		}
 	}
 

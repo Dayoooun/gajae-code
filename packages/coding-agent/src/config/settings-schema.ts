@@ -270,12 +270,22 @@ export const SETTINGS_SCHEMA = {
 	// per-machine overrides remain trivial.
 	"auth.broker.url": { type: "string", default: undefined },
 	"auth.broker.token": { type: "string", default: undefined },
+	"session.directoryMigration": {
+		type: "enum",
+		values: ["copy-retain", "disabled"] as const,
+		default: "copy-retain",
+	},
 
 	// Notifications (shared daemon with Telegram/Discord/Slack presentation adapters)
 	"notifications.enabled": { type: "boolean", default: false },
-	"notifications.telegram.botToken": { type: "string", default: undefined },
+	"notifications.telegram.botToken": {
+		type: "string",
+		default: undefined,
+		validate: (value: unknown) => typeof value === "string",
+	},
 	"notifications.telegram.chatId": { type: "string", default: undefined },
 	"notifications.telegram.activation": { type: "record", default: {} as Record<string, unknown> },
+	"notifications.telegram.btw.enabled": { type: "boolean", default: true },
 	"notifications.telegram.rich.enabled": {
 		type: "boolean",
 		default: true,
@@ -646,20 +656,30 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
+	"tools.preAdmissionArtifactSpill": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			label: "Pre-admission artifact spill",
+			description:
+				"Experimental opt-in: save oversized tool results before provider context construction, retaining a UTF-8-safe head, tail, digest, and artifact receipt inline",
+		},
+	},
 
 	"tools.readArtifactSpillThreshold": {
 		type: "number",
-		default: 0,
+		default: 256,
 		ui: {
 			tab: "tools",
-			label: "Experimental read-tool artifact spill threshold (KB)",
+			label: "Read artifact spill threshold (KB)",
 			description:
-				"Advanced opt-in only: combined-size cap for `read` output across all requested ranges. Above this the full output is saved as an artifact and a bounded head+tail snippet is kept inline. Live layofflabs/gpt-5.5 medium evidence on 2026-07-07 found no token savings and a lower cache-hit rate at 50 KB, so normal coding sessions should leave this Off unless intentionally measuring large-read behavior.",
+				"Explicit large reads above this combined size are saved as an artifact with a bounded head-and-tail snippet inline. Bare reads, directories, and converted-document receipts remain inline.",
 			options: [
-				{ value: "0", label: "Off", description: "Default; no read-specific spill (backstop only)" },
+				{ value: "0", label: "Off", description: "No read-specific spill (backstop only)" },
 				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
 				{ value: "100", label: "100 KB", description: "~25K tokens" },
-				{ value: "256", label: "256 KB", description: "~64K tokens" },
+				{ value: "256", label: "256 KB", description: "Default; ~64K tokens" },
 				{ value: "512", label: "512 KB", description: "~128K tokens" },
 				{ value: "1000", label: "1 MB", description: "~250K tokens" },
 			],
@@ -668,17 +688,17 @@ export const SETTINGS_SCHEMA = {
 
 	"tools.fileMentionInlineBytes": {
 		type: "number",
-		default: 20,
+		default: 10,
 		ui: {
 			tab: "tools",
 			label: "File-mention inline cap (KB)",
 			description:
-				"Inline byte cap for auto-read `@path` file mentions, deliberately below the read-tool cap so an incidental mention injects a smaller snippet than an explicit read. The full file is still available via the read tool.",
+				"Inline byte cap for auto-read `@path` file mentions, aligned with the 10 KiB bare-read receipt so incidental mentions stay within the same bounded context budget. The full file is still available via the read tool.",
 			options: [
 				{ value: "5", label: "5 KB", description: "~1.25K tokens" },
-				{ value: "10", label: "10 KB", description: "~2.5K tokens" },
-				{ value: "20", label: "20 KB", description: "Default; ~5K tokens" },
-				{ value: "50", label: "50 KB", description: "~12.5K tokens (matches read cap)" },
+				{ value: "10", label: "10 KB", description: "Default; ~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens (matches bare-read receipt)" },
 			],
 		},
 	},
@@ -1151,7 +1171,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "model",
 			label: "Max Retry Delay",
 			description:
-				"Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows).",
+				"Maximum wait between retries, in ms. Legacy retries clamp provider Retry-After hints to this value; managed fallback honors typed Retry-After hints even when they exceed it.",
 		},
 	},
 	"retry.requestMaxRetries": {
@@ -1198,6 +1218,15 @@ export const SETTINGS_SCHEMA = {
 	// Interaction
 	// ────────────────────────────────────────────────────────────────────────
 
+	"mouse.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			label: "Mouse Support",
+			description: "Enable SGR mouse wheel scrolling and overlay row selection. Disabled in tmux and screen.",
+		},
+	},
 	// Conversation flow
 	steeringMode: {
 		type: "enum",
@@ -1987,6 +2016,51 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
+	"read.receiptBudgetLines": {
+		type: "number",
+		default: 50,
+		ui: {
+			tab: "editing",
+			label: "Read Receipt Line Budget",
+			description: "Maximum lines included in a bare read receipt before a selector footer is shown",
+			options: [
+				{ value: "25", label: "25 lines" },
+				{ value: "50", label: "50 lines", description: "Default" },
+				{ value: "100", label: "100 lines" },
+				{ value: "200", label: "200 lines" },
+			],
+		},
+	},
+	"read.receiptBudgetBytes": {
+		type: "number",
+		default: 10,
+		ui: {
+			tab: "editing",
+			label: "Read Receipt Byte Budget (KB)",
+			description: "Maximum UTF-8 body size for a bare read receipt before a selector footer is shown",
+			options: [
+				{ value: "5", label: "5 KB", description: "~1.25K tokens" },
+				{ value: "10", label: "10 KB", description: "Default; ~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+			],
+		},
+	},
+	"read.summaryMaxBytes": {
+		type: "number",
+		default: 20,
+		ui: {
+			tab: "editing",
+			label: "Read Summary Size Budget (KB)",
+			description: "Maximum UTF-8 size for a structural read summary before additional units are elided",
+			options: [
+				{ value: "10", label: "10 KB", description: "~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "Default; ~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+				{ value: "100", label: "100 KB", description: "~25K tokens" },
+			],
+		},
+	},
 
 	"read.summarize.enabled": {
 		type: "boolean",
@@ -2758,6 +2832,15 @@ export const SETTINGS_SCHEMA = {
 	// Tasks
 	// ────────────────────────────────────────────────────────────────────────
 
+	"tasksPane.defaultVisible": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			label: "Tasks Pane Visible By Default",
+			description: "Open the unified tasks pane when the interactive UI starts",
+		},
+	},
 	// Plan mode
 	"plan.enabled": {
 		type: "boolean",
@@ -3408,6 +3491,122 @@ export function getEnumValues(path: SettingPath): readonly string[] | undefined 
 	return "values" in def ? (def.values as readonly string[]) : undefined;
 }
 
+export const CONFIG_SCHEMA_VERSION = 1;
+
+export type SettingsSchemaIssue = {
+	path: string;
+	kind: "unknown" | "invalid" | "coerced" | "pending-migration";
+	detail: string;
+};
+
+export type SettingsSchemaReport = { issues: SettingsSchemaIssue[]; valid: boolean };
+
+function schemaValueAtPath(value: Record<string, unknown>, path: string): unknown {
+	let current: unknown = value;
+	for (const segment of path.split(".")) {
+		if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
+		current = (current as Record<string, unknown>)[segment];
+	}
+	return current;
+}
+
+function schemaSetAtPath(value: Record<string, unknown>, path: string, next: unknown): void {
+	const segments = path.split(".");
+	let current = value;
+	for (const segment of segments.slice(0, -1)) {
+		const child = current[segment];
+		if (!child || typeof child !== "object" || Array.isArray(child)) current[segment] = {};
+		current = current[segment] as Record<string, unknown>;
+	}
+	current[segments.at(-1)!] = next;
+}
+
+function schemaPaths(value: Record<string, unknown>, prefix = ""): string[] {
+	const paths: string[] = [];
+	for (const [key, child] of Object.entries(value)) {
+		const path = prefix ? `${prefix}.${key}` : key;
+		const definition = SETTINGS_SCHEMA[path as SettingPath];
+		// Records intentionally accept user-defined keys; validate their entries below.
+		if (definition?.type === "record") {
+			paths.push(path);
+		} else if (child && typeof child === "object" && !Array.isArray(child)) {
+			paths.push(...schemaPaths(child as Record<string, unknown>, path));
+		} else {
+			paths.push(path);
+		}
+	}
+	return paths;
+}
+
+function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], value: unknown): boolean {
+	return (
+		(definition.type === "boolean" && typeof value === "boolean") ||
+		(definition.type === "string" && typeof value === "string") ||
+		(definition.type === "number" &&
+			typeof value === "number" &&
+			Number.isFinite(value) &&
+			(!("validate" in definition) || !definition.validate || definition.validate(value))) ||
+		(definition.type === "enum" &&
+			typeof value === "string" &&
+			(definition.values as readonly string[]).includes(value)) ||
+		(definition.type === "array" && Array.isArray(value)) ||
+		(definition.type === "record" && !!value && typeof value === "object" && !Array.isArray(value))
+	);
+}
+
+/** Coerce supported scalar legacy values and report unknown or invalid settings without dropping them. */
+export function reconcileSettingsSchema(raw: Record<string, unknown>): {
+	settings: Record<string, unknown>;
+	report: SettingsSchemaReport;
+} {
+	const settings = structuredClone(raw);
+	const issues: SettingsSchemaIssue[] = [];
+	const knownPaths = new Set(Object.keys(SETTINGS_SCHEMA));
+	for (const path of schemaPaths(settings)) {
+		if (path === "configSchemaVersion" || knownPaths.has(path)) continue;
+		if (![...knownPaths].some(known => known.startsWith(`${path}.`))) {
+			issues.push({ path, kind: "unknown", detail: "Setting is not recognized by this version." });
+		}
+	}
+	for (const path of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
+		const value = schemaValueAtPath(settings, path);
+		if (value === undefined) continue;
+		const definition = SETTINGS_SCHEMA[path];
+		let next = value;
+		if (definition.type === "boolean" && (value === "true" || value === "false")) next = value === "true";
+		if (
+			definition.type === "number" &&
+			typeof value === "string" &&
+			value.trim() !== "" &&
+			Number.isFinite(Number(value))
+		) {
+			next = Number(value);
+		}
+		if (next !== value) {
+			schemaSetAtPath(settings, path, next);
+			issues.push({ path, kind: "coerced", detail: `Coerced ${typeof value} to ${definition.type}.` });
+		}
+		if (!validSettingValue(definition, next))
+			issues.push({ path, kind: "invalid", detail: `Expected ${definition.type}.` });
+		if (
+			definition.type === "record" &&
+			"valueSchema" in definition &&
+			definition.valueSchema &&
+			validSettingValue(definition, next)
+		) {
+			for (const [key, entry] of Object.entries(next as Record<string, unknown>)) {
+				if (
+					definition.valueSchema.type === "model-selector-value" &&
+					!(typeof entry === "string" || (Array.isArray(entry) && entry.every(item => typeof item === "string")))
+				) {
+					issues.push({ path: `${path}.${key}`, kind: "invalid", detail: "Expected model-selector-value." });
+				}
+			}
+		}
+	}
+	return { settings, report: { issues, valid: !issues.some(issue => issue.kind === "invalid") } };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Derived Types from Schema
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3560,6 +3759,9 @@ export interface NotificationsSettings {
 	telegram: {
 		botToken: string | undefined;
 		chatId: string | undefined;
+		btw: {
+			enabled: boolean;
+		};
 		rich: {
 			enabled: boolean;
 		};

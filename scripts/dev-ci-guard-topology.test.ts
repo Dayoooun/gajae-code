@@ -26,8 +26,7 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		const d = await workflow();
 		expect(d.jobs.affected.needs).toContain("telegram-daemon-generation");
 		const aggregate = (d.jobs.affected.steps as any[]).map(s => s.run ?? "").join("\n");
-		expect(aggregate).toContain("telegram_guard='${{ needs.telegram-daemon-generation.result }}'");
-		expect(aggregate).toMatch(/case "\$telegram_guard" in success\|skipped\)/);
+		expect(aggregate).toContain("test '${{ needs.telegram-daemon-generation.result }}' = success || test '${{ needs.telegram-daemon-generation.result }}' = skipped");
 	});
 
 	test("validates the same requested commit in the guard, planner, and shards (no arbitrary dispatch head)", async () => {

@@ -28,9 +28,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import type { ImageContent, TextContent } from "@gajae-code/ai";
+import type { ImageContent, TextContent, Tool } from "@gajae-code/ai";
 import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
-import { logger, postmortem, VERSION } from "@gajae-code/utils";
+import { logger, postmortem, prompt, VERSION } from "@gajae-code/utils";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import type {
@@ -38,6 +38,7 @@ import type {
 	WorkflowGateTerminalController,
 	WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
+import btwUserPrompt from "../../prompts/system/btw-user.md" with { type: "text" };
 import { parseThinkingLevel } from "../../thinking";
 import type {
 	AskAnswerRequest,
@@ -76,10 +77,14 @@ import {
 	sessionTag,
 } from "./config";
 import { telegramControlCommandUsage } from "./config-commands";
-import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage } from "./helpers";
+import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
-import { type EnsureDaemonResult, ensureTelegramDaemonRunningDetailed } from "./telegram-daemon";
+import {
+	type EnsureDaemonResult,
+	endpointAuthorityDigest,
+	ensureTelegramDaemonRunningDetailed,
+} from "./telegram-daemon";
 
 // ===========================================================================
 // Session lifecycle control protocol (TypeScript mirror of the Rust wire
@@ -868,7 +873,10 @@ interface SessionRuntime {
 	disposeGateTerminalController: () => void;
 	disposeAckRecoveryParticipant: () => void;
 	disposeGateEmitterListener: () => void;
+	/** Aborts and fences side turns while notification delivery is disabled. */
+	disableEphemeralTurns: () => void;
 	waitForGateResolutionQuiescence: () => Promise<void>;
+	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>;
 	workflowGate?: WorkflowGateEmitter;
 	gatePresentations?: PresentationArbiter;
 	redact: boolean;
@@ -918,10 +926,52 @@ interface SessionRuntime {
 	/** True between turn_end and the next turn_start: drops late async message_update
 	 * frames so a stale live edit can never be emitted after the finalized turn. */
 	turnClosed?: boolean;
+	/** Started tool calls awaiting a terminal activity frame, keyed by tool call id. */
+	inFlightTools: Map<string, { toolName: string; args: unknown }>;
 	/** Cancels the postmortem cleanup that emits `session_closed` on process teardown. */
 	cancelPostmortemCleanup: () => void;
-	/** Stops optional broker presence heartbeats. */
-	stopBrokerHeartbeat: () => void;
+	/** Disposes side-turn resources when their owning logical session becomes unavailable. */
+	abortEphemeralTurns: () => void;
+}
+
+const SENSITIVE_MODEL_LABEL =
+	/(?:\b(?:https?|wss?):\/\/|\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|\b(?:api[-_ ]?key|access[-_ ]?token|bearer|secret|password|account(?:\s*id)?|email|exception|stack trace)\b|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}\b)/i;
+const TOOL_SUMMARY_MAX = 280;
+const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
+
+/** Stable projection of the tool-owned safe-display seam (never the full Tool surface). */
+type SafeSummaryTool = Pick<Tool, "safeSummary" | "safeSummaryFields">;
+
+export function projectToolSummary(
+	tool: SafeSummaryTool | undefined,
+	kind: "args" | "result",
+	value: unknown,
+): string | undefined {
+	let summary: string | undefined;
+	try {
+		if (tool?.safeSummary) {
+			summary = tool.safeSummary(kind, value);
+		} else {
+			const fields = tool?.safeSummaryFields?.[kind];
+			if (fields) {
+				const source =
+					value && typeof value === "object" && !Array.isArray(value)
+						? (value as Record<string, unknown>)
+						: undefined;
+				if (source) {
+					const projected: Record<string, unknown> = {};
+					for (const field of fields) if (Object.hasOwn(source, field)) projected[field] = source[field];
+					summary = JSON.stringify(projected);
+				}
+			}
+		}
+	} catch {
+		return undefined;
+	}
+	if (typeof summary !== "string") return undefined;
+	const normalized = summary.replace(/[\u0000-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069]/g, " ").trim();
+	if (!normalized || SENSITIVE_MODEL_LABEL.test(normalized)) return undefined;
+	return truncate(normalized, TOOL_SUMMARY_MAX);
 }
 
 /** Request-local requester authority for stable ControlSurface dispatches. */
@@ -938,7 +988,26 @@ function pushSessionFrame(
 	frame: { type: string; [key: string]: unknown },
 ): void {
 	runtime.host.emitEvent({ kind: frame.type, payload: frame });
+	if (frame.type === "turn_stream") {
+		runtime.server.pushTurnStreamUnchecked(
+			String(frame.sessionId),
+			frame.phase === "live" ? "live" : "finalized",
+			String(frame.text),
+			typeof frame.finalAnswer === "boolean" ? frame.finalAnswer : undefined,
+			typeof frame.messageRef === "string" ? frame.messageRef : undefined,
+		);
+		return;
+	}
 	runtime.server.pushFrame(JSON.stringify(frame));
+}
+
+function pushFileAttachment(
+	runtime: Pick<SessionRuntime, "server" | "host">,
+	frame: { type: "file_attachment"; sessionId: string; name: string; mime?: string; caption?: string },
+	data: Buffer,
+): void {
+	runtime.host.emitEvent({ kind: frame.type, payload: { ...frame, data: data.toString("base64") } });
+	runtime.server.pushFileAttachmentUnchecked(frame.sessionId, frame.name, frame.mime, data, frame.caption);
 }
 
 /** Agent lifecycle is SDK session truth, independent of optional chat delivery. */
@@ -981,6 +1050,7 @@ const defaultConfig: NotificationConfig = {
 	rich: { enabled: true },
 	richDraft: { enabled: false },
 	topics: {},
+	btw: { enabled: true },
 };
 
 export function notificationsEnabled(): boolean {
@@ -1628,11 +1698,18 @@ function hasTerminalArbitrationCapability(
 	Required<
 		Pick<
 			WorkflowGateEmitter,
-			"resolveGate" | "prepareTerminalization" | "clearPreparedTerminalization" | "registerGateTerminalController"
+			| "resolveGate"
+			| "recoverAcceptedGates"
+			| "lookupCompletedResolution"
+			| "prepareTerminalization"
+			| "clearPreparedTerminalization"
+			| "registerGateTerminalController"
 		>
 	> {
 	return (
 		typeof workflowGate?.resolveGate === "function" &&
+		typeof workflowGate.recoverAcceptedGates === "function" &&
+		typeof workflowGate.lookupCompletedResolution === "function" &&
 		typeof workflowGate.prepareTerminalization === "function" &&
 		typeof workflowGate.clearPreparedTerminalization === "function" &&
 		typeof workflowGate.registerGateTerminalController === "function"
@@ -1986,7 +2063,7 @@ function sdkControlSurface(
 			pending.completeDirect();
 			return { resolved: true };
 		},
-		answerGate: async (id, response, expectedSessionId) => {
+		answerGate: async (id, response, expectedSessionId, idempotencyKey) => {
 			if (!acceptGateResolution())
 				throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
 			if (expectedSessionId === undefined) auditMissingExpectedSessionId("workflow.gate_answer");
@@ -1999,6 +2076,26 @@ function sdkControlSurface(
 				throw Object.assign(new Error("Workflow gates are unavailable for this session."), {
 					code: "resource_gone",
 				});
+			const workflowGate = ctx.workflowGate;
+			if (!hasTerminalArbitrationCapability(workflowGate))
+				throw Object.assign(new Error("Workflow gates are unavailable for this session."), {
+					code: "resource_gone",
+				});
+			const gateResponse = {
+				gate_id: id,
+				answer: response,
+				idempotency_key: idempotencyKey ?? id,
+			};
+			const completed = workflowGate.lookupCompletedResolution(gateResponse);
+			if (completed.kind === "completed") return completed.resolution;
+			if (completed.kind === "accepted_incomplete") {
+				await trackGateResolution(workflowGate.recoverAcceptedGates());
+				const recovered = workflowGate.lookupCompletedResolution(gateResponse);
+				if (recovered.kind === "completed") return recovered.resolution;
+				throw Object.assign(new Error("Workflow gate resolution outcome is uncertain."), {
+					code: "terminal_uncertain",
+				});
+			}
 			const prepared = presentations.prepareDirectControl(id);
 			if (!prepared || prepared.status === "stale")
 				throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
@@ -2007,31 +2104,22 @@ function sdkControlSurface(
 			if (prepared.status !== "queued" && prepared.status !== "retired")
 				throw new Error(`Unexpected direct control preparation: ${prepared.status}`);
 			if (
-				ctx.workflowGate?.prepareTerminalization?.(
-					id,
-					prepared.status === "queued" ? "not_published" : "retired",
-				) !== true
+				workflowGate.prepareTerminalization(id, prepared.status === "queued" ? "not_published" : "retired") !== true
 			) {
 				presentations.finishDirectControl(id, prepared, "rejected");
 				throw Object.assign(new Error("Workflow gate lacks a terminalization proof."), { code: "resource_gone" });
 			}
 			try {
-				const resolution = await trackGateResolution(
-					ctx.workflowGate?.resolveGate?.({
-						gate_id: id,
-						answer: response,
-						idempotency_key: id,
-					}) ?? unavailable("workflow.gate_answer", "workflow gates are unavailable for this session")(),
-				);
+				const resolution = await trackGateResolution(workflowGate.resolveGate(gateResponse));
 				const status = (resolution as { status?: unknown }).status;
 				if (status === "accepted" || status === "rejected") {
-					if (status === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+					if (status === "rejected") workflowGate.clearPreparedTerminalization(id);
 					presentations.finishDirectControl(id, prepared, status);
 					return resolution;
 				}
 			} catch (error) {
 				const outcome = reconcileDirectControlFailure(id);
-				if (outcome === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+				if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 				presentations.finishDirectControl(id, prepared, outcome);
 				if (outcome === "unknown")
 					throw Object.assign(new Error("Workflow gate resolution outcome is uncertain."), {
@@ -2040,7 +2128,7 @@ function sdkControlSurface(
 				throw error;
 			}
 			const outcome = reconcileDirectControlFailure(id);
-			if (outcome === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+			if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 			presentations.finishDirectControl(id, prepared, outcome);
 			logger.warn("workflow_gate_direct_control_uncertain_outcome", {
 				operation: "workflow.gate_answer",
@@ -2064,6 +2152,22 @@ function sdkControlSurface(
 				throw Object.assign(new Error("Workflow gates are unavailable for this session."), {
 					code: "resource_gone",
 				});
+			const workflowGate = ctx.workflowGate;
+			if (!hasTerminalArbitrationCapability(workflowGate))
+				throw Object.assign(new Error("Workflow gates are unavailable for this session."), {
+					code: "resource_gone",
+				});
+			const gateResponse = { gate_id: id, answer: choice, idempotency_key: id };
+			const completed = workflowGate.lookupCompletedResolution(gateResponse);
+			if (completed.kind === "completed") return completed.resolution;
+			if (completed.kind === "accepted_incomplete") {
+				await trackGateResolution(workflowGate.recoverAcceptedGates());
+				const recovered = workflowGate.lookupCompletedResolution(gateResponse);
+				if (recovered.kind === "completed") return recovered.resolution;
+				throw Object.assign(new Error("Workflow plan resolution outcome is uncertain."), {
+					code: "terminal_uncertain",
+				});
+			}
 			const prepared = presentations.prepareDirectControl(id);
 			if (!prepared || prepared.status === "stale")
 				throw Object.assign(new Error("Workflow plan is no longer answerable."), { code: "resource_gone" });
@@ -2072,31 +2176,22 @@ function sdkControlSurface(
 			if (prepared.status !== "queued" && prepared.status !== "retired")
 				throw new Error(`Unexpected direct control preparation: ${prepared.status}`);
 			if (
-				ctx.workflowGate?.prepareTerminalization?.(
-					id,
-					prepared.status === "queued" ? "not_published" : "retired",
-				) !== true
+				workflowGate.prepareTerminalization(id, prepared.status === "queued" ? "not_published" : "retired") !== true
 			) {
 				presentations.finishDirectControl(id, prepared, "rejected");
 				throw Object.assign(new Error("Workflow plan lacks a terminalization proof."), { code: "resource_gone" });
 			}
 			try {
-				const resolution = await trackGateResolution(
-					ctx.workflowGate?.resolveGate?.({
-						gate_id: id,
-						answer: choice,
-						idempotency_key: id,
-					}) ?? unavailable("workflow.plan_approve", "workflow gates are unavailable for this session")(),
-				);
+				const resolution = await trackGateResolution(workflowGate.resolveGate(gateResponse));
 				const status = (resolution as { status?: unknown }).status;
 				if (status === "accepted" || status === "rejected") {
-					if (status === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+					if (status === "rejected") workflowGate.clearPreparedTerminalization(id);
 					presentations.finishDirectControl(id, prepared, status);
 					return resolution;
 				}
 			} catch (error) {
 				const outcome = reconcileDirectControlFailure(id);
-				if (outcome === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+				if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 				presentations.finishDirectControl(id, prepared, outcome);
 				if (outcome === "unknown")
 					throw Object.assign(new Error("Workflow plan resolution outcome is uncertain."), {
@@ -2105,7 +2200,7 @@ function sdkControlSurface(
 				throw error;
 			}
 			const outcome = reconcileDirectControlFailure(id);
-			if (outcome === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+			if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 			presentations.finishDirectControl(id, prepared, outcome);
 			logger.warn("workflow_gate_direct_control_uncertain_outcome", {
 				operation: "workflow.plan_approve",
@@ -2124,14 +2219,14 @@ function sdkControlSurface(
 				throw Object.assign(new Error("skill.invoke args must be a string."), { code: "invalid_input" });
 			return ctx.invokeSkill(name, args);
 		},
-		setPlanMode: on => {
+		setPlanMode: async on => {
 			if (!bindings.has("setPlanMode") || !ctx.setPlanMode)
 				return unavailable("mode.plan.set", "no plan-mode seam is installed")();
 
 			if (typeof on !== "boolean")
 				throw Object.assign(new Error("mode.plan.set requires a boolean on value."), { code: "invalid_input" });
 
-			return { state: ctx.setPlanMode(on) };
+			return { state: await ctx.setPlanMode(on) };
 		},
 		operateGoal: (op, objective) => {
 			if (!bindings.has("operateGoal") || !ctx.operateGoal)
@@ -2252,6 +2347,367 @@ function sdkControlSurface(
 	return surface;
 }
 
+const EPHEMERAL_TURN_DEADLINE_MS = 120_000;
+const EPHEMERAL_TURN_TTL_MS = 300_000;
+const EPHEMERAL_TURN_MAX_RECORDS = 256;
+const EPHEMERAL_TURN_MAX_ACTIVE_PER_SESSION = 2;
+const EPHEMERAL_TURN_MAX_RESULT_BYTES = 262_144;
+
+interface EphemeralTurnTuple {
+	sessionId: string;
+	requestId: string;
+	updateId: number;
+	messageId: number;
+	threadId: string;
+}
+
+type EphemeralTurnStatus = "ok" | "busy" | "timeout" | "cancelled" | "session_unavailable" | "failed";
+
+interface EphemeralTurnAuthority {
+	sessionId: string;
+	endpointDigest: string;
+	eventGeneration: number;
+}
+
+interface EphemeralTurnEvent {
+	tuple: EphemeralTurnTuple;
+	authority: EphemeralTurnAuthority;
+	status: EphemeralTurnStatus;
+	text?: string;
+	completedAt: number;
+	expiresAt: number;
+}
+
+interface EphemeralTurnTombstone {
+	tuple: EphemeralTurnTuple;
+	authority: EphemeralTurnAuthority;
+	status: EphemeralTurnStatus;
+	completedAt: number;
+	expiresAt: number;
+}
+
+interface ActiveEphemeralTurn {
+	tuple: EphemeralTurnTuple;
+	authority: EphemeralTurnAuthority;
+	connectionId: string;
+	staleConnectionIds: Set<string>;
+	controller: AbortController;
+	subscribers: Set<string>;
+	deadline: NodeJS.Timeout;
+	abortListener: () => void;
+}
+
+function ephemeralTuple(frame: Record<string, unknown>): EphemeralTurnTuple | undefined {
+	const { sessionId, requestId, updateId, messageId, threadId } = frame;
+	return typeof sessionId === "string" &&
+		typeof requestId === "string" &&
+		typeof updateId === "number" &&
+		Number.isSafeInteger(updateId) &&
+		typeof messageId === "number" &&
+		Number.isSafeInteger(messageId) &&
+		messageId > 0 &&
+		typeof threadId === "string"
+		? { sessionId, requestId, updateId, messageId, threadId }
+		: undefined;
+}
+
+function sameEphemeralTuple(left: EphemeralTurnTuple, right: EphemeralTurnTuple): boolean {
+	return (
+		left.sessionId === right.sessionId &&
+		left.requestId === right.requestId &&
+		left.updateId === right.updateId &&
+		left.messageId === right.messageId &&
+		left.threadId === right.threadId
+	);
+}
+
+function ephemeralTupleKey(tuple: EphemeralTurnTuple): string {
+	return JSON.stringify([tuple.sessionId, tuple.requestId, tuple.updateId, tuple.messageId, tuple.threadId]);
+}
+
+/** Host-owned, bounded idempotency and cancellation lifecycle for v3 side turns. */
+export class EphemeralTurnHost {
+	#active = new Map<string, ActiveEphemeralTurn>();
+	#terminalEvents = new Map<string, EphemeralTurnEvent>();
+	#tombstones = new Map<string, EphemeralTurnTombstone>();
+	#expiryTimer: NodeJS.Timeout | undefined;
+	#disposed = false;
+	#enabled = true;
+	#now: () => number;
+	#sendTo: (connectionId: string, frame: Record<string, unknown>) => void;
+	#execute: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>;
+	#authority: EphemeralTurnAuthority | undefined;
+
+	constructor(
+		sendTo: (connectionId: string, frame: Record<string, unknown>) => void,
+		execute: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>,
+		now: () => number = Date.now,
+	) {
+		this.#sendTo = sendTo;
+		this.#execute = execute;
+		this.#now = now;
+	}
+
+	configureAuthority(authority: EphemeralTurnAuthority): void {
+		if (this.#authority && !this.#sameAuthority(this.#authority, authority))
+			for (const active of [...this.#active.values()]) active.controller.abort("session_unavailable");
+		this.#authority = { ...authority };
+	}
+
+	disable(): void {
+		if (this.#disposed) return;
+		this.#enabled = false;
+		for (const active of this.#active.values()) active.controller.abort("session_unavailable");
+		this.#terminalEvents.clear();
+		this.#tombstones.clear();
+		if (this.#expiryTimer) clearTimeout(this.#expiryTimer);
+		this.#expiryTimer = undefined;
+	}
+
+	enable(): void {
+		if (!this.#disposed) this.#enabled = true;
+	}
+
+	dispose(): void {
+		this.#disposed = true;
+		for (const active of this.#active.values()) active.controller.abort("session_unavailable");
+		if (this.#expiryTimer) clearTimeout(this.#expiryTimer);
+		this.#expiryTimer = undefined;
+		this.#terminalEvents.clear();
+		this.#tombstones.clear();
+	}
+
+	handle(connectionId: string, frame: Record<string, unknown>): boolean {
+		if (!this.#enabled) return frame.type === "ephemeral_turn" || frame.type === "ephemeral_turn_cancel";
+		if (frame.type === "ephemeral_turn") return this.#start(connectionId, frame);
+		if (frame.type === "ephemeral_turn_cancel") return this.#cancel(connectionId, frame);
+		return false;
+	}
+
+	sessionUnavailable(sessionId: string): void {
+		for (const active of [...this.#active.values()])
+			if (active.tuple.sessionId === sessionId) active.controller.abort("session_unavailable");
+	}
+
+	/** Testable event-ring eviction boundary; tombstones remain idempotency authority. */
+	evictTerminalEvents(): void {
+		this.#terminalEvents.clear();
+	}
+
+	#start(connectionId: string, frame: Record<string, unknown>): boolean {
+		const tuple = ephemeralTuple(frame);
+		const question = typeof frame.question === "string" ? frame.question.trim() : "";
+		const authority = this.#authority;
+		if (!tuple || !question || !authority || tuple.sessionId !== authority.sessionId) return true;
+		this.#purge();
+		const key = ephemeralTupleKey(tuple);
+		const active = this.#active.get(key);
+		if (active) {
+			if (!this.#sameAuthority(active.authority, authority)) {
+				active.controller.abort("session_unavailable");
+				return true;
+			}
+			if (active.connectionId === connectionId || active.staleConnectionIds.has(connectionId)) return true;
+			active.staleConnectionIds.add(active.connectionId);
+			active.connectionId = connectionId;
+			active.subscribers = new Set([connectionId]);
+			return true;
+		}
+		const event = this.#terminalEvents.get(key);
+		if (event) {
+			if (this.#sameAuthority(event.authority, authority))
+				this.#send(connectionId, event.tuple, event.status, event.text);
+			return true;
+		}
+		const tombstone = this.#tombstones.get(key);
+		if (tombstone) {
+			if (this.#sameAuthority(tombstone.authority, authority)) this.#send(connectionId, tombstone.tuple, "failed");
+			return true;
+		}
+		for (const candidate of this.#tombstones.values()) {
+			if (candidate.tuple.sessionId === tuple.sessionId && candidate.tuple.requestId === tuple.requestId) {
+				logger.warn("notifications: ephemeral request id conflict", {
+					sessionId: tuple.sessionId,
+					requestId: tuple.requestId,
+				});
+				return true;
+			}
+		}
+		for (const candidate of this.#active.values()) {
+			if (candidate.tuple.sessionId === tuple.sessionId && candidate.tuple.requestId === tuple.requestId) {
+				logger.warn("notifications: ephemeral request id conflict", {
+					sessionId: tuple.sessionId,
+					requestId: tuple.requestId,
+				});
+				return true;
+			}
+		}
+		const activeForSession = [...this.#active.values()].filter(
+			candidate => candidate.tuple.sessionId === tuple.sessionId,
+		).length;
+		if (activeForSession >= EPHEMERAL_TURN_MAX_ACTIVE_PER_SESSION) {
+			const completedAt = this.#now();
+			this.#finish(key, {
+				tuple,
+				authority: { ...authority },
+				status: "busy",
+				completedAt,
+				expiresAt: completedAt + EPHEMERAL_TURN_TTL_MS,
+			});
+			this.#send(connectionId, tuple, "busy");
+			return true;
+		}
+		const controller = new AbortController();
+		const abortListener = () => this.#complete(key, this.#abortStatus(controller.signal));
+		const record: ActiveEphemeralTurn = {
+			tuple,
+			authority: { ...authority },
+			connectionId,
+			controller,
+			subscribers: new Set([connectionId]),
+			staleConnectionIds: new Set(),
+			deadline: setTimeout(() => controller.abort("timeout"), EPHEMERAL_TURN_DEADLINE_MS),
+			abortListener,
+		};
+		this.#active.set(key, record);
+		controller.signal.addEventListener("abort", abortListener, { once: true });
+		void this.#execute(question, controller.signal).then(
+			result =>
+				this.#complete(
+					key,
+					controller.signal.aborted ? this.#abortStatus(controller.signal) : "ok",
+					result.replyText,
+				),
+			() => this.#complete(key, controller.signal.aborted ? this.#abortStatus(controller.signal) : "failed"),
+		);
+		return true;
+	}
+
+	#cancel(connectionId: string, frame: Record<string, unknown>): boolean {
+		const tuple = ephemeralTuple(frame);
+		const authority = this.#authority;
+		if (!tuple || frame.reason !== "daemon_shutdown" || !authority || tuple.sessionId !== authority.sessionId)
+			return true;
+		const active = this.#active.get(ephemeralTupleKey(tuple));
+		if (
+			!active ||
+			!sameEphemeralTuple(active.tuple, tuple) ||
+			active.connectionId !== connectionId ||
+			!this.#sameAuthority(active.authority, authority)
+		)
+			return true;
+		active.controller.abort("cancelled");
+		return true;
+	}
+
+	#abortStatus(signal: AbortSignal): EphemeralTurnStatus {
+		return signal.reason === "timeout"
+			? "timeout"
+			: signal.reason === "session_unavailable"
+				? "session_unavailable"
+				: "cancelled";
+	}
+
+	#sameAuthority(left: EphemeralTurnAuthority, right: EphemeralTurnAuthority): boolean {
+		return (
+			left.sessionId === right.sessionId &&
+			left.endpointDigest === right.endpointDigest &&
+			left.eventGeneration === right.eventGeneration
+		);
+	}
+
+	#complete(key: string, status: EphemeralTurnStatus, text?: string): void {
+		const active = this.#active.get(key);
+		if (!active) return;
+		clearTimeout(active.deadline);
+		active.controller.signal.removeEventListener("abort", active.abortListener);
+		this.#active.delete(key);
+		if (this.#disposed || !this.#enabled) return;
+		const terminalTextIsValid =
+			typeof text === "string" &&
+			text.trim().length > 0 &&
+			Buffer.byteLength(text, "utf8") <= EPHEMERAL_TURN_MAX_RESULT_BYTES;
+		const terminalStatus = status === "ok" && !terminalTextIsValid ? "failed" : status;
+		const completedAt = this.#now();
+		const terminal: EphemeralTurnEvent = {
+			tuple: active.tuple,
+			authority: active.authority,
+			status: terminalStatus,
+			...(terminalStatus === "ok" ? { text: text ?? "" } : {}),
+			completedAt,
+			expiresAt: completedAt + EPHEMERAL_TURN_TTL_MS,
+		};
+		this.#finish(key, terminal);
+		for (const connectionId of active.subscribers) {
+			try {
+				this.#send(connectionId, terminal.tuple, terminal.status, terminal.text);
+			} catch {
+				// Directed SDK delivery has already logged the disconnected route.
+			}
+		}
+	}
+
+	#finish(key: string, terminal: EphemeralTurnEvent): void {
+		this.#terminalEvents.set(key, terminal);
+		this.#tombstones.set(key, {
+			tuple: terminal.tuple,
+			authority: terminal.authority,
+			status: terminal.status,
+			completedAt: terminal.completedAt,
+			expiresAt: terminal.expiresAt,
+		});
+		this.#purge();
+		while (this.#terminalEvents.size > EPHEMERAL_TURN_MAX_RECORDS)
+			this.#terminalEvents.delete(this.#terminalEvents.keys().next().value!);
+		while (this.#tombstones.size > EPHEMERAL_TURN_MAX_RECORDS) {
+			const oldestKey = this.#tombstones.keys().next().value!;
+			this.#tombstones.delete(oldestKey);
+			this.#terminalEvents.delete(oldestKey);
+		}
+		this.#scheduleExpiry();
+	}
+
+	#send(connectionId: string, tuple: EphemeralTurnTuple, status: EphemeralTurnStatus, text?: string): void {
+		this.#sendTo(connectionId, {
+			type: "ephemeral_turn_result",
+			...tuple,
+			status,
+			...(status === "ok" ? { text: text ?? "" } : {}),
+		});
+	}
+
+	#purge(): void {
+		const now = this.#now();
+		for (const [key, tombstone] of this.#tombstones) {
+			if (tombstone.expiresAt > now) continue;
+			this.#tombstones.delete(key);
+			this.#terminalEvents.delete(key);
+		}
+	}
+
+	#scheduleExpiry(): void {
+		if (this.#disposed) return;
+		if (this.#expiryTimer) clearTimeout(this.#expiryTimer);
+		const nextExpiry = [...this.#tombstones.values()].reduce(
+			(earliest, tombstone) => Math.min(earliest, tombstone.expiresAt),
+			Number.POSITIVE_INFINITY,
+		);
+		if (!Number.isFinite(nextExpiry)) {
+			this.#expiryTimer = undefined;
+			return;
+		}
+		this.#expiryTimer = setTimeout(
+			() => {
+				this.#expiryTimer = undefined;
+				if (this.#disposed) return;
+				this.#purge();
+				this.#scheduleExpiry();
+			},
+			Math.max(0, nextExpiry - this.#now()),
+		);
+		this.#expiryTimer.unref();
+	}
+}
 /** Parse only v3 frames carried through the existing control-command seam. */
 function sdkInboundFrame(commandJson: string | undefined): Record<string, unknown> | undefined {
 	if (!commandJson) return undefined;
@@ -2285,8 +2741,11 @@ export function createNotificationsExtension(
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
 		spawnedByGjc?: boolean;
 		controller?: NotificationSessionController;
+		/** Whether this host mode can own the root SDK endpoint. Default: true. */
+		sdkHostModeSupported?: boolean;
 
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
+		runEphemeralTurn?: (promptText: string, signal: AbortSignal) => Promise<{ replyText: string }>;
 	} = {},
 ): void {
 	const lifecycleStartupCapability = lifecycleStartupCapabilityForApi(api);
@@ -2305,6 +2764,7 @@ export function createNotificationsExtension(
 	let activeRuntimeId: string | undefined;
 	let identityControlInFlight = false;
 	let deferredIdentityRotation: { event: { previousSessionFile?: string }; ctx: ExtensionContext } | undefined;
+	let extensionShuttingDown = false;
 
 	async function ensureTelegramOwner(
 		settings: Settings,
@@ -2360,7 +2820,10 @@ export function createNotificationsExtension(
 		const activeRuntime = runtimes.get(id);
 		const requestedRuntime = retryRuntime ?? activeRuntime;
 		if (expectedRuntime && requestedRuntime !== expectedRuntime) return false;
-		if (reason === "session" && requestedRuntime) requestedRuntime.stopping = true;
+		if (reason === "session" && requestedRuntime) {
+			requestedRuntime.stopping = true;
+			requestedRuntime.abortEphemeralTurns();
+		}
 		if (reason === "session" && requestedRuntime) {
 			// Fence the exact runtime before awaiting its startup promise: a late start
 			// must observe removal and clean itself up rather than becoming reachable.
@@ -2373,7 +2836,12 @@ export function createNotificationsExtension(
 				.catch(() => {})
 				.then(() => {
 					if (runtimes.get(id) === requestedRuntime || cleanupRetries.get(id) === requestedRuntime)
-						void stopSession(id, reason, requestedRuntime);
+						void stopSession(id, reason, requestedRuntime).catch(error =>
+							// A retained owner-release failure keeps the exact runtime in
+							// cleanupRetries for a later retry; log it rather than letting a
+							// fire-and-forget rejection become a fatal unhandled rejection.
+							logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`),
+						);
 				});
 		const rt = requestedRuntime;
 
@@ -2385,6 +2853,7 @@ export function createNotificationsExtension(
 		}
 		if (reason === "notifications" && rt.host.started) {
 			rt.notificationsActive = false;
+			rt.disableEphemeralTurns();
 			try {
 				rt.disposeAnswerSource();
 			} catch {}
@@ -2404,9 +2873,6 @@ export function createNotificationsExtension(
 			rt.cancelPostmortemCleanup();
 		} catch {}
 		try {
-			rt.stopBrokerHeartbeat();
-		} catch {}
-		try {
 			rt.disposeAnswerSource();
 		} catch {}
 		try {
@@ -2414,6 +2880,9 @@ export function createNotificationsExtension(
 		} catch {}
 		try {
 			rt.disposeGateListener();
+		} catch {}
+		try {
+			rt.workflowGate?.setRuntimeTurnProvider?.(null);
 		} catch {}
 		await rt.waitForGateResolutionQuiescence();
 		try {
@@ -2497,7 +2966,8 @@ export function createNotificationsExtension(
 		const lifecycleRequestId = safeLifecycleRequestId(process.env.GJC_LIFECYCLE_REQUEST_ID);
 		const { settings, cfg, settingsAvailable } = resolveSettings(options.settings);
 		const notificationsEnabledForSession = controller.query(ctx).effectiveEnabled;
-		const sdkEnabledForSession = shouldHostSdk(settings, isNotificationEligibleContext(ctx));
+		const sdkEnabledForSession =
+			(options.sdkHostModeSupported ?? true) && shouldHostSdk(settings, isNotificationEligibleContext(ctx));
 		const lifecycleRequired = lifecycleStartupCapability !== undefined;
 		const failLifecycleStartup = (
 			reason: "disabled" | "ineligible" | "failed",
@@ -2567,7 +3037,6 @@ export function createNotificationsExtension(
 		}
 		const gatePresentations = new PresentationArbiter(server, () => runtime?.redact ?? redact, tag);
 		let inboundSdkFrame: ((connectionId: string, frame: Record<string, unknown>) => void) | undefined;
-		let stopBrokerHeartbeat = () => {};
 		const inFlightGateResolutions = new Set<Promise<void>>();
 		const trackGateResolution = <T>(resolution: Promise<T>): Promise<T> => {
 			const quiesced = resolution.then(
@@ -2608,6 +3077,8 @@ export function createNotificationsExtension(
 		const removeProviderDefinitions = (capability: string) => {
 			if (capability === "permission") ctx.setSdkPermissionProvider?.(undefined);
 		};
+
+		const hostCapCache = new Map<string, ReadonlySet<string>>();
 
 		const configOverrides = new Map<string, unknown>();
 		const configRevision = { current: 0 };
@@ -2767,6 +3238,11 @@ export function createNotificationsExtension(
 			submission.failed = true;
 			submission.error = error;
 			removePendingPromptCorrelation(correlation);
+			if (
+				runtime?.activePromptCorrelation?.commandId === correlation.commandId &&
+				runtime.activePromptCorrelation.turnId === correlation.turnId
+			)
+				runtime.activePromptCorrelation = undefined;
 			emitPromptFailure(correlation, error);
 		};
 		const acknowledgePrompt = (connectionId: string, correlation: { commandId: string; turnId: string }) => {
@@ -2834,6 +3310,10 @@ export function createNotificationsExtension(
 		};
 
 		const sendSdkFrame = (connectionId: string, frame: Record<string, unknown>) => {
+			if (extensionShuttingDown || runtime?.stopping || runtimes.get(id) !== runtime) {
+				abandonPromptResponse(connectionId, frame);
+				return;
+			}
 			const json = JSON.stringify(frame);
 			if (connectionId.startsWith("seam:")) {
 				try {
@@ -2865,6 +3345,7 @@ export function createNotificationsExtension(
 			stateRoot,
 			token,
 			sendFrame: (connectionId, frame) => sendSdkFrame(connectionId, frame),
+			connectionCapabilities: connectionId => hostCapCache.get(connectionId) ?? EMPTY_CAPABILITIES,
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
 			onFrame: handler => {
@@ -2982,14 +3463,16 @@ export function createNotificationsExtension(
 			disposeGateTerminalController: () => {},
 			disposeAckRecoveryParticipant: () => {},
 			disposeGateEmitterListener: () => {},
+			trackGateResolution,
 			waitForGateResolutionQuiescence: async () => {
 				await Promise.allSettled(inFlightGateResolutions);
 			},
 			workflowGate: undefined,
 			gatePresentations,
 			stopping: false,
+			abortEphemeralTurns: () => {},
+			disableEphemeralTurns: () => {},
 			cancelPostmortemCleanup: () => {},
-			stopBrokerHeartbeat,
 
 			redact,
 			verbosity,
@@ -3001,8 +3484,10 @@ export function createNotificationsExtension(
 			recordPromptTerminal,
 			emitPromptLifecycle,
 			pendingInbound: new Set<number>(),
+			inFlightTools: new Map<string, { toolName: string; args: unknown }>(),
 		};
-		runtimes.set(id, runtime);
+		const initializedRuntime = runtime;
+		runtimes.set(id, initializedRuntime);
 		activeRuntimeId = id;
 		const startSettled = Promise.withResolvers<SessionStartResult>();
 		sessionStartPromises.set(id, startSettled.promise);
@@ -3036,16 +3521,40 @@ export function createNotificationsExtension(
 			} catch {}
 		};
 
+		const ephemeralTurns = new EphemeralTurnHost(sendSdkFrame, async (question, signal) => {
+			if (!options.runEphemeralTurn) throw new Error("Ephemeral turns are unavailable.");
+			return await options.runEphemeralTurn(prompt.render(btwUserPrompt, { question }), signal);
+		});
+		initializedRuntime.abortEphemeralTurns = () => ephemeralTurns.dispose();
+		initializedRuntime.disableEphemeralTurns = () => ephemeralTurns.disable();
 		try {
 			server.onSdkFrame((err, inbound) => {
 				if (err || !inbound) return;
 				try {
-					inboundSdkFrame?.(inbound.connectionId, JSON.parse(inbound.json) as Record<string, unknown>);
+					const frame = JSON.parse(inbound.json) as unknown;
+					if (!frame || typeof frame !== "object") return;
+					const typedFrame = frame as Record<string, unknown>;
+					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
+					inboundSdkFrame?.(inbound.connectionId, typedFrame);
 				} catch {}
+			});
+			// Required: the negotiated-capability callback is how the TS host learns
+			// each connection's caps for replay-frame gating. If the linked
+			// @gajae-code/natives binary predates it (linked/deduped installs where the
+			// version did not change), fail loudly with an actionable message instead of
+			// silently shipping a half-wired capability bridge.
+			if (typeof server.onNegotiatedCapabilities !== "function") {
+				throw new Error(
+					"@gajae-code/natives is out of date: missing onNegotiatedCapabilities. Rebuild the native addon (bun --cwd=packages/natives run build).",
+				);
+			}
+			server.onNegotiatedCapabilities((_err, connectionId, capabilities) => {
+				if (connectionId) hostCapCache.set(connectionId, new Set(capabilities));
 			});
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
 				host.handleDisconnect(connectionId);
+				hostCapCache.delete(connectionId);
 				for (const submission of promptSubmissions.values())
 					if (submission.connectionId === connectionId) abandonPrompt(submission);
 			});
@@ -3267,12 +3776,36 @@ export function createNotificationsExtension(
 			// thread (forwarded by the daemon over the WS, fail-closed at the daemon).
 			server.onInbound((err, inbound) => {
 				if (err || !inbound) return;
+				const authenticatedInbound = inbound as typeof inbound & {
+					connectionId: string;
+					messageId?: number;
+					reason?: string;
+				};
 				if (inbound.kind === "control_command") {
 					const frame = sdkInboundFrame(inbound.commandJson);
 					if (frame) {
 						inboundSdkFrame?.(`seam:${inbound.requestId ?? "notification"}`, frame);
 						return;
 					}
+				}
+				if (
+					(inbound.kind === "ephemeral_turn" || inbound.kind === "ephemeral_turn_cancel") &&
+					!runtime?.notificationsActive
+				)
+					return;
+				if (inbound.kind === "ephemeral_turn" || inbound.kind === "ephemeral_turn_cancel") {
+					ephemeralTurns.handle(authenticatedInbound.connectionId, {
+						type: authenticatedInbound.kind,
+						sessionId: authenticatedInbound.sessionId,
+						requestId: authenticatedInbound.requestId,
+						updateId: authenticatedInbound.updateId,
+						messageId: authenticatedInbound.messageId,
+						threadId: authenticatedInbound.threadId,
+						...(authenticatedInbound.kind === "ephemeral_turn"
+							? { question: authenticatedInbound.text }
+							: { reason: authenticatedInbound.reason }),
+					});
+					return;
 				}
 
 				if (inbound.kind === "user_message") {
@@ -3321,6 +3854,12 @@ export function createNotificationsExtension(
 						update.verbosity = inbound.verbosity;
 					}
 					if (typeof inbound.redact === "boolean") {
+						// Redact turning ON: terminalize any already-visible in-flight tool
+						// bubbles (while redact is still off so the helper emits) so they never
+						// strand permanently in "started"; subsequent detail is then suppressed.
+						if (inbound.redact && !runtime.redact) {
+							terminalizeInFlightTools(runtime, runtime.id, "unknown");
+						}
 						runtime.redact = inbound.redact;
 						update.redact = inbound.redact;
 					}
@@ -3402,6 +3941,11 @@ export function createNotificationsExtension(
 			};
 			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
 			const endpoint = await server.start();
+			ephemeralTurns.configureAuthority({
+				sessionId: id,
+				endpointDigest: endpointAuthorityDigest(endpoint.url, token),
+				eventGeneration: host.generation,
+			});
 			throwIfLifecycleStopped();
 			if (runtimes.get(id) !== runtime) {
 				finishStartup({ status: "failed" });
@@ -3445,30 +3989,20 @@ export function createNotificationsExtension(
 						},
 					});
 					throwIfLifecycleStopped();
-					runtime.brokerRegistrationActive = true;
-					const timer = setInterval(() => {
-						void index
-							.append({
-								type: "host_heartbeat",
-								sessionId: id,
-								locator,
-								endpointGeneration: host.generation,
-								pid: process.pid,
-							})
-							.catch(error => logger.warn(`sdk broker heartbeat failed: ${String(error)}`));
-					}, 5_000);
-					stopBrokerHeartbeat = () => clearInterval(timer);
+					initializedRuntime.brokerRegistrationActive = true;
+					// Host liveness is derived from alive(pid) when the index is read; heartbeats
+					// are deliberately not appended to the durable session index.
 				} catch (brokerError) {
 					if (lifecycleRequired) throw brokerError;
 					logger.warn(`sdk broker registration skipped: ${String(brokerError)}`);
 				}
 			}
 
-			runtime.stopBrokerHeartbeat = stopBrokerHeartbeat;
-			const startedRuntime = runtime;
-			runtime.enableNotifications = () => {
+			const startedRuntime = initializedRuntime;
+			initializedRuntime.enableNotifications = () => {
 				const runtime = startedRuntime;
 				if (runtime.notificationsActive) return;
+				ephemeralTurns.enable();
 				runtime.notificationsActive = true;
 				runtime.disposeAnswerSource = registerInteractiveAnswerSource(
 					runtime.id,
@@ -3479,35 +4013,42 @@ export function createNotificationsExtension(
 					if (runtime.redact) return { ok: false, error: TELEGRAM_FILE_REDACTION_ERROR };
 					try {
 						const data = await fs.promises.readFile(file.path);
-						pushSessionFrame(runtime, {
-							type: "file_attachment",
-							sessionId: runtime.id,
-							name: path.basename(file.path),
-							data: data.toString("base64"),
-							caption: file.caption,
-						});
+						pushFileAttachment(
+							runtime,
+							{
+								type: "file_attachment",
+								sessionId: runtime.id,
+								name: path.basename(file.path),
+								caption: file.caption,
+							},
+							data,
+						);
 						return { ok: true };
 					} catch (e) {
 						return { ok: false, error: e instanceof Error ? e.message : String(e) };
 					}
 				});
 			};
-			const activeRuntime = runtime;
+			const activeRuntime = initializedRuntime;
 			// A native terminal close (SIGHUP), SIGTERM, Ctrl+C exit, or fatal error
 			// skips AgentSession.dispose(), so the `session_shutdown` extension event
 			// never fires and the daemon-side topic would be orphaned. postmortem
 			// awaits registered cleanups on those paths, so send the graceful
 			// `session_closed` frame from there too. stopSession() cancels this
 			// registration on every other teardown path, so it never double-fires.
-			runtime.cancelPostmortemCleanup = postmortem.register(`notifications-session-closed:${id}`, async () => {
-				await stopSession(runtime!.id);
-			});
+			initializedRuntime.cancelPostmortemCleanup = postmortem.register(
+				`notifications-session-closed:${id}`,
+				async () => {
+					await stopSession(initializedRuntime.id);
+				},
+			);
 			logger.info(`notifications: serving session ${id} at ${endpoint.url}`);
 			// A workflow-gate emitter can be installed after session startup.
 			// Attach dynamically so the SDK bus presents every durable gate.
 			const attachWorkflowGate = (gate: WorkflowGateEmitter | undefined): void => {
 				if (activeRuntime.workflowGate === gate) return;
 				activeRuntime.disposeGateListener();
+				activeRuntime.workflowGate?.setRuntimeTurnProvider?.(null);
 				activeRuntime.disposeAckRecoveryParticipant();
 				gatePresentations.dispose();
 				activeRuntime.disposeGateTerminalController();
@@ -3520,6 +4061,7 @@ export function createNotificationsExtension(
 					return;
 				}
 				activeRuntime.workflowGate = gate;
+				gate.setRuntimeTurnProvider?.(() => activeRuntime.activePromptCorrelation?.turnId);
 				if (hasTerminalArbitrationCapability(gate)) {
 					const controller: WorkflowGateTerminalController = {
 						completeGateInteractions: gateId => gatePresentations.complete(gateId),
@@ -3573,18 +4115,30 @@ export function createNotificationsExtension(
 					});
 					activeRuntime.disposeAckRecoveryParticipant = () => gate.setAckRecoveryParticipant?.(null);
 				}
-				void gate.recoverAcceptedGates?.();
+				void (typeof gate.recoverAcceptedGates === "function"
+					? trackGateResolution(gate.recoverAcceptedGates()).catch(() => {})
+					: Promise.resolve());
 			};
 			activeRuntime.disposeGateEmitterListener = registerWorkflowGateEmitterListener(id, attachWorkflowGate);
 			if (ctx.workflowGate) attachWorkflowGate(ctx.workflowGate);
-			if (notificationsEnabledForSession) runtime.enableNotifications();
-			finishStartup({ status: "started", runtime });
-			return { status: "started", runtime };
+			if (notificationsEnabledForSession) initializedRuntime.enableNotifications();
+			finishStartup({ status: "started", runtime: initializedRuntime });
+			return { status: "started", runtime: initializedRuntime };
 		} catch (e) {
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
 			const result = failLifecycleStartup("failed", e);
 			finishStartup(result);
-			if (!(await stopSession(id, "session", runtime))) await cleanupAbandonedStartup();
+			let stopped = false;
+			try {
+				stopped = await stopSession(id, "session", runtime);
+			} catch (error) {
+				// A secondary owner-release failure during abandoned-startup cleanup is
+				// retained for an explicit later retry via cleanupRetries; log it rather
+				// than letting it escape startSession and surface a red extension error
+				// through session_start / session_switch / session_branch.
+				logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
+			}
+			if (!stopped) await cleanupAbandonedStartup();
 			return { ...result, runtime };
 		}
 	}
@@ -3709,13 +4263,27 @@ export function createNotificationsExtension(
 		event: { previousSessionFile?: string },
 		ctx: ExtensionContext,
 	): Promise<void> => {
+		if (extensionShuttingDown) return;
 		const newId = sessionId(ctx);
 		const prevId = activeRuntimeId ?? sessionIdFromFile(event.previousSessionFile);
 		if (prevId && prevId !== newId) {
 			controller.rekeySession(prevId, newId);
-			await stopSession(prevId);
+			try {
+				await stopSession(prevId);
+			} catch (error) {
+				// A retained owner-release failure keeps the exact runtime in
+				// cleanupRetries for an explicit later retry; log it rather than
+				// surfacing a red extension error
+				// while rotating session authority (/new, fork, resume, branch).
+				logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
+			}
 		}
+		if (extensionShuttingDown) return;
 		await startSession(ctx);
+		if (extensionShuttingDown) {
+			await stopSession(newId);
+			return;
+		}
 		await controller.reconcileCurrentSession(ctx);
 	};
 	api.on("session_switch", async (event, ctx) => {
@@ -3732,6 +4300,19 @@ export function createNotificationsExtension(
 		}
 		await rotateSessionAuthority(event, ctx);
 	});
+
+	const terminalizeInFlightTools = (rt: SessionRuntime, id: string, phase: "cancelled" | "unknown"): void => {
+		if (rt.notificationsActive && !rt.redact) {
+			for (const [toolCallId, { toolName }] of rt.inFlightTools) {
+				try {
+					pushSessionFrame(rt, { type: "tool_activity", sessionId: id, toolCallId, toolName, phase });
+				} catch (e) {
+					logger.warn(`notifications: synthetic tool_activity failed: ${String(e)}`);
+				}
+			}
+		}
+		rt.inFlightTools.clear();
+	};
 
 	// Drive the live typing indicator: mark busy when the agent loop starts so
 	// the daemon shows "typing…" in the thread while the agent is thinking,
@@ -3761,7 +4342,9 @@ export function createNotificationsExtension(
 	api.on("turn_start", (_event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
-		if (!rt?.notificationsActive) return;
+		if (!rt) return;
+		rt.turnSeq = (rt.turnSeq ?? 0) + 1;
+		if (!rt.notificationsActive) return;
 		// A new turn is live: re-open the live-stream window (see turnClosed).
 		rt.turnClosed = false;
 		if (rt.pendingInbound.size === 0) return;
@@ -3779,7 +4362,7 @@ export function createNotificationsExtension(
 	// per `turn_end`. turn_end fires once per turn iteration, so a single
 	// user-visible idle previously produced many idle pings (the flood); agent_end
 	// fires exactly once per settle, yielding exactly one idle notification.
-	api.on("agent_end", (_event, ctx) => {
+	api.on("agent_end", (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
@@ -3792,13 +4375,17 @@ export function createNotificationsExtension(
 		} else {
 			rt.emitPromptLifecycle(undefined, { type: "agent_end", sessionId: id });
 		}
+		rt.activePromptCorrelation = undefined;
+		terminalizeInFlightTools(rt, id, event.stopReason === "cancelled" ? "cancelled" : "unknown");
 		try {
 			pushSessionFrame(rt, { type: "activity", sessionId: id, state: "idle" });
 		} catch (e) {
 			logger.warn(`notifications: activity (idle) failed: ${String(e)}`);
 		}
 		if (!rt.notificationsActive) return;
-		void rt.workflowGate?.recoverAcceptedGates?.();
+		void (typeof rt.workflowGate?.recoverAcceptedGates === "function"
+			? rt.trackGateResolution(rt.workflowGate.recoverAcceptedGates()).catch(() => {})
+			: Promise.resolve());
 		const seq = rt.idleSeq++;
 		// Re-assert the identity header so the daemon renames the topic once the
 		// session title has been auto-generated ("{repo}/{branch} - {title}"). The
@@ -3870,11 +4457,10 @@ export function createNotificationsExtension(
 		rt.preAskFlushedText = text;
 		// Decision A: a stream-enabled turn must finalize as an in-place edit of ONE
 		// live message, never a fresh (rich-promotable) send. If live frames were
-		// async-queued and none landed before this flush, allocate the per-turn ref
-		// now so the finalized frame always carries a messageRef → the daemon keeps it
-		// editable (HTML edit) and never rich-promotes a streamed final.
-		if (finalAnswer && rt.stream && rt.liveRef === undefined) {
-			rt.turnSeq = (rt.turnSeq ?? 0) + 1;
+		// async-queued and none landed before this flush, reuse the per-turn ref
+		// assigned at turn_start so the finalized frame remains editable (HTML edit)
+		// and never rich-promotes a streamed final.
+		if (finalAnswer && rt.stream && rt.liveRef === undefined && rt.turnSeq !== undefined) {
 			rt.liveRef = String(rt.turnSeq);
 		}
 		try {
@@ -3898,11 +4484,99 @@ export function createNotificationsExtension(
 	// path and ordered before it — unlike message_update, which is queued async),
 	// then flushed here before the ask tool's execute calls registerAsk.
 	api.on("tool_execution_start", (event, ctx) => {
-		if (event.toolName !== "ask") return;
+		if (event.toolName === "ask") {
+			const id = sessionId(ctx);
+			const rt = runtimes.get(id);
+			if (!rt?.notificationsActive || rt.redact) return;
+			flushTurnText(rt, id, rt.currentTurnText, false);
+		}
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt?.notificationsActive || rt.redact) return;
-		flushTurnText(rt, id, rt.currentTurnText, false);
+		rt.inFlightTools.set(event.toolCallId, { toolName: event.toolName, args: event.args });
+		try {
+			pushSessionFrame(rt, {
+				type: "tool_activity",
+				sessionId: id,
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				phase: "started",
+			});
+		} catch (e) {
+			logger.warn(`notifications: tool_activity start failed: ${String(e)}`);
+		}
+	});
+
+	api.on("tool_execution_end", (event, ctx) => {
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
+		if (!rt) return;
+		const inFlight = rt.inFlightTools.get(event.toolCallId);
+		if (!rt.notificationsActive || rt.redact) {
+			rt.inFlightTools.delete(event.toolCallId);
+			return;
+		}
+		try {
+			const frame: {
+				type: "tool_activity";
+				sessionId: string;
+				toolCallId: string;
+				toolName: string;
+				phase: "completed" | "failed";
+				isError: boolean;
+				argsSummary?: string;
+				resultSummary?: string;
+			} = {
+				type: "tool_activity",
+				sessionId: id,
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				phase: event.isError ? "failed" : "completed",
+				isError: event.isError,
+			};
+			if (rt.verbosity === "verbose") {
+				const tool = ctx.resolveTool(event.toolName);
+				const argsSummary = projectToolSummary(tool, "args", inFlight?.args);
+				const resultSummary = projectToolSummary(tool, "result", event.result);
+				if (argsSummary !== undefined) frame.argsSummary = argsSummary;
+				if (resultSummary !== undefined) frame.resultSummary = resultSummary;
+			}
+			pushSessionFrame(rt, frame);
+		} catch (e) {
+			logger.warn(`notifications: tool_activity end failed: ${String(e)}`);
+		} finally {
+			rt.inFlightTools.delete(event.toolCallId);
+		}
+	});
+
+	api.on("reasoning_summary_end", (event, ctx) => {
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
+		if (!rt?.notificationsActive || rt.redact || rt.verbosity !== "verbose") return;
+		if (!event.message || typeof event.message !== "object" || !("content" in event.message)) return;
+		const content = event.message.content;
+		if (!Array.isArray(content)) return;
+		const block = content[event.contentIndex];
+		if (block?.type !== "thinking" || (block.provenance !== "summary" && block.provenance !== "mixed")) return;
+		// CoT boundary: emit ONLY the canonical provider-marked summaryText. Never
+		// fall back to the event payload, which could carry inconsistent/mutated text.
+		const text = block.summaryText;
+		if (typeof text !== "string" || text === "") return;
+		try {
+			pushSessionFrame(rt, {
+				type: "reasoning_summary",
+				sessionId: id,
+				text,
+				// Coalesce on the reasoning block's stable itemId carried on the event, NOT
+				// the mutable rt.turnSeq: a streamed reasoning_summary_end is queued async and
+				// turn_start for the next iteration advances turnSeq synchronously first, so
+				// reading turnSeq here could bind turn N's summary to turn N+1. Absent an
+				// itemId, omit turnRef (threaded-render sends a fresh non-editable message).
+				...((block as { itemId?: string }).itemId ? { turnRef: (block as { itemId?: string }).itemId } : {}),
+			});
+		} catch (e) {
+			logger.warn(`notifications: reasoning_summary failed: ${String(e)}`);
+		}
 	});
 
 	api.on("turn_end", (event, ctx) => {
@@ -3932,8 +4606,7 @@ export function createNotificationsExtension(
 		const rt = runtimes.get(id);
 		if (!rt?.notificationsActive || !rt.stream || rt.redact || rt.turnClosed) return;
 		if ((event.message as { role?: unknown }).role !== "assistant") return;
-		if (rt.liveRef === undefined) {
-			rt.turnSeq = (rt.turnSeq ?? 0) + 1;
+		if (rt.liveRef === undefined && rt.turnSeq !== undefined) {
 			rt.liveRef = String(rt.turnSeq);
 		}
 		const now = Date.now();
@@ -3979,9 +4652,24 @@ export function createNotificationsExtension(
 	});
 
 	api.on("session_shutdown", async (_event, ctx) => {
+		extensionShuttingDown = true;
+		identityControlInFlight = false;
+		deferredIdentityRotation = undefined;
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
+		if (rt) terminalizeInFlightTools(rt, id, "unknown");
 		const controllerStop =
 			typeof ctx.sessionManager.getCwd === "function" ? controller.stopCurrentSession(ctx) : Promise.resolve(false);
 		void controllerStop.catch(error => logger.warn(`notifications: controller shutdown failed: ${String(error)}`));
-		await stopSession(sessionId(ctx));
+		try {
+			await stopSession(id);
+		} catch (error) {
+			// A retained owner-release failure keeps the exact runtime in
+			// cleanupRetries for an explicit later retry; log it rather than
+			// surfacing a red extension error at
+			// shutdown. On terminal quit there is no later retry cycle, so log at
+			// error severity (matching the postmortem cleanup precedent).
+			logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
+		}
 	});
 }

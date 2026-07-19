@@ -38,6 +38,7 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       has_tasks: ${{ steps.plan.outputs.has_tasks }}
       has_native: ${{ steps.plan.outputs.has_native }}
+      has_darwin_arm64_tab_worker_smoke: ${{ steps.plan.outputs.has_darwin_arm64_tab_worker_smoke }}
       changed_paths: ${{ steps.plan.outputs.changed_paths }}
       plan_mode: ${{ steps.plan.outputs.plan_mode }}
       plan_digest: ${{ steps.plan.outputs.plan_digest }}
@@ -51,6 +52,11 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: "1.3"
@@ -66,11 +72,12 @@ jobs:
       - name: Upload canonical affected plan
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-plan-${{ github.run_id }}
           path: .ci-dev-affected-plan.json
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
+          overwrite: true
 
 
   telegram-daemon-generation:
@@ -194,9 +201,10 @@ jobs:
         with:
           shared-key: windows-dev-doctor-win32-x64
           cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
           key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
@@ -215,12 +223,9 @@ jobs:
           bun run dev:doctor
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-  # Native addon build runs at most once per run and publishes the built `.node`
-  # files as an artifact the runtime-dependent shards download. A content-hash
-  # cache of the native sources lets PRs that don't touch crates/natives restore
-  # the prebuilt addon and skip the Rust/native source build entirely; only a
-  # cache miss (native source actually changed) recompiles. Skipped when the plan
-  # needs no native build at all.
+  # Native addon build runs once per run and publishes the built `.node` files as
+  # an artifact the runtime-dependent shards download. It is skipped when the
+  # plan needs no native build at all.
   affected-native:
     name: Affected path validation / native-build
     needs: [affected-plan]
@@ -233,10 +238,16 @@ jobs:
       CI_DEV_AFFECTED_PLAN: .ci-dev-affected-plan.json
       CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}
       CI_DEV_PLAN_SOURCE_SHA: ${{ needs.affected-plan.outputs.plan_source_sha }}
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: "24"
@@ -246,45 +257,27 @@ jobs:
       - name: Download and validate canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-plan-${{ github.run_id }}
           path: .
       - run: bun scripts/ci-dev-affected.ts --validate-plan
-      - name: Detect native host ABI
-        id: native-host
-        shell: bash
-        run: |
-          glibc="$(getconf GNU_LIBC_VERSION | tr ' ' '-')"
-          echo "glibc=$glibc" >> "$GITHUB_OUTPUT"
-      - name: Restore cached native addon
-        id: native-cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
-        with:
-          path: packages/natives/native/pi_natives.*.node
-          key: dev-affected-native-v2-baseline-modern-${{ runner.os }}-${{ steps.native-host.outputs.glibc }}-${{ hashFiles('crates/**/*.rs', 'crates/**/Cargo.toml', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'packages/natives/scripts/**', 'packages/natives/package.json', 'scripts/ci-build-native.ts', 'scripts/host-detect.ts') }}
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
-        if: steps.native-cache.outputs.cache-hit != 'true'
         with:
           toolchain: nightly-2026-04-29
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
-        if: steps.native-cache.outputs.cache-hit != 'true'
         with:
           shared-key: dev-affected-native-linux-x64
           cache-on-failure: true
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
-        if: steps.native-cache.outputs.cache-hit != 'true'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
           key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - name: Install system deps
-        if: steps.native-cache.outputs.cache-hit != 'true'
         run: bash scripts/ci-install-system-deps.sh
-      - if: steps.native-cache.outputs.cache-hit != 'true'
-        run: bun install --frozen-lockfile
+      - run: bun install --frozen-lockfile
       - name: Build affected native addon(s)
-        if: steps.native-cache.outputs.cache-hit != 'true'
         run: bun scripts/ci-dev-affected.ts --native-build
       - name: Verify required native addon variants
         run: |
@@ -293,12 +286,86 @@ jobs:
       - name: Upload native addon(s)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: dev-affected-native-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-native-${{ github.run_id }}
           path: |
             packages/natives/native/pi_natives.linux-x64-baseline.node
             packages/natives/native/pi_natives.linux-x64-modern.node
           if-no-files-found: error
           retention-days: 1
+          overwrite: true
+
+  # Darwin arm64 builds the checked-out PR head end-to-end for every compiled
+  # tab-worker smoke-graph path. The planner emits this canonical relevance flag.
+  affected-darwin-arm64-tab-worker-smoke:
+    name: Affected path validation / darwin-arm64 tab-worker smoke
+    needs: [affected-plan]
+    if: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' }}
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
+          node -e 'if (process.platform !== "darwin" || process.arch !== "arm64") { throw new Error(`Expected darwin/arm64, got ${process.platform}/${process.arch}`) }'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "24"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3"
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+        with:
+          toolchain: nightly-2026-04-29
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          shared-key: dev-affected-darwin-arm64-tab-worker
+          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          cache-workspace-crates: true
+      - name: Cache bun dependencies
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+      - run: bun install --frozen-lockfile
+      - name: Build native addon (darwin-arm64)
+        env:
+          TARGET_PLATFORM: darwin
+          TARGET_ARCH: arm64
+        run: bun run ci:build:native
+      - name: Build darwin-arm64 coding-agent binary
+        run: bun --cwd=packages/coding-agent run build
+      - name: Smoke compiled tab worker with fresh owner directories
+        shell: bash
+        run: |
+          runtime_dir="$(mktemp -d)"
+          mkdir -p "$runtime_dir/home" "$runtime_dir/xdg"
+          HOME="$runtime_dir/home" XDG_CONFIG_HOME="$runtime_dir/xdg/config" XDG_DATA_HOME="$runtime_dir/xdg/data" XDG_CACHE_HOME="$runtime_dir/xdg/cache" packages/coding-agent/dist/gjc --smoke-test
+          printf 'CI_DEV_DARWIN_SMOKE_HOME=%s\n' "$runtime_dir/home" >> "$GITHUB_ENV"
+          printf 'CI_DEV_DARWIN_SMOKE_XDG_CONFIG_HOME=%s\n' "$runtime_dir/xdg/config" >> "$GITHUB_ENV"
+          printf 'CI_DEV_DARWIN_SMOKE_XDG_DATA_HOME=%s\n' "$runtime_dir/xdg/data" >> "$GITHUB_ENV"
+          printf 'CI_DEV_DARWIN_SMOKE_XDG_CACHE_HOME=%s\n' "$runtime_dir/xdg/cache" >> "$GITHUB_ENV"
+      - name: Write immutable Darwin smoke receipt
+        env:
+          CI_DEV_DARWIN_BINARY: packages/coding-agent/dist/gjc
+          CI_DEV_DARWIN_NATIVE_ADDON: packages/natives/native/pi_natives.darwin-arm64.node
+        run: bun scripts/ci-validate-darwin-receipt.ts --write
+      - name: Upload Darwin smoke receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: dev-affected-darwin-receipt-${{ github.run_id }}
+          path: .ci-dev-darwin-arm64-receipt.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
 
   # One shard per planned task on the broad runner. Native build tasks are
   # excluded (they run in affected-native); shards that load the native addon at
@@ -328,10 +395,17 @@ jobs:
       CI_DEV_MATRIX_RUST: ${{ matrix.rust }}
       CI_DEV_MATRIX_NEXTEST: ${{ matrix.nextest }}
       CI_DEV_MATRIX_NATIVE: ${{ matrix.native }}
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: "24"
@@ -341,7 +415,7 @@ jobs:
       - name: Download and validate canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-plan-${{ github.run_id }}
           path: .
       - run: bun scripts/ci-dev-affected.ts --validate-plan
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
@@ -364,7 +438,7 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
           key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
@@ -375,7 +449,7 @@ jobs:
         if: ${{ matrix.native }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: dev-affected-native-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-native-${{ github.run_id }}
           path: packages/natives/native
       - name: Run affected task shard
         env:
@@ -391,84 +465,167 @@ jobs:
       - name: Upload shard completion receipt
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: dev-affected-shard-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+          name: dev-affected-shard-${{ github.run_id }}-${{ strategy.job-index }}
           path: .ci-dev-shard-receipts/${{ strategy.job-index }}.json
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
+          overwrite: true
 
 
-  # Branch protection must keep requiring this stable aggregate status. It runs
-  # no validation itself; it passes iff the planner, native build, every affected
-  # shard, every affected shard, and the relevant Telegram daemon generation
-  # guard succeeded (skipped native, shards, and guard are fine for no-op or
-  # docs-only changes). The job name must stay exactly "Affected path validation".
-  affected:
-    name: Affected path validation
+  # This producer is deliberately not the protected status: the downstream job
+  # validates the finalized bundle downloaded by its immutable artifact ID.
+  # It also requires the Telegram daemon generation guard when that guard is relevant.
+  affected-evidence-producer:
+    name: Affected path validation / evidence producer
     if: ${{ always() }}
-    needs: [affected-plan, affected-native, affected-shards, telegram-daemon-generation, windows-dev-doctor]
+    needs: [affected-plan, affected-native, affected-shards, telegram-daemon-generation, windows-dev-doctor, affected-darwin-arm64-tab-worker-smoke]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
+    outputs:
+      artifact_id: ${{ steps.upload-evidence.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload-evidence.outputs.artifact-digest }}
     env:
       CI_DEV_AFFECTED_PLAN: .ci-dev-affected-plan.json
       CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}
       CI_DEV_PLAN_SOURCE_SHA: ${{ needs.affected-plan.outputs.plan_source_sha }}
+      CI_DEV_PLAN_MODE: ${{ needs.affected-plan.outputs.plan_mode }}
       CI_DEV_SHARD_RECEIPTS: .ci-dev-shard-receipts
+      CI_DEV_EVIDENCE_ROOT: .
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: "1.3"
       - name: Download canonical affected plan
-        if: ${{ needs.affected-plan.result == 'success' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-plan-${{ github.run_id }}
           path: .
       - name: Download shard completion receipts
-        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_tasks == 'true' }}
+        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_tasks == 'true' && needs.affected-shards.result == 'success' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          pattern: dev-affected-shard-${{ github.run_id }}-${{ github.run_attempt }}-*
+          pattern: dev-affected-shard-${{ github.run_id }}-*
           path: .ci-dev-shard-receipts
           merge-multiple: true
       - name: Validate canonical shard completion
-        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_tasks == 'true' }}
+        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_tasks == 'true' && needs.affected-shards.result == 'success' }}
         run: bun scripts/ci-dev-affected.ts --validate-shard-receipts
-      - name: Aggregate affected path validation shards
+      - name: Download Darwin smoke receipt
+        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' && needs.affected-darwin-arm64-tab-worker-smoke.result == 'success' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: dev-affected-darwin-receipt-${{ github.run_id }}
+          path: .
+      - name: Validate Darwin smoke receipt
+        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' && needs.affected-darwin-arm64-tab-worker-smoke.result == 'success' }}
+        run: bun scripts/ci-validate-darwin-receipt.ts
+      - name: Require Telegram daemon generation guard
+        shell: bash
         run: |
-          plan='${{ needs.affected-plan.result }}'
-          native='${{ needs.affected-native.result }}'
-          shards='${{ needs.affected-shards.result }}'
-          has_native='${{ needs.affected-plan.outputs.has_native }}'
-          has_tasks='${{ needs.affected-plan.outputs.has_tasks }}'
-          windows_doctor='${{ needs.windows-dev-doctor.result }}'
-          telegram_guard='${{ needs.telegram-daemon-generation.result }}'
-          echo "affected-plan: $plan"
-          echo "affected-native: $native"
-          echo "affected-shards: $shards"
-          echo "planned native work: $has_native"
-          echo "planned shard work: $has_tasks"
-          echo "windows-dev-doctor: $windows_doctor"
-          echo "telegram-daemon-generation: $telegram_guard"
-          test "$plan" = success || { echo "planner did not succeed"; exit 1; }
-          case "$has_native" in true|false) ;; *) echo "planner emitted invalid has_native=$has_native"; exit 1 ;; esac
-          case "$has_tasks" in true|false) ;; *) echo "planner emitted invalid has_tasks=$has_tasks"; exit 1 ;; esac
-          if [ "$has_native" = true ]; then
-            test "$native" = success || { echo "required native build did not succeed"; exit 1; }
-          else
-            test "$native" = skipped || { echo "unplanned native build was not skipped"; exit 1; }
-          fi
-          if [ "$has_tasks" = true ]; then
-            test "$shards" = success || { echo "required affected shards did not succeed"; exit 1; }
-          else
-            test "$shards" = skipped || { echo "unplanned affected shards were not skipped"; exit 1; }
-          fi
-          case "$windows_doctor" in success|skipped) ;; *) echo "Windows dev:doctor did not pass"; exit 1 ;; esac
-          case "$telegram_guard" in success|skipped) ;; *) echo "Telegram daemon generation guard did not pass"; exit 1 ;; esac
-          echo "Affected path validation: all required shards passed"
+          result='${{ needs.telegram-daemon-generation.result }}'
+          test "$result" = success || test "$result" = skipped
+      - name: Produce affected evidence
+        env:
+          CI_DEV_PLAN_RESULT: ${{ needs.affected-plan.result }}
+          CI_DEV_NATIVE_RESULT: ${{ needs.affected-native.result }}
+          CI_DEV_SHARDS_RESULT: ${{ needs.affected-shards.result }}
+          CI_DEV_HAS_NATIVE: ${{ needs.affected-plan.outputs.has_native }}
+          CI_DEV_HAS_TASKS: ${{ needs.affected-plan.outputs.has_tasks }}
+          CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}
+          CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
+          CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT: ${{ needs.affected-darwin-arm64-tab-worker-smoke.result }}
+          CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke }}
+        run: bun scripts/ci-dev-affected.ts --write-affected-evidence
+      - name: Upload affected evidence
+        id: upload-evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: dev-affected-evidence-${{ github.run_id }}
+          path: |
+            .ci-dev-affected-evidence.json
+            .ci-dev-affected-evidence.receipt.json
+            .ci-dev-affected-plan.json
+            .ci-dev-shard-receipts
+            .ci-dev-darwin-arm64-receipt.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  affected:
+    name: Affected path validation
+    if: ${{ always() }}
+    needs: [affected-evidence-producer, affected-plan, affected-native, affected-shards, telegram-daemon-generation, windows-dev-doctor]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    env:
+      CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}
+      CI_DEV_PLAN_SOURCE_SHA: ${{ needs.affected-plan.outputs.plan_source_sha }}
+      CI_DEV_PLAN_MODE: ${{ needs.affected-plan.outputs.plan_mode }}
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CI_DEV_PLAN_RESULT: ${{ needs.affected-plan.result }}
+      CI_DEV_NATIVE_RESULT: ${{ needs.affected-native.result }}
+      CI_DEV_SHARDS_RESULT: ${{ needs.affected-shards.result }}
+      CI_DEV_HAS_NATIVE: ${{ needs.affected-plan.outputs.has_native }}
+      CI_DEV_HAS_TASKS: ${{ needs.affected-plan.outputs.has_tasks }}
+      CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}
+      CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
+      CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' && 'success' || 'skipped' }}
+      CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke }}
+    steps:
+      - name: Fail closed on producer and live dependency results
+        env:
+          CI_DEV_EVIDENCE_ROOT: ${{ runner.temp }}/ci-dev-affected-evidence
+        shell: bash
+        run: |
+          test '${{ needs.affected-evidence-producer.result }}' = success
+          test '${{ needs.affected-plan.result }}' = success
+          test '${{ needs.telegram-daemon-generation.result }}' = success || test '${{ needs.telegram-daemon-generation.result }}' = skipped
+          test '${{ needs.affected-evidence-producer.outputs.artifact_id }}' != ''
+          test '${{ needs.affected-evidence-producer.outputs.artifact_digest }}' != ''
+          test "$CI_DEV_EVIDENCE_ROOT" != "$GITHUB_WORKSPACE"
+          case "$CI_DEV_EVIDENCE_ROOT" in "$GITHUB_WORKSPACE"/*) exit 1;; esac
+          rm -rf "$CI_DEV_EVIDENCE_ROOT"
+          mkdir -p "$CI_DEV_EVIDENCE_ROOT"
+      - name: Download finalized affected evidence
+      # download-artifact selects the immutable upload by artifact ID; the pinned
+      # action exposes no downloaded digest output to compare, so artifact_digest
+      # remains a required producer audit binding rather than a path selector.
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          artifact-ids: ${{ needs.affected-evidence-producer.outputs.artifact_id }}
+          path: ${{ runner.temp }}/ci-dev-affected-evidence
+          merge-multiple: true
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3"
+      - name: Validate finalized Darwin smoke receipt
+        if: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' }}
+        env:
+          CI_DEV_DARWIN_RECEIPT: ${{ runner.temp }}/ci-dev-affected-evidence/.ci-dev-darwin-arm64-receipt.json
+        run: bun scripts/ci-validate-darwin-receipt.ts
+      - name: Validate finalized affected evidence
+        env:
+          CI_DEV_EVIDENCE_ROOT: ${{ runner.temp }}/ci-dev-affected-evidence
+        run: bun scripts/ci-dev-affected.ts --validate-affected-evidence
 
   gjc-state-gates-matrix:
     name: gjc-state-gates / ${{ matrix.group }}

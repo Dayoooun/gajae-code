@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { parseNotifyArgs, promptForToken, runNotifyCliCommand, runNotifyCommand } from "../src/cli/notify-cli";
 import type { CasReceipt } from "../src/config/atomic-yaml-patch";
 import { Settings, type SettingsAtomicPatch } from "../src/config/settings";
@@ -1099,6 +1100,57 @@ describe("shared Telegram setup poller-contention policy", () => {
 	});
 });
 
+test("Discord setup prompts missing values and commits them atomically", async () => {
+	const settings = setupSettings();
+	const prompts: Array<[string, boolean]> = [];
+	const values = ["discord-secret", "app", "guild", "channel"];
+	await runNotifyCommand(
+		{ action: "setup", provider: "discord", rawArgs: [] },
+		{
+			settings,
+			setupInteractive: true,
+			valuePrompt: async (label, masked) => {
+				prompts.push([label, masked]);
+				return values.shift() ?? "";
+			},
+			ensureProviderDaemon: async () => "attached",
+		},
+	);
+	expect(prompts).toEqual([
+		["discord-bot-token: ", true],
+		["discord-application-id: ", false],
+		["discord-guild-id: ", false],
+		["discord-parent-channel-id: ", false],
+	]);
+	expect(getNotificationConfig(settings).discord).toMatchObject({
+		botToken: "discord-secret",
+		applicationId: "app",
+		guildId: "guild",
+		parentChannelId: "channel",
+	});
+});
+
+test("interactive Discord setup validates prompted required values before persistence", async () => {
+	for (const prompted of ["   ", "--redact"]) {
+		const settings = setupSettings();
+		await expect(
+			runNotifyCommand(
+				{ action: "setup", provider: "discord", rawArgs: [] },
+				{
+					settings,
+					setupInteractive: true,
+					valuePrompt: async () => prompted,
+				},
+			),
+		).rejects.toThrow(prompted.trim() ? "must not start with --" : "is required");
+		expect(getNotificationConfig(settings).discord?.botToken).toBeUndefined();
+	}
+});
+
+test("notify parser rejects flag values that look like flags and unknown subcommands", () => {
+	expect(parseNotifyArgs(["notify", "setup", "discord", "--discord-bot-token", "--redact"])).toBeUndefined();
+	expect(parseNotifyArgs(["notify", "bogus"])).toBeUndefined();
+});
 test("CLI setup reports atomic persistence failure without an enabled success message", async () => {
 	const settings = setupSettings({
 		"notifications.enabled": true,
@@ -1185,8 +1237,9 @@ describe("notify daemon-internal lightweight startup", () => {
 	test("daemon-internal exits before loading settings when owner pid is stale", async () => {
 		let settingsLoaded = false;
 		let daemonConstructed = false;
-		const { stderr } = await captureOutput(() =>
-			runDaemonInternal(["--owner-id", "12345-dead", "--agent-dir", tempAgentDir()], {
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await runDaemonInternal(["--owner-id", `12345-${token}`, "--agent-dir", tempAgentDir()], {
 				pidAlive: () => false,
 				SettingsImpl: {
 					async init() {
@@ -1201,11 +1254,14 @@ describe("notify daemon-internal lightweight startup", () => {
 					requestStop(): void {}
 					async run(): Promise<void> {}
 				} as never,
-			}),
-		);
-		expect(stderr).toContain("owner process");
-		expect(settingsLoaded).toBe(false);
-		expect(daemonConstructed).toBe(false);
+			});
+			expect(warning).toHaveBeenCalledWith("GJC notify daemon exiting because its owner is not alive");
+			expect(warning.mock.calls.flat().join("\n")).not.toContain(token);
+			expect(settingsLoaded).toBe(false);
+			expect(daemonConstructed).toBe(false);
+		} finally {
+			warning.mockRestore();
+		}
 	});
 
 	test("owner pid parser accepts pid-prefixed owner ids only", () => {

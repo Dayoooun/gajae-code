@@ -7,10 +7,37 @@ import * as fs from "node:fs/promises";
 const repoRoot = path.join(import.meta.dir, "..");
 const ZERO_SHA = /^0+$/;
 const PACKAGE_SCOPES = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
-// The coding-agent package has hundreds of test files; keep dev affected
-// validation below the shard timeout by splitting package-wide/full-workspace
-// TypeScript suites across the matrix instead of one root-test runner.
-const CODING_AGENT_TEST_SHARDS = 8;
+// The coding-agent package has hundreds of test files; keep affected validation
+// below the shard timeout by splitting package-wide/full-workspace TypeScript
+// suites across the matrix. Dev keeps the default; Main CI full mode overrides
+// via CI_CODING_AGENT_TEST_SHARDS to bound the long tail.
+const DEFAULT_CODING_AGENT_TEST_SHARDS = 8;
+
+function codingAgentTestShards(): number {
+	return positiveIntFromEnv("CI_CODING_AGENT_TEST_SHARDS", DEFAULT_CODING_AGENT_TEST_SHARDS);
+}
+
+// Number of nextest partitions the rust-test suite is split into. Dev runs one
+// unpartitioned rust-test task; Main CI full mode raises this to bound the
+// rust-test long tail.
+const DEFAULT_RUST_TEST_PARTITIONS = 1;
+
+function rustTestPartitions(): number {
+	return positiveIntFromEnv("CI_RUST_TEST_PARTITIONS", DEFAULT_RUST_TEST_PARTITIONS);
+}
+
+function positiveIntFromEnv(name: string, fallback: number): number {
+	const raw = Bun.env[name]?.trim();
+	if (!raw) return fallback;
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isInteger(parsed) && parsed >= 1 ? parsed : fallback;
+}
+
+// True when Main CI requests the deterministic full plan via `CI_FORCE_FULL`.
+function isForceFullMode(): boolean {
+	const raw = Bun.env.CI_FORCE_FULL?.trim();
+	return raw === "1" || raw === "true";
+}
 // SDK host lifecycle and coordinator prompt-control changes need the stable first
 // package shard in addition to targeted coverage. Keep this list limited to the
 // stateful surfaces whose regressions depend on broader package ordering.
@@ -138,6 +165,18 @@ async function main(): Promise<void> {
 		await validateShardReceipts();
 		return;
 	}
+	if (process.argv.includes("--validate-aggregate")) {
+		await validateAggregate();
+		return;
+	}
+	if (process.argv.includes("--write-affected-evidence")) {
+		await writeAffectedEvidence();
+		return;
+	}
+	if (process.argv.includes("--validate-affected-evidence")) {
+		await validateAffectedEvidence();
+		return;
+	}
 	if (process.argv.includes("--native-build")) {
 		await runNativeBuild();
 		return;
@@ -187,7 +226,44 @@ export function resolvePlanMode(): PlanMode {
 // Resolve the plan for the current changed paths and CI mode. PR mode builds the
 // targeted plan from a filesystem index of test files (for source→test mapping);
 // push mode reuses the broad affected planner unchanged.
+// Main CI full mode: emit the complete task union regardless of changed paths so
+// every check runs on `main`, and short-circuit the changed-path / canonical-plan
+// machinery entirely. It is deterministic, so the planner and every shard resolve
+// the identical plan without a shared plan artifact.
+export function planFullTasks(packages: readonly WorkspacePackage[]): Task[] {
+	const tasks = new Map<string, Task>();
+	addNativeBuild(tasks);
+	addWorkspaceTestTasks(tasks, packages);
+	add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
+	addRustTestTasks(tasks);
+	add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
+	add(tasks, "runtime-check", "Runtime checks (needs native addon)", ["bun", "run", "check:runtime"], resolvePackageCwd("packages/coding-agent"));
+	// root-check (ci:check:full) is intentionally omitted: Main CI runs it in the
+	// dedicated native-free `check` job, so emitting it here would double-run it.
+	return Array.from(tasks.values());
+}
+
+// Emit the rust-test task, split into nextest partitions when configured. Each
+// partition shards the test set (not a repeated full run) via `cargo nextest run
+// --partition count:i/N`, wired through run-rs-task.ts.
+function addRustTestTasks(tasks: Map<string, Task>): void {
+	const partitions = rustTestPartitions();
+	if (partitions <= 1) {
+		add(tasks, "rust-test", "Rust tests", ["bun", "run", "test:rs"]);
+		return;
+	}
+	for (let index = 1; index <= partitions; index++) {
+		add(
+			tasks,
+			`rust-test:partition-${index}-of-${partitions}`,
+			`Rust tests partition ${index}/${partitions}`,
+			["bun", "scripts/run-rs-task.ts", "test:rs", `count:${index}/${partitions}`],
+		);
+	}
+}
+
 async function resolvePlannedTasks(paths: readonly string[]): Promise<Task[]> {
+	if (isForceFullMode()) return planFullTasks(await getWorkspacePackages());
 	const fromArtifact = await loadCanonicalPlan();
 	if (fromArtifact) return fromArtifact;
 	const normalizedPaths = normalizeChangedPaths(paths);
@@ -254,17 +330,27 @@ function isNativeBuildKey(key: string): boolean {
 function taskNeedsNative(key: string): boolean {
 	return (
 		key === "root-test" ||
+		key === "root-check" ||
+		key === "check:@gajae-code/coding-agent" ||
 		key === "cli-smoke" ||
+		key === "runtime-check" ||
 		key === "wrapper-version" ||
 		key === "deep-interview-definitions" ||
 		key === "deep-interview-runtime" ||
+		key === "bridge-client-sdk-package-smoke" ||
 		key.startsWith("test:")
 	);
 }
 
+// rust-test may be split into nextest partitions (`rust-test:partition-i-of-N`)
+// in Main CI full mode; treat every partition like the single rust-test task.
+function isRustTestKey(key: string): boolean {
+	return key === "rust-test" || key.startsWith("rust-test:partition-");
+}
+
 // Tasks that need the Rust toolchain (and nextest) provisioned on their shard.
 function taskNeedsRust(key: string): boolean {
-	return key === "rust-check" || key === "rust-test" || key === "ci-selftest" || key === "ci-dry-run" || key === "affected-selftest" || key === "affected-dry-run";
+	return key === "rust-check" || isRustTestKey(key) || key === "ci-selftest" || key === "ci-dry-run" || key === "affected-selftest" || key === "affected-dry-run";
 }
 
 // Build the machine-readable descriptor list for the current changed-path plan.
@@ -278,26 +364,50 @@ export function describeTasks(tasks: readonly Task[]): TaskMatrixEntry[] {
 		cwd: task.cwd ? path.relative(repoRoot, task.cwd) || "." : undefined,
 		native: task.capabilities?.nativeConsumer ?? taskNeedsNative(task.key),
 		rust: task.capabilities?.rust ?? taskNeedsRust(task.key),
-		nextest: task.capabilities?.nextest ?? task.key === "rust-test",
+		nextest: task.capabilities?.nextest ?? isRustTestKey(task.key),
 		nativeBuild: task.capabilities?.nativeProducer ?? isNativeBuildKey(task.key),
 	}));
 }
 
 // `--matrix-json` prints the planned tasks as a JSON array on stdout (consumed
 // by tests and for debugging). Under GitHub Actions it also appends the dev-ci
-// planner outputs: `matrix` (the shard include list, excluding native-build
-// tasks), `has_tasks`, `has_native`, and the resolved `changed_paths` so every
-// downstream job reuses the planner's exact diff via CI_DEV_CHANGED_PATHS
-// instead of re-resolving the base ref on each runner.
-async function emitMatrix(): Promise<void> {
-	const paths = normalizeChangedPaths(await getChangedPaths());
-	const mode = resolvePlanMode();
-	const tasks = await resolvePlannedTasks(paths);
+// planner outputs: `matrix`, `has_tasks`, `has_native`, and the canonical Darwin
+// smoke flag. Downstream jobs reuse the planner's exact diff via
+// CI_DEV_CHANGED_PATHS instead of re-resolving the base ref on each runner.
+// Paths that affect the compiled tab-worker smoke graph. Keep this authoritative
+// predicate in the planner: dev-ci consumes its emitted flag rather than copying
+// path checks into individual jobs.
+export function isDarwinArm64TabWorkerSmokePath(changedPath: string): boolean {
+	// The compiled worker recursively loads browser, eval, scraper, and utility
+	// helpers. Directory ownership is deliberately conservative so a newly-added
+	// helper in those graph roots cannot silently bypass the Darwin smoke.
+	return changedPath.startsWith("packages/coding-agent/src/tools/browser/") ||
+		changedPath.startsWith("packages/coding-agent/src/tools/puppeteer/") ||
+		changedPath.startsWith("packages/coding-agent/src/eval/js/") ||
+		changedPath.startsWith("packages/coding-agent/src/web/scrapers/") ||
+		changedPath.startsWith("packages/coding-agent/src/utils/") ||
+		changedPath.startsWith("packages/utils/src/") ||
+		changedPath === "packages/coding-agent/src/tools/tool-errors.ts" ||
+		changedPath === "packages/coding-agent/src/tools/path-utils.ts" ||
+		changedPath === "packages/coding-agent/src/cli.ts" ||
+		changedPath === "packages/coding-agent/scripts/build-binary.ts" ||
+		changedPath === "packages/coding-agent/scripts/compile-args.ts" ||
+		changedPath.startsWith("packages/natives/") ||
+		changedPath === "scripts/ci-build-native.ts";
+}
+
+export function needsDarwinArm64TabWorkerSmoke(paths: readonly string[]): boolean {
+	return paths.some(isDarwinArm64TabWorkerSmokePath);
+}
+
+// Main CI full mode: emit a lean matrix from the deterministic full plan. It
+// deliberately skips the dev source-sha/checkout asserts, the canonical plan
+// artifact, plan digest, and the Darwin smoke flag — Main CI re-derives the same
+// full plan on every shard and gates on a simple aggregate job, not evidence
+// receipts.
+async function emitFullMatrix(): Promise<void> {
+	const tasks = planFullTasks(await getWorkspacePackages());
 	const entries = describeTasks(tasks);
-	const sourceSha = Bun.env.CI_DEV_SOURCE_SHA?.trim() || (Bun.env.GITHUB_SHA ?? "HEAD");
-	const canonical = JSON.stringify({ schemaVersion: 1, sourceSha, mode, paths, tasks: serializeTasks(tasks) });
-	const digest = new Bun.CryptoHasher("sha256").update(canonical).digest("hex");
-	await Bun.write(path.join(repoRoot, ".ci-dev-affected-plan.json"), canonical);
 	console.log(JSON.stringify(entries));
 
 	const githubOutput = process.env.GITHUB_OUTPUT;
@@ -310,6 +420,37 @@ async function emitMatrix(): Promise<void> {
 		`matrix=${JSON.stringify({ include: shards })}`,
 		`has_tasks=${shards.length > 0}`,
 		`has_native=${hasNative}`,
+		"",
+	];
+	await fs.appendFile(githubOutput, lines.join("\n"));
+}
+
+async function emitMatrix(): Promise<void> {
+	if (isForceFullMode()) return emitFullMatrix();
+	const sourceSha = await resolveSourceSha();
+	await requireCommitObject(sourceSha, "source head");
+	await assertCheckedOutSourceHead(sourceSha);
+	const paths = normalizeChangedPaths(await getChangedPaths());
+	const mode = resolvePlanMode();
+	const tasks = await resolvePlannedTasks(paths);
+	const entries = describeTasks(tasks);
+	const canonical = JSON.stringify({ schemaVersion: 1, sourceSha, mode, paths, tasks: serializeTasks(tasks) });
+	const digest = new Bun.CryptoHasher("sha256").update(canonical).digest("hex");
+	await Bun.write(path.join(repoRoot, ".ci-dev-affected-plan.json"), canonical);
+	console.log(JSON.stringify(entries));
+
+	const githubOutput = process.env.GITHUB_OUTPUT;
+	if (!githubOutput) return;
+	const shards = entries
+		.filter(entry => !entry.nativeBuild)
+		.map(entry => ({ key: entry.key, identity: entry.identity, description: entry.description, native: entry.native, rust: entry.rust, nextest: entry.nextest }));
+	const hasNative = entries.some(entry => entry.nativeBuild);
+	const hasDarwinArm64TabWorkerSmoke = needsDarwinArm64TabWorkerSmoke(paths);
+	const lines = [
+		`matrix=${JSON.stringify({ include: shards })}`,
+		`has_tasks=${shards.length > 0}`,
+		`has_native=${hasNative}`,
+		`has_darwin_arm64_tab_worker_smoke=${hasDarwinArm64TabWorkerSmoke}`,
 		`plan_digest=${digest}`,
 		`plan_source_sha=${sourceSha}`,
 		`plan_mode=${mode}`,
@@ -381,6 +522,7 @@ function printPlan(paths: readonly string[], plannedTasks: readonly Task[]): voi
 }
 
 async function getChangedPaths(): Promise<string[]> {
+	if (isForceFullMode()) return [];
 	const explicitPaths = Bun.env.CI_DEV_CHANGED_PATHS?.trim();
 	if (explicitPaths) {
 		return explicitPaths
@@ -391,10 +533,10 @@ async function getChangedPaths(): Promise<string[]> {
 	}
 
 	const base = await resolveBaseRef();
-	const head = Bun.env.CI_DEV_SOURCE_SHA?.trim() || Bun.env.GITHUB_SHA?.trim() || "HEAD";
+	const head = await resolveSourceSha();
 	await requireCommitObject(base, "base");
 	await requireCommitObject(head, "source head");
-	const range = `${base}...${head}`;
+	const range = `${base}..${head}`;
 	const diff = await $`git diff --name-only -z ${range}`.cwd(repoRoot).quiet().nothrow();
 	if (diff.exitCode !== 0) {
 		const stderr = diff.stderr.toString().trim();
@@ -408,31 +550,50 @@ async function requireCommitObject(ref: string, label: string): Promise<void> {
 	if (result.exitCode !== 0) throw new Error(`Failed to compute changed paths: ${label} '${ref}' is not available`);
 }
 
+async function resolveSourceSha(): Promise<string> {
+	const configured = Bun.env.CI_DEV_SOURCE_SHA?.trim() || Bun.env.GITHUB_SHA?.trim();
+	if (configured) return configured;
+	const checkedOut = await $`git rev-parse HEAD`.cwd(repoRoot).quiet().nothrow();
+	if (checkedOut.exitCode !== 0) throw new Error("Failed to resolve source head");
+	return checkedOut.stdout.toString().trim();
+}
+
+async function assertCheckedOutSourceHead(sourceSha: string): Promise<void> {
+	const checkedOut = await $`git rev-parse HEAD`.cwd(repoRoot).quiet().nothrow();
+	if (checkedOut.exitCode !== 0 || checkedOut.stdout.toString().trim() !== sourceSha) {
+		throw new Error(`Failed to publish affected plan: checked-out SHA does not match source head '${sourceSha}'`);
+	}
+}
+
 async function resolveBaseRef(): Promise<string> {
 	const eventName = Bun.env.GITHUB_EVENT_NAME?.trim();
 	const before = Bun.env.GITHUB_EVENT_BEFORE?.trim();
 	const baseSha = Bun.env.GITHUB_BASE_SHA?.trim();
 	const baseRef = Bun.env.GITHUB_BASE_REF?.trim();
 
+	// A PR event supplies its immutable base commit. Prefer it over the mutable
+	// branch ref: the base branch can be force-pushed after the event is queued,
+	// leaving the current origin/<baseRef> unrelated to the checked-out PR head.
+	if (eventName === "pull_request" && baseSha && !ZERO_SHA.test(baseSha)) {
+		return baseSha;
+	}
 	if (eventName === "pull_request" && baseRef) {
 		const mergeBase = await $`git merge-base HEAD ${`origin/${baseRef}`}`.cwd(repoRoot).quiet().nothrow();
 		if (mergeBase.exitCode === 0) {
 			const value = mergeBase.stdout.toString().trim();
 			if (value !== "") return value;
 		}
+		if (baseSha && !ZERO_SHA.test(baseSha)) return baseSha;
 		return `origin/${baseRef}`;
 	}
 	if (baseSha && !ZERO_SHA.test(baseSha)) {
 		return baseSha;
 	}
+	if (eventName === "pull_request" && baseRef) {
+		return `origin/${baseRef}`;
+	}
 	if (before && !ZERO_SHA.test(before)) {
 		return before;
-	}
-
-	const mergeBase = await $`git merge-base HEAD origin/dev`.cwd(repoRoot).quiet().nothrow();
-	if (mergeBase.exitCode === 0) {
-		const value = mergeBase.stdout.toString().trim();
-		if (value !== "") return value;
 	}
 	return "origin/dev";
 }
@@ -538,6 +699,9 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 				addPackageTestTasks(tasks, workspacePackage);
 			}
 		}
+	}
+	if (needsDarwinArm64TabWorkerSmoke(paths)) {
+		add(tasks, "install-methods", "Install method smoke tests", ["bun", "run", "ci:test:install-methods"]);
 	}
 
 	if (toolingScriptChanged && !fullWorkspace && !ciOnly && !workflowHarnessOnly) {
@@ -680,6 +844,9 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		}
 	}
 
+	if (needsDarwinArm64TabWorkerSmoke(relevant)) {
+		add(tasks, "install-methods", "Install method smoke tests", ["bun", "run", "ci:test:install-methods"]);
+	}
 	if (needCiSelftest) {
 		add(tasks, "ci-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts"]);
 		add(tasks, "ci-dry-run", "Affected CI selector dry-run", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
@@ -714,17 +881,18 @@ function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: Workspa
 		return;
 	}
 
-	for (let shard = 1; shard <= CODING_AGENT_TEST_SHARDS; shard++) {
-		addCodingAgentTestShard(tasks, shard);
+	const total = codingAgentTestShards();
+	for (let shard = 1; shard <= total; shard++) {
+		addCodingAgentTestShard(tasks, shard, total);
 	}
 }
 
-function addCodingAgentTestShard(tasks: Map<string, Task>, shard: number): void {
+function addCodingAgentTestShard(tasks: Map<string, Task>, shard: number, total: number = codingAgentTestShards()): void {
 	add(
 		tasks,
-		`test:@gajae-code/coding-agent:shard-${shard}-of-${CODING_AGENT_TEST_SHARDS}`,
-		`Test @gajae-code/coding-agent shard ${shard}/${CODING_AGENT_TEST_SHARDS}`,
-		["bun", "test", `--shard=${shard}/${CODING_AGENT_TEST_SHARDS}`],
+		`test:@gajae-code/coding-agent:shard-${shard}-of-${total}`,
+		`Test @gajae-code/coding-agent shard ${shard}/${total}`,
+		["bun", "test", `--shard=${shard}/${total}`],
 		resolvePackageCwd("packages/coding-agent"),
 	);
 }
@@ -1228,7 +1396,7 @@ function serializeTasks(tasks: readonly Task[]): Task[] {
 			cwd,
 			capabilities: task.capabilities ?? {
 				rust: taskNeedsRust(task.key),
-				nextest: task.key === "rust-test",
+				nextest: isRustTestKey(task.key),
 				nativeConsumer: taskNeedsNative(task.key),
 				nativeProducer: isNativeBuildKey(task.key),
 			},
@@ -1240,6 +1408,285 @@ function serializeTasks(tasks: readonly Task[]): Task[] {
 function canonicalTaskIdentity(task: Task): string {
 	const cwd = task.cwd ? path.relative(repoRoot, task.cwd) || "." : ".";
 	return task.identity ?? `legacy:${toBase64Url(task.key)}:${toBase64Url(cwd)}`;
+}
+
+export interface AffectedAggregateResults {
+	plan: string;
+	native: string;
+	shards: string;
+	windowsDoctor: string;
+	windowsDoctorRequired: string;
+	hasNative: string;
+	hasTasks: string;
+	darwinArm64TabWorkerSmoke: string;
+	darwinArm64TabWorkerSmokeRequired: string;
+}
+
+export function validateAffectedAggregate(results: AffectedAggregateResults): void {
+	if (results.plan !== "success") throw new Error("planner did not succeed");
+	if (results.hasNative !== "true" && results.hasNative !== "false") throw new Error(`planner emitted invalid has_native=${results.hasNative}`);
+	if (results.hasTasks !== "true" && results.hasTasks !== "false") throw new Error(`planner emitted invalid has_tasks=${results.hasTasks}`);
+	if (results.native !== (results.hasNative === "true" ? "success" : "skipped")) throw new Error(results.hasNative === "true" ? "required native build did not succeed" : "unplanned native build was not skipped");
+	if (results.shards !== (results.hasTasks === "true" ? "success" : "skipped")) throw new Error(results.hasTasks === "true" ? "required affected shards did not succeed" : "unplanned affected shards were not skipped");
+	if (results.windowsDoctorRequired !== "true" && results.windowsDoctorRequired !== "false") throw new Error(`planner emitted invalid windows_doctor_required=${results.windowsDoctorRequired}`);
+	if (results.windowsDoctor !== (results.windowsDoctorRequired === "true" ? "success" : "skipped")) throw new Error(results.windowsDoctorRequired === "true" ? "required Windows dev:doctor did not succeed" : "unplanned Windows dev:doctor was not skipped");
+	if (results.darwinArm64TabWorkerSmokeRequired !== "true" && results.darwinArm64TabWorkerSmokeRequired !== "false") throw new Error(`planner emitted invalid darwin_arm64_tab_worker_smoke_required=${results.darwinArm64TabWorkerSmokeRequired}`);
+	if (results.darwinArm64TabWorkerSmoke !== (results.darwinArm64TabWorkerSmokeRequired === "true" ? "success" : "skipped")) throw new Error(results.darwinArm64TabWorkerSmokeRequired === "true" ? "required Darwin arm64 tab-worker smoke did not succeed" : "unplanned Darwin arm64 tab-worker smoke was not skipped");
+}
+
+async function validateAggregate(): Promise<void> {
+	const results: AffectedAggregateResults = {
+		plan: Bun.env.CI_DEV_PLAN_RESULT?.trim() || "",
+		native: Bun.env.CI_DEV_NATIVE_RESULT?.trim() || "",
+		shards: Bun.env.CI_DEV_SHARDS_RESULT?.trim() || "",
+		windowsDoctor: Bun.env.CI_DEV_WINDOWS_DOCTOR_RESULT?.trim() || "",
+		windowsDoctorRequired: Bun.env.CI_DEV_WINDOWS_DOCTOR_REQUIRED?.trim() || "",
+		hasNative: Bun.env.CI_DEV_HAS_NATIVE?.trim() || "",
+		hasTasks: Bun.env.CI_DEV_HAS_TASKS?.trim() || "",
+		darwinArm64TabWorkerSmoke: Bun.env.CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT?.trim() || "",
+		darwinArm64TabWorkerSmokeRequired: Bun.env.CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED?.trim() || "",
+	};
+
+
+	console.log(`affected-plan: ${results.plan}`);
+	console.log(`affected-native: ${results.native}`);
+	console.log(`affected-shards: ${results.shards}`);
+	console.log(`planned native work: ${results.hasNative}`);
+	console.log(`planned shard work: ${results.hasTasks}`);
+	console.log(`windows-dev-doctor: ${results.windowsDoctor}`);
+	console.log(`planned Windows dev:doctor: ${results.windowsDoctorRequired}`);
+	console.log(`darwin-arm64 tab-worker smoke: ${results.darwinArm64TabWorkerSmoke}`);
+	console.log(`planned Darwin arm64 tab-worker smoke: ${results.darwinArm64TabWorkerSmokeRequired}`);
+	validateAffectedAggregate(results);
+	const tasks = await loadCanonicalPlan();
+	if (!tasks) throw new Error("affected-plan-invalid: aggregate requires a canonical plan");
+	validatePlanCapabilities(tasks, results, Bun.env.CI_DEV_PLAN_MODE?.trim() || resolvePlanMode());
+	console.log("Affected path validation: all required shards passed");
+}
+
+function validatePlanCapabilities(tasks: readonly Task[], results: Pick<AffectedAggregateResults, "hasNative" | "hasTasks">, mode: string): void {
+	if (mode !== "pr" && mode !== "push") throw new Error("affected-plan-invalid: invalid plan mode");
+	const expectedHasNative = String(tasks.some(task => task.capabilities?.nativeProducer === true));
+	const expectedHasTasks = String(tasks.some(task => task.capabilities?.nativeProducer !== true));
+	if (results.hasNative !== expectedHasNative || results.hasTasks !== expectedHasTasks) throw new Error("affected-plan-invalid: plan capability flags mismatch");
+}
+
+const AFFECTED_EVIDENCE_MANIFEST = ".ci-dev-affected-evidence.json";
+const AFFECTED_EVIDENCE_RECEIPT = ".ci-dev-affected-evidence.receipt.json";
+const AFFECTED_PLAN_NAME = ".ci-dev-affected-plan.json";
+const AFFECTED_SHARD_DIR = ".ci-dev-shard-receipts";
+const SHA256 = /^[a-f0-9]{64}$/;
+const SOURCE_SHA = /^[a-f0-9]{40}$/;
+
+type EvidenceChild = { name: string; sha256: string };
+type EvidenceTask = { key: string; identity: string };
+type ReplayScope = { repository: string; workflow: string; runId: string };
+type AffectedEvidenceManifest = {
+	schemaVersion: 1; subject: "ci-dev-affected-evidence"; sourceSha: string; planDigest: string; planMode: PlanMode;
+	replayScope: ReplayScope; aggregateResults: AffectedAggregateResults; taskIdentities: EvidenceTask[]; childEvidence: EvidenceChild[];
+};
+type DetachedEvidenceReceipt = {
+	schemaVersion: 1; subject: "ci-dev-affected-evidence"; manifestSha256: string; sourceSha: string; planDigest: string; replayScope: ReplayScope;
+};
+
+function sha256(value: string | Uint8Array): string { return new Bun.CryptoHasher("sha256").update(value).digest("hex"); }
+function canonicalEvidence(value: object): string { return `${JSON.stringify(value)}\n`; }
+function evidenceRoot(): string { return path.resolve(requiredEnv("CI_DEV_EVIDENCE_ROOT")); }
+function evidenceError(reason: string): Error { return new Error(`affected-evidence-invalid: ${reason}`); }
+function exactKeys(value: Record<string, unknown>, keys: readonly string[], reason: string): void {
+	if (Object.keys(value).length !== keys.length || Object.keys(value).some(key => !keys.includes(key))) throw evidenceError(reason);
+}
+function requiredEnv(name: string): string { const value = Bun.env[name]?.trim(); if (!value) throw evidenceError(`missing ${name}`); return value; }
+
+function isMissingError(error: unknown): boolean { return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT"; }
+async function checkedEvidencePath(root: string, relative: string, finalKind: "file" | "directory"): Promise<string> {
+	const resolvedRoot = path.resolve(root);
+	const target = path.resolve(resolvedRoot, relative);
+	if (!target.startsWith(`${resolvedRoot}${path.sep}`)) throw evidenceError("path escaped staging root");
+	let rootStat: import("node:fs").Stats;
+	try { rootStat = await fs.lstat(resolvedRoot); } catch (error) { if (isMissingError(error)) throw evidenceError("missing staging root"); throw error; }
+	if (rootStat.isSymbolicLink()) throw evidenceError("symlink staging root");
+	if (!rootStat.isDirectory()) throw evidenceError("non-directory staging root");
+	let current = resolvedRoot;
+	for (const piece of path.relative(resolvedRoot, target).split(path.sep)) {
+		current = path.join(current, piece);
+		let stat: import("node:fs").Stats;
+		try { stat = await fs.lstat(current); } catch (error) { if (isMissingError(error)) throw evidenceError("missing evidence object"); throw error; }
+		if (stat.isSymbolicLink()) throw evidenceError("symlink evidence object");
+		const final = current === target;
+		if (final ? (finalKind === "file" ? !stat.isFile() : !stat.isDirectory()) : !stat.isDirectory()) {
+			throw evidenceError(final ? `non-${finalKind} evidence object` : "non-directory evidence parent");
+		}
+	}
+	return target;
+}
+async function readEvidenceBytes(root: string, relative: string): Promise<Uint8Array> { return new Uint8Array(await fs.readFile(await checkedEvidencePath(root, relative, "file"))); }
+function decodeEvidenceJson(raw: Uint8Array): string { try { return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw); } catch { throw evidenceError("malformed UTF-8 evidence"); } }
+async function readEvidenceFile(root: string, relative: string): Promise<string> { return decodeEvidenceJson(await readEvidenceBytes(root, relative)); }
+async function checkEvidenceDirectory(root: string, relative: string): Promise<string> { return checkedEvidencePath(root, relative, "directory"); }
+
+function expectedEvidenceTasks(tasks: readonly Task[]): EvidenceTask[] {
+	return tasks.filter(task => task.capabilities?.nativeProducer !== true).map(task => ({ key: task.key, identity: canonicalTaskIdentity(task) }));
+}
+function expectedEvidenceNames(tasks: readonly Task[]): string[] {
+	return [AFFECTED_PLAN_NAME, ...expectedEvidenceTasks(tasks).map((_, index) => `${AFFECTED_SHARD_DIR}/${index}.json`)];
+}
+function canonicalReplayScope(): ReplayScope {
+	return { repository: requiredEnv("GITHUB_REPOSITORY"), workflow: requiredEnv("GITHUB_WORKFLOW"), runId: requiredEnv("GITHUB_RUN_ID") };
+}
+function aggregateFromEnv(): AffectedAggregateResults {
+	return {
+		plan: requiredEnv("CI_DEV_PLAN_RESULT"),
+		native: requiredEnv("CI_DEV_NATIVE_RESULT"),
+		shards: requiredEnv("CI_DEV_SHARDS_RESULT"),
+		windowsDoctor: requiredEnv("CI_DEV_WINDOWS_DOCTOR_RESULT"),
+		windowsDoctorRequired: requiredEnv("CI_DEV_WINDOWS_DOCTOR_REQUIRED"),
+		hasNative: requiredEnv("CI_DEV_HAS_NATIVE"),
+		hasTasks: requiredEnv("CI_DEV_HAS_TASKS"),
+		darwinArm64TabWorkerSmoke: requiredEnv("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT"),
+		darwinArm64TabWorkerSmokeRequired: requiredEnv("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED"),
+	};
+}
+function parseAggregate(value: unknown): AffectedAggregateResults {
+	if (!isRecord(value)) throw evidenceError("malformed aggregate results");
+	exactKeys(
+		value,
+		[
+			"plan",
+			"native",
+			"shards",
+			"windowsDoctor",
+			"windowsDoctorRequired",
+			"hasNative",
+			"hasTasks",
+			"darwinArm64TabWorkerSmoke",
+			"darwinArm64TabWorkerSmokeRequired",
+		],
+		"unexpected aggregate results field",
+	);
+	if (!Object.values(value).every(isString)) throw evidenceError("malformed aggregate results");
+	return {
+		plan: value.plan as string,
+		native: value.native as string,
+		shards: value.shards as string,
+		windowsDoctor: value.windowsDoctor as string,
+		windowsDoctorRequired: value.windowsDoctorRequired as string,
+		hasNative: value.hasNative as string,
+		hasTasks: value.hasTasks as string,
+		darwinArm64TabWorkerSmoke: value.darwinArm64TabWorkerSmoke as string,
+		darwinArm64TabWorkerSmokeRequired: value.darwinArm64TabWorkerSmokeRequired as string,
+	};
+}
+function parseReplayScope(value: unknown): ReplayScope {
+	if (!isRecord(value)) throw evidenceError("malformed replay scope");
+	exactKeys(value, ["repository", "workflow", "runId"], "unexpected replay scope field");
+	if (!isString(value.repository) || !isString(value.workflow) || !isString(value.runId) || !value.repository || !value.workflow || !value.runId) throw evidenceError("malformed replay scope");
+	return { repository: value.repository, workflow: value.workflow, runId: value.runId };
+}
+function parseEvidenceTasks(value: unknown): EvidenceTask[] {
+	if (!Array.isArray(value)) throw evidenceError("malformed task identities");
+	return value.map(entry => { if (!isRecord(entry)) throw evidenceError("malformed task identity"); exactKeys(entry, ["key", "identity"], "unexpected task identity field"); if (!isString(entry.key) || !isString(entry.identity) || !entry.key || !entry.identity) throw evidenceError("malformed task identity"); return { key: entry.key, identity: entry.identity }; });
+}
+function parseEvidenceChildren(value: unknown): EvidenceChild[] {
+	if (!Array.isArray(value)) throw evidenceError("malformed child evidence");
+	return value.map(entry => { if (!isRecord(entry)) throw evidenceError("malformed child evidence"); exactKeys(entry, ["name", "sha256"], "unexpected child evidence field"); if (!isString(entry.name) || !isString(entry.sha256) || !SHA256.test(entry.sha256)) throw evidenceError("malformed child evidence"); return { name: entry.name, sha256: entry.sha256 }; });
+}
+function parseCanonicalManifest(raw: string): AffectedEvidenceManifest {
+	let decoded: unknown; try { decoded = JSON.parse(raw); } catch { throw evidenceError("malformed manifest"); }
+	if (!isRecord(decoded)) throw evidenceError("malformed manifest");
+	exactKeys(decoded, ["schemaVersion", "subject", "sourceSha", "planDigest", "planMode", "replayScope", "aggregateResults", "taskIdentities", "childEvidence"], "unexpected manifest field");
+	if (decoded.schemaVersion !== 1 || decoded.subject !== "ci-dev-affected-evidence" || !isString(decoded.sourceSha) || !SOURCE_SHA.test(decoded.sourceSha) || !isString(decoded.planDigest) || !SHA256.test(decoded.planDigest) || (decoded.planMode !== "pr" && decoded.planMode !== "push")) throw evidenceError("malformed manifest");
+	const manifest: AffectedEvidenceManifest = { schemaVersion: 1, subject: "ci-dev-affected-evidence", sourceSha: decoded.sourceSha, planDigest: decoded.planDigest, planMode: decoded.planMode, replayScope: parseReplayScope(decoded.replayScope), aggregateResults: parseAggregate(decoded.aggregateResults), taskIdentities: parseEvidenceTasks(decoded.taskIdentities), childEvidence: parseEvidenceChildren(decoded.childEvidence) };
+	if (raw !== canonicalEvidence(manifest)) throw evidenceError("non-canonical manifest bytes");
+	return manifest;
+}
+function parseCanonicalReceipt(raw: string): DetachedEvidenceReceipt {
+	let decoded: unknown; try { decoded = JSON.parse(raw); } catch { throw evidenceError("malformed receipt"); }
+	if (!isRecord(decoded)) throw evidenceError("malformed receipt");
+	exactKeys(decoded, ["schemaVersion", "subject", "manifestSha256", "sourceSha", "planDigest", "replayScope"], "unexpected receipt field");
+	if (decoded.schemaVersion !== 1 || decoded.subject !== "ci-dev-affected-evidence" || !isString(decoded.manifestSha256) || !SHA256.test(decoded.manifestSha256) || !isString(decoded.sourceSha) || !SOURCE_SHA.test(decoded.sourceSha) || !isString(decoded.planDigest) || !SHA256.test(decoded.planDigest)) throw evidenceError("malformed receipt");
+	const receipt: DetachedEvidenceReceipt = { schemaVersion: 1, subject: "ci-dev-affected-evidence", manifestSha256: decoded.manifestSha256, sourceSha: decoded.sourceSha, planDigest: decoded.planDigest, replayScope: parseReplayScope(decoded.replayScope) };
+	if (raw !== canonicalEvidence(receipt)) throw evidenceError("non-canonical receipt bytes");
+	return receipt;
+}
+
+async function readValidatedEvidencePlan(root: string): Promise<{ tasks: Task[]; raw: Uint8Array; mode: PlanMode }> {
+	const raw = await readEvidenceBytes(root, AFFECTED_PLAN_NAME);
+	let decoded: unknown; try { decoded = JSON.parse(decodeEvidenceJson(raw)); } catch { throw evidenceError("malformed canonical plan"); }
+	if (!isRecord(decoded) || (decoded.mode !== "pr" && decoded.mode !== "push")) throw evidenceError("malformed canonical plan");
+	const planPath = path.join(root, AFFECTED_PLAN_NAME);
+	const original = Bun.env.CI_DEV_AFFECTED_PLAN;
+	Bun.env.CI_DEV_AFFECTED_PLAN = planPath;
+	try { const tasks = await loadCanonicalPlan(); if (!tasks) throw evidenceError("missing canonical plan"); return { tasks, raw, mode: decoded.mode }; }
+	finally { if (original === undefined) delete Bun.env.CI_DEV_AFFECTED_PLAN; else Bun.env.CI_DEV_AFFECTED_PLAN = original; }
+}
+async function collectChildEvidence(root: string, tasks: readonly Task[]): Promise<EvidenceChild[]> {
+	const expected = expectedEvidenceNames(tasks);
+	const shardTasks = expectedEvidenceTasks(tasks);
+	if (shardTasks.length === 0) {
+		try { await fs.lstat(path.join(root, AFFECTED_SHARD_DIR)); throw evidenceError("unexpected shard receipt directory"); } catch (error) { if (error instanceof Error && error.message.startsWith("affected-evidence-invalid")) throw error; if (!isMissingError(error)) throw error; }
+	} else {
+		const directory = await checkEvidenceDirectory(root, AFFECTED_SHARD_DIR);
+		const entries = await fs.readdir(directory);
+		if (entries.length !== shardTasks.length || entries.some(entry => !/^\d+\.json$/.test(entry))) throw evidenceError("shard receipt set does not match canonical plan");
+	}
+	const children: EvidenceChild[] = [];
+	for (const [index, name] of expected.entries()) {
+		const rawBytes = await readEvidenceBytes(root, name);
+		const raw = decodeEvidenceJson(rawBytes);
+		if (index > 0) {
+			let value: unknown; try { value = JSON.parse(raw); } catch { throw evidenceError("malformed shard receipt"); }
+			const expectedTask = shardTasks[index - 1]!;
+			if (!isRecord(value) || Object.keys(value).length !== 2 || value.key !== expectedTask.key || value.identity !== expectedTask.identity) throw evidenceError("shard receipt set does not match canonical plan");
+		}
+		children.push({ name, sha256: sha256(rawBytes) });
+	}
+	return children;
+}
+async function writeAffectedEvidence(): Promise<void> {
+	const root = evidenceRoot();
+	const { tasks, raw: planRaw, mode: planMode } = await readValidatedEvidencePlan(root);
+	const results = aggregateFromEnv(); validateAffectedAggregate(results);
+	const digest = requiredEnv("CI_DEV_PLAN_DIGEST");
+	const mode = requiredEnv("CI_DEV_PLAN_MODE");
+	if (mode !== "pr" && mode !== "push") throw evidenceError("invalid CI_DEV_PLAN_MODE");
+	if (mode !== planMode) throw evidenceError("plan mode mismatch");
+	validatePlanCapabilities(tasks, results, mode);
+	if (sha256(planRaw) !== digest) throw evidenceError("plan digest mismatch");
+	const manifestPath = path.join(root, AFFECTED_EVIDENCE_MANIFEST); const receiptPath = path.join(root, AFFECTED_EVIDENCE_RECEIPT);
+	for (const target of [manifestPath, receiptPath]) { try { await fs.lstat(target); throw evidenceError("evidence target already exists"); } catch (error) { if (error instanceof Error && error.message.startsWith("affected-evidence-invalid")) throw error; if (!isMissingError(error)) throw error; } }
+	const manifest: AffectedEvidenceManifest = { schemaVersion: 1, subject: "ci-dev-affected-evidence", sourceSha: requiredEnv("CI_DEV_SOURCE_SHA"), planDigest: digest, planMode: mode, replayScope: canonicalReplayScope(), aggregateResults: results, taskIdentities: expectedEvidenceTasks(tasks), childEvidence: await collectChildEvidence(root, tasks) };
+	let wroteManifest = false;
+	try {
+		await fs.writeFile(manifestPath, canonicalEvidence(manifest), { flag: "wx" }); wroteManifest = true;
+		const finalized = await readEvidenceBytes(root, AFFECTED_EVIDENCE_MANIFEST);
+		if (Bun.env.CI_DEV_INJECT_EVIDENCE_POST_MANIFEST_FAILURE === "true") throw evidenceError("injected post-manifest failure");
+		const receipt: DetachedEvidenceReceipt = { schemaVersion: 1, subject: "ci-dev-affected-evidence", manifestSha256: sha256(finalized), sourceSha: manifest.sourceSha, planDigest: manifest.planDigest, replayScope: manifest.replayScope };
+		await fs.writeFile(receiptPath, canonicalEvidence(receipt), { flag: "wx" });
+		console.log(`affected evidence produced: ${manifest.childEvidence.length} child evidence file(s)`);
+	} catch (error) { if (wroteManifest) await fs.rm(manifestPath, { force: true }); throw error; }
+}
+async function validateAffectedEvidence(): Promise<void> {
+	const root = evidenceRoot();
+	const receiptRaw = await readEvidenceFile(root, AFFECTED_EVIDENCE_RECEIPT);
+	const manifestBytes = await readEvidenceBytes(root, AFFECTED_EVIDENCE_MANIFEST);
+	const manifestRaw = decodeEvidenceJson(manifestBytes);
+	const receipt = parseCanonicalReceipt(receiptRaw);
+	if (receipt.manifestSha256 !== sha256(manifestBytes)) throw evidenceError("manifest digest mismatch");
+	const manifest = parseCanonicalManifest(manifestRaw);
+	const { tasks, raw: planRaw, mode: planMode } = await readValidatedEvidencePlan(root);
+	const expectedReplay = canonicalReplayScope(); const expectedSource = requiredEnv("CI_DEV_SOURCE_SHA"); const expectedDigest = requiredEnv("CI_DEV_PLAN_DIGEST");
+	if (manifest.sourceSha !== expectedSource || receipt.sourceSha !== expectedSource || manifest.planDigest !== expectedDigest || receipt.planDigest !== expectedDigest || JSON.stringify(manifest.replayScope) !== JSON.stringify(expectedReplay) || JSON.stringify(receipt.replayScope) !== JSON.stringify(expectedReplay)) throw evidenceError("replay binding mismatch");
+	if (manifest.planMode !== requiredEnv("CI_DEV_PLAN_MODE") || manifest.planMode !== planMode || sha256(planRaw) !== expectedDigest) throw evidenceError("plan binding mismatch");
+	validateAffectedAggregate(manifest.aggregateResults);
+	const liveAggregate = aggregateFromEnv();
+	if (JSON.stringify(manifest.aggregateResults) !== JSON.stringify(liveAggregate)) throw evidenceError("aggregate result mismatch");
+	validatePlanCapabilities(tasks, liveAggregate, manifest.planMode);
+	const expectedTasks = expectedEvidenceTasks(tasks);
+	if (JSON.stringify(manifest.taskIdentities) !== JSON.stringify(expectedTasks)) throw evidenceError("task identity mismatch");
+	const children = await collectChildEvidence(root, tasks);
+	if (JSON.stringify(manifest.childEvidence) !== JSON.stringify(children)) throw evidenceError("child evidence mismatch");
+	console.log(`affected evidence validated: ${children.length} child evidence file(s)`);
 }
 
 async function validateShardReceipts(): Promise<void> {

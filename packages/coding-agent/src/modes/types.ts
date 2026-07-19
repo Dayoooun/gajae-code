@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@gajae-code/agent-core";
 import type { CompactionOutcome } from "@gajae-code/agent-core/compaction";
 import type { AssistantMessage, ImageContent, Message, UsageReport } from "@gajae-code/ai";
-import type { Component, Container, EditorTheme, Loader, Spacer, Text, TUI } from "@gajae-code/tui";
+import type { Component, Container, EditorTheme, Loader, SlashCommand, Spacer, Text, TUI } from "@gajae-code/tui";
 import type { KeybindingsManager } from "../config/keybindings";
 import type { Settings } from "../config/settings";
 import type {
@@ -12,7 +12,6 @@ import type {
 } from "../extensibility/extensions";
 import type { CompactOptions } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
-import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
 import type { MCPManager } from "../runtime-mcp";
 import type { NotificationSessionReconcileResult, NotificationSessionStatus } from "../sdk/bus/session-control";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
@@ -22,14 +21,15 @@ import type { CredentialAutoImportOptions } from "../setup/credential-auto-impor
 import type { LspStartupServerInfo } from "../tools";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
+import type { CommandPaletteAction } from "./components/command-palette";
 import type { CustomEditor } from "./components/custom-editor";
 import type { EvalExecutionComponent } from "./components/eval-execution";
 import type { PetMode } from "./components/gajae-pet-widget";
 import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
-import type { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
+import type { StatusLineComponent } from "./components/tool-status-header";
 import type { IrcObservationLedger } from "./irc-observation-ledger";
 import type { OAuthManualInputManager } from "./oauth-manual-input";
 import type { Theme } from "./theme/theme";
@@ -51,6 +51,17 @@ export type SubmittedUserInput = {
 	started: boolean;
 };
 
+export type ComposerSubmissionOptions = Readonly<{
+	ownsComposer: boolean;
+	editor: CustomEditor;
+}>;
+
+export function canApplyComposerSubmission(
+	options: ComposerSubmissionOptions | undefined,
+	editor: CustomEditor,
+): boolean {
+	return options === undefined || (options.ownsComposer && editor === options.editor);
+}
 export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned";
 
 export type TodoItem = {
@@ -109,10 +120,6 @@ export interface InteractiveModeContext {
 	isBashNoContext: boolean;
 	toolOutputExpanded: boolean;
 	todoExpanded: boolean;
-	planModeEnabled: boolean;
-	goalModeEnabled: boolean;
-	goalModePaused: boolean;
-	planModePlanFilePath?: string;
 	hideThinkingBlock: boolean;
 	pendingImages: ImageContent[];
 	compactionQueuedMessages: CompactionQueuedMessage[];
@@ -174,10 +181,9 @@ export interface InteractiveModeContext {
 	showNewVersionNotification(newVersion: string): void;
 	clearEditor(): void;
 	updatePendingMessagesDisplay(): void;
-	queueCompactionMessage(text: string, mode: "steer" | "followUp"): void;
+	queueCompactionMessage(text: string, mode: "steer" | "followUp", options?: ComposerSubmissionOptions): void;
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void>;
 	flushPendingBashComponents(): void;
-	flushPendingModelSwitch(): Promise<void>;
 	setWorkingMessage(message?: string): void;
 	applyPendingWorkingMessage(): void;
 	ensureLoadingAnimation(): void;
@@ -196,12 +202,15 @@ export interface InteractiveModeContext {
 	commitPetPreviewMode(mode: PetMode): boolean;
 	/** Re-mount the composer (pet-aware) after an overlay/selector closes. */
 	restoreComposer(): void;
-	startPendingSubmission(input: {
-		text: string;
-		images?: ImageContent[];
-		customType?: string;
-		display?: boolean;
-	}): SubmittedUserInput;
+	startPendingSubmission(
+		input: {
+			text: string;
+			images?: ImageContent[];
+			customType?: string;
+			display?: boolean;
+		},
+		options?: ComposerSubmissionOptions,
+	): SubmittedUserInput;
 	cancelPendingSubmission(): boolean;
 	markPendingSubmissionStarted(input: SubmittedUserInput): boolean;
 	finishPendingSubmission(input: SubmittedUserInput): void;
@@ -282,10 +291,18 @@ export interface InteractiveModeContext {
 		customInstructionsOrOptions?: string | CompactOptions,
 		isAuto?: boolean,
 	): Promise<CompactionOutcome>;
+
 	openInBrowser(urlOrPath: string): void;
+	/** Resolved source of truth for slash autocomplete and command palette entries. */
+	getSlashCommands?(): readonly SlashCommand[];
 	refreshSlashCommandState(cwd?: string): Promise<void>;
 
 	// Selector handling
+	showCommandPalette(
+		commands: SlashCommand[],
+		actions: CommandPaletteAction[],
+		executeSlashCommand: (name: string) => Promise<void>,
+	): void;
 	showSettingsSelector(): void;
 	showThemeSelector(): void;
 	showPetSelector(): void;
@@ -299,6 +316,7 @@ export interface InteractiveModeContext {
 	showUserMessageSelector(): void;
 	showTreeSelector(): void;
 	showSessionSelector(): void;
+	showSessionsDashboard(): void;
 	handleResumeSession(sessionPath: string): Promise<void>;
 	handleSessionDeleteCommand(): Promise<void>;
 	showOAuthSelector(mode: "login" | "logout", providerId?: string, options?: OAuthSelectorOptions): Promise<void>;
@@ -306,6 +324,10 @@ export interface InteractiveModeContext {
 	showDebugSelector(): void;
 	showSessionObserver(): void;
 	showJobsOverlay(): void;
+	showTasksPane(): void;
+	showTranscriptViewer(): void;
+	isTranscriptViewerOpen(): boolean;
+	refreshTranscriptViewer(): void;
 	resetObserverRegistry(): void;
 
 	// Input handling
@@ -325,9 +347,6 @@ export interface InteractiveModeContext {
 	toggleThinkingBlockVisibility(): void;
 	openExternalEditor(): void;
 	registerExtensionShortcuts(): void;
-	handlePlanModeCommand(initialPrompt?: string): Promise<void>;
-	handleGoalModeCommand(rest?: string): Promise<void>;
-	handlePlanApproval(details: PlanApprovalDetails): Promise<void>;
 
 	// Hook UI methods
 	initHooksAndCustomTools(): Promise<void>;
@@ -335,6 +354,14 @@ export interface InteractiveModeContext {
 		reason: "start" | "switch" | "branch" | "tree" | "shutdown",
 		previousSessionFile?: string,
 	): Promise<void>;
+	planModeController: Pick<
+		import("./controllers/plan-mode-controller").PlanModeController,
+		"enabled" | "paused" | "planFilePath" | "handleCommand" | "handleApproval" | "flushPendingModelSwitch"
+	>;
+	goalModeController: Pick<
+		import("./controllers/goal-mode-controller").GoalModeController,
+		"enabled" | "paused" | "handleCommand"
+	>;
 	setHookWidget(key: string, content: ExtensionWidgetContent, options?: ExtensionWidgetOptions): void;
 	setHookStatus(key: string, text: string | undefined): void;
 	showHookSelector(

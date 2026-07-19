@@ -7,6 +7,7 @@ import { buildChatDaemonSpawnArgs } from "../src/sdk/bus/chat-daemon-control";
 import { buildTelegramDaemonSpawnArgs, daemonPaths } from "../src/sdk/bus/telegram-daemon";
 
 const repoRoot = path.resolve(import.meta.dir, "../../..");
+const executableSuffix = process.platform === "win32" ? ".exe" : "";
 
 describe("compiled daemon smoke coverage", () => {
 	function tempDir(prefix: string): string {
@@ -46,6 +47,47 @@ describe("compiled daemon smoke coverage", () => {
 		]);
 		return { exitCode, stdout, stderr, timedOut };
 	}
+	const cliEntrypoint = path.join(repoRoot, "packages/coding-agent/src/cli.ts");
+
+	function rootCliStaticImports(source: string): string[] {
+		const importsFrom = Array.from(source.matchAll(/^import[\s\S]*?from\s+["']([^"']+)["'];?$/gm), match => match[1]);
+		const sideEffectImports = Array.from(source.matchAll(/^import\s+["']([^"']+)["'];?$/gm), match => match[1]);
+		return [...importsFrom, ...sideEffectImports];
+	}
+
+	test("root CLI defers the chat daemon bus graph while the hidden daemon child still spawns", async () => {
+		const agentDir = tempDir("gjc-chat-daemon-root-entry-");
+		const cwd = tempDir("gjc-chat-daemon-root-cwd-");
+		const configPath = path.join(agentDir, "config.yml");
+		const config = "notifications:\n  enabled: false\n";
+		fs.writeFileSync(configPath, config);
+		try {
+			const staticImports = rootCliStaticImports(fs.readFileSync(cliEntrypoint, "utf8"));
+			expect(staticImports).not.toContain("./sdk/bus/chat-daemon-cli");
+
+			const result = await runWithTimeout(
+				[
+					"bun",
+					"run",
+					cliEntrypoint,
+					"daemon",
+					"discord-internal",
+					"--owner-id",
+					`${process.pid}-root-entry-test`,
+					"--agent-dir",
+					agentDir,
+				],
+				{ cwd },
+				10_000,
+			);
+			expect(result.timedOut).toBe(false);
+			expect(`${result.exitCode}\n${result.stdout}\n${result.stderr}`).toStartWith("0\n");
+			expect(fs.readFileSync(configPath, "utf8")).toBe(config);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
 
 	async function buildCompiledDaemonSmokeBinary(outPath: string): Promise<void> {
 		const proc = Bun.spawn(["bun", "run", "build"], {
@@ -59,7 +101,7 @@ describe("compiled daemon smoke coverage", () => {
 			new Response(proc.stderr).text(),
 		]);
 		expect(`${exitCode}\n${stdout}\n${stderr}`).toStartWith("0\n");
-		fs.copyFileSync(path.join(repoRoot, "packages/coding-agent/dist/gjc"), outPath);
+		fs.copyFileSync(path.join(repoRoot, `packages/coding-agent/dist/gjc${executableSuffix}`), outPath);
 		fs.chmodSync(outPath, 0o755);
 	}
 
@@ -134,7 +176,7 @@ describe("compiled daemon smoke coverage", () => {
 	});
 	test("compiled binary preserves the shipped chat worker entrypoint", async () => {
 		const temp = tempDir("gjc-compiled-daemon-binary-");
-		const binaryPath = path.join(temp, "gjc-repro");
+		const binaryPath = path.join(temp, `gjc-repro${executableSuffix}`);
 		try {
 			await buildCompiledDaemonSmokeBinary(binaryPath);
 			const nativeVersion = (

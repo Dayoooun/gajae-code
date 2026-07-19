@@ -23,6 +23,7 @@ import chalk from "chalk";
 import type { Args } from "./cli/args";
 import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
+import { resolveLaunchDisposition } from "./cli/launch-disposition";
 import { runListModelsCommand } from "./cli/list-models";
 import { selectSession } from "./cli/session-picker";
 import { findConfigFile } from "./config";
@@ -57,6 +58,7 @@ import type { AgentSession } from "./session/agent-session";
 import {
 	type ResumeSessionIdentity,
 	resolveResumableSession,
+	type SessionDirectoryMigrationPolicy,
 	type SessionInfo,
 	SessionManager,
 	type StrictSessionOpenResult,
@@ -281,7 +283,7 @@ export function resolveAcpStartupOptions(
 }
 
 async function readPipedInput(): Promise<string | undefined> {
-	if (process.stdin.isTTY !== false) return undefined;
+	if (process.stdin.isTTY === true) return undefined;
 	try {
 		const text = await Bun.stdin.text();
 		if (text.trim().length === 0) return undefined;
@@ -289,6 +291,30 @@ async function readPipedInput(): Promise<string | undefined> {
 	} catch {
 		return undefined;
 	}
+}
+
+async function readPipedInputIfReady(): Promise<string | undefined> {
+	if (process.stdin.isTTY === true) return undefined;
+
+	const ready = Promise.withResolvers<void>();
+	const onReadable = () => ready.resolve();
+	const onEnd = () => ready.resolve();
+	const onError = () => ready.resolve();
+	process.stdin.once("readable", onReadable);
+	process.stdin.once("end", onEnd);
+	process.stdin.once("error", onError);
+	await Promise.race([ready.promise, new Promise<void>(resolve => setImmediate(resolve))]);
+	process.stdin.removeListener("readable", onReadable);
+	process.stdin.removeListener("end", onEnd);
+	process.stdin.removeListener("error", onError);
+
+	const chunks: Buffer[] = [];
+	for (let chunk = process.stdin.read(); chunk !== null; chunk = process.stdin.read()) {
+		chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+	}
+	if (chunks.length === 0) return undefined;
+	const text = Buffer.concat(chunks).toString("utf8");
+	return text.trim() ? text : undefined;
 }
 
 export interface InteractiveModeNotify {
@@ -510,6 +536,7 @@ type SelectResumeSession = (sessions: SessionInfo[]) => Promise<SessionSelection
 type OpenExistingSessionStrict = (
 	identity: ResumeSessionIdentity,
 	sessionDir?: string,
+	migrationPolicy?: SessionDirectoryMigrationPolicy,
 ) => Promise<StrictSessionOpenResult>;
 
 export const BARE_RESUME_CONFLICT_ERROR =
@@ -694,6 +721,7 @@ export async function createSessionManager(
 	cwd: string,
 	activeSettings: Settings = settings,
 ): Promise<SessionManager | undefined> {
+	const migrationPolicy = activeSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
 	if (parsed.resume === true) {
 		return undefined;
 	}
@@ -703,13 +731,13 @@ export async function createSessionManager(
 		}
 		const forkSource = parsed.fork;
 		if (forkSource.includes("/") || forkSource.includes("\\") || forkSource.endsWith(".jsonl")) {
-			return await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir);
+			return await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir, undefined, migrationPolicy);
 		}
 		const match = await resolveResumableSession(forkSource, cwd, parsed.sessionDir);
 		if (!match) {
 			throw new Error(`Session "${forkSource}" not found.`);
 		}
-		return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir);
+		return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir, undefined, migrationPolicy);
 	}
 
 	if (parsed.noSession) {
@@ -718,7 +746,7 @@ export async function createSessionManager(
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
-			return await SessionManager.open(sessionArg, parsed.sessionDir);
+			return await SessionManager.open(sessionArg, parsed.sessionDir, undefined, migrationPolicy);
 		}
 		const match = await resolveResumableSession(sessionArg, cwd, parsed.sessionDir);
 		if (!match) {
@@ -732,13 +760,19 @@ export async function createSessionManager(
 				if (!shouldFork) {
 					throw new Error(`Session "${sessionArg}" is in another project (${match.session.cwd}).`);
 				}
-				return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir);
+				return await SessionManager.forkFrom(
+					match.session.path,
+					cwd,
+					parsed.sessionDir,
+					undefined,
+					migrationPolicy,
+				);
 			}
 		}
-		return await SessionManager.open(match.session.path, parsed.sessionDir);
+		return await SessionManager.open(match.session.path, parsed.sessionDir, undefined, migrationPolicy);
 	}
 	if (parsed.continue) {
-		return await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		return await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, migrationPolicy);
 	}
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
@@ -761,7 +795,7 @@ export async function createSessionManager(
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
 	if (activeSettings.get("autoResume")) {
-		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, migrationPolicy);
 		if (manager.getEntries().length > 0) {
 			parsed.continue = true;
 		}
@@ -1005,6 +1039,7 @@ export interface RunRootCommandDependencies {
 	startupUpdate?: { check: () => Promise<string | undefined> };
 	initTheme?: typeof initTheme;
 	readPipedInput?: typeof readPipedInput;
+	stdinIsTTY?: boolean;
 	runStartupCredentialAutoImportIfNeeded?: typeof runStartupCredentialAutoImportIfNeeded;
 	getChangelogForDisplay?: typeof getChangelogForDisplay;
 	createInteractiveMode?: CreateInteractiveMode;
@@ -1014,6 +1049,7 @@ export interface RunRootCommandDependencies {
 	selectResumeSession?: SelectResumeSession;
 	openExistingSessionStrict?: OpenExistingSessionStrict;
 	initializeSettings?: typeof Settings.init;
+	loadSettingsForScope?: typeof Settings.loadForScope;
 }
 
 export async function runRootCommand(
@@ -1054,15 +1090,25 @@ export async function runRootCommand(
 			process.stdout.write(`${chalk.dim("No sessions found")}\n`);
 			return;
 		}
-		const selection = await (deps.selectResumeSession ?? selectSession)(sessions);
+		const selection = deps.selectResumeSession
+			? await deps.selectResumeSession(sessions)
+			: await selectSession(sessions, parsedArgs.sessionDir);
 		if (selection.kind === "cancelled") {
 			return;
 		}
+		const resumeMigrationPolicy =
+			(await (deps.loadSettingsForScope ?? Settings.loadForScope)({ cwd: resumeCwd })).get(
+				"session.directoryMigration",
+			) === "disabled"
+				? "disabled"
+				: "copy-retain";
 		let opened: StrictSessionOpenResult;
 		try {
 			opened = await (deps.openExistingSessionStrict ?? SessionManager.openExistingStrict)(
 				selection.identity,
 				parsedArgs.sessionDir,
+				undefined,
+				resumeMigrationPolicy,
 			);
 		} catch {
 			process.stderr.write(`${BARE_RESUME_OPEN_ERROR}\n`);
@@ -1144,8 +1190,16 @@ export async function runRootCommand(
 	if (parsedArgs.noTitle || parsedArgs.mode === "acp") {
 		Bun.env.PI_NO_TITLE = "1";
 	}
+	const hasPreparedInput = parsedArgs.messages.length > 0 || parsedArgs.fileArgs.length > 0;
 	const { pipedInput, fileText, fileImages } = await logger.time("prepareInitialMessage", async () => {
-		const pipedInput = await (deps.readPipedInput ?? readPipedInput)();
+		const pipedInput =
+			parsedArgs.mode === "acp"
+				? undefined
+				: deps.readPipedInput
+					? await deps.readPipedInput()
+					: hasPreparedInput
+						? await readPipedInputIfReady()
+						: await readPipedInput();
 		if (parsedArgs.fileArgs.length === 0) {
 			return { pipedInput, fileText: undefined, fileImages: undefined };
 		}
@@ -1160,14 +1214,25 @@ export async function runRootCommand(
 		fileImages,
 		stdinContent: pipedInput,
 	});
-	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
+	const disposition = resolveLaunchDisposition({
+		stdinIsTTY: deps.stdinIsTTY ?? process.stdin.isTTY,
+		pipedInput,
+		hasPreparedInput,
+		print: Boolean(parsedArgs.print),
+		mode: parsedArgs.mode,
+	});
+	if (disposition.nonInteractiveError) {
+		process.stderr.write(`${chalk.red(disposition.nonInteractiveError)}\n`);
+		process.exit(1);
+	}
+	const autoPrint = disposition.autoPrint;
 	const startupUpdateRoute = classifyStartupUpdateRoute(parsedArgs, autoPrint);
 	const startupUpdate = new StartupUpdateOrchestrator(
 		startupUpdateRoute,
 		() => settingsInstance.get("startup.checkUpdate"),
 		deps.startupUpdate?.check ?? (() => checkForNewVersion(VERSION)),
 	);
-	const isInteractive = startupUpdateRoute === "interactive";
+	const isInteractive = disposition.isInteractive;
 	const mode = parsedArgs.mode || "text";
 
 	// Initialize discovery system with settings for provider persistence
@@ -1299,6 +1364,7 @@ export async function runRootCommand(
 	sessionOptions.modelRegistry = modelRegistry;
 	sessionOptions.hasUI = isInteractive;
 	sessionOptions.notificationHostModeSupported = isInteractive;
+	sessionOptions.sdkHostModeSupported = isInteractive;
 	sessionOptions.settings = settingsInstance;
 	const hasRootStartupProfile = Boolean(settingsInstance.get("modelProfile.default") || parsedArgs.mpreset);
 
@@ -1331,6 +1397,30 @@ export async function runRootCommand(
 		applyCliRuntimeApiKeyOverride(authStorage, parsedArgs.apiKey, sessionOptions.model);
 	}
 
+	if (
+		!deps.suppressProcessExit &&
+		deps.createAgentSession === undefined &&
+		parsedArgs.noSession === true &&
+		!parsedArgs.continue &&
+		parsedArgs.resume === undefined &&
+		parsedArgs.fork === undefined &&
+		!isInteractive &&
+		mode !== "acp" &&
+		!hasRootStartupProfile &&
+		!sessionOptions.model &&
+		!sessionOptions.modelPattern &&
+		modelRegistry.getAvailable().length === 0
+	) {
+		process.stderr.write(`${chalk.red(`No models available. ${formatModelOnboardingGuidance()}`)}\n`);
+		process.stderr.write(
+			`${chalk.yellow(`\nAdvanced manual config remains available at ${ModelsConfigFile.path()}`)}\n`,
+		);
+		process.exitCode = 1;
+		authStorage.close();
+		stopThemeWatcher();
+		await postmortem.cleanup();
+		return;
+	}
 	const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
 	const createSession: CreateSessionForMain = async (options, context): Promise<CreateAgentSessionResult> => {
 		const result = await logger.time("createAgentSession", createAgentSessionImpl, options);
@@ -1345,10 +1435,16 @@ export async function runRootCommand(
 	};
 
 	if (mode === "acp") {
-		await (deps.runAcpMode ?? (await import("./modes/acp")).runAcpMode)({
-			agentDir: settingsInstance.getAgentDir(),
-			...(acpStartupOptions ? { startupOptions: acpStartupOptions } : {}),
-		});
+		try {
+			await (deps.runAcpMode ?? (await import("./modes/acp")).runAcpMode)({
+				agentDir: settingsInstance.getAgentDir(),
+				...(acpStartupOptions ? { startupOptions: acpStartupOptions } : {}),
+			});
+		} finally {
+			authStorage.close();
+			stopThemeWatcher();
+			if (!deps.suppressProcessExit) await postmortem.cleanup();
+		}
 	} else {
 		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager, eventBus } = await createSession(
 			sessionOptions,
@@ -1483,20 +1579,21 @@ export async function runRootCommand(
 			}
 		} else {
 			const runPrint = deps.runPrintMode ?? (await import("./modes/print-mode")).runPrintMode;
-			await runPrint(session, {
-				mode,
-				messages: parsedArgs.messages,
-				initialMessage,
-				initialImages,
-				suppressProcessExit: deps.suppressProcessExit,
-			});
-			if ($env.PI_TIMING) {
-				logger.printTimings();
-			}
-			stopThemeWatcher();
-			if (!deps.suppressProcessExit) {
-				const exitCode = typeof process.exitCode === "number" ? process.exitCode : 0;
-				await postmortem.quit(exitCode);
+			try {
+				await runPrint(session, {
+					mode,
+					messages: parsedArgs.messages,
+					initialMessage,
+					initialImages,
+					suppressProcessExit: deps.suppressProcessExit,
+				});
+				if ($env.PI_TIMING) {
+					logger.printTimings();
+				}
+			} finally {
+				stopThemeWatcher();
+				authStorage.close();
+				if (!deps.suppressProcessExit) await postmortem.cleanup();
 			}
 		}
 	}

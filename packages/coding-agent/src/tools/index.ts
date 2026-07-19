@@ -1,9 +1,10 @@
 import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
 import type { Model, ServiceTier, ToolChoice } from "@gajae-code/ai";
-import { $env, $flag, logger } from "@gajae-code/utils";
+import { $env, logger } from "@gajae-code/utils";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import { EditTool } from "../edit";
+import { isTruthyPythonFlag } from "../eval/py/env";
 import { checkPythonKernelAvailability } from "../eval/py/kernel";
 import type { Skill } from "../extensibility/skills";
 import type { GoalModeState, GoalRuntime } from "../goals";
@@ -114,7 +115,6 @@ export type ContextFileEntry = {
 	depth?: number;
 };
 
-export type { DiscoverableMCPTool } from "../runtime-mcp/discoverable-tool-metadata";
 export type {
 	DiscoverableTool,
 	DiscoverableToolSearchIndex,
@@ -278,6 +278,8 @@ export interface ToolSession {
 	bashRestrictionProfile?: BashRestrictionProfile;
 	/** Optional per-session allowlist for tools exposed through search_tool_bm25. */
 	discoverableToolAllowedNames?: readonly string[];
+	/** Throw instead of warn when toolNames contains an unknown name. */
+	strictToolNames?: boolean;
 	/** Get artifacts directory for artifact:// URLs */
 	getArtifactsDir?: () => string | null;
 	/** Get the ArtifactManager backing this session (shared across parent + subagents). */
@@ -326,18 +328,6 @@ export interface ToolSession {
 	getTodoPhases?: () => TodoPhase[];
 	/** Replace cached todo phases for this session. */
 	setTodoPhases?: (phases: TodoPhase[]) => void;
-	/** Whether MCP tool discovery is active for this session. */
-	isMCPDiscoveryEnabled?: () => boolean;
-	/** Get hidden-but-discoverable MCP tools for search_tool_bm25 prompts and fallbacks.
-	 * @deprecated Use getDiscoverableTools with source filter instead. */
-	getDiscoverableMCPTools?: () => import("../runtime-mcp/discoverable-tool-metadata").DiscoverableMCPTool[];
-	/** Get the cached discoverable MCP search index for search_tool_bm25 execution.
-	 * @deprecated Use getDiscoverableToolSearchIndex instead. */
-	getDiscoverableMCPSearchIndex?: () => import("../tool-discovery/tool-index").DiscoverableMCPSearchIndex;
-	/** Get MCP tools activated by prior search_tool_bm25 calls. */
-	getSelectedMCPToolNames?: () => string[];
-	/** Merge MCP tool selections into the active session tool set. */
-	activateDiscoveredMCPTools?: (toolNames: string[]) => Promise<string[]>;
 	// ── Generic tool discovery (unified — covers built-in + MCP + extension) ──
 	/** Whether any form of tool discovery is active (tools.discoveryMode !== "off" or mcp.discoveryMode). */
 	isToolDiscoveryEnabled?: () => boolean;
@@ -511,18 +501,65 @@ export interface EvalBackendsAllowance {
 }
 
 /**
- * Parse PI_PY / PI_JS environment variables. Each is a boolean flag; unset
- * means "not specified, defer to settings". Returns null when neither is set
+ * Parse the `GJC_PY` multi-value token into per-backend booleans.
+ *
+ * Tokens (case-insensitive):
+ * - `0` / `bash` → JavaScript only (`{ py: false, js: true }`)
+ * - `1` / `py`   → Python only (`{ py: true, js: false }`)
+ * - `js`         → JavaScript only (`{ py: false, js: true }`)
+ * - `mix` / `both` → both backends (`{ py: true, js: true }`)
+ *
+ * Returns `null` when `GJC_PY` is unset, empty, or holds an unrecognized
+ * token, so the caller can fall back to the legacy `PI_PY` / `PI_JS` flags or
+ * per-key settings. This matches the documented contract that invalid values
+ * are ignored.
+ */
+export function parseGjcPy(env: Record<string, string | undefined>): { py: boolean; js: boolean } | null {
+	const raw = env.GJC_PY;
+	if (raw === undefined) return null;
+	const token = raw.trim().toLowerCase();
+	if (token === "") return null;
+	switch (token) {
+		case "0":
+		case "bash":
+			return { py: false, js: true };
+		case "1":
+		case "py":
+			return { py: true, js: false };
+		case "js":
+			return { py: false, js: true };
+		case "mix":
+		case "both":
+			return { py: true, js: true };
+		default:
+			return null;
+	}
+}
+
+/**
+ * Parse legacy `PI_PY` / `PI_JS` boolean flags. Each is a boolean flag; unset
+ * means "not specified, defer to settings". Returns `null` when neither is set
  * so the caller can fall through to `readEvalBackendsAllowance` per key.
  */
-function getEvalBackendsFromEnv(): EvalBackendsAllowance | null {
-	const pyEnv = $env.PI_PY;
-	const jsEnv = $env.PI_JS;
+function parseLegacyEvalEnvFlags(env: Record<string, string | undefined>): EvalBackendsAllowance | null {
+	const pyEnv = env.PI_PY;
+	const jsEnv = env.PI_JS;
 	if (pyEnv === undefined && jsEnv === undefined) return null;
 	return {
-		python: pyEnv === undefined ? true : $flag("PI_PY"),
-		js: jsEnv === undefined ? true : $flag("PI_JS"),
+		python: pyEnv === undefined ? true : isTruthyPythonFlag(pyEnv),
+		js: jsEnv === undefined ? true : isTruthyPythonFlag(jsEnv),
 	};
+}
+
+/**
+ * Resolve eval-backend allowance from environment only. `GJC_PY` wins when set
+ * to a recognized token; otherwise the legacy `PI_PY` / `PI_JS` flags apply.
+ * Returns `null` when no env override is set so the caller can defer to settings.
+ */
+export function resolveEvalBackendsFromEnv(env: Record<string, string | undefined>): EvalBackendsAllowance | null {
+	const gjc = parseGjcPy(env);
+	if (gjc) return { python: gjc.py, js: gjc.js };
+	return parseLegacyEvalEnvFlags(env);
 }
 
 /** Read per-backend allowance from settings (defaults true). */
@@ -534,12 +571,19 @@ export function readEvalBackendsAllowance(session: ToolSession): EvalBackendsAll
 }
 
 /**
- * Materialize the active eval backend allowance: PI_PY / PI_JS env flags
- * override the per-key settings; otherwise settings (defaults true) win.
+ * Materialize the active eval backend allowance. `GJC_PY` takes precedence
+ * over the legacy `PI_PY` / `PI_JS` env flags, which in turn override the
+ * per-key settings (defaults true). When no env override is set, settings win.
  */
 export function resolveEvalBackends(session: ToolSession): EvalBackendsAllowance {
-	return getEvalBackendsFromEnv() ?? readEvalBackendsAllowance(session);
+	return resolveEvalBackendsFromEnv($env) ?? readEvalBackendsAllowance(session);
 }
+
+export {
+	resolvePythonIntegrationGate,
+	resolvePythonIpcTrace,
+	resolvePythonSkipCheck,
+} from "../eval/py/env";
 
 /**
  * Create tools from BUILTIN_TOOLS registry.
@@ -670,6 +714,14 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		requestedTools.push("yield");
 	}
 
+	if (requestedTools) {
+		const unknownToolNames = requestedTools.filter(name => !allToolsByRequestName.has(name));
+		if (unknownToolNames.length > 0) {
+			const message = `Unknown tool name${unknownToolNames.length === 1 ? "" : "s"}: ${unknownToolNames.join(", ")}`;
+			if (session.strictToolNames) throw new Error(message);
+			logger.warn(message);
+		}
+	}
 	const filteredRequestedTools = requestedTools
 		?.map(name => allToolsByRequestName.get(name))
 		.filter((entry): entry is [string, ToolFactory] => entry !== undefined)

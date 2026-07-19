@@ -17,6 +17,10 @@ const MAX_LIST_LIMIT = 50;
 const RECEIPT_PREVIEW_WIDTH = 280;
 const PREVIEW_WIDTH = 2_000;
 const FULL_PREVIEW_WIDTH = 12_000;
+const RECEIPT_PREVIEW_BYTES = 1_024;
+const PREVIEW_BYTES = 8_192;
+const FULL_PREVIEW_BYTES = 49_152;
+
 const STEER_QUEUED_GUIDANCE =
 	"The steer message is queued for the subagent's next steering boundary and has not necessarily taken effect yet.";
 
@@ -783,7 +787,40 @@ function isSubagentJob(job: AsyncJob): boolean {
 }
 
 function sanitizeText(text: string, width: number): string {
-	return truncateToWidth(replaceTabs(text), width, Ellipsis.Unicode);
+	return capCodePointsAndBytes(
+		truncateToWidth(replaceTabs(text), width, Ellipsis.Unicode),
+		width,
+		previewByteCap(width),
+	);
+}
+
+function previewByteCap(width: number): number {
+	return width === FULL_PREVIEW_WIDTH
+		? FULL_PREVIEW_BYTES
+		: width === PREVIEW_WIDTH
+			? PREVIEW_BYTES
+			: RECEIPT_PREVIEW_BYTES;
+}
+
+export function capCodePointsAndBytes(text: string, maxCodePoints: number, maxBytes: number): string {
+	const ellipsis = "…";
+	const collapsed = text.replace(/…{2,}$/u, ellipsis);
+	const codePoints = [...collapsed];
+	if (codePoints.length <= maxCodePoints && Buffer.byteLength(collapsed) <= maxBytes) return collapsed;
+
+	const source = collapsed.endsWith(ellipsis) ? collapsed.slice(0, -ellipsis.length) : collapsed;
+	const ellipsisBytes = Buffer.byteLength(ellipsis);
+	let preview = "";
+	let previewBytes = 0;
+	let previewCodePoints = 0;
+	for (const codePoint of source) {
+		const codePointBytes = Buffer.byteLength(codePoint);
+		if (previewCodePoints + 1 + 1 > maxCodePoints || previewBytes + codePointBytes + ellipsisBytes > maxBytes) break;
+		preview += codePoint;
+		previewBytes += codePointBytes;
+		previewCodePoints++;
+	}
+	return `${preview}${ellipsis}`;
 }
 
 function previewJobOutput(
@@ -799,7 +836,11 @@ function previewJobOutput(
 	const width =
 		verbosity === "full" ? FULL_PREVIEW_WIDTH : verbosity === "preview" ? PREVIEW_WIDTH : RECEIPT_PREVIEW_WIDTH;
 	const normalized = replaceTabs(source.text);
-	const preview = truncateToWidth(normalized, width, Ellipsis.Unicode);
+	const preview = capCodePointsAndBytes(
+		truncateToWidth(normalized, width, Ellipsis.Unicode),
+		width,
+		previewByteCap(width),
+	);
 	return { type: source.type, preview, truncated: preview !== normalized };
 }
 

@@ -16,7 +16,11 @@ import {
 	resolveDaemonAction,
 } from "../src/daemon/operator-contract";
 import { resolveGjcRuntimeSpawnInfo } from "../src/daemon/runtime";
-import { processIncarnation } from "../src/sdk/broker/process-incarnation";
+import {
+	isProcessIncarnation,
+	parseDarwinProcessIncarnation,
+	processIncarnation,
+} from "../src/sdk/broker/process-incarnation";
 import {
 	acquireChatDaemonOwnership,
 	buildChatDaemonSpawnArgs,
@@ -129,6 +133,8 @@ function readyTelegramSpawnFixture({
 					settings,
 					ownerId: pending.ownerId,
 					acquisitionId: pending.ownerId,
+					tokenFingerprint: tokenFingerprint("123456:secret-token"),
+					chatId: "42",
 					pid: pending.pid,
 					incarnation: pidIncarnation(pending.pid),
 				}),
@@ -440,8 +446,10 @@ describe("TelegramDaemonController.reload", () => {
 			pid: number;
 			generation?: number;
 		};
+		const ownerIdIndex = spawns[0]?.args.indexOf("--owner-id") ?? -1;
+		expect(ownerIdIndex).toBeGreaterThanOrEqual(0);
 		expect(after.ownerId).not.toBe("old");
-		expect(after.ownerId.startsWith("4242-")).toBe(true);
+		expect(after.ownerId).toBe(spawns[0]?.args[ownerIdIndex + 1]);
 		expect(after.pid).toBe(4243);
 		expect(after.generation).toBe(DAEMON_GENERATION);
 		// No leftover control request after a successful reload.
@@ -747,6 +755,8 @@ describe("renewDaemonHeartbeat steal-lock contention", () => {
 			settings: s,
 			ownerId: "old",
 			acquisitionId: "old",
+			tokenFingerprint: tokenFingerprint(BOT_TOKEN),
+			chatId: "42",
 			pid: 999,
 			generation: DAEMON_GENERATION,
 			incarnation: "test:999",
@@ -773,6 +783,8 @@ describe("renewDaemonHeartbeat steal-lock contention", () => {
 			settings: s,
 			ownerId: "old",
 			acquisitionId: "old",
+			tokenFingerprint: tokenFingerprint(BOT_TOKEN),
+			chatId: "42",
 			pid: 999,
 			generation: DAEMON_GENERATION,
 			incarnation: "test:999",
@@ -804,6 +816,8 @@ describe("renewDaemonHeartbeat steal-lock contention", () => {
 			settings: s,
 			ownerId: "old",
 			acquisitionId: "old",
+			tokenFingerprint: tokenFingerprint(BOT_TOKEN),
+			chatId: "42",
 			pid: 999,
 			generation: DAEMON_GENERATION,
 			incarnation: "test:999",
@@ -1925,12 +1939,12 @@ describe("Chat daemon owner-lock publication", () => {
 		const agentDir = tempAgentDir();
 		const paths = chatDaemonPaths(agentDir, "slack");
 		fs.mkdirSync(paths.dir, { recursive: true });
-		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 82, incarnation: "dead", createdAt: 1 }));
-		const liveReclaim = `${JSON.stringify({ pid: 81, incarnation: "live-incarnation", createdAt: Date.now() })}\n`;
+		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 82, incarnation: "darwin:1700000000:999999", createdAt: 1 }));
+		const liveReclaim = `${JSON.stringify({ pid: 81, incarnation: "darwin:1700000000:123456", createdAt: Date.now() })}\n`;
 		fs.writeFileSync(`${paths.lock}.reclaim`, liveReclaim);
 		const probe = {
 			pidAlive: (pid: number) => pid === 81,
-			pidIncarnation: (pid: number) => (pid === 81 ? "live-incarnation" : undefined),
+			pidIncarnation: (pid: number) => (pid === 81 ? "darwin:1700000000:123456" : undefined),
 		};
 
 		expect(
@@ -2114,5 +2128,82 @@ describe("topic registry reload persistence", () => {
 		expect(registry.get("S1")?.name).toBe("repo/main - title");
 		// topicId routing must also survive.
 		expect(registry.sessionForTopic("100")).toBe("S1");
+	});
+});
+describe("canonical processIncarnation daemon lock identity", () => {
+	test("default-path produces canonical linux:<startTicks> format", () => {
+		// On Linux, processIncarnation reads /proc/<pid>/stat; pid 4242 does not
+		// exist on this host, so the result is undefined. Verify the canonical
+		// shape directly: the old local defaultPidIncarnation produced the same
+		// linux:<ticks> format, so locks are comparable across code paths.
+		expect(isProcessIncarnation("linux:12345")).toBe(true);
+		expect(isProcessIncarnation("linux:0")).toBe(true);
+		expect(isProcessIncarnation("linux:")).toBe(false);
+	});
+
+	test("default-path produces canonical darwin:<sec>:<usec> format", () => {
+		const bsdInfo = new Uint8Array(136);
+		const view = new DataView(bsdInfo.buffer);
+		view.setBigUint64(120, 1_700_000_000n, true);
+		view.setBigUint64(128, 123_456n, true);
+		const result = parseDarwinProcessIncarnation(bsdInfo);
+		expect(result).toBe("darwin:1700000000:123456");
+		expect(isProcessIncarnation("darwin:1700000000:123456")).toBe(true);
+		expect(isProcessIncarnation("darwin:Thu Jul 17 10:00:00 2025")).toBe(false);
+	});
+
+	test("default-path produces canonical windows:<filetime> format", () => {
+		const result = processIncarnation(4_242, {
+			platform: "win32",
+			runCommand: () => ({ exitCode: 0, stdout: "4242\t133830291061234567\n" }),
+		});
+		expect(result).toBe("windows:133830291061234567");
+		expect(isProcessIncarnation(result)).toBe(true);
+	});
+
+	test("locale-dependent Darwin lstart strings are not canonical", () => {
+		expect(isProcessIncarnation("darwin:Thu Jul 17 10:00:00 2025")).toBe(false);
+		expect(isProcessIncarnation("darwin:Do 17 Jul 2025 10:00:00")).toBe(false);
+		expect(isProcessIncarnation("darwin:1700000000:123456")).toBe(true);
+	});
+
+	test("reclaims a non-canonical Darwin lstart owner lock as not-owned", async () => {
+		const agentDir = tempAgentDir();
+		const paths = chatDaemonPaths(agentDir, "discord");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		// Simulate a stale lock written by the old locale-dependent defaultPidIncarnation.
+		fs.writeFileSync(
+			paths.lock,
+			JSON.stringify({ pid: 95, incarnation: "darwin:Thu Jul 17 10:00:00 2025", createdAt: 1 }),
+		);
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				version: 1,
+				kind: "discord",
+				pid: 95,
+				ownerId: "old",
+				identity: "old",
+				incarnation: "darwin:Thu Jul 17 10:00:00 2025",
+				startedAt: 1,
+				heartbeatAt: 1,
+			}),
+		);
+		const probe = {
+			pidAlive: () => true,
+			pidIncarnation: () => "darwin:1700000000:123456",
+		};
+		expect(
+			await acquireChatDaemonOwnership({
+				agentDir,
+				kind: "discord",
+				ownerId: "new",
+				pid: 96,
+				identity: "identity",
+				incarnation: "darwin:1700000000:123456",
+				...probe,
+			}),
+		).toBe(true);
+		expect(JSON.parse(fs.readFileSync(paths.state, "utf8")).ownerId).toBe("new");
 	});
 });

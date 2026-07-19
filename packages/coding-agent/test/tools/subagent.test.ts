@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { AsyncJobManager } from "../../src/async";
 import { Settings } from "../../src/config/settings";
-import { SubagentTool, type ToolSession } from "../../src/tools";
+import { capCodePointsAndBytes, SubagentTool, type ToolSession } from "../../src/tools";
 
 function createSession(agentId = "0-Main"): ToolSession {
 	return {
@@ -28,6 +28,50 @@ function createManager(): AsyncJobManager {
 
 function getText(result: { content: Array<{ type: string; text?: string }> }): string {
 	return result.content.find(part => part.type === "text")?.text ?? "";
+}
+
+const PREVIEW_TIERS = [
+	{ name: "receipt", bytes: 1_024, codePoints: 280, verbosity: "receipt" },
+	{ name: "preview", bytes: 8_192, codePoints: 2_000, verbosity: "preview" },
+	{ name: "full", bytes: 49_152, codePoints: 12_000, verbosity: "full" },
+] as const;
+
+function multibytePayload(bytes: number): string {
+	const prefix = "\u200b\u0301";
+	const remaining = bytes - Buffer.byteLength(prefix);
+	return `${prefix}${"\u{e0100}".repeat(Math.floor(remaining / 4))}${
+		remaining % 4 === 0 ? "" : remaining % 4 === 1 ? "a" : remaining % 4 === 2 ? "\u0301" : "\u200b"
+	}`;
+}
+
+async function inspectCompletedSubagent(
+	text: string,
+	verbosity: "receipt" | "preview" | "full",
+): Promise<{ resultPreview?: string; label: string; assignment?: string; truncated?: boolean }> {
+	const manager = createManager();
+	const tool = new SubagentTool(createSession());
+	const jobId = manager.register("task", text, async () => text, {
+		id: `job-${verbosity}`,
+		ownerId: "0-Main",
+		metadata: {
+			subagent: {
+				id: `0-${verbosity}`,
+				agent: "executor",
+				agentSource: "bundled",
+				assignment: text,
+			},
+		},
+	});
+	await manager.getJob(jobId)?.promise;
+	const result = await tool.execute(`subagent-${verbosity}`, {
+		action: "inspect",
+		ids: [`0-${verbosity}`],
+		verbosity,
+	});
+	const snapshot = result.details?.subagents[0];
+	await manager.dispose({ timeoutMs: 100 });
+	if (!snapshot) throw new Error("Expected completed subagent snapshot");
+	return snapshot;
 }
 
 describe("SubagentTool", () => {
@@ -647,6 +691,91 @@ describe("SubagentTool", () => {
 		).rejects.toThrow("no_runner");
 		await manager.dispose({ timeoutMs: 100 });
 	});
+	describe("subagent preview byte caps", () => {
+		it("keeps cap-1 and exact multibyte payloads unchanged and caps cap+1 payloads per tier", () => {
+			for (const tier of PREVIEW_TIERS) {
+				for (const size of [tier.bytes - 1, tier.bytes]) {
+					const input = multibytePayload(size);
+					expect(capCodePointsAndBytes(input, tier.bytes + 1, tier.bytes), tier.name).toBe(input);
+				}
+
+				const capped = capCodePointsAndBytes(multibytePayload(tier.bytes + 1), tier.bytes + 1, tier.bytes);
+				expect(capped, tier.name).toEndWith("…");
+				expect(
+					[...capped].filter(codePoint => codePoint === "…"),
+					tier.name,
+				).toHaveLength(1);
+				expect(Buffer.byteLength(capped), tier.name).toBeLessThanOrEqual(tier.bytes);
+			}
+		});
+
+		it("caps output previews and sanitized fields after width truncation", async () => {
+			for (const tier of PREVIEW_TIERS) {
+				const snapshot = await inspectCompletedSubagent(multibytePayload(tier.bytes + 1), tier.verbosity);
+				expect(snapshot.resultPreview, tier.name).toEndWith("…");
+				expect(snapshot.truncated, tier.name).toBe(true);
+				expect(Buffer.byteLength(snapshot.resultPreview ?? ""), tier.name).toBeLessThanOrEqual(tier.bytes);
+				expect(Buffer.byteLength(snapshot.label), "receipt label").toBeLessThanOrEqual(1_024);
+				if (tier.verbosity === "full") {
+					expect(Buffer.byteLength(snapshot.assignment ?? ""), tier.name).toBeLessThanOrEqual(49_152);
+				}
+			}
+		});
+
+		it("collapses an existing truncation ellipsis before applying its own marker", () => {
+			const capped = capCodePointsAndBytes(`${"a".repeat(1_023)}……`, 2_000, 1_024);
+			expect(capped).toEndWith("…");
+			expect([...capped].filter(codePoint => codePoint === "…")).toHaveLength(1);
+			expect(Buffer.byteLength(capped)).toBeLessThanOrEqual(1_024);
+		});
+
+		it("handles zero-width and combining-mark boundary payloads without double ellipses", async () => {
+			for (const character of ["\u200b", "\u0301"]) {
+				for (const tier of PREVIEW_TIERS) {
+					// Exercise cap-1/cap/cap+1 byte budgets directly with a pure payload.
+					for (const byteBudget of [tier.bytes - 1, tier.bytes, tier.bytes + 1]) {
+						const input = character.repeat(tier.bytes * 2);
+						const capped = capCodePointsAndBytes(input, Number.MAX_SAFE_INTEGER, byteBudget);
+						expect(Buffer.byteLength(capped), `${character} ${tier.name} ${byteBudget}`).toBeLessThanOrEqual(
+							byteBudget,
+						);
+						expect(capped, `${character} ${tier.name} ${byteBudget}`).toEndWith("…");
+						expect(
+							[...capped].filter(codePoint => codePoint === "…"),
+							`${character} ${tier.name} ${byteBudget}`,
+						).toHaveLength(1);
+					}
+
+					// previewJobOutput runs after truncateToWidth for every verbosity tier.
+					const snapshot = await inspectCompletedSubagent(character.repeat(tier.codePoints + 1), tier.verbosity);
+					const preview = snapshot.resultPreview ?? "";
+					expect(Buffer.byteLength(preview), `${character} ${tier.name} preview`).toBeLessThanOrEqual(tier.bytes);
+					expect(preview, `${character} ${tier.name} preview`).toEndWith("…");
+					expect(
+						[...preview].filter(codePoint => codePoint === "…"),
+						`${character} ${tier.name} preview`,
+					).toHaveLength(1);
+					// sanitizeText is used for every snapshot label and for full assignments.
+					expect(Buffer.byteLength(snapshot.label), `${character} ${tier.name} label`).toBeLessThanOrEqual(1_024);
+					expect(snapshot.label, `${character} ${tier.name} label`).toEndWith("…");
+					expect(
+						[...snapshot.label].filter(codePoint => codePoint === "…"),
+						`${character} ${tier.name} label`,
+					).toHaveLength(1);
+					if (tier.verbosity === "full") {
+						const assignment = snapshot.assignment ?? "";
+						expect(Buffer.byteLength(assignment), `${character} full assignment`).toBeLessThanOrEqual(tier.bytes);
+						expect(assignment, `${character} full assignment`).toEndWith("…");
+						expect(
+							[...assignment].filter(codePoint => codePoint === "…"),
+							`${character} full assignment`,
+						).toHaveLength(1);
+					}
+				}
+			}
+		});
+	});
+
 	it("list and inspect default terminal subagents return receipt previews without bulk output and no unverified ref", async () => {
 		const manager = createManager();
 		const tool = new SubagentTool(createSession());

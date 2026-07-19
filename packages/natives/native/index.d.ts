@@ -114,8 +114,9 @@ export declare class NotificationServer {
   /** Register the reply callback. Must be called before [`Self::start`]. */
   onReply(callback: (err: null | Error, reply: ReplyEvent) => void): void
   /**
-   * Register the inbound-message callback (free-text injections and in-thread
-   * config commands). Must be called before [`Self::start`].
+   * Register the authenticated inbound-message callback (free-text,
+   * side-question request/cancel, and in-thread config/control commands).
+   * Must be called before [`Self::start`].
    */
   onInbound(callback: (err: null | Error, msg: InboundEvent) => void): void
   /**
@@ -123,6 +124,11 @@ export declare class NotificationServer {
    * [`Self::start`].
    */
   onSdkFrame(callback: (err: null | Error, frame: SdkFrameEvent) => void): void
+  /**
+   * Register the negotiated-capabilities callback. Must be called before
+   * [`Self::start`].
+   */
+  onNegotiatedCapabilities(callback: (err: null | Error, connectionId: string, capabilities: string[]) => void): void
   /**
    * Register the connection-close callback. Must be called before
    * [`Self::start`].
@@ -176,14 +182,30 @@ export declare class NotificationServer {
   /**
    * Broadcast an ephemeral threaded-session frame. `frame_json` is a JSON
    * `ServerMessage` (e.g. `identity_header`, `context_update`, `turn_stream`,
-   * `image_attachment`, `session_closed`, `config_update`, `hello`). Not
-   * buffered for replay.
+   * `ephemeral_turn_result`, `image_attachment`, `session_closed`,
+   * `config_update`, `hello`). Not buffered for replay.
    *
    * # Errors
    * Fails if not started or `frame_json` is not a valid `ServerMessage`.
    */
   pushFrame(frameJson: string): void
-  /** Send raw JSON to one connected v3 SDK client. */
+  /**
+   * Broadcast a TypeScript-constructed turn frame without re-parsing JSON.
+   * External frames must continue through [`Self::push_frame`] for serde
+   * validation.
+   */
+  pushTurnStreamUnchecked(sessionId: string, phase: string, text: string, finalAnswer?: boolean | undefined | null, messageRef?: string | undefined | null): void
+  /**
+   * Broadcast a file attachment from raw N-API bytes, encoding the unchanged
+   * base64 wire field only in Rust.
+   */
+  pushFileAttachmentUnchecked(sessionId: string, name: string, mime: string | undefined | null, data: Buffer, caption?: string | undefined | null): void
+  /**
+   * Return counters guarding the known-good frame crossing against
+   * regressions.
+   */
+  knownGoodFrameStats(): KnownGoodFrameStats
+  /** Send a validated, bounded JSON envelope to one connected v3 SDK client. */
   sendTo(connectionId: string, json: string): void
   /**
    * Publish a replayable `session_ready` readiness signal. `ready_json` is a
@@ -351,7 +373,7 @@ export declare class Shell {
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_11_0(): void
+export declare function __piNativesV0_11_3(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -361,6 +383,8 @@ export declare function __piNativesV0_11_0(): void
  * `pi_shell::fixup`. Synchronous and cheap (one parse pass over the input).
  */
 export declare function applyBashFixups(command: string): BashFixupResult
+
+export declare function applyOwnerOnlyPathSecurity(path: string, kind: "directory" | "file"): NativeOwnerOnlySecurityResult
 
 /** Typed terminal acknowledgement result returned by acknowledgement promises. */
 export interface AskSelectedAckOutcomeEvent {
@@ -571,6 +595,8 @@ export interface BuildInfo {
   languageSet: string
 }
 
+export declare function canonicalExistingDirectoryIdentity(path: string | Uint8Array): NativeCanonicalDirectoryIdentity
+
 /** Clipboard image payload encoded as PNG bytes. */
 export interface ClipboardImage {
   /** PNG-encoded image bytes. */
@@ -682,6 +708,29 @@ export declare enum Ellipsis {
  * Returns an error if decoding, resizing, or SIXEL encoding fails.
  */
 export declare function encodeSixel(bytes: Uint8Array, targetWidthPx: number, targetHeightPx: number): string
+
+/**
+ * Remove an already durably planned detached directory only when a fresh
+ * descriptor-relative snapshot exactly equals the persisted snapshot. The
+ * caller-planned root remains in place while its opened descriptor is
+ * authoritative throughout recursive removal.
+ */
+export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeDirectoryTreeSnapshot): NativeExactUnlinkResult
+
+/**
+ * Restore only the detached object that still has the supplied platform
+ * identity. The detached and original paths must retain the same validated
+ * parent, and restoration never replaces an existing original path.
+ */
+export declare function exactRestore(detachedPath: string, originalPath: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
+
+/**
+ * Delete only the regular file that still has the supplied platform identity.
+ *
+ * This never follows a symlink or reparse point in the target path and reports
+ * validation failures as typed results rather than deleting a replacement.
+ */
+export declare function exactUnlink(path: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
 
 /**
  * Execute a brush shell command.
@@ -1045,26 +1094,51 @@ export interface HtmlToMarkdownOptions {
 }
 
 /**
- * An inbound message forwarded to the TypeScript host: a free-text injection,
- * in-thread config command, or deterministic control command.
+ * An authenticated inbound message forwarded to the TypeScript host: free-text
+ * injection, ephemeral side-question request/cancel, in-thread config command,
+ * or deterministic control command.
  */
 export interface InboundEvent {
-  /** Inbound kind (`user_message`, `config_command`, or `control_command`). */
+  /**
+   * Inbound kind (`user_message`, `ephemeral_turn`,
+   * `ephemeral_turn_cancel`, `config_command`, or `control_command`).
+   */
   kind: string
+  /**
+   * Server-authenticated identity of the WebSocket connection that delivered
+   * this event.
+   */
+  connectionId: string
   /** The session this inbound belongs to. */
   sessionId: string
-  /** Free-text body (`user_message` only). */
+  /** Free-text body (`user_message` or `ephemeral_turn` only). */
   text?: string
-  /** Telegram update id for dedupe (`user_message` only). */
+  /**
+   * Telegram update id for dedupe (`user_message`, `ephemeral_turn`, or
+   * `ephemeral_turn_cancel` only).
+   */
   updateId?: number
-  /** Originating thread/topic id (`user_message` only). */
+  /**
+   * Originating thread/topic id (`user_message`, `ephemeral_turn`, or
+   * `ephemeral_turn_cancel` only).
+   */
   threadId?: string
+  /**
+   * Originating Telegram message id (`ephemeral_turn` and
+   * `ephemeral_turn_cancel` only).
+   */
+  messageId?: number
   /** Requested verbosity `"lean"|"verbose"` (`config_command` only). */
   verbosity?: string
   /** Requested redaction state (`config_command` only). */
   redact?: boolean
-  /** Client-generated request id (`control_command` only). */
+  /**
+   * Client-generated request id (`ephemeral_turn`, `ephemeral_turn_cancel`,
+   * or `control_command` only).
+   */
   requestId?: string
+  /** Cancellation reason (`ephemeral_turn_cancel` only). */
+  reason?: string
   /** JSON-encoded command payload (`control_command` only). */
   commandJson?: string
   /**
@@ -1214,6 +1288,19 @@ export declare enum KeyEventType {
   Repeat = 2,
   /** Key release event. */
   Release = 3
+}
+
+/** Observable counters for the internal known-good N-API frame lane. */
+export interface KnownGoodFrameStats {
+  /** Frames constructed as `TurnStream` without parsing a JSON string. */
+  knownGoodTurnStreamFrames: number
+  /** JSON serde parses of externally supplied `turn_stream` frames. */
+  turnStreamSerdeValidationParses: number
+  /**
+   * Base64 characters encoded in Rust for `file_attachment` frames (the JS
+   * side crosses raw `Buffer` bytes and never allocates the base64 string).
+   */
+  fileAttachmentRustBase64Chars: number
 }
 
 /** A lifecycle request forwarded to the TypeScript daemon for orchestration. */
@@ -1415,6 +1502,103 @@ export interface MinimizerResult {
 
 export declare function nativeBuildInfo(): BuildInfo
 
+/** Result of resolving an existing directory to its stable platform identity. */
+export type NativeCanonicalDirectoryIdentity =
+	| { ok: true; platform: "posix" | "win32"; canonicalPath: string; code?: never }
+	| {
+			ok: false;
+			platform?: never;
+			canonicalPath?: never;
+			code: "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
+	  }
+
+/**
+ * A deterministic, no-follow description of a directory tree. `relative_path`
+ * is UTF-8, uses `/` separators, and is empty only for the root entry.
+ */
+export interface NativeDirectoryTreeEntry {
+  relativePath: string
+  kind: string
+  dev: string
+  ino: string
+  size: string
+  mtimeNs: string
+  sha256?: string
+}
+
+export interface NativeDirectoryTreeResult {
+  ok: boolean
+  code?: string
+  snapshot?: NativeDirectoryTreeSnapshot
+}
+
+/**
+ * Stable evidence returned by `snapshot_directory_tree` and consumed verbatim
+ * by `exact_remove_directory_tree`.
+ */
+export interface NativeDirectoryTreeSnapshot {
+  rootDev: string
+  rootIno: string
+  entries: Array<NativeDirectoryTreeEntry>
+}
+
+/**
+ * Caller-supplied identity and preauthorized quarantine evidence for exact
+ * deletion.
+ */
+export interface NativeExactFileIdentity {
+  dev: bigint
+  ino: bigint
+  size: bigint
+  mtimeNs: bigint
+  /**
+   * When true, atomically detach a directory rather than deleting a regular
+   * file.
+   */
+  directory?: boolean
+  /**
+   * Keep a regular file in quarantine after its identity has been verified
+   * instead of unlinking it. This makes cross-device retirement recoverable.
+   */
+  detachOnly?: boolean
+  /**
+   * A caller-persisted, single-component no-replace quarantine destination.
+   * Required for every exact deletion so authority survives a post-detach
+   * crash.
+   */
+  quarantineName?: string
+  /**
+   * SHA-256 of regular-file bytes. Required for regular-file deletion and
+   * verified from the detached object before unlinking it.
+   */
+  sha256?: string
+}
+
+/** Typed result of an identity-bound regular-file deletion or directory detach. */
+export interface NativeExactUnlinkResult {
+  ok: boolean
+  code?: string
+  detachedPath?: string
+}
+
+/** Result of applying or checking owner-only path security. */
+export type NativeOwnerOnlySecurityResult =
+	| { ok: true; code?: never }
+	| {
+			ok: false;
+			code:
+				| "not_found"
+				| "not_directory"
+				| "network_unsupported"
+				| "reparse_point"
+				| "acl_unavailable"
+				| "acl_apply_failed"
+				| "acl_verify_failed"
+				| "identity_unavailable"
+				| "owner_mismatch"
+				| "io_error";
+	  }
+
 /** Bound endpoint info returned from [`NotificationServer::start`]. */
 export interface NotificationEndpoint {
   /** Bind host (loopback). */
@@ -1542,6 +1726,8 @@ export declare function ptyTimeoutCount(): bigint
  * Returns an error if clipboard access fails or image encoding fails.
  */
 export declare function readImageFromClipboard(): Promise<ClipboardImage | undefined | null>
+
+export declare function renameNoReplacePath(sourcePath: string, destinationPath: string): NativeExactUnlinkResult
 
 /** A client reply forwarded to the TypeScript host for gate resolution. */
 export interface ReplyEvent {
@@ -1698,6 +1884,13 @@ export interface SliceResult {
  */
 export declare function sliceWithWidth(line: string, startCol: number, length: number, strict: boolean | undefined | null, tabWidth: number): SliceResult
 
+/**
+ * Capture a deterministic, descriptor-relative snapshot of a regular-file and
+ * directory-only tree. Symlinks, special files, non-UTF-8 names, and topology
+ * changes are rejected rather than followed.
+ */
+export declare function snapshotDirectoryTree(path: string): NativeDirectoryTreeResult
+
 export declare function summarizeCode(options: SummaryOptions): SummaryResult
 
 export interface SummaryOptions {
@@ -1748,6 +1941,8 @@ export declare function supportsLanguage(lang: string): boolean
 export declare function truncateLinesToWidth(lines: Array<string>, maxWidth: number, ellipsisKind: Ellipsis | undefined | null, pad: boolean | undefined | null, tabWidth: number): Array<string>
 
 export declare function truncateToWidth(text: string, maxWidth: number, ellipsisKind: Ellipsis | undefined | null, pad: boolean | undefined | null, tabWidth: number): string
+
+export declare function verifyOwnerOnlyPathSecurity(path: string, kind: "directory" | "file"): NativeOwnerOnlySecurityResult
 
 /**
  * Calculate visible width of text, excluding ANSI escape sequences.

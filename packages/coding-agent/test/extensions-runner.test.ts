@@ -32,10 +32,14 @@ describe("ExtensionRunner", () => {
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
 		authStorage.close();
-		tempDir.removeSync();
+		if (process.platform === "win32") {
+			Bun.gc(true);
+			await Bun.sleep(50);
+		}
+		await tempDir.remove();
 	});
 
 	const loadTestExtensions = async (configuredPaths: string[] = []) => {
@@ -55,6 +59,35 @@ describe("ExtensionRunner", () => {
 			errors: result.errors.filter(error => isTestScoped(error.path)),
 		};
 	};
+
+	describe("safe tool resolver", () => {
+		it("exposes only tool safe-summary metadata through extension context", () => {
+			const safeSummary = (kind: "args" | "result", value: unknown) =>
+				kind === "args" ? `safe:${String(value)}` : undefined;
+			const resolver = vi.fn((name: string) =>
+				name === "safe-tool"
+					? { safeSummary, safeSummaryFields: { args: ["path"], result: ["status"] } }
+					: undefined,
+			);
+			const runner = new ExtensionRunner(
+				[],
+				{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.initialize({} as never, { resolveTool: resolver } as never);
+
+			const ctx = runner.createContext();
+			expect(ctx.resolveTool("safe-tool")).toEqual({
+				safeSummary,
+				safeSummaryFields: { args: ["path"], result: ["status"] },
+			});
+			expect(ctx.resolveTool("unknown-tool")).toBeUndefined();
+			expect(resolver).toHaveBeenCalledWith("safe-tool");
+			expect(resolver).toHaveBeenCalledWith("unknown-tool");
+		});
+	});
 
 	describe("shortcut conflicts", () => {
 		it("warns when extension shortcut conflicts with built-in", async () => {
@@ -747,6 +780,7 @@ describe("ExtensionRunner", () => {
 					setLabel: () => {},
 					getActiveTools: () => [],
 					getAllTools: () => [],
+					resolveTool: () => undefined,
 					setActiveTools: async () => {},
 					getCommands: () => [],
 					setModel: async () => false,
@@ -823,6 +857,7 @@ describe("ExtensionRunner", () => {
 					setLabel: () => {},
 					getActiveTools: () => [],
 					getAllTools: () => [],
+					resolveTool: () => undefined,
 					setActiveTools: async () => {},
 					getCommands: () => [],
 					setModel: async () => false,
@@ -859,7 +894,7 @@ describe("ExtensionRunner", () => {
 			expect(sessionManager.getHeader()?.title).toBe("Named by extension");
 		});
 
-		it("routes counted pending-message queues through createContext and zero-falls-back when omitted", async () => {
+		it("routes counted pending-message queues without exposing side-turn execution", async () => {
 			const extCode = `
 				export default function(pi) {
 					pi.on("session_start", () => {});
@@ -875,6 +910,7 @@ describe("ExtensionRunner", () => {
 				setLabel: () => {},
 				getActiveTools: () => [],
 				getAllTools: () => [],
+				resolveTool: () => undefined,
 				setActiveTools: async () => {},
 				getCommands: () => [],
 				setModel: async () => false,
@@ -910,6 +946,8 @@ describe("ExtensionRunner", () => {
 				sessionManager,
 				modelRegistry,
 			);
+			const earlyContext = wired.createContext();
+			expect("runEphemeralTurn" in earlyContext).toBe(false);
 			wired.initialize(runtimeActions, {
 				...baseContextActions,
 				getPendingMessageCounts: () => ({ steering: 2, followUp: 1, nextTurn: 3 }),
@@ -1212,6 +1250,7 @@ describe("ExtensionRunner", () => {
 					setLabel: () => {},
 					getActiveTools: () => [],
 					getAllTools: () => [],
+					resolveTool: () => undefined,
 					setActiveTools: async () => {},
 					getCommands: () => [],
 					setModel: async () => false,
