@@ -355,6 +355,18 @@ export class SessionIndex {
 		};
 	}
 	async diagnose(): Promise<SessionIndexDiagnosis> {
+		const exists = await Promise.all(
+			[snapshotFor(this.#agentDir), logFor(this.#agentDir)].map(async file => {
+				try {
+					await fs.stat(file);
+					return true;
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+					throw error;
+				}
+			}),
+		);
+		if (!exists.some(Boolean)) return { status: "healthy", validPrefixSeq: 0, snapshotSeq: 0 };
 		return await withFileLock(logFor(this.#agentDir), async () => (await this.#scan()).diagnosis);
 	}
 	async repair(): Promise<SessionIndexRepairResult> {

@@ -12,6 +12,15 @@ const event = (sessionId: string) => ({
 	pid: process.pid,
 });
 describe("SDK session index", () => {
+	it("diagnoses a missing index without creating session directories", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-missing-"));
+		expect(await new SessionIndex(dir).diagnose()).toEqual({
+			status: "healthy",
+			validPrefixSeq: 0,
+			snapshotSeq: 0,
+		});
+		expect(await fs.exists(path.join(dir, "sdk", "sessions"))).toBe(false);
+	});
 	it("replays only rows after the snapshotted prefix", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const index = await new SessionIndex(dir).open();
