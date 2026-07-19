@@ -11,6 +11,7 @@ import { sanitizeText } from "@gajae-code/utils";
 import { getMarkdownTheme, theme } from "../theme/theme";
 import type { TranscriptItemRegistry, TranscriptSourcePayload } from "../transcript-item-registry";
 import { DynamicBorder } from "./dynamic-border";
+import { toolDisplayText } from "./tool-transcript-format";
 
 const INDENT = "    ";
 const PAGE_SIZE = 15;
@@ -375,10 +376,25 @@ export function transcriptViewerEntries(registry: TranscriptItemRegistry): Trans
 				: item.kind === "assistant-thinking"
 					? "Thinking"
 					: item.kind === "tool"
-						? "Tool"
+						? String(payload.metadata.name ?? "Tool")
 						: item.kind === "user"
 							? "User"
 							: item.kind;
-		return [{ id: item.id, kind: item.kind, label, payload, ...capabilities }];
+		const getDisplayText =
+			item.kind === "tool"
+				? (expanded: boolean) =>
+						toolDisplayText(
+							{
+								name: String(payload.metadata.name ?? ""),
+								args: (payload.metadata.arguments ?? {}) as Record<string, unknown>,
+								intent: payload.metadata.intent as string | undefined,
+								resultText: String(payload.metadata.resultText ?? ""),
+								isError: Boolean(payload.metadata.isError),
+								hasResult: Boolean(payload.metadata.hasResult),
+							},
+							expanded,
+						)
+				: undefined;
+		return [{ id: item.id, kind: item.kind, label, payload, ...capabilities, getDisplayText }];
 	});
 }
