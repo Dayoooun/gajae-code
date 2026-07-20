@@ -11,6 +11,7 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * {@link NOTIFICATION_PROTOCOL_VERSION}: additive wire frames do not bump the generation,
  * but lifecycle, ownership, or capability enforcement changes do. A freshly-upgraded host
  * uses this value to identify and safely replace an older, still-live daemon.
- * The development baseline includes generation 4; this fenced ownership behavior is generation 5.
+ * The development baseline includes generation 4; fenced ownership began at generation 5,
+ * and terminal shutdown continuation fencing is generation 6.
  */
-export const DAEMON_GENERATION = 5;
+export const DAEMON_GENERATION = 6;

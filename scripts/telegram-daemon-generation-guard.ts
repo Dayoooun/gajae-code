@@ -8,35 +8,47 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 8;
+export const GUARD_CONTRACT_VERSION = 9;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
+const GENERATION_FIVE_BOOTSTRAP_SHA256 = {
+	contract: "1644acc9de4ff0f8d4252f82a71d30d6688faf358acf645e328d8e5629572df1",
+	daemon: "42528cb24eaebf8c1ea13e643f76104e1c01b7e4c6ac77dad7d13ca6c5370041",
+	chat: "a81e0b196fee296282e4d10f104bb50242d23b4865136cf767aabc94b7d0102d",
+} as const;
+
+export function isGenerationFiveBootstrapFingerprint(input: {
+	contract: string;
+	daemon: string;
+	chat: string;
+}): boolean {
+	return (
+		input.contract === GENERATION_FIVE_BOOTSTRAP_SHA256.contract &&
+		input.daemon === GENERATION_FIVE_BOOTSTRAP_SHA256.daemon &&
+		input.chat === GENERATION_FIVE_BOOTSTRAP_SHA256.chat
+	);
+}
 
 type Family = "telegram" | "discord" | "slack";
 type Inventory = Readonly<Record<Family, Readonly<Record<string, readonly string[]>>>>;
 type Declaration = { text: string; canonical: string; valid: boolean } | undefined;
 type GuardManifest = { contractVersion: number; inventory: Inventory; digests: Readonly<Record<string, string>> };
 
-
-
 /**
  * This is a deliberately small, exact lifecycle contract. Do not include session
  * endpoint or provider generations: they do not replace daemon owners.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "b91f76bcfba6e9d8ed1eb55360af44056edf76220f98d85ca89df0b231bb06f6";
-
-
-
+const PROTECTED_INVENTORY_SHA256 = "22cde0199d0dc0ebd6b30f7bbfe8f1a79b05e2ed7008df0180500addcb8fb312";
 function inventoryHash(inventory: Inventory): string {
 	return crypto.createHash("sha256").update(JSON.stringify(inventory)).digest("hex");
 }
 
 export function validateInventory(inventory: Inventory = protectedInventory): void {
-	if (GUARD_CONTRACT_VERSION !== 8) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
+	if (GUARD_CONTRACT_VERSION !== 9) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
 	for (const [family, files] of Object.entries(inventory)) {
 		for (const [file, symbols] of Object.entries(files)) {
 			if (!file || symbols.length === 0 || new Set(symbols).size !== symbols.length)
@@ -188,6 +200,7 @@ function nodeName(node: any): string | undefined {
 	if (node?.id?.type === "Identifier") return node.id.name;
 	if (node?.key?.type === "Identifier") return node.key.name;
 	if (node?.key?.type === "StringLiteral") return node.key.value;
+	if (node?.key?.type === "PrivateName" && node.key.id?.type === "Identifier") return `#${node.key.id.name}`;
 }
 
 // Object-literal property/method usages (e.g. `{ ...state, identity }`) share a
@@ -223,6 +236,11 @@ function resolveDeclaration(node: any, name: string): { node?: any; ambiguous: b
 	// another `stop`/`status` — must never be silently hashed as matches[0].
 	if (matches.length !== 1) return { ambiguous: matches.length > 1 };
 	if (!property) return { node: matches[0], ambiguous: false };
+	if (matches[0]?.type === "ClassDeclaration") {
+		const members = matches[0].body?.body?.filter((item: any) => nodeName(item) === property) ?? [];
+		if (members.length === 1) return { node: members[0], ambiguous: false };
+		return { ambiguous: members.length > 1 };
+	}
 	const declaration = matches[0].declarations?.find((item: any) => item.id?.name === rootName);
 	const object = declaration?.init?.type === "TSAsExpression" ? declaration.init.expression : declaration?.init;
 	const properties = object?.properties?.filter((item: any) => nodeName(item) === property) ?? [];
@@ -351,13 +369,12 @@ function guardContractVersion(source: string | undefined): number | undefined {
 	}
 }
 
-
 export function isLegacyBootstrapBase(base: ReadonlyMap<string, string | undefined>): boolean {
 	if (base.get(guardScript) !== undefined || base.get(manifestScript) !== undefined) return false;
 	const contract = base.get(telegramContract);
 	const daemon = base.get(telegramDaemon);
 	const chat = base.get(chatControl);
-	if (!contract || !daemon || !chat || /\b(?:ownershipPhase|acquisitionId)\b/.test(daemon) || !declaration(daemon, "acquireDaemonOwnership")) return false;
+	if (!contract || !daemon || !chat || !declaration(daemon, "acquireDaemonOwnership")) return false;
 	try {
 		const program = parse(contract, { sourceType: "module", plugins: ["typescript"] }).program;
 		const chatProgram = parse(chat, { sourceType: "module", plugins: ["typescript"] }).program;
@@ -373,13 +390,26 @@ export function isLegacyBootstrapBase(base: ReadonlyMap<string, string | undefin
 		const generationDeclaration = generation?.declarations?.find((item: any) => item.id?.name === "DAEMON_GENERATION");
 		const controller = declarationNode(chatProgram, "ChatDaemonController");
 		const hasOperate = controller?.type === "ClassDeclaration" && controller.body?.body.some((member: any) => member.type === "ClassMethod" && nodeName(member) === "operate");
-		return protocolDeclaration?.init?.type === "NumericLiteral" &&
-			protocolDeclaration.init.value === 3 &&
+		const legacyProtocolAlias =
 			generationDeclaration?.init?.type === "Identifier" &&
 			generationDeclaration.init.name === "NOTIFICATION_PROTOCOL_VERSION" &&
+			!/\b(?:ownershipPhase|acquisitionId)\b/.test(daemon);
+		const generationFiveDevBaseline =
+			generationDeclaration?.init?.type === "NumericLiteral" &&
+			generationDeclaration.init.value === 5 &&
+			isGenerationFiveBootstrapFingerprint({
+				contract: crypto.createHash("sha256").update(contract).digest("hex"),
+				daemon: crypto.createHash("sha256").update(daemon).digest("hex"),
+				chat: crypto.createHash("sha256").update(chat).digest("hex"),
+			});
+		return (
+			protocolDeclaration?.init?.type === "NumericLiteral" &&
+			protocolDeclaration.init.value === 3 &&
+			(legacyProtocolAlias || generationFiveDevBaseline) &&
 			!declarationNode(chatProgram, "CHAT_DAEMON_GENERATIONS") &&
 			!declarationNode(chatProgram, "chatDaemonGeneration") &&
-			hasOperate;
+			hasOperate
+		);
 	} catch {
 		return false;
 	}

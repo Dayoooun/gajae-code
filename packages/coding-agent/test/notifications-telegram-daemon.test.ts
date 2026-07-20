@@ -1087,9 +1087,9 @@ describe("telegram daemon", () => {
 		fs.writeFileSync(paths.state, JSON.stringify(liveOwnerState(extra)));
 		fs.writeFileSync(paths.lock, "");
 	}
-	test("keeps the wire protocol at 3 while reload ownership uses generation 5", () => {
+	test("keeps the wire protocol at 3 while lifecycle ownership uses generation 6", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		expect(DAEMON_GENERATION).toBe(5);
+		expect(DAEMON_GENERATION).toBe(6);
 	});
 
 	test.each([
@@ -1178,6 +1178,67 @@ describe("telegram daemon", () => {
 			now: () => 101,
 		});
 		expect(result).toEqual({ acquired: false, blocked: true, reason: "identity_mismatch" });
+	});
+	test.each([
+		["partially fenced current-generation", DAEMON_GENERATION, undefined],
+		["fully fenced current-generation", DAEMON_GENERATION, "stored-acquisition"],
+		["partially fenced newer-generation", DAEMON_GENERATION + 1, undefined],
+	] as const)("#2278 blocks a live %s foreign owner when incarnation reproof is unavailable", async (_, generation, acquisitionId) => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		writeLiveOwner(agentDir, {
+			generation,
+			incarnation: "stored-incarnation",
+			acquisitionId,
+			ownershipPhase: "ready",
+			tokenFingerprint: "other-token",
+			chatId: "other-chat",
+		});
+		const result = await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "e60b05c186ca",
+			chatId: "42",
+			pidAlive: () => true,
+			pidIncarnation: pid => (pid === process.pid ? testPidIncarnation(pid) : undefined),
+			now: () => 101,
+		});
+		expect(result).toEqual({ acquired: false, blocked: true, reason: "identity_mismatch" });
+		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(true);
+		expect(JSON.parse(fs.readFileSync(daemonPaths(agentDir).state, "utf8"))).toMatchObject({
+			tokenFingerprint: "other-token",
+			chatId: "other-chat",
+			incarnation: "stored-incarnation",
+		});
+	});
+
+	test("#2278 does not recreate a missing lock over a live unfenced newer-generation foreign owner", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		writeLiveOwner(agentDir, {
+			generation: DAEMON_GENERATION + 1,
+			incarnation: undefined,
+			acquisitionId: "foreign-acquisition",
+			ownershipPhase: "ready",
+			tokenFingerprint: "other-token",
+			chatId: "other-chat",
+		});
+		fs.unlinkSync(daemonPaths(agentDir).lock);
+		const result = await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "e60b05c186ca",
+			chatId: "42",
+			pidAlive: () => true,
+			pidIncarnation: pid => (pid === process.pid ? testPidIncarnation(pid) : undefined),
+			now: () => 101,
+		});
+		expect(result).toEqual({ acquired: false, blocked: true, reason: "identity_mismatch" });
+		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
+		expect(JSON.parse(fs.readFileSync(daemonPaths(agentDir).state, "utf8"))).toMatchObject({
+			generation: DAEMON_GENERATION + 1,
+			acquisitionId: "foreign-acquisition",
+			tokenFingerprint: "other-token",
+			chatId: "other-chat",
+		});
 	});
 
 	test("#2028 does not attach a PID-reused current-generation owner", async () => {
@@ -8137,6 +8198,7 @@ test("graceful stop drains active and idle /btw terminal deliveries concurrently
 	);
 	expect(terminalCalls).toHaveLength(2);
 	expect(terminalCalls.every(call => call.options?.noRetry === true)).toBe(true);
+	expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(true);
 }, 5_000);
 
 test("SIGTERM drains a rate-limited final and selected acknowledgement before releasing ownership", async () => {
@@ -8148,7 +8210,7 @@ test("SIGTERM drains a rate-limited final and selected acknowledgement before re
 		chatId: "42",
 		pid: process.pid,
 		randomId: () => "owner",
-		now: () => 0,
+		now: Date.now,
 		pidIncarnation: testPidIncarnation,
 	});
 	expect(
@@ -8161,15 +8223,19 @@ test("SIGTERM drains a rate-limited final and selected acknowledgement before re
 			pid: process.pid,
 			generation: DAEMON_GENERATION,
 			incarnation: testPidIncarnation(process.pid),
-			now: () => 0,
+			now: Date.now,
 		}),
 	).toBe(true);
-	let now = 0;
+	const shutdownStartedAt = Date.now();
 	const lockPresentAtSend: boolean[] = [];
+	const sentTexts: string[] = [];
 	const bot = {
-		async call(method: string) {
+		async call(method: string, body: { text?: string }) {
 			if (method === "getChat") return { ok: true, result: { type: "private" } };
-			if (method === "sendMessage") lockPresentAtSend.push(fs.existsSync(daemonPaths(agentDir).lock));
+			if (method === "sendMessage") {
+				lockPresentAtSend.push(fs.existsSync(daemonPaths(agentDir).lock));
+				sentTexts.push(body.text ?? "");
+			}
 			return { ok: true, result: { message_id: lockPresentAtSend.length } };
 		},
 	};
@@ -8184,14 +8250,7 @@ test("SIGTERM drains a rate-limited final and selected acknowledgement before re
 		botApi: bot,
 		control: { shouldStop: async () => true },
 		pidIncarnation: testPidIncarnation,
-		now: () => now,
-		setTimeoutImpl: ((callback: () => void, delay?: number) => {
-			if (delay === 25) {
-				now += 1_000;
-				callback();
-			}
-			return 0;
-		}) as unknown as typeof setTimeout,
+		now: Date.now,
 	});
 	const daemonState = daemon as unknown as {
 		pool: {
@@ -8202,7 +8261,7 @@ test("SIGTERM drains a rate-limited final and selected acknowledgement before re
 				itemId?: string;
 				deadlineAt?: number;
 				payload: unknown;
-			}) => void;
+			}) => { settled: Promise<string> };
 		};
 		selectedAckPending: Map<string, unknown>;
 	};
@@ -8212,13 +8271,25 @@ test("SIGTERM drains a rate-limited final and selected acknowledgement before re
 		ws: { readyState: WebSocket.OPEN, send() {} },
 		pending: new Map(),
 	};
+	const longFinal = "가".repeat(9_000);
+	const longFinalChunks = splitTelegramHtml(markdownToTelegramHtml(longFinal));
+	const expectedFinalTexts = [
+		longFinalChunks[0]!,
+		...Array.from({ length: 6 }, (_, index) => `final ${index + 1}`),
+		...longFinalChunks.slice(1),
+	];
 	daemonState.pool.tokens = 0;
+	const settlements: Promise<string>[] = [];
 	for (let index = 0; index < 7; index++) {
-		daemonState.pool.submit({
-			sessionId: "S",
-			lane: "finalized",
-			payload: { send: { method: "sendMessage", lane: "finalized", text: `final ${index}` } },
-		});
+		settlements.push(
+			daemonState.pool.submit({
+				sessionId: "S",
+				lane: "finalized",
+				payload: {
+					send: { method: "sendMessage", lane: "finalized", text: index === 0 ? longFinal : `final ${index}` },
+				},
+			}).settled,
+		);
 	}
 	const selectedAck = {
 		pendingKey: "selected",
@@ -8231,17 +8302,22 @@ test("SIGTERM drains a rate-limited final and selected acknowledgement before re
 		itemId: "selected",
 	};
 	daemonState.selectedAckPending.set(selectedAck.pendingKey, selectedAck);
-	daemonState.pool.submit({
-		sessionId: "S",
-		lane: "ask",
-		itemId: "selected",
-		deadlineAt: 30_000,
-		payload: { selectedAck },
-	});
+	settlements.push(
+		daemonState.pool.submit({
+			sessionId: "S",
+			lane: "ask",
+			itemId: "selected",
+			deadlineAt: Date.now() + 30_000,
+			payload: { selectedAck },
+		}).settled,
+	);
 	const run = daemon.run();
 	await run;
-	expect(lockPresentAtSend).toHaveLength(8);
-	expect(lockPresentAtSend).toEqual(Array.from({ length: 8 }, () => true));
+	expect(Date.now() - shutdownStartedAt).toBeLessThan(1_000);
+	expect(sentTexts).toEqual(["Selected!", ...expectedFinalTexts]);
+	expect(await Promise.all(settlements)).toEqual(Array.from({ length: 8 }, () => "accepted"));
+	expect(lockPresentAtSend).toHaveLength(expectedFinalTexts.length + 1);
+	expect(lockPresentAtSend).toEqual(Array.from({ length: expectedFinalTexts.length + 1 }, () => true));
 	expect(daemonState.selectedAckPending.size).toBe(0);
 	expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
 });
@@ -8261,15 +8337,21 @@ test("SIGTERM joins an admitted Bot API send before releasing ownership", async 
 		markSendStarted = resolve;
 	});
 	let resolveSend!: () => void;
+	let blockedFirstSend = true;
+	const sentTexts: string[] = [];
 	const bot = {
-		call(method: string): Promise<unknown> {
+		call(method: string, body: { text?: string }): Promise<unknown> {
 			if (method === "sendMessage") {
-				markSendStarted();
-				return new Promise(resolve => {
-					resolveSend = () => resolve({ ok: true, result: { message_id: 1 } });
-				});
+				sentTexts.push(body.text ?? "");
+				if (blockedFirstSend) {
+					blockedFirstSend = false;
+					markSendStarted();
+					return new Promise(resolve => {
+						resolveSend = () => resolve({ ok: true, result: { message_id: 1 } });
+					});
+				}
 			}
-			return Promise.resolve({ ok: true, result: {} });
+			return Promise.resolve({ ok: true, result: { message_id: sentTexts.length } });
 		},
 	};
 	class NoScan extends TelegramNotificationDaemon {
@@ -8284,22 +8366,266 @@ test("SIGTERM joins an admitted Bot API send before releasing ownership", async 
 		control: { shouldStop: async () => true },
 	});
 	const daemonState = daemon as unknown as {
-		pool: { submit: (item: { sessionId: string; lane: "finalized"; payload: unknown }) => void };
+		pool: {
+			tokens: number;
+			submit: (item: { sessionId: string; lane: "finalized"; payload: unknown }) => void;
+		};
 		flushPool: () => Promise<void>;
+		effects: { beginShutdown: () => void };
 	};
+	const shutdownStarted = Promise.withResolvers<void>();
+	const beginShutdown = daemonState.effects.beginShutdown.bind(daemonState.effects);
+	daemonState.effects.beginShutdown = () => {
+		beginShutdown();
+		shutdownStarted.resolve();
+	};
+	const longFinal = "가".repeat(9_000);
+	const longFinalChunks = splitTelegramHtml(markdownToTelegramHtml(longFinal));
 	daemonState.pool.submit({
 		sessionId: "S",
 		lane: "finalized",
-		payload: { send: { method: "sendMessage", lane: "finalized", text: "final in flight" } },
+		payload: { send: { method: "sendMessage", lane: "finalized", text: longFinal } },
 	});
-	const flushing = daemonState.flushPool();
+	daemonState.pool.tokens = 1;
+	const activeFlush = daemonState.flushPool();
 	await sendStarted;
+	daemonState.pool.submit({
+		sessionId: "S",
+		lane: "finalized",
+		payload: { send: { method: "sendMessage", lane: "finalized", text: "queued behind active flush" } },
+	});
+	daemonState.pool.tokens = 1;
+	const queuedFlush = daemonState.flushPool();
 	const run = daemon.run();
+	await shutdownStarted.promise;
+	expect(sentTexts).toEqual([longFinalChunks[0]!]);
 	expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(true);
 	resolveSend();
-	await flushing;
+	await Promise.all([activeFlush, queuedFlush]);
 	await run;
+	expect(sentTexts).toEqual([longFinalChunks[0]!, "queued behind active flush", ...longFinalChunks.slice(1)]);
 	expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
+});
+
+test("shutdown rejects a new external pool admission after stop begins", async () => {
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	const daemonState = daemon as unknown as {
+		pool: {
+			pending: number;
+			submit: (item: { sessionId: string; lane: "finalized"; payload: unknown }) => void;
+		};
+		flushPool: () => Promise<void>;
+		submitPool: (item: {
+			sessionId: string;
+			lane: "finalized";
+			payload: { send: { method: "sendMessage"; lane: "finalized"; text: string } };
+		}) => boolean;
+	};
+	daemon.requestStop("signal");
+	expect(
+		daemonState.submitPool({
+			sessionId: "late",
+			lane: "finalized",
+			payload: { send: { method: "sendMessage", lane: "finalized", text: "late" } },
+		}),
+	).toBe(false);
+	expect(daemonState.pool.pending).toBe(0);
+	daemonState.pool.submit({
+		sessionId: "queued-after-stop",
+		lane: "finalized",
+		payload: { send: { method: "sendMessage", lane: "finalized", text: "queued after stop" } },
+	});
+	await daemonState.flushPool();
+	expect(daemonState.pool.pending).toBe(1);
+	expect(bot.calls.filter(entry => entry.method === "sendMessage")).toHaveLength(0);
+});
+
+test("ownership loss aborts admitted effects and skips terminal backlog delivery", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: tokenFingerprint("tok"),
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "owner",
+		pidIncarnation: testPidIncarnation,
+	});
+	expect(
+		await renewDaemonHeartbeat({
+			settings: s,
+			ownerId: "owner",
+			acquisitionId: "owner",
+			tokenFingerprint: tokenFingerprint("tok"),
+			chatId: "42",
+			pid: process.pid,
+			generation: DAEMON_GENERATION,
+			incarnation: testPidIncarnation(process.pid),
+		}),
+	).toBe(true);
+	const bot = new FakeBotApi();
+	const call = bot.call.bind(bot);
+	let replaced = false;
+	const replacementTopics = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+	const replacementSnapshot = '{"replacement":true}\n';
+	let controlCleared = false;
+	bot.call = async (method, body, options) => {
+		if (method === "getUpdates" && !replaced) {
+			replaced = true;
+			const paths = daemonPaths(agentDir);
+			const current = JSON.parse(fs.readFileSync(paths.state, "utf8"));
+			fs.writeFileSync(
+				paths.state,
+				JSON.stringify({
+					...current,
+					ownerId: "replacement",
+					acquisitionId: "replacement",
+					ownershipPhase: "ready",
+					pid: 999,
+					incarnation: testPidIncarnation(999),
+					heartbeatAt: Date.now(),
+				}),
+			);
+			fs.writeFileSync(replacementTopics, replacementSnapshot);
+			return { ok: true, result: [] };
+		}
+		return call(method, body, options);
+	};
+	class NoScan extends TelegramNotificationDaemon {
+		override async scanRoots(): Promise<void> {}
+	}
+	const daemon = new NoScan({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		pidIncarnation: testPidIncarnation,
+		control: {
+			shouldStop: async () => false,
+			clear: async () => {
+				controlCleared = true;
+			},
+		},
+	});
+	const daemonState = daemon as unknown as {
+		pool: { submit: (item: { sessionId: string; lane: "finalized"; payload: unknown }) => void };
+		ensureAttachmentDir: (sessionId: string) => Promise<string>;
+	};
+	const attachmentDir = await daemonState.ensureAttachmentDir("S");
+	fs.writeFileSync(path.join(attachmentDir, "temporary.txt"), "temporary");
+	daemonState.pool.submit({
+		sessionId: "S",
+		lane: "finalized",
+		payload: { send: { method: "sendMessage", lane: "finalized", text: "must not send" } },
+	});
+	await daemon.run();
+	expect(bot.calls.filter(entry => entry.method === "sendMessage")).toHaveLength(0);
+	expect(JSON.parse(fs.readFileSync(daemonPaths(agentDir).state, "utf8"))).toMatchObject({
+		ownerId: "replacement",
+		acquisitionId: "replacement",
+	});
+	expect(fs.existsSync(attachmentDir)).toBe(false);
+	expect(fs.readFileSync(replacementTopics, "utf8")).toBe(replacementSnapshot);
+	expect(controlCleared).toBe(false);
+});
+
+test("ownership loss aborts and settles an in-flight admitted delivery without releasing foreign state", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: tokenFingerprint("tok"),
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "owner",
+		pidIncarnation: testPidIncarnation,
+	});
+	expect(
+		await renewDaemonHeartbeat({
+			settings: s,
+			ownerId: "owner",
+			acquisitionId: "owner",
+			tokenFingerprint: tokenFingerprint("tok"),
+			chatId: "42",
+			pid: process.pid,
+			generation: DAEMON_GENERATION,
+			incarnation: testPidIncarnation(process.pid),
+		}),
+	).toBe(true);
+	const sendStarted = Promise.withResolvers<void>();
+	let deliverySignal: AbortSignal | undefined;
+	const bot = new FakeBotApi();
+	const call = bot.call.bind(bot);
+	bot.call = async (method, body, options) => {
+		if (method === "sendMessage" && (body as { text?: string }).text === "in flight") {
+			bot.calls.push({ method, body, options });
+			deliverySignal = options?.signal;
+			sendStarted.resolve();
+			return new Promise((_, reject) =>
+				options?.signal?.addEventListener(
+					"abort",
+					() => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+					{ once: true },
+				),
+			);
+		}
+		return call(method, body, options);
+	};
+	class NoScan extends TelegramNotificationDaemon {
+		override async scanRoots(): Promise<void> {}
+	}
+	const daemon = new NoScan({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		pidIncarnation: testPidIncarnation,
+	});
+	const daemonState = daemon as unknown as {
+		pool: {
+			submit: (item: { sessionId: string; lane: "finalized"; payload: unknown }) => { settled: Promise<string> };
+		};
+		flushPool: () => Promise<void>;
+	};
+	const handle = daemonState.pool.submit({
+		sessionId: "S",
+		lane: "finalized",
+		payload: { send: { method: "sendMessage", lane: "finalized", text: "in flight" } },
+	});
+	const flushing = daemonState.flushPool();
+	await sendStarted.promise;
+	const paths = daemonPaths(agentDir);
+	const current = JSON.parse(fs.readFileSync(paths.state, "utf8"));
+	fs.writeFileSync(
+		paths.state,
+		JSON.stringify({
+			...current,
+			ownerId: "replacement",
+			acquisitionId: "replacement",
+			ownershipPhase: "ready",
+			pid: 999,
+			incarnation: testPidIncarnation(999),
+			heartbeatAt: Date.now(),
+		}),
+	);
+	await daemon.run();
+	await flushing;
+	expect(deliverySignal?.aborted).toBe(true);
+	expect(await handle.settled).toBe("ambiguous");
+	expect(bot.calls.filter(entry => entry.method === "sendMessage")).toHaveLength(1);
+	expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({
+		ownerId: "replacement",
+		acquisitionId: "replacement",
+	});
 });
 
 test("run() loop exits when an owner-scoped control request asks it to stop", async () => {

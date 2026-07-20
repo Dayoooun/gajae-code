@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 import manifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
-import { assertGuardAuthority, currentTreeDigests, declaration, evaluate, GUARD_CONTRACT_VERSION, isLegacyBootstrapBase, manifestForCurrentTree, protectedInventory, validateCiInputs, validateCurrentTreeManifest, validateInventory, validateManifest, validateSha, writeManifest } from "./telegram-daemon-generation-guard";
+import { assertGuardAuthority, currentTreeDigests, declaration, evaluate, GUARD_CONTRACT_VERSION, isGenerationFiveBootstrapFingerprint, isLegacyBootstrapBase, manifestForCurrentTree, protectedInventory, validateCiInputs, validateCurrentTreeManifest, validateInventory, validateManifest, validateSha, writeManifest } from "./telegram-daemon-generation-guard";
 
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
@@ -166,6 +166,31 @@ describe("daemon generation release guard", () => {
 		}
 	});
 
+	test("pins the exact pre-guard generation-5 development topology", () => {
+		expect(
+			isGenerationFiveBootstrapFingerprint({
+				contract: "1644acc9de4ff0f8d4252f82a71d30d6688faf358acf645e328d8e5629572df1",
+				daemon: "42528cb24eaebf8c1ea13e643f76104e1c01b7e4c6ac77dad7d13ca6c5370041",
+				chat: "a81e0b196fee296282e4d10f104bb50242d23b4865136cf767aabc94b7d0102d",
+			}),
+		).toBe(true);
+		expect(
+			isGenerationFiveBootstrapFingerprint({
+				contract: "0644acc9de4ff0f8d4252f82a71d30d6688faf358acf645e328d8e5629572df1",
+				daemon: "42528cb24eaebf8c1ea13e643f76104e1c01b7e4c6ac77dad7d13ca6c5370041",
+				chat: "a81e0b196fee296282e4d10f104bb50242d23b4865136cf767aabc94b7d0102d",
+			}),
+		).toBe(false);
+
+		const broadGenerationFive = files({ telegramOwnership: "return true;" });
+		broadGenerationFive.set(
+			telegramContract,
+			"export const NOTIFICATION_PROTOCOL_VERSION = 3;\nexport const DAEMON_GENERATION = 5;",
+		);
+		broadGenerationFive.set(chatControl, legacyChatDaemonControl);
+		expect(isLegacyBootstrapBase(broadGenerationFive)).toBe(false);
+	});
+
 	test("semantic manifest rejects duplicate, moved, and narrowed inventories", () => {
 		expect(() => validateManifest()).not.toThrow();
 		const duplicate = mutableInventory();
@@ -257,6 +282,35 @@ describe("daemon generation release guard", () => {
 		].join("\n");
 		// The protected class method resolves, not a shadowing local or object shorthand.
 		expect(declaration(source, "identity")).toContain('identity(): string { return "real"; }');
+	});
+
+	test("protects the daemon constructor callsite that installs the supervised Bot API", () => {
+		const supervised =
+			"export class TelegramNotificationDaemon { constructor() { this.botApi = createSupervisedBotApi(rawBotApi, this.effects); } }";
+		const bypassed =
+			"export class TelegramNotificationDaemon { constructor() { this.botApi = rawBotApi; } }";
+		expect(declaration(supervised, "TelegramNotificationDaemon.constructor")).toContain("createSupervisedBotApi");
+		const base = new Map<string, string>([
+			[telegramContract, "export const DAEMON_GENERATION = 6;"],
+			[telegramDaemon, supervised],
+		]);
+		const head = new Map<string, string>([
+			[telegramContract, "export const DAEMON_GENERATION = 6;"],
+			[telegramDaemon, bypassed],
+		]);
+		const callsiteInventory = {
+			telegram: {
+				[telegramContract]: ["DAEMON_GENERATION"],
+				[telegramDaemon]: ["TelegramNotificationDaemon.constructor"],
+			},
+			discord: {},
+			slack: {},
+		} as const;
+		const result = evaluate(base, head, callsiteInventory);
+		expect(result.protectedChanges).toEqual([
+			`telegram:${telegramDaemon}:TelegramNotificationDaemon.constructor`,
+		]);
+		expect(result.telegramGenerationBumped).toBe(false);
 	});
 
 	test("fails closed as <malformed> when a protected name resolves to two class methods", () => {

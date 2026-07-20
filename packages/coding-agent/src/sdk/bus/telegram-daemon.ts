@@ -701,21 +701,6 @@ function isLegacyOrUnfencedOwner(state: DaemonState): boolean {
 	);
 }
 
-/**
- * Generation-5 records written before PID fencing can still consume an
- * owner-scoped control request, but their numeric PID is never signalable.
- */
-export function isUnfencedBaselineOwner(state: DaemonState | undefined): state is DaemonState {
-	return Boolean(
-		state &&
-			hasSafeDaemonStateShape(state) &&
-			state.generation === DAEMON_GENERATION &&
-			state.incarnation === undefined &&
-			state.acquisitionId === undefined &&
-			state.ownershipPhase === undefined,
-	);
-}
-
 /** Read the stable process-start identity used to reject recycled PIDs. */
 export function defaultTelegramDaemonPidIncarnation(pid: number): string | undefined {
 	return processIncarnation(pid);
@@ -750,19 +735,17 @@ function liveOwnerUsesDifferentIdentity(input: {
 	pidIncarnation?: (pid: number) => string | undefined;
 }): boolean {
 	const { state } = input;
-	return Boolean(
-		state &&
-			hasSafeDaemonStateShape(state) &&
-			state.stoppedAt === undefined &&
-			!ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) &&
-			input.pidAlive(state.pid) &&
-			(hasMatchingPidIncarnation({
-				state,
-				pidIncarnation: input.pidIncarnation ?? defaultTelegramDaemonPidIncarnation,
-			}) ||
-				state.incarnation === undefined ||
-				isUnfencedBaselineOwner(state)),
-	);
+	if (
+		!state ||
+		!hasSafeDaemonStateShape(state) ||
+		state.stoppedAt !== undefined ||
+		ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) ||
+		!input.pidAlive(state.pid)
+	)
+		return false;
+	if (state.incarnation === undefined) return true;
+	const currentIncarnation = (input.pidIncarnation ?? defaultTelegramDaemonPidIncarnation)(state.pid);
+	return currentIncarnation === undefined || currentIncarnation === state.incarnation;
 }
 
 /** True for a physically live owner with this configuration, including recognized legacy records. */
@@ -2157,7 +2140,7 @@ class TelegramEffectSupervisor {
 	readonly #abort = new AbortController();
 	readonly #terminalAbort = new AbortController();
 	readonly #terminalContext = new AsyncLocalStorage<boolean>();
-	#terminalDepth = 0;
+	readonly #continuationContext = new AsyncLocalStorage<boolean>();
 	readonly #pending = new Set<Promise<unknown>>();
 
 	call(
@@ -2166,7 +2149,7 @@ class TelegramEffectSupervisor {
 		body: unknown,
 		opts?: { signal?: AbortSignal; noRetry?: boolean },
 	): Promise<unknown> {
-		const terminal = this.#terminalContext.getStore() === true || this.#terminalDepth > 0;
+		const terminal = this.#terminalContext.getStore() === true;
 		if (this.#stopping && !terminal)
 			return Promise.reject(Object.assign(new Error("Daemon is stopping"), { name: "AbortError" }));
 		const signal = terminal
@@ -2192,6 +2175,14 @@ class TelegramEffectSupervisor {
 		return this.#stopping;
 	}
 
+	get terminalAdmission(): boolean {
+		return this.#terminalContext.getStore() === true;
+	}
+
+	get continuationAdmission(): boolean {
+		return this.#continuationContext.getStore() === true;
+	}
+
 	beginShutdown(): void {
 		this.#stopping = true;
 	}
@@ -2205,14 +2196,11 @@ class TelegramEffectSupervisor {
 	}
 
 	allowTerminal<T>(effect: () => Promise<T>): Promise<T> {
-		this.#terminalDepth += 1;
-		return this.#terminalContext.run(true, async () => {
-			try {
-				return await this.track(effect());
-			} finally {
-				this.#terminalDepth -= 1;
-			}
-		});
+		return this.#terminalContext.run(true, () => this.track(effect()));
+	}
+
+	allowContinuation<T>(effect: () => Promise<T>): Promise<T> {
+		return this.#continuationContext.run(true, effect);
 	}
 
 	async join(deadlineMs: number): Promise<boolean> {
@@ -2229,6 +2217,12 @@ class TelegramEffectSupervisor {
 	}
 }
 
+function createSupervisedBotApi(rawBotApi: BotApi, effects: TelegramEffectSupervisor): BotApi {
+	return {
+		call: (method, body, callOpts) => effects.call(rawBotApi, method, body, callOpts),
+	};
+}
+
 export class TelegramNotificationDaemon {
 	readonly aliasTable: AliasTable;
 	readonly messageRoutes = new Map<string | number, CallbackRoute | Omit<CallbackRoute, "answer">>();
@@ -2243,6 +2237,8 @@ export class TelegramNotificationDaemon {
 	private readonly pollConflictBackoff = new OperatorBackoffPolicy({ initialMs: 500, maxMs: 5_000 });
 	private readonly loopBackoff = new OperatorBackoffPolicy({ initialMs: 250, maxMs: 4_000 });
 	private running = false;
+	#ownershipLost = false;
+	#ownershipEstablished = false;
 	private readonly fsImpl: TelegramDaemonFs;
 	private readonly botApi: BotApi;
 	private readonly effects = new TelegramEffectSupervisor();
@@ -2344,6 +2340,29 @@ export class TelegramNotificationDaemon {
 	 */
 	requestStop(_reason?: "reload" | "stop" | "signal"): void {
 		this.effects.beginShutdown();
+		this.#stoppingBtw = true;
+		this.runtime.requestStop();
+		this.running = false;
+	}
+
+	#abandonQueuedDeliveriesOnOwnershipLoss(): void {
+		const removed = this.pool.removeWhere(() => true, "removed");
+		for (const item of removed) {
+			if (item.payload.selectedAck)
+				this.finishSelectedAck(item.payload.selectedAck, { status: "unknown", reason: "shutdown" });
+			item.payload.btwDelivery?.finish("stale");
+		}
+		for (const selectedAck of new Set(this.selectedAckPending.values()))
+			this.finishSelectedAck(selectedAck, { status: "unknown", reason: "shutdown" });
+	}
+
+	#loseOwnership(): void {
+		if (this.#ownershipLost) return;
+		this.#ownershipLost = true;
+		this.effects.beginShutdown();
+		this.effects.abortPending();
+		this.effects.abortTerminal();
+		this.#abandonQueuedDeliveriesOnOwnershipLoss();
 		this.#stoppingBtw = true;
 		this.runtime.requestStop();
 		this.running = false;
@@ -2681,9 +2700,7 @@ export class TelegramNotificationDaemon {
 				fetchImpl: opts.fetchImpl,
 				setTimeoutImpl: opts.setTimeoutImpl,
 			});
-		this.botApi = {
-			call: (method, body, callOpts) => this.effects.call(rawBotApi, method, body, callOpts),
-		};
+		this.botApi = createSupervisedBotApi(rawBotApi, this.effects);
 		this.runtime = new NotificationOperatorRuntime({
 			now: opts.now,
 			setTimeoutImpl: opts.setTimeoutImpl,
@@ -2898,9 +2915,10 @@ export class TelegramNotificationDaemon {
 	}
 
 	async persistAliases(): Promise<void> {
-		const paths = daemonPaths(this.opts.settings.getAgentDir());
-		await ensureDir(this.fsImpl, paths.dir);
-		await writeJsonAtomic(this.fsImpl, paths.aliases, this.aliasTable.serialize());
+		await this.#commitIfCurrentOwner(async paths => {
+			await ensureDir(this.fsImpl, paths.dir);
+			await writeJsonAtomic(this.fsImpl, paths.aliases, this.aliasTable.serialize());
+		});
 	}
 
 	async loadSeenUpdateIds(): Promise<void> {
@@ -2919,11 +2937,12 @@ export class TelegramNotificationDaemon {
 	}
 
 	async persistSeenUpdateIds(): Promise<void> {
-		const paths = daemonPaths(this.opts.settings.getAgentDir());
-		await ensureDir(this.fsImpl, paths.dir);
-		await writeJsonAtomic(this.fsImpl, paths.seenUpdates, {
-			version: 1,
-			updateIds: [...this.dispatchState.seenUpdateIds].slice(-SEEN_UPDATE_ID_LIMIT),
+		await this.#commitIfCurrentOwner(async paths => {
+			await ensureDir(this.fsImpl, paths.dir);
+			await writeJsonAtomic(this.fsImpl, paths.seenUpdates, {
+				version: 1,
+				updateIds: [...this.dispatchState.seenUpdateIds].slice(-SEEN_UPDATE_ID_LIMIT),
+			});
 		});
 	}
 
@@ -2953,11 +2972,12 @@ export class TelegramNotificationDaemon {
 		candidate.add(updateId);
 		while (candidate.size > SEEN_UPDATE_ID_LIMIT) candidate.delete(candidate.values().next().value!);
 		try {
-			const paths = daemonPaths(this.opts.settings.getAgentDir());
-			await ensureDir(this.fsImpl, paths.dir);
-			await writeJsonAtomic(this.fsImpl, paths.seenUpdates, {
-				version: 1,
-				updateIds: [...candidate],
+			await this.#commitIfCurrentOwner(async paths => {
+				await ensureDir(this.fsImpl, paths.dir);
+				await writeJsonAtomic(this.fsImpl, paths.seenUpdates, {
+					version: 1,
+					updateIds: [...candidate],
+				});
 			});
 		} catch {
 			logger.warn("notifications: Telegram update state publication failed");
@@ -3799,9 +3819,10 @@ export class TelegramNotificationDaemon {
 
 	private persistTopics(): Promise<void> {
 		const pending = this.topicsPersistQueue.then(async () => {
-			const paths = daemonPaths(this.opts.settings.getAgentDir());
-			await ensureDir(this.fsImpl, paths.dir);
-			await writeJsonAtomic(this.fsImpl, path.join(paths.dir, "telegram-topics.json"), this.topics.serialize());
+			await this.#commitIfCurrentOwner(async paths => {
+				await ensureDir(this.fsImpl, paths.dir);
+				await writeJsonAtomic(this.fsImpl, path.join(paths.dir, "telegram-topics.json"), this.topics.serialize());
+			});
 		});
 		this.topicsPersistQueue = pending.catch(() => undefined);
 		return pending;
@@ -3927,10 +3948,17 @@ export class TelegramNotificationDaemon {
 	 * never poisons the queue (each flush is already best-effort internally).
 	 */
 	private flushChain: Promise<void> = Promise.resolve();
-	private flushPool(terminal = false): Promise<void> {
-		const next = this.flushChain.then(() =>
-			terminal ? this.effects.allowTerminal(() => this.flushPoolInner()) : this.flushPoolInner(),
-		);
+	private flushPool(terminal = false, terminalRefillAt?: number): Promise<void> {
+		const admittedBeforeShutdown = !this.effects.stopping;
+		const next = this.flushChain.then(() => {
+			if (this.effects.stopping && !terminal && !admittedBeforeShutdown) return;
+			const flush = () =>
+				this.effects.allowContinuation(() => {
+					if (terminalRefillAt !== undefined) this.pool.availableTokens(terminalRefillAt);
+					return this.flushPoolInner();
+				});
+			return terminal || admittedBeforeShutdown ? this.effects.allowTerminal(flush) : flush();
+		});
 		this.flushChain = next.catch(() => {});
 		return next;
 	}
@@ -3943,20 +3971,27 @@ export class TelegramNotificationDaemon {
 	 * best-effort flush itself.
 	 */
 	private async drainQueuedNotificationsOnShutdown(deadlineAt: number): Promise<boolean> {
-		// Join work admitted before shutdown even when it has already left the pool.
-		// The terminal deadline aborts hung Bot API calls; retaining ownership is safer
-		// than claiming quiescence when the deadline expires.
+		// Serialize behind every pre-shutdown flush, then credit a full refill before
+		// each terminal batch. This preserves each queued item's settlement handle and
+		// real deadline while bypassing the normal one-token-per-second wait during the
+		// bounded shutdown window.
 		await this.flushChain;
-		while (this.pool.pending > 0 && this.runtime.now() < deadlineAt) {
-			await this.flushPool(true);
-			if (this.pool.pending > 0 && this.runtime.now() < deadlineAt) await this.runtime.sleep(25);
+		let refillRound = 0;
+		while (this.pool.pending > 0 && Date.now() < deadlineAt) {
+			refillRound += 1;
+			await this.flushPool(true, deadlineAt + refillRound * 60_000);
 		}
 		return this.pool.pending === 0;
 	}
 
 	/** Drain the shared rate-limit pool and deliver each granted send to its topic. */
 	private submitPool(item: Parameters<RateLimitPool<TelegramQueuePayload>["submit"]>[0]): boolean {
-		if (this.effects.stopping) return false;
+		if (this.effects.stopping && !this.effects.terminalAdmission && !this.effects.continuationAdmission) {
+			if (item.payload.selectedAck)
+				this.finishSelectedAck(item.payload.selectedAck, { status: "unknown", reason: "shutdown" });
+			item.payload.btwDelivery?.finish("not_delivered");
+			return false;
+		}
 		this.pool.submit(item);
 		return true;
 	}
@@ -4336,7 +4371,7 @@ export class TelegramNotificationDaemon {
 		if (!(await this.pairedChatIsPrivate())) return;
 		await this.notifyThreadedFallback();
 		if (send.identity && this.flatIdentitySent.has(sessionId)) return;
-		this.submitPool({ sessionId, lane: send.lane, coalesceKey: send.coalesceKey, payload: { send } });
+		if (!this.submitPool({ sessionId, lane: send.lane, coalesceKey: send.coalesceKey, payload: { send } })) return;
 		await this.flushPool();
 		if (send.identity) this.flatIdentitySent.add(sessionId);
 	}
@@ -4417,6 +4452,44 @@ export class TelegramNotificationDaemon {
 		});
 	}
 
+	async #commitIfCurrentOwner(action: (paths: DaemonPaths) => Promise<void>): Promise<boolean> {
+		const paths = daemonPaths(this.opts.settings.getAgentDir());
+		// Constructors are also used for offline state recovery before the lifecycle
+		// is started. Fence commits only after this instance has entered ownership
+		// enforcement; otherwise preserve the established pre-run persistence contract.
+		if (!this.#ownershipEstablished) {
+			await action(paths);
+			return true;
+		}
+		if (!(await acquireTransitionLock({ fs: this.fsImpl, path: paths.steal }))) {
+			if (this.#ownershipEstablished) this.#loseOwnership();
+			return false;
+		}
+		try {
+			const state = await readJson<DaemonState>(this.fsImpl, paths.state);
+			const pid = this.opts.pid ?? process.pid;
+			const incarnation = (this.opts.pidIncarnation ?? defaultTelegramDaemonPidIncarnation)(pid);
+			if (
+				!hasSafeDaemonStateShape(state) ||
+				state.stoppedAt !== undefined ||
+				state.ownerId !== this.opts.ownerId ||
+				state.acquisitionId !== this.opts.ownerId ||
+				state.pid !== pid ||
+				state.incarnation !== incarnation ||
+				state.ownershipPhase !== "ready" ||
+				state.generation !== DAEMON_GENERATION ||
+				!ownerIdentityMatches(state, tokenFingerprint(this.opts.botToken), this.opts.chatId)
+			) {
+				if (this.#ownershipEstablished) this.#loseOwnership();
+				return false;
+			}
+			await action(paths);
+			return true;
+		} finally {
+			await this.fsImpl.unlink(paths.steal).catch(() => undefined);
+		}
+	}
+
 	/**
 	 * Ownership must be renewed independently of Telegram's 25-second long poll:
 	 * the ownership TTL is shorter than a single poll request.
@@ -4426,7 +4499,7 @@ export class TelegramNotificationDaemon {
 			if (!this.running) return;
 			void this.runtime
 				.runExclusive("telegram-owner-heartbeat", async () => {
-					if (!(await this.renewOwnershipHeartbeat())) this.runtime.requestStop();
+					if (!(await this.renewOwnershipHeartbeat())) this.#loseOwnership();
 				})
 				.catch(err => {
 					logger.warn(`notifications: ownership heartbeat failed: ${sanitizeDiagnostic(String(err))}`);
@@ -5606,6 +5679,10 @@ export class TelegramNotificationDaemon {
 			await this.startLifecycleControl();
 			return;
 		}
+		// The caller created this daemon only after acquiring its provisional owner
+		// record. Treat the first failed renewal as ownership loss too: admitted
+		// effects may already exist in direct/runtime callers before run() starts.
+		this.#ownershipEstablished = true;
 		this.running = await renewDaemonHeartbeat({
 			settings: this.opts.settings,
 			ownerId: this.opts.ownerId,
@@ -5616,7 +5693,10 @@ export class TelegramNotificationDaemon {
 			pid: this.opts.pid ?? process.pid,
 			incarnation: (this.opts.pidIncarnation ?? defaultTelegramDaemonPidIncarnation)(this.opts.pid ?? process.pid),
 		});
-		if (!this.running) return;
+		if (!this.running) {
+			this.#loseOwnership();
+			return;
+		}
 		this.runtime.start();
 		this.startOwnershipHeartbeatTimer();
 		this.startFlushTimer();
@@ -5636,7 +5716,10 @@ export class TelegramNotificationDaemon {
 			let idleSince = this.runtime.now();
 			while (this.running) {
 				if (await this.controlStopRequested()) break;
-				if (!(await this.renewOwnershipHeartbeat())) break;
+				if (!(await this.renewOwnershipHeartbeat())) {
+					this.#loseOwnership();
+					break;
+				}
 				await this.runScan();
 				if (await this.controlStopRequested()) break;
 				const idleElapsed = this.runtime.now() - idleSince >= (this.opts.idleTimeoutMs ?? 60_000);
@@ -5682,11 +5765,15 @@ export class TelegramNotificationDaemon {
 				deadline.resolve(false);
 			}, BTW_SHUTDOWN_JOIN_MS);
 			const shutdown = this.effects.allowTerminal(async () => {
-				// Start both drains together so a hung /btw cannot postpone final/ask work.
-				const btwDrain = this.#drainBtwTurns();
-				const notificationDrain = this.drainQueuedNotificationsOnShutdown(deadlineAt);
-				await btwDrain;
-				drained = await notificationDrain;
+				if (this.#ownershipLost) {
+					drained = true;
+				} else {
+					// Start both drains together so a hung /btw cannot postpone final/ask work.
+					const btwDrain = this.#drainBtwTurns();
+					const notificationDrain = this.drainQueuedNotificationsOnShutdown(deadlineAt);
+					await btwDrain;
+					drained = await notificationDrain;
+				}
 				this.runtime.stop();
 				this.stopOwnershipHeartbeatTimer();
 				this.stopFlushTimer();
@@ -5694,10 +5781,14 @@ export class TelegramNotificationDaemon {
 				this.stopTypingTimer();
 				this.stopLifecycleControl();
 				await this.cleanupAllAttachmentDirs();
-				await this.persistAliases();
-				await this.persistTopics();
-				await this.persistSeenUpdateIds();
-				await this.opts.control?.clear?.(this.opts.ownerId);
+				if (!this.#ownershipLost) {
+					await this.persistAliases();
+					await this.persistTopics();
+					await this.persistSeenUpdateIds();
+					await this.#commitIfCurrentOwner(async () => {
+						await this.opts.control?.clear?.(this.opts.ownerId);
+					});
+				}
 				persisted = true;
 			});
 			const completed = await Promise.race([
@@ -5712,7 +5803,9 @@ export class TelegramNotificationDaemon {
 			]);
 			clearTimeout(deadlineTimer);
 			const quiesced = completed && drained && (await this.effects.join(Math.max(0, deadlineAt - Date.now())));
-			if (!quiesced || !persisted) {
+			if (this.#ownershipLost) {
+				logger.warn("notifications: daemon ownership was lost; skipped terminal delivery and ownership release");
+			} else if (!quiesced || !persisted) {
 				logger.warn("notifications: shutdown was not durably quiesced; retaining daemon ownership");
 			} else {
 				await releaseDaemonOwnership({
