@@ -1916,7 +1916,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	// Compute output metadata for agent:// URL integration
 	let outputMeta: { lineCount: number; charCount: number; byteSize?: number; sha256?: string } | undefined;
 	let outputPath: string | undefined;
-	if (options.artifactsDir) {
+	// Never overwrite the artifact with empty output: a failed/no-op resume leg
+	// produces empty `rawOutput`, and unconditionally writing it would destroy a
+	// prior run's success artifact (observed as a 0-byte `<id>.md` after a failed
+	// resume). An empty artifact carries no information, so skip the write and
+	// preserve whatever a previous leg persisted.
+	if (options.artifactsDir && rawOutput.length > 0) {
 		const candidateOutputPath = path.join(options.artifactsDir, `${id}.md`);
 		try {
 			await Bun.write(candidateOutputPath, rawOutput);

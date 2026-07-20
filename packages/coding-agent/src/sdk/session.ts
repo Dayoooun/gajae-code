@@ -10,6 +10,7 @@ import {
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
 import {
+	type AssistantMessage,
 	type AuthCredentialSelector,
 	type CredentialDisabledEvent,
 	type Message,
@@ -17,6 +18,7 @@ import {
 	type ProviderSessionState,
 	type SimpleStreamOptions,
 	streamSimple,
+	type ToolResultMessage,
 } from "@gajae-code/ai";
 import {
 	getOpenAICodexTransportDetails,
@@ -219,6 +221,57 @@ function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessag
 		details,
 		timestamp: Date.now(),
 	};
+}
+
+/**
+ * Reconcile a resumed transcript that ends on an unpaired tool call.
+ *
+ * When a subagent finishes by calling `yield` (or any turn is torn down right
+ * after a tool executes), the terminating abort can land before the tool
+ * result is persisted, leaving the saved session ending on an assistant
+ * `toolCall` with no matching `toolResult`. Replaying that history verbatim on
+ * resume produces an invalid provider request (a tool_use not followed by a
+ * tool_result) and the resumed turn fails immediately. Synthesize a placeholder
+ * result for any such trailing unpaired tool call so a resumed session always
+ * starts from a valid, paired history. No-op for well-formed transcripts.
+ */
+export function reconcileTrailingToolCalls(messages: AgentMessage[]): AgentMessage[] {
+	let lastAssistantIdx = -1;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i].role === "assistant") {
+			lastAssistantIdx = i;
+			break;
+		}
+	}
+	if (lastAssistantIdx === -1) return messages;
+	const lastAssistant = messages[lastAssistantIdx] as AssistantMessage;
+	const toolCalls = lastAssistant.content.filter(
+		(part): part is Extract<AssistantMessage["content"][number], { type: "toolCall" }> => part.type === "toolCall",
+	);
+	if (toolCalls.length === 0) return messages;
+	const satisfied = new Set<string>();
+	for (let i = lastAssistantIdx + 1; i < messages.length; i++) {
+		const message = messages[i];
+		if (message.role === "toolResult") satisfied.add(message.toolCallId);
+	}
+	const missing = toolCalls.filter(toolCall => !satisfied.has(toolCall.id));
+	if (missing.length === 0) return messages;
+	const now = Date.now();
+	const synthesized: ToolResultMessage[] = missing.map(toolCall => ({
+		role: "toolResult",
+		toolCallId: toolCall.id,
+		toolName: toolCall.name,
+		content: [
+			{
+				type: "text",
+				text: "Tool result was not persisted before the previous turn ended; synthesized on resume to keep tool_use/tool_result pairing valid.",
+			},
+		],
+		details: {},
+		isError: false,
+		timestamp: now,
+	}));
+	return [...messages, ...synthesized];
 }
 
 function buildMcpNotificationBatchMessage(entries: McpNotificationEntry[]): AgentMessage | null {
@@ -2487,7 +2540,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		// Restore messages if session has existing data
 		if (hasExistingSession) {
-			agent.replaceMessages(existingSession.messages);
+			agent.replaceMessages(reconcileTrailingToolCalls(existingSession.messages));
 		} else {
 			// Save initial model, thinking level, and service tier for new sessions so they can be restored on resume.
 			if (model) {
