@@ -1354,8 +1354,16 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				: (thinkingLevel ?? resolvedThinkingLevel);
 			effectiveThinkingLevelForWarning = effectiveThinkingLevel;
 
+			// Resumed task session files live inside the parent session's managed
+			// artifact directory, not in the top-level managed-session candidate list.
+			// The resume descriptor is registered by this process with the exact child
+			// path, so authorize that known directory explicitly instead of routing it
+			// through the interactive resume-picker candidate gate.
+			const isResumeRun = options.runMode === "resume" || options.runMode === "message";
 			const sessionManager = sessionFile
-				? await awaitAbortable(SessionManager.open(sessionFile))
+				? await awaitAbortable(
+						SessionManager.open(sessionFile, isResumeRun ? path.dirname(sessionFile) : undefined),
+					)
 				: SessionManager.inMemory(worktree ?? cwd);
 			if (options.parentArtifactManager) {
 				sessionManager.adoptArtifactManager(options.parentArtifactManager);
@@ -1916,7 +1924,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	// Compute output metadata for agent:// URL integration
 	let outputMeta: { lineCount: number; charCount: number; byteSize?: number; sha256?: string } | undefined;
 	let outputPath: string | undefined;
-	if (options.artifactsDir) {
+	// Never overwrite the artifact with empty output: a failed/no-op resume leg
+	// produces empty `rawOutput`, and unconditionally writing it would destroy a
+	// prior run's success artifact (observed as a 0-byte `<id>.md` after a failed
+	// resume). An empty artifact carries no information, so skip the write and
+	// preserve whatever a previous leg persisted.
+	if (options.artifactsDir && rawOutput.length > 0) {
 		const candidateOutputPath = path.join(options.artifactsDir, `${id}.md`);
 		try {
 			await Bun.write(candidateOutputPath, rawOutput);

@@ -35,12 +35,17 @@ import {
 	tokenFingerprint,
 } from "../src/sdk/bus/config";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
-import { daemonPaths, ensureTelegramDaemonRunning } from "../src/sdk/bus/telegram-daemon";
+import { daemonPaths, ensureTelegramDaemonRunning, renewDaemonHeartbeat } from "../src/sdk/bus/telegram-daemon";
 import {
 	createLightweightDaemonSettings,
 	loadLightweightDaemonSettings,
 	runDaemonInternal,
 } from "../src/sdk/bus/telegram-daemon-cli";
+import {
+	attachLifecycleStartupCapability,
+	SdkStartupCapability,
+	SdkStartupRollbackTracker,
+} from "../src/sdk/startup-capability";
 import { SessionManager } from "../src/session/session-manager";
 import { cleanupFixtureRoot } from "./helpers/fixture-broker-cleanup";
 import {
@@ -1302,6 +1307,7 @@ describe("notifications config", () => {
 				settings,
 				model: getBundledModel("openai", "gpt-4o-mini"),
 				disableExtensionDiscovery: true,
+				ensureNotificationProviderDaemon: async () => "attached",
 				extensions: [],
 				skills: [],
 				contextFiles: [],
@@ -1394,7 +1400,13 @@ describe("notifications config", () => {
 				settings,
 				model: getBundledModel("openai", "gpt-4o-mini"),
 				disableExtensionDiscovery: true,
-				extensions: [api => createNotificationsExtension(api, { settings })],
+				extensions: [
+					api =>
+						createNotificationsExtension(api, {
+							settings,
+							ensureProviderDaemon: async () => "attached",
+						}),
+				],
 				skills: [],
 				contextFiles: [],
 				promptTemplates: [],
@@ -1455,6 +1467,172 @@ describe("notifications config", () => {
 		}
 	}, 30000);
 
+	describe("embedded provider readiness startup", () => {
+		const providerSettings = (agentDir: string) =>
+			isolatedNotificationSettings(agentDir, {
+				"notifications.enabled": true,
+				"notifications.discord.botToken": "discord-token",
+				"notifications.discord.applicationId": "discord-app",
+				"notifications.discord.guildId": "discord-guild",
+				"notifications.discord.parentChannelId": "discord-parent",
+			});
+
+		test("rejects ordinary session_start after provider readiness fails without publishing an endpoint", async () => {
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-provider-readiness-failure-"));
+			const agentDir = path.join(cwd, ".gjc", "agent");
+			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
+			const settings = providerSettings(agentDir);
+			let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+			try {
+				resetSettingsForTest();
+				await Settings.init({ inMemory: true, cwd, agentDir });
+				session = (
+					await createAgentSession({
+						cwd,
+						agentDir,
+						sessionManager: SessionManager.inMemory(cwd),
+						settings,
+						model: getBundledModel("openai", "gpt-4o-mini"),
+						disableExtensionDiscovery: true,
+						ensureNotificationProviderDaemon: async () => {
+							throw new Error("provider readiness denied");
+						},
+						extensions: [],
+						skills: [],
+						contextFiles: [],
+						promptTemplates: [],
+						slashCommands: [],
+						enableMCP: false,
+						enableLsp: false,
+					})
+				).session;
+				const runner = session.extensionRunner;
+				if (!runner) throw new Error("notifications extension runner was not registered");
+				const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${session.sessionId}.json`);
+
+				const errors: string[] = [];
+				const unsubscribe = runner.onError(error => errors.push(error.error));
+				await runner.emit({ type: "session_start" });
+				unsubscribe();
+				expect(errors).toContain("notifications: SDK startup failed: provider readiness denied");
+				expect(fs.existsSync(endpoint)).toBe(false);
+			} finally {
+				await session?.extensionRunner?.emit({ type: "session_shutdown" });
+				session?.dispose();
+				await cleanupFixtureRoot(cleanup);
+				resetSettingsForTest();
+			}
+		}, 30000);
+
+		test("removes a readiness-failed runtime with rollback proof so /notify on retries a real startup", async () => {
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-provider-readiness-retry-"));
+			const agentDir = path.join(cwd, ".gjc", "agent");
+			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
+			const settings = providerSettings(agentDir);
+			const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+			let notify: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> | void } | undefined;
+			let providerReady = false;
+			const rollback = new SdkStartupRollbackTracker();
+			const capability = new SdkStartupCapability(rollback);
+			const api = {
+				on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+					handlers.set(event, handler);
+				},
+				registerCommand(
+					name: string,
+					command: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> | void },
+				) {
+					if (name === "notify") notify = command;
+				},
+			} as unknown as ExtensionAPI;
+			attachLifecycleStartupCapability(api, capability);
+			const context = {
+				cwd,
+				sessionManager: {
+					getSessionId: () => "provider-readiness-retry",
+					getSessionName: () => "provider readiness retry",
+				},
+				ui: { notify: () => {} },
+			} as unknown as ExtensionCommandContext;
+			const endpoint = path.join(cwd, ".gjc", "state", "sdk", "provider-readiness-retry.json");
+			createNotificationsExtension(api, {
+				settings,
+				ensureProviderDaemon: async () => {
+					if (!providerReady) throw new Error("provider readiness denied");
+				},
+			});
+			const sessionStart = handlers.get("session_start");
+			const sessionShutdown = handlers.get("session_shutdown");
+			if (!sessionStart || !sessionShutdown || !notify)
+				throw new Error("notifications extension did not register its command handlers");
+			try {
+				await sessionStart({}, context);
+				expect(await capability.promise).toMatchObject({
+					status: "failed",
+					failure: { message: "provider readiness denied" },
+				});
+				expect(fs.existsSync(endpoint)).toBe(false);
+				expect(rollback.result).toMatchObject({
+					runtimeRemoved: true,
+					hostStopped: true,
+					brokerRegistrationReleased: true,
+				});
+
+				providerReady = true;
+				await notify.handler("on", context);
+				expect(fs.existsSync(endpoint)).toBe(true);
+			} finally {
+				await sessionShutdown({}, context);
+				await cleanupFixtureRoot(cleanup);
+				resetSettingsForTest();
+			}
+		}, 30000);
+
+		test("waits for provider readiness before publishing the embedded session endpoint", async () => {
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-provider-readiness-success-"));
+			const agentDir = path.join(cwd, ".gjc", "agent");
+			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
+			const settings = providerSettings(agentDir);
+			let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+			let endpoint = "";
+			try {
+				resetSettingsForTest();
+				await Settings.init({ inMemory: true, cwd, agentDir });
+				session = (
+					await createAgentSession({
+						cwd,
+						agentDir,
+						sessionManager: SessionManager.inMemory(cwd),
+						settings,
+						model: getBundledModel("openai", "gpt-4o-mini"),
+						disableExtensionDiscovery: true,
+						ensureNotificationProviderDaemon: async () => {
+							expect(fs.existsSync(endpoint)).toBe(false);
+						},
+						extensions: [],
+						skills: [],
+						contextFiles: [],
+						promptTemplates: [],
+						slashCommands: [],
+						enableMCP: false,
+						enableLsp: false,
+					})
+				).session;
+				const runner = session.extensionRunner;
+				if (!runner) throw new Error("notifications extension runner was not registered");
+				endpoint = path.join(cwd, ".gjc", "state", "sdk", `${session.sessionId}.json`);
+
+				await runner.emit({ type: "session_start" });
+				expect(fs.existsSync(endpoint)).toBe(true);
+			} finally {
+				await session?.extensionRunner?.emit({ type: "session_shutdown" });
+				session?.dispose();
+				await cleanupFixtureRoot(cleanup);
+				resetSettingsForTest();
+			}
+		}, 30000);
+	});
+
 	test("sessionScope=primary keeps a canonical SDK endpoint while suppressing GJC-spawned child delivery", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-notif-spawned-"));
 		const agentDir = path.join(cwd, ".gjc", "agent");
@@ -1485,6 +1663,7 @@ describe("notifications config", () => {
 				sessionManager: SessionManager.inMemory(cwd),
 				settings,
 				model: getBundledModel("openai", "gpt-4o-mini"),
+				ensureNotificationProviderDaemon: async () => "attached",
 				disableExtensionDiscovery: true,
 				extensions: [],
 				skills: [],
@@ -1663,15 +1842,31 @@ describe("notifications config", () => {
 
 		createNotificationsExtension(api, {
 			settings,
-			ensureTelegramDaemon: input =>
-				ensureTelegramDaemonRunning(input, {
+			ensureTelegramDaemon: input => {
+				let ownerId: string | undefined;
+				return ensureTelegramDaemonRunning(input, {
 					pid: 4242,
-					pidAlive: () => true,
-					spawn: () => {
+					pidAlive: pid => pid === 4242 || pid === 4243,
+					pidIncarnation: pid => `linux:${pid}`,
+					spawn: (_command, args) => {
+						ownerId = args[args.indexOf("--owner-id") + 1];
 						spawns++;
-						return { unref() {} };
+						return { pid: 4243, unref() {} };
 					},
-				}),
+					sleep: async () => {
+						if (!ownerId) throw new Error("Telegram daemon spawn did not provide an owner ID");
+						await renewDaemonHeartbeat({
+							settings,
+							ownerId,
+							acquisitionId: ownerId,
+							pid: 4243,
+							pidIncarnation: pid => `linux:${pid}`,
+						});
+					},
+					waitStepMs: 1,
+					readinessTimeoutMs: 100,
+				});
+			},
 		});
 
 		const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
