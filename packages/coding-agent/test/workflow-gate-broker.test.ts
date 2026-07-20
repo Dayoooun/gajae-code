@@ -86,6 +86,24 @@ describe("WorkflowGateBroker", () => {
 		expect(audit.some(e => e.event === "gate_response_accepted")).toBe(true);
 	});
 
+	it("counts Unicode code points for deep-interview Other-answer schema limits without advancing rejected gates", async () => {
+		const { broker, advanced } = makeBroker();
+		const schema = { type: "string" as const, minLength: 1, maxLength: 10_000, title: "Other answer" };
+		const acceptedGate = broker.openGate({ stage: "deep-interview", kind: "question", schema }, liveContinuation());
+		const accepted = await broker.resolve({ gate_id: acceptedGate.gate_id, answer: "😀".repeat(10_000) });
+		expect(accepted.status).toBe("accepted");
+		expect(advanced).toHaveLength(1);
+
+		const rejectedGate = broker.openGate({ stage: "deep-interview", kind: "question", schema }, liveContinuation());
+		const rejected = await broker.resolve({ gate_id: rejectedGate.gate_id, answer: "😀".repeat(10_001) });
+		expect(rejected).toMatchObject({
+			status: "rejected",
+			error: { errors: [{ keyword: "maxLength", expected: 10_000 }] },
+		});
+		expect(advanced).toHaveLength(1);
+		expect(broker.listPendingGates()).toMatchObject([{ gate_id: rejectedGate.gate_id }]);
+	});
+
 	it("does not mark an accepted gate terminalized without a terminalization proof", async () => {
 		const advanced: unknown[] = [];
 		const broker = new WorkflowGateBroker("run-no-terminal-proof", new MemoryGateStore(), {

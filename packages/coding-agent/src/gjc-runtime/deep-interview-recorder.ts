@@ -10,6 +10,7 @@ import {
 	answerHash,
 	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewIntentManifest,
+	assertDeepInterviewStructuredResponseWithinLimit,
 	createDeepInterviewIntentManifest,
 	type DeepInterviewEstablishedFact,
 	type DeepInterviewIntentItem,
@@ -551,6 +552,7 @@ export async function enrichDeepInterviewRoundScoring(
 	input: DeepInterviewScoringInput,
 	options: { sessionId?: string } = {},
 ): Promise<{ record: DeepInterviewRoundRecord }> {
+	assertDeepInterviewStructuredResponseWithinLimit(input);
 	const envelope = await readEnvelope(statePath);
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
 	const rounds = readRounds(envelope);

@@ -527,6 +527,37 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 		expect(persisted.state.current_ambiguity).toBe(0.5);
 	});
 
+	it("accepts a 100,000-code-point emoji scoring payload and rejects 100,001 without mutation", async () => {
+		const cwd = await tempDir();
+		const statePath = statePathFor(cwd);
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{ round: 1, questionId: "q1", questionText: "Q1?" },
+			{ sessionId: TEST_SESSION_ID },
+		);
+		const scoringAtLength = (length: number) => {
+			const input = {
+				round: 1,
+				questionId: "q1",
+				scores: { goal: 0.5 },
+				ambiguity: 0.5,
+				triggers: [trigger({ name: "" })],
+			};
+			input.triggers[0]!.name = "😀".repeat(length - [...JSON.stringify(input)].length);
+			expect([...JSON.stringify(input)]).toHaveLength(length);
+			return input;
+		};
+
+		await enrichDeepInterviewRoundScoring(cwd, statePath, scoringAtLength(100_000), { sessionId: TEST_SESSION_ID });
+		expect(JSON.parse(await fs.readFile(statePath, "utf-8")).state.rounds[0].lifecycle).toBe("scored");
+		const beforeRejectedOverflow = await fs.readFile(statePath, "utf-8");
+		await expect(
+			enrichDeepInterviewRoundScoring(cwd, statePath, scoringAtLength(100_001), { sessionId: TEST_SESSION_ID }),
+		).rejects.toThrow("structured deep-interview response exceeds max length 100000");
+		expect(await fs.readFile(statePath, "utf-8")).toBe(beforeRejectedOverflow);
+	});
+
 	it("refuses to persist an invalid scored transition and does not falsely converge", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
