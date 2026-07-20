@@ -607,6 +607,60 @@ function ownershipLockMatchesMetadata(lock: OwnershipLockRead, metadata: Ownersh
 	return lock.kind === "valid" && JSON.stringify(lock.metadata) === JSON.stringify(metadata);
 }
 
+/**
+ * Replace an acquisition's lease only after proving the old lease is unchanged.
+ * The transition fence serializes lifecycle writers; the exact read-back prevents
+ * a stale binder from overwriting a newer owner if that fence is lost.
+ */
+async function rebindOwnershipLock(input: {
+	fs: TelegramDaemonFs;
+	path: string;
+	transitionPath: string;
+	transition: DaemonTransitionLock;
+	expected: OwnershipLockMetadata;
+	rebound: OwnershipLockMetadata;
+}): Promise<boolean> {
+	if (!(await transitionLockIsHeldByCaller({ fs: input.fs, path: input.transitionPath, lock: input.transition })))
+		return false;
+	if (!ownershipLockMatchesMetadata(await readOwnershipLock(input.fs, input.path), input.expected)) return false;
+	if (!(await transitionLockIsHeldByCaller({ fs: input.fs, path: input.transitionPath, lock: input.transition })))
+		return false;
+	try {
+		await writeJsonAtomic(input.fs, input.path, input.rebound);
+	} catch {
+		return false;
+	}
+	return (
+		(await transitionLockIsHeldByCaller({ fs: input.fs, path: input.transitionPath, lock: input.transition })) &&
+		ownershipLockMatchesMetadata(await readOwnershipLock(input.fs, input.path), input.rebound)
+	);
+}
+
+/** Restore the launcher lease only when the failed binder still owns the child lease. */
+async function rollbackOwnershipLockRebind(input: {
+	fs: TelegramDaemonFs;
+	path: string;
+	transitionPath: string;
+	transition: DaemonTransitionLock;
+	previous: OwnershipLockMetadata;
+	rebound: OwnershipLockMetadata;
+}): Promise<boolean> {
+	if (!(await transitionLockIsHeldByCaller({ fs: input.fs, path: input.transitionPath, lock: input.transition })))
+		return false;
+	if (!ownershipLockMatchesMetadata(await readOwnershipLock(input.fs, input.path), input.rebound)) return false;
+	if (!(await transitionLockIsHeldByCaller({ fs: input.fs, path: input.transitionPath, lock: input.transition })))
+		return false;
+	try {
+		await writeJsonAtomic(input.fs, input.path, input.previous);
+	} catch {
+		return false;
+	}
+	return (
+		(await transitionLockIsHeldByCaller({ fs: input.fs, path: input.transitionPath, lock: input.transition })) &&
+		ownershipLockMatchesMetadata(await readOwnershipLock(input.fs, input.path), input.previous)
+	);
+}
+
 async function ownershipLockIsReclaimable(input: {
 	fs: TelegramDaemonFs;
 	path: string;
@@ -1345,13 +1399,52 @@ export async function renewDaemonHeartbeat(input: {
 		)
 			return false;
 		if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))) return false;
-		await writeJsonAtomic(fsImpl, paths.state, {
-			...state,
-			pid,
-			incarnation,
-			ownershipPhase: "ready",
-			heartbeatAt: (input.now ?? Date.now)(),
-		});
+		const previousLock = canBindProvisionalPid ? await readOwnershipLock(fsImpl, paths.lock) : undefined;
+		const expectedLock =
+			previousLock?.kind === "valid" &&
+			previousLock.metadata.pid === state.pid &&
+			previousLock.metadata.incarnation === state.incarnation &&
+			previousLock.metadata.ownerId === state.ownerId &&
+			previousLock.metadata.acquisitionId === state.acquisitionId
+				? previousLock.metadata
+				: undefined;
+		const reboundLock = expectedLock ? { ...expectedLock, pid, incarnation } : undefined;
+		if (
+			canBindProvisionalPid &&
+			(!expectedLock ||
+				!reboundLock ||
+				!(await rebindOwnershipLock({
+					fs: fsImpl,
+					path: paths.lock,
+					transitionPath: paths.steal,
+					transition,
+
+					expected: expectedLock,
+					rebound: reboundLock,
+				})))
+		)
+			return false;
+		try {
+			await writeJsonAtomic(fsImpl, paths.state, {
+				...state,
+				pid,
+				incarnation,
+				ownershipPhase: "ready",
+				heartbeatAt: (input.now ?? Date.now)(),
+			});
+		} catch {
+			if (expectedLock && reboundLock)
+				await rollbackOwnershipLockRebind({
+					fs: fsImpl,
+					path: paths.lock,
+					transitionPath: paths.steal,
+					transition,
+
+					previous: expectedLock,
+					rebound: reboundLock,
+				});
+			return false;
+		}
 		return true;
 	} finally {
 		await releaseDaemonTransitionLock({ fs: fsImpl, path: paths.steal, lock: transition });
@@ -1482,14 +1575,48 @@ async function bindProvisionalDaemonPid(input: {
 		)
 			return false;
 		if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))) return false;
-		await writeJsonAtomic(fsImpl, paths.state, {
-			...state,
-			// This durable marker distinguishes a launcher reservation from a PID
-			// the launcher authoritatively rebound to its child.
-			launcherPid: state.launcherPid ?? state.pid,
-			pid: input.pid,
-			incarnation: input.incarnation,
-		});
+		const previousLock = await readOwnershipLock(fsImpl, paths.lock);
+		if (
+			previousLock.kind !== "valid" ||
+			previousLock.metadata.pid !== state.pid ||
+			previousLock.metadata.incarnation !== state.incarnation ||
+			previousLock.metadata.ownerId !== state.ownerId ||
+			previousLock.metadata.acquisitionId !== state.acquisitionId
+		)
+			return false;
+		const reboundLock = { ...previousLock.metadata, pid: input.pid, incarnation: input.incarnation };
+		if (
+			!(await rebindOwnershipLock({
+				fs: fsImpl,
+				path: paths.lock,
+				transitionPath: paths.steal,
+				transition,
+
+				expected: previousLock.metadata,
+				rebound: reboundLock,
+			}))
+		)
+			return false;
+		try {
+			await writeJsonAtomic(fsImpl, paths.state, {
+				...state,
+				// This durable marker distinguishes a launcher reservation from a PID
+				// the launcher authoritatively rebound to its child.
+				launcherPid: state.launcherPid ?? state.pid,
+				pid: input.pid,
+				incarnation: input.incarnation,
+			});
+		} catch {
+			await rollbackOwnershipLockRebind({
+				fs: fsImpl,
+				path: paths.lock,
+				transitionPath: paths.steal,
+				transition,
+				previous: previousLock.metadata,
+				rebound: reboundLock,
+			});
+			return false;
+		}
 		return true;
 	} finally {
 		await releaseDaemonTransitionLock({ fs: fsImpl, path: paths.steal, lock: transition });

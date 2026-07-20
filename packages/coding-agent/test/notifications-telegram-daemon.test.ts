@@ -1135,20 +1135,22 @@ describe("telegram daemon", () => {
 			sessions: { "concurrent-session": expect.any(String) },
 		});
 	});
-	test("concurrent ensure follows an unbound launcher acquisition when its child heartbeat rebinds", async () => {
+	test("concurrent ensure follows an unbound launcher acquisition when its child heartbeat rebinds, then reclaims the dead child lock after a crash or forced kill", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
 		const root = path.join(agentDir, "concurrent-rebound");
 		const fp = tokenFingerprint("123456:secret-token");
 		let childProvenanceAvailable = false;
+		let childAlive = true;
 		let spawned = 0;
 		const pidIncarnation = (pid: number) => {
 			if (pid === 4242) return "linux:4242";
 			if (pid === 4243) return childProvenanceAvailable ? "linux:4243" : undefined;
+			if (pid === 4245) return "linux:4245";
 			return "linux:100";
 		};
-		const pidAlive = (pid: number) => pid === 4242 || pid === 4243;
+		const pidAlive = (pid: number) => pid === 4242 || (pid === 4243 && childAlive) || pid === 4245;
 
 		const acquisitionId = "launcher-acquisition";
 		const first = await spawnTelegramDaemonOwner(
@@ -1208,6 +1210,12 @@ describe("telegram daemon", () => {
 		expect(JSON.parse(fs.readFileSync(paths.roots, "utf8"))).toMatchObject({
 			sessions: { "concurrent-rebound": expect.any(String) },
 		});
+		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toMatchObject({
+			pid: 4243,
+			incarnation: "linux:4243",
+			ownerId: acquisitionId,
+			acquisitionId,
+		});
 
 		const state = await readDaemonState(s);
 		await expect(
@@ -1234,6 +1242,51 @@ describe("telegram daemon", () => {
 				timeoutMs: 0,
 			}),
 		).resolves.toBe(false);
+
+		// A child crash (including an ungraceful forced kill) must leave its own,
+		// dead lease reclaimable even while the source launcher remains live.
+		childAlive = false;
+		let replacementPublished = false;
+		await expect(
+			ensureTelegramDaemonRunningDetailed(
+				{ settings: s, cwd: path.join(agentDir, "replacement"), sessionId: "replacement" },
+				{
+					pid: 4244,
+					pidAlive,
+					pidIncarnation,
+					randomId: () => "replacement-acquisition",
+					spawn: () => {
+						spawned++;
+						return { pid: 4245, unref() {} };
+					},
+					readinessTimeoutMs: 25,
+					waitStepMs: 5,
+					sleep: async () => {
+						if (replacementPublished) return;
+						replacementPublished = true;
+						const replacement = await readDaemonState(s);
+						expect(replacement).toBeDefined();
+						expect(
+							await renewDaemonHeartbeat({
+								settings: s,
+								ownerId: replacement?.ownerId ?? "",
+								acquisitionId: replacement?.acquisitionId,
+								pid: 4245,
+								pidIncarnation,
+							}),
+						).toBe(true);
+					},
+				},
+			),
+		).resolves.toBe("spawned");
+		expect(spawned).toBe(2);
+		expect(replacementPublished).toBe(true);
+		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toMatchObject({
+			pid: 4245,
+			incarnation: "linux:4245",
+			ownerId: "replacement-acquisition",
+			acquisitionId: "replacement-acquisition",
+		});
 	});
 	test("times out a canonical initializer that never publishes ready state without registering its root", async () => {
 		const agentDir = tempAgentDir();
@@ -3341,6 +3394,14 @@ describe("telegram daemon", () => {
 
 		expect([firstBound, secondBound].filter(Boolean)).toHaveLength(1);
 		expect((await readDaemonState(s))?.pid).toBe(firstBound ? 8123 : 9123);
+
+		const boundPid = firstBound ? 8123 : 9123;
+		expect(JSON.parse(fs.readFileSync(daemonPaths(agentDir).lock, "utf8"))).toMatchObject({
+			pid: boundPid,
+			incarnation: firstBound ? "linux:108" : "linux:109",
+			ownerId: "daemon-launch-token",
+			acquisitionId: "daemon-launch-token",
+		});
 	});
 	test("serializes release with launcher PID handoff", async () => {
 		const agentDir = tempAgentDir();

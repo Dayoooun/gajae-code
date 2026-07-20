@@ -1646,8 +1646,9 @@ export interface NativeExactUnlinkResult {
   detachedPath?: string
   retainedSuccessorPath?: string
   /**
-   * An internal exchange placeholder whose verified cleanup failed. This is
-   * never a publisher successor and remains recoverable only at this path.
+   * An internal exchange-placeholder cleanup entry retained after cleanup
+   * could not complete. This is never a canonical publisher successor and
+   * remains recoverable only at this path.
    */
   retainedPlaceholderPath?: string
 }

@@ -144,8 +144,9 @@ pub struct NativeExactUnlinkResult {
 	pub code: Option<String>,
 	pub detached_path: Option<String>,
 	pub retained_successor_path: Option<String>,
-	/// An internal exchange placeholder whose verified cleanup failed. This is
-	/// never a publisher successor and remains recoverable only at this path.
+	/// An internal exchange-placeholder cleanup entry retained after cleanup
+	/// could not complete. This is never a canonical publisher successor and
+	/// remains recoverable only at this path.
 	pub retained_placeholder_path: Option<String>,
 }
 
@@ -755,6 +756,10 @@ mod platform {
 		OnceLock::new();
 
 	#[cfg(test)]
+	static BEFORE_EXCHANGE_HOOK: OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> =
+		OnceLock::new();
+
+	#[cfg(test)]
 	static AFTER_PLACEHOLDER_DETACH_HOOK: OnceLock<
 		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 	> = OnceLock::new();
@@ -765,6 +770,14 @@ mod platform {
 			.get_or_init(|| Mutex::new(None))
 			.lock()
 			.expect("exchange hook lock") = hook;
+	}
+
+	#[cfg(test)]
+	pub(super) fn set_before_exchange_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
+		*BEFORE_EXCHANGE_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.expect("before exchange hook lock") = hook;
 	}
 
 	#[cfg(test)]
@@ -787,6 +800,19 @@ mod platform {
 		{
 			entered.send(()).expect("exchange hook receiver");
 			resume.recv().expect("exchange hook resume");
+		}
+	}
+
+	#[cfg(test)]
+	fn pause_before_exchange_for_test() {
+		if let Some((entered, resume)) = BEFORE_EXCHANGE_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.expect("before exchange hook lock")
+			.as_ref()
+		{
+			entered.send(()).expect("before exchange hook receiver");
+			resume.recv().expect("before exchange hook resume");
 		}
 	}
 
@@ -1464,17 +1490,29 @@ mod platform {
 		// Exchange keeps the canonical pathname occupied by an empty directory while
 		// the detached object is verified. A regular-file rename cannot replace that
 		// directory, so a rename-published successor cannot be deleted by cleanup.
+		#[cfg(test)]
+		pause_before_exchange_for_test();
 		if let Err(code) = rename_exchange(parent_fd, parent_fd, &name, &quarantine) {
 			let cleanup = remove_exchange_placeholder(parent_fd, &quarantine, placeholder);
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent_fd) };
-			return NativeExactUnlinkResult::failure(
-				if matches!(cleanup, ExchangePlaceholderRemoval::Removed) {
-					code
-				} else {
-					"cleanup_failed"
+			return match cleanup {
+				ExchangePlaceholderRemoval::Removed => NativeExactUnlinkResult::failure(code),
+				ExchangePlaceholderRemoval::RetainedMismatch(retained_name)
+				| ExchangePlaceholderRemoval::RetainedFailure(retained_name, _) => {
+					NativeExactUnlinkResult::retained_placeholder_failure(
+						"cleanup_failed",
+						path
+							.parent()
+							.unwrap_or_else(|| Path::new("."))
+							.join(retained_name.to_string_lossy().as_ref())
+							.to_string_lossy()
+							.into_owned(),
+					)
 				},
-			);
+				ExchangePlaceholderRemoval::RestoredMismatch
+				| ExchangePlaceholderRemoval::Failed(_) => NativeExactUnlinkResult::failure("cleanup_failed"),
+			};
 		}
 		#[cfg(test)]
 		pause_after_exchange_for_test();
@@ -4690,6 +4728,78 @@ mod exact_unlink_placeholder_tests {
 	#[test]
 	fn retained_successor_and_stale_quarantine_are_reported_separately() {
 		retained_successor_after_stale_removal_is_reported_separately(true);
+	}
+
+	#[test]
+	fn exchange_failure_retains_placeholder_cleanup_path() {
+		let _guard = exchange_hook_test_guard();
+		let root = std::env::temp_dir().join(format!(
+			"gjc-exact-unlink-exchange-failure-placeholder-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+		let target = root.join("target");
+		fs::write(&target, b"stale").expect("write stale target");
+		let metadata = fs::metadata(&target).expect("stat target");
+		let identity = ExactFileIdentity {
+			dev:             metadata.dev(),
+			ino:             metadata.ino(),
+			size:            metadata.size(),
+			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:       false,
+			detach_only:     false,
+			quarantine_name: Some(".quarantine".to_owned()),
+			sha256:          Some(sha256(b"stale")),
+		};
+		let (exchange_entered_tx, exchange_entered_rx) = mpsc::channel();
+		let (exchange_resume_tx, exchange_resume_rx) = mpsc::channel();
+		platform::set_before_exchange_hook(Some((exchange_entered_tx, exchange_resume_rx)));
+		let (placeholder_entered_tx, placeholder_entered_rx) = mpsc::channel();
+		let (placeholder_resume_tx, placeholder_resume_rx) = mpsc::channel();
+		platform::set_after_placeholder_detach_hook(Some((
+			placeholder_entered_tx,
+			placeholder_resume_rx,
+		)));
+		let target_for_unlink = target.clone();
+		let unlink = thread::spawn(move || platform::exact_unlink(&target_for_unlink, &identity));
+		exchange_entered_rx.recv().expect("wait before exchange");
+		fs::remove_file(&target).expect("remove exchange source to force failure");
+		exchange_resume_tx.send(()).expect("resume exchange");
+		placeholder_entered_rx
+			.recv()
+			.expect("wait for placeholder cleanup detach");
+		let retained = fs::read_dir(&root)
+			.expect("read temporary directory")
+			.map(|entry| entry.expect("read temporary entry").path())
+			.find(|path| {
+				path
+					.file_name()
+					.and_then(|name| name.to_str())
+					.is_some_and(|name| name.starts_with(".gjc-exact-unlink-placeholder-"))
+			})
+			.expect("find detached placeholder");
+		fs::write(retained.join("blocker"), b"retained").expect("make placeholder cleanup fail");
+		placeholder_resume_tx
+			.send(())
+			.expect("resume placeholder cleanup");
+		let result = unlink.join().expect("exact unlink thread");
+		platform::set_before_exchange_hook(None);
+		platform::set_after_placeholder_detach_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("cleanup_failed"));
+		assert!(result.detached_path.is_none());
+		assert!(result.retained_successor_path.is_none());
+		assert_eq!(
+			result.retained_placeholder_path.as_deref(),
+			Some(retained.to_string_lossy().as_ref())
+		);
+		assert!(retained.is_dir(), "retained cleanup path is not recoverable");
+		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 
 	#[test]

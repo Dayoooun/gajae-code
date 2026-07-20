@@ -8,14 +8,14 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 15;
+export const GUARD_CONTRACT_VERSION = 16;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
 const nativeAuthorityFamilies = {
-	"crates/pi-natives/src/path_identity.rs": ["telegram"],
+	"crates/pi-natives/src/path_identity.rs": ["telegram", "discord", "slack"],
 	"crates/pi-natives/src/ps.rs": ["telegram", "discord", "slack"],
 	"crates/pi-shell/src/process.rs": ["telegram", "discord", "slack"],
 	"packages/natives/native/index.d.ts": ["telegram", "discord", "slack"],
@@ -40,7 +40,7 @@ type GuardManifest = {
  * endpoint or provider generations: they do not replace daemon owners.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "53228244fe0e74e5c9ef401006b0a83e2a476edf8bd53b4edf9931f444e59196";
+const PROTECTED_INVENTORY_SHA256 = "8504fc2996d657b728ebe7a260b4cb2c14a7e8ed1c70afe5661bec331a0d252b";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -58,6 +58,8 @@ export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
 
 /** Chat owner/reclaim publication is shared authority for both provider families. */
 export const CHAT_OWNER_LOCK_PROTECTED_DECLARATIONS = [
+	"isExactPreUpgradeUnavailableChatDaemonState",
+	"hasChatDaemonStatePid",
 	"createChatDaemonOwnerLock",
 	"reclaimChatDaemonOwnerLock",
 	"acquireChatDaemonReclaimLock",
@@ -66,6 +68,7 @@ export const CHAT_OWNER_LOCK_PROTECTED_DECLARATIONS = [
 	"unlinkExactChatDaemonOwnerLock",
 	"staleChatDaemonLockLease",
 	"ownsChatDaemonOwnerLock",
+	"isChatDaemonOwnerLock",
 ] as const;
 
 function validateChatOwnerLockInventory(inventory: Inventory): void {
@@ -89,7 +92,7 @@ function inventoryHash(inventory: Inventory): string {
 }
 
 export function validateInventory(inventory: Inventory = protectedInventory): void {
-	if (GUARD_CONTRACT_VERSION !== 15) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
+	if (GUARD_CONTRACT_VERSION !== 16) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
 	for (const [family, files] of Object.entries(inventory)) {
 		for (const [file, symbols] of Object.entries(files)) {
 			if (!file || symbols.length === 0 || new Set(symbols).size !== symbols.length)

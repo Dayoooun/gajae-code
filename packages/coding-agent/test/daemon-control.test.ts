@@ -827,7 +827,9 @@ describe("renewDaemonHeartbeat steal-lock contention", () => {
 	test("binds a child heartbeat only through its matching provisional acquisition", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
-		writeState(agentDir, freshState({ ownershipPhase: "provisional", pid: 4242, incarnation: "linux:102" }));
+		const provisional = freshState({ ownershipPhase: "provisional", pid: 4242, incarnation: "linux:102" });
+		writeState(agentDir, provisional);
+		writeOwnershipLock(agentDir, provisional);
 		const bound = await renewDaemonHeartbeat({
 			settings: s,
 			ownerId: "old",

@@ -14,8 +14,30 @@ const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const inventory = {
 	telegram: { [telegramContract]: ["DAEMON_GENERATION"], [telegramDaemon]: ["acquireDaemonOwnership"] },
-	discord: { [chatControl]: ["CHAT_DAEMON_GENERATIONS", "chatDaemonGeneration", "hasSafeChatDaemonStateShape", "classify", "operate"] },
-	slack: { [chatControl]: ["CHAT_DAEMON_GENERATIONS", "chatDaemonGeneration", "hasSafeChatDaemonStateShape", "classify", "operate"] },
+	discord: {
+		[chatControl]: [
+			"CHAT_DAEMON_GENERATIONS",
+			"chatDaemonGeneration",
+			"hasSafeChatDaemonStateShape",
+			"isExactPreUpgradeUnavailableChatDaemonState",
+			"hasChatDaemonStatePid",
+			"isChatDaemonOwnerLock",
+			"classify",
+			"operate",
+		],
+	},
+	slack: {
+		[chatControl]: [
+			"CHAT_DAEMON_GENERATIONS",
+			"chatDaemonGeneration",
+			"hasSafeChatDaemonStateShape",
+			"isExactPreUpgradeUnavailableChatDaemonState",
+			"hasChatDaemonStatePid",
+			"isChatDaemonOwnerLock",
+			"classify",
+			"operate",
+		],
+	},
 } as const;
 
 function files(input: {
@@ -40,6 +62,9 @@ function files(input: {
 				`export const CHAT_DAEMON_GENERATIONS = { discord: ${input.discordGeneration ?? 1}, slack: ${input.slackGeneration ?? 1} } as const;`,
 				"export function chatDaemonGeneration(kind: \"discord\" | \"slack\") { return CHAT_DAEMON_GENERATIONS[kind]; }",
 				"export function hasSafeChatDaemonStateShape(value: unknown) { return value !== null; }",
+				"export function isExactPreUpgradeUnavailableChatDaemonState(value: unknown) { return value === 'unavailable'; }",
+				"export function hasChatDaemonStatePid(value: unknown) { return value !== null; }",
+				"export function isChatDaemonOwnerLock(value: unknown) { return value !== null; }",
 				`class ChatDaemonController { classify() { return "compatible"; } async operate() { ${input.chatLifecycle ?? ""} } }`,
 			].join("\n"),
 		],
@@ -99,6 +124,43 @@ describe("daemon generation release guard", () => {
 			]),
 		);
 		expect(result.chatGenerationBumped).toEqual({ discord: true, slack: true });
+	});
+
+	test("requires both chat generation bumps for each legacy and exact-lease takeover predicate", () => {
+		for (const [symbol, before, after] of [
+			[
+				"isExactPreUpgradeUnavailableChatDaemonState",
+				"export function isExactPreUpgradeUnavailableChatDaemonState(value: unknown) { return value === 'unavailable'; }",
+				"export function isExactPreUpgradeUnavailableChatDaemonState(value: unknown) { return value === 'legacy'; }",
+			],
+			[
+				"hasChatDaemonStatePid",
+				"export function hasChatDaemonStatePid(value: unknown) { return value !== null; }",
+				"export function hasChatDaemonStatePid(value: unknown) { return value === null; }",
+			],
+			[
+				"isChatDaemonOwnerLock",
+				"export function isChatDaemonOwnerLock(value: unknown) { return value !== null; }",
+				"export function isChatDaemonOwnerLock(value: unknown) { return value === null; }",
+			],
+		] as const) {
+			const base = files({ discordGeneration: 3, slackGeneration: 3 });
+			const unbumpedHead = files({ discordGeneration: 3, slackGeneration: 3 });
+			unbumpedHead.set(chatControl, (unbumpedHead.get(chatControl) ?? "").replace(before, after));
+			const missingBumps = decide(base, unbumpedHead);
+			expect(missingBumps.protectedChanges).toEqual(
+				expect.arrayContaining([
+					`discord:${chatControl}:${symbol}`,
+					`slack:${chatControl}:${symbol}`,
+				]),
+			);
+			expect(missingBumps.chatGenerationBumped).toEqual({ discord: false, slack: false });
+
+			const bumpedHead = files({ discordGeneration: 4, slackGeneration: 4 });
+			bumpedHead.set(chatControl, (bumpedHead.get(chatControl) ?? "").replace(before, after));
+			const result = decide(base, bumpedHead);
+			expect(result.chatGenerationBumped).toEqual({ discord: true, slack: true });
+		}
 	});
 
 	test("AST extraction ignores strings and comments while preserving typed declarations", () => {
@@ -189,7 +251,7 @@ describe("daemon generation release guard", () => {
 
 	test("requires mapped family generation bumps for native lifecycle authority changes", () => {
 		const sources = [
-			["crates/pi-natives/src/path_identity.rs", ["telegram"]],
+			["crates/pi-natives/src/path_identity.rs", ["telegram", "discord", "slack"]],
 			["crates/pi-natives/src/ps.rs", ["telegram", "discord", "slack"]],
 			["crates/pi-shell/src/process.rs", ["telegram", "discord", "slack"]],
 			["packages/natives/native/index.d.ts", ["telegram", "discord", "slack"]],
