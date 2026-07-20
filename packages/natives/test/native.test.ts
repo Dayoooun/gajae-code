@@ -125,9 +125,9 @@ describe("pi-natives", () => {
 
 			const childReference = Process.fromPid(childPid);
 			expect(childReference).not.toBeNull();
-			childReference?.signalRoot(os.constants.signals.SIGKILL);
-			for (let attempt = 0; attempt < 100 && Process.fromPid(childPid); attempt++) await Bun.sleep(10);
-			expect(Process.fromPid(childPid)).toBeNull();
+			expect(childReference?.signalRoot(os.constants.signals.SIGKILL)).toBe(true);
+			expect(await childReference?.waitForExit({ timeoutMs: 2_000 })).toBe(true);
+			expect(childReference?.status()).toBe("exited");
 		} finally {
 			if (childPid) Process.fromPid(childPid)?.signalRoot(os.constants.signals.SIGKILL);
 			Process.fromPid(root.pid)?.signalRoot(os.constants.signals.SIGKILL);
