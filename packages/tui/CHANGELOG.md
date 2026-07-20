@@ -1,14 +1,16 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Keybinding configuration arrays are now defensively copied so external mutations cannot diverge snapshots from resolved key matches.
+- Supplementary Unicode terminal input now crosses the stdin decoding boundary as complete code points instead of separate UTF-16 surrogate events.
+- Bracketed-paste framing now preserves ordinary input before coalesced or split start markers, retains split end markers byte-for-byte, and reprocesses multiple framed pastes in order instead of dropping command prefixes.
 
 ## [0.11.3] - 2026-07-19
 ### Fixed
 
-- Keybinding configuration arrays are now defensively copied so external mutations cannot diverge snapshots from resolved key matches.
 - Suppressed slash-command and skill autocomplete inside line-local single-backtick code spans while preserving path completion and ordinary slash matching outside literals (#2619).
-- Supplementary Unicode terminal input now crosses the stdin decoding boundary as complete code points instead of separate UTF-16 surrogate events.
-- Bracketed-paste framing now preserves ordinary input before coalesced or split start markers, retains split end markers byte-for-byte, and reprocesses multiple framed pastes in order instead of dropping command prefixes.
 
 ## [0.11.0] - 2026-07-15
 ### Fixed
