@@ -1092,8 +1092,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			sessionId: this.session.getSessionId?.() ?? null,
 		});
 		for (const question of params.questions) {
-			if (question.deepInterview !== undefined)
-				assertDeepInterviewStructuredResponseWithinLimit(question.deepInterview);
+			if (question.deepInterview !== undefined) assertDeepInterviewStructuredResponseWithinLimit(question);
 		}
 		let activeRemoteReceipt: AskRemoteReceipt | undefined;
 		let activeRemoteRequest: AskAnswerRequest | undefined;

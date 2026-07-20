@@ -30,10 +30,12 @@ import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { applyAmbiguityFloorToEnvelope } from "./deep-interview-ambiguity";
 import {
 	assertDeepInterviewEnvelopeInputLimits,
+	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewIntentManifest,
 	assertDeepInterviewIntentReview,
 	assertDeepInterviewStructuredResponseWithinLimit,
 	type DeepInterviewIntentManifest,
+	MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH,
 	mergeDeepInterviewEnvelope,
 	normalizeDeepInterviewEnvelope,
 } from "./deep-interview-state";
@@ -1435,6 +1437,24 @@ async function handleClear(args: readonly string[], cwd: string): Promise<StateC
 const DEEP_INTERVIEW_INTENT_ID_RE = /(?:artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}/g;
 
 async function assertDeepInterviewHandoffReady(state: Record<string, unknown>): Promise<void> {
+	const specPath = typeof state.spec_path === "string" ? state.spec_path : undefined;
+	const expectedSha = typeof state.spec_sha256 === "string" ? state.spec_sha256 : undefined;
+	let content: string | undefined;
+	if (specPath) {
+		try {
+			content = await fs.readFile(specPath, "utf-8");
+		} catch (error) {
+			throw new StateCommandError(
+				2,
+				`deep-interview handoff cannot read persisted spec: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		assertDeepInterviewInputWithinLimit(
+			content,
+			MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH,
+			"persisted deep-interview spec",
+		);
+	}
 	const envelope = normalizeDeepInterviewEnvelope(state);
 	const inner = envelope.state;
 	if (!inner) return;
@@ -1444,19 +1464,8 @@ async function assertDeepInterviewHandoffReady(state: Record<string, unknown>): 
 		return;
 	}
 	assertDeepInterviewIntentManifest(inner.intent_contract);
-	const specPath = typeof state.spec_path === "string" ? state.spec_path : undefined;
-	const expectedSha = typeof state.spec_sha256 === "string" ? state.spec_sha256 : undefined;
-	if (!specPath || !expectedSha)
+	if (!specPath || !expectedSha || content === undefined)
 		throw new StateCommandError(2, "deep-interview handoff requires a persisted intent-validated spec");
-	let content: string;
-	try {
-		content = await fs.readFile(specPath, "utf-8");
-	} catch (error) {
-		throw new StateCommandError(
-			2,
-			`deep-interview handoff cannot read persisted spec: ${error instanceof Error ? error.message : String(error)}`,
-		);
-	}
 	if (createHash("sha256").update(content).digest("hex") !== expectedSha)
 		throw new StateCommandError(2, "deep-interview handoff spec hash mismatch");
 	const observedIds = [...new Set(content.match(DEEP_INTERVIEW_INTENT_ID_RE) ?? [])].sort();

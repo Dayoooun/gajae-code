@@ -429,6 +429,7 @@ export async function appendOrMergeDeepInterviewRound(
 	input: DeepInterviewAnswerInput,
 	options: { sessionId?: string } = {},
 ): Promise<{ action: AppendOrMergeAction; record: DeepInterviewRoundRecord; disputedFactIds?: string[] }> {
+	assertDeepInterviewStructuredResponseWithinLimit(input);
 	if (input.customInput !== undefined)
 		assertDeepInterviewInputWithinLimit(input.customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
 	const envelope = await readEnvelope(statePath);

@@ -4,6 +4,7 @@ import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { AppendOrMergeResult } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import * as deepInterviewRecorder from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
+import { deepInterviewCharacterCount } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import { getThemeByName, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { AskAnswerRequest, AskAnswerSource, AskRemoteReceipt, ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool, askSchema, askToolRenderer } from "@gajae-code/coding-agent/tools/ask";
@@ -2706,30 +2707,18 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(result.details?.selectedOptions).toEqual(["yes"]);
 	});
 
-	function deepInterviewMetadataAtSerializedLength(length: number) {
-		const metadata = {
-			...deepInterviewMeta(),
-			references: Array.from({ length: 32 }, () => ({
-				reference_id: "x",
-				label: "x",
-				origin: "x",
-				url: "x",
-				excerpt: "x",
-			})),
-		};
-		for (const reference of metadata.references) {
-			for (const field of ["excerpt", "url"] as const) {
-				const remaining = length - JSON.stringify(metadata).length;
-				if (remaining <= 0) break;
-				reference[field] += "x".repeat(Math.min(remaining, 2_048 - reference[field].length));
-			}
-		}
-		if (JSON.stringify(metadata).length !== length)
-			throw new Error("unable to construct structured metadata boundary");
-		return metadata;
+	function deepInterviewQuestionAtSerializedLength(length: number) {
+		const question = singleDeepInterviewQuestion();
+		question.question = "";
+		const paddingLength = length - deepInterviewCharacterCount(JSON.stringify(question));
+		if (paddingLength < 0) throw new Error("deep-interview question base exceeds structured-response limit");
+		question.question = "😀".repeat(paddingLength);
+		if (deepInterviewCharacterCount(JSON.stringify(question)) !== length)
+			throw new Error("unable to construct structured question boundary");
+		return question;
 	}
 
-	it("accepts exactly 100000 serialized metadata characters and rejects 100001 before gate or recorder advancement", async () => {
+	it("accepts exactly 100000 structured question characters and rejects 100001 before gate or recorder advancement", async () => {
 		const appendSpy = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as AppendOrMergeResult["record"],
@@ -2742,29 +2731,17 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const tool = new AskTool(
 			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
 		);
-		const exact = deepInterviewMetadataAtSerializedLength(100_000);
-		const oversized = deepInterviewMetadataAtSerializedLength(100_001);
+		const exact = deepInterviewQuestionAtSerializedLength(100_000);
+		const oversized = deepInterviewQuestionAtSerializedLength(100_001);
 
-		expect(JSON.stringify(exact)).toHaveLength(100_000);
-		await tool.execute(
-			"call-structured-limit-exact",
-			{ questions: [{ ...singleDeepInterviewQuestion(), deepInterview: exact }] },
-			undefined,
-			undefined,
-			undefined,
-		);
+		expect(deepInterviewCharacterCount(JSON.stringify(exact))).toBe(100_000);
+		await tool.execute("call-structured-limit-exact", { questions: [exact] }, undefined, undefined, undefined);
 		expect(gateEmitter.emitGate).toHaveBeenCalledTimes(1);
 		expect(appendSpy).toHaveBeenCalledTimes(1);
 
-		expect(JSON.stringify(oversized)).toHaveLength(100_001);
+		expect(deepInterviewCharacterCount(JSON.stringify(oversized))).toBe(100_001);
 		await expect(
-			tool.execute(
-				"call-structured-limit-oversized",
-				{ questions: [{ ...singleDeepInterviewQuestion(), deepInterview: oversized }] },
-				undefined,
-				undefined,
-				undefined,
-			),
+			tool.execute("call-structured-limit-oversized", { questions: [oversized] }, undefined, undefined, undefined),
 		).rejects.toThrow("structured deep-interview response exceeds max length 100000");
 		expect(gateEmitter.emitGate).toHaveBeenCalledTimes(1);
 		expect(appendSpy).toHaveBeenCalledTimes(1);
