@@ -1087,9 +1087,9 @@ describe("telegram daemon", () => {
 		fs.writeFileSync(paths.state, JSON.stringify(liveOwnerState(extra)));
 		fs.writeFileSync(paths.lock, "");
 	}
-	test("keeps the wire protocol at 3 while lifecycle ownership uses generation 6", () => {
+	test("keeps the wire protocol at 3 while lifecycle ownership uses generation 7", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		expect(DAEMON_GENERATION).toBe(6);
+		expect(DAEMON_GENERATION).toBe(7);
 	});
 
 	test.each([
@@ -1098,6 +1098,8 @@ describe("telegram daemon", () => {
 		2,
 		3,
 		4,
+		5,
+		6,
 	])("#2278 flags every valid lower generation (%s) for a live reload", async generation => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
@@ -1474,12 +1476,12 @@ describe("telegram daemon", () => {
 		expect(sleeps).toEqual([1, 1, 1]);
 	});
 
-	test("generation 6 reloads a live generation-5 owner via a safe SIGTERM handoff", async () => {
+	test("generation 7 reloads a live generation-6 owner via a safe SIGTERM handoff", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
-		// Generation 5 predates the durable tool-activity policy but is otherwise a
+		// Generation 6 predates the reconciled ownership transition contract but is otherwise a
 		// fresh live owner that a version-only check would attach to.
-		writeLiveOwner(agentDir, { generation: 5, heartbeatAt: Date.now(), incarnation: "test:999" });
+		writeLiveOwner(agentDir, { generation: 6, heartbeatAt: Date.now(), incarnation: "test:999" });
 		const paths = daemonPaths(agentDir);
 		const alive = new Set<number>([999, 4242]);
 		const signals: Array<[number, string]> = [];

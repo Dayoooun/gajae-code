@@ -341,7 +341,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts:ownerPidFromOwnerId": "46691373b2bee01f28f3817a6aa6a7efffe880c2cea337c89155582c98d952bf",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts:runDaemonInternal": "4d61235b0c32bf9afc63e1af29eaeca05368607c4997257c15febe071b30b582",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts:runDaemonSmoke": "6f085a667aa5c83de46d2d8945fb845c355fcbb43c46872342a44489203a5830",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts:DAEMON_GENERATION": "a5f44fd22ba1c7e59b109931d0ac04d1c1e3a8043e1fe5958a69c8cb43d82687",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts:DAEMON_GENERATION": "f711a6c4b9fe731cdfa6a08efa154c99940269566a06f64cb066480e0f0745cc",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts:NOTIFICATION_PROTOCOL_VERSION": "b99289f651fedcf020d28dbaf6f07dd37e7e4a5f6dc1f5118b872112325f1e81",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:TelegramDaemonController": "707592928e7d143087d23f416cc6222b24c215d69202bb4c4e7ac93eb70dbd76",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:clearOwnRequest": "f2b3e39929173a08f69be38ecf09ad175f3090ca0016b9fd8fc55edddeacdeeb",
