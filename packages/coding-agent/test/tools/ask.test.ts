@@ -489,7 +489,7 @@ describe("AskTool cancellation", () => {
 			record: {} as AppendOrMergeResult["record"],
 		});
 		const exact = "😀".repeat(10_000);
-		const local = new AskTool(createSession());
+		const local = new AskTool(createSession({ getSessionId: () => "test-session" }));
 		const localContext = createContext({
 			select: async (_prompt, options, dialogOptions) => {
 				dialogOptions?.customInput?.onSubmit(exact);
@@ -2764,7 +2764,11 @@ describe("AskTool deep-interview recorder persistence", () => {
 			emitGate: vi.fn(async () => ({ selected: ["Budget"] })),
 		};
 		const tool = new AskTool(
-			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+			createSession({
+				hasUI: false,
+				getSessionId: () => "test-session",
+				getWorkflowGateEmitter: () => gateEmitter,
+			} as Partial<ToolSession>),
 		);
 		const exact = deepInterviewQuestionAtPayloadLength(100_000);
 		const oversized = deepInterviewQuestionAtPayloadLength(100_001);
@@ -2826,7 +2830,11 @@ describe("AskTool deep-interview recorder persistence", () => {
 			],
 		};
 		const tool = new AskTool(
-			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+			createSession({
+				hasUI: false,
+				getSessionId: () => "test-session",
+				getWorkflowGateEmitter: () => gateEmitter,
+			} as Partial<ToolSession>),
 		);
 
 		await tool.execute(
