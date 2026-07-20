@@ -2320,6 +2320,7 @@ describe("telegram daemon", () => {
 					pid: 4242,
 					now: () => nowMs,
 					pidAlive: pid => pid === 999,
+					pidIncarnation: () => "linux:100",
 					sendSignal: () => {},
 					sleep: async ms => {
 						nowMs += ms;
@@ -2331,7 +2332,7 @@ describe("telegram daemon", () => {
 					},
 				},
 			),
-		).rejects.toThrow("Telegram daemon generation reload failed");
+		).rejects.toThrow("Unable to replace stale Telegram daemon");
 		expect(spawns).toBe(0);
 	});
 
