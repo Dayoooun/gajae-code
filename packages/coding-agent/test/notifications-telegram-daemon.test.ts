@@ -1135,6 +1135,106 @@ describe("telegram daemon", () => {
 			sessions: { "concurrent-session": expect.any(String) },
 		});
 	});
+	test("concurrent ensure follows an unbound launcher acquisition when its child heartbeat rebinds", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		const root = path.join(agentDir, "concurrent-rebound");
+		const fp = tokenFingerprint("123456:secret-token");
+		let childProvenanceAvailable = false;
+		let spawned = 0;
+		const pidIncarnation = (pid: number) => {
+			if (pid === 4242) return "linux:4242";
+			if (pid === 4243) return childProvenanceAvailable ? "linux:4243" : undefined;
+			return "linux:100";
+		};
+		const pidAlive = (pid: number) => pid === 4242 || pid === 4243;
+
+		const acquisitionId = "launcher-acquisition";
+		const first = await spawnTelegramDaemonOwner(
+			{ settings: s, roots: [root], tokenFingerprint: fp, chatId: "42" },
+			{
+				pid: 4242,
+				pidAlive,
+				pidIncarnation,
+				randomId: () => acquisitionId,
+				spawn: () => {
+					spawned++;
+					return { pid: 4243, unref() {} };
+				},
+			},
+		);
+		expect(first).toMatchObject({ result: "owner_spawned", acquisition: { launcherPid: 4242, pid: 4243 } });
+		expect(await readDaemonState(s)).toMatchObject({
+			pid: 4242,
+			ownerId: acquisitionId,
+			acquisitionId,
+			ownershipPhase: "provisional",
+		});
+
+		let published = false;
+		await expect(
+			ensureTelegramDaemonRunningDetailed(
+				{ settings: s, cwd: root, sessionId: "concurrent-rebound" },
+				{
+					pid: 4244,
+					pidAlive,
+					pidIncarnation,
+					spawn: () => {
+						spawned++;
+						return { pid: 4245, unref() {} };
+					},
+					readinessTimeoutMs: 25,
+					waitStepMs: 5,
+					sleep: async () => {
+						if (published) return;
+						published = true;
+						childProvenanceAvailable = true;
+						expect(
+							await renewDaemonHeartbeat({
+								settings: s,
+								ownerId: acquisitionId,
+								acquisitionId,
+								pid: 4243,
+								pidIncarnation,
+							}),
+						).toBe(true);
+					},
+				},
+			),
+		).resolves.toBe("attached");
+		expect(spawned).toBe(1);
+		expect(published).toBe(true);
+		expect(JSON.parse(fs.readFileSync(paths.roots, "utf8"))).toMatchObject({
+			sessions: { "concurrent-rebound": expect.any(String) },
+		});
+
+		const state = await readDaemonState(s);
+		await expect(
+			waitForTelegramDaemonReady({
+				settings: s,
+				ownerId: state?.ownerId,
+				acquisitionId: `${acquisitionId}-foreign`,
+				tokenFingerprint: fp,
+				chatId: "42",
+				pidAlive,
+				pidIncarnation,
+				timeoutMs: 0,
+			}),
+		).resolves.toBe(false);
+		await expect(
+			waitForTelegramDaemonReady({
+				settings: s,
+				ownerId: state?.ownerId,
+				acquisitionId,
+				tokenFingerprint: "foreign-token",
+				chatId: "42",
+				pidAlive,
+				pidIncarnation,
+				timeoutMs: 0,
+			}),
+		).resolves.toBe(false);
+	});
 	test("times out a canonical initializer that never publishes ready state without registering its root", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);

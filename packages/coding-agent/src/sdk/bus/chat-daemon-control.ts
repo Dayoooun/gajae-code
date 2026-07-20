@@ -92,6 +92,53 @@ export function hasSafeChatDaemonStateShape(value: unknown): value is ChatDaemon
 	return typeof state.generation === "number" && Number.isSafeInteger(state.generation) && state.generation >= 0;
 }
 
+/**
+ * Versions before immutable process provenance persisted this single sentinel.
+ * Recover it only after proving its recorded PID is dead; every other malformed
+ * record remains fail-closed.
+ */
+function isExactPreUpgradeUnavailableChatDaemonState(
+	value: unknown,
+): value is Omit<ChatDaemonState, "generation" | "incarnation"> & { incarnation: "unavailable" } {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const state = value as Record<string, unknown>;
+	const keys = Object.keys(state);
+	if (
+		keys.some(
+			key =>
+				key !== "version" &&
+				key !== "kind" &&
+				key !== "pid" &&
+				key !== "ownerId" &&
+				key !== "identity" &&
+				key !== "incarnation" &&
+				key !== "startedAt" &&
+				key !== "heartbeatAt" &&
+				key !== "transportHealthy" &&
+				key !== "stoppedAt",
+		)
+	)
+		return false;
+	return (
+		state.version === 1 &&
+		(state.kind === "discord" || state.kind === "slack") &&
+		typeof state.pid === "number" &&
+		Number.isSafeInteger(state.pid) &&
+		state.pid > 0 &&
+		typeof state.ownerId === "string" &&
+		state.ownerId.length > 0 &&
+		typeof state.identity === "string" &&
+		state.identity.length > 0 &&
+		state.incarnation === "unavailable" &&
+		typeof state.startedAt === "number" &&
+		Number.isFinite(state.startedAt) &&
+		typeof state.heartbeatAt === "number" &&
+		Number.isFinite(state.heartbeatAt) &&
+		typeof state.transportHealthy === "boolean" &&
+		(state.stoppedAt === undefined || (typeof state.stoppedAt === "number" && Number.isFinite(state.stoppedAt)))
+	);
+}
+
 function hasChatDaemonStatePid(value: unknown): value is { pid: number } {
 	return (
 		!!value &&
@@ -498,6 +545,7 @@ export class ChatDaemonController implements BuiltInDaemonController {
 			: defaultProcessReference(pid, this.deps.platform);
 	}
 	private isDefinitelyStoppedState(state: ChatDaemonState | undefined): boolean {
+		if (isExactPreUpgradeUnavailableChatDaemonState(state)) return !this.alive(state.pid);
 		if (!state || !hasSafeChatDaemonOwnerShape(state)) return false;
 		if (!this.alive(state.pid)) return true;
 		// Proven PID reuse means this persisted owner is gone. The distinct live PID
@@ -537,6 +585,7 @@ export class ChatDaemonController implements BuiltInDaemonController {
 	}
 	private classify(state: ChatDaemonState | undefined, identity: string | undefined): ChatDaemonStateClassification {
 		if (!state) return "absent";
+		if (isExactPreUpgradeUnavailableChatDaemonState(state)) return this.alive(state.pid) ? "malformed" : "stopped";
 		if (!hasSafeChatDaemonOwnerShape(state)) return "malformed";
 		if (this.isDefinitelyStoppedState(state)) return "stopped";
 		if (!identity || state.kind !== this.kind || state.identity !== identity) return "unauthorized";

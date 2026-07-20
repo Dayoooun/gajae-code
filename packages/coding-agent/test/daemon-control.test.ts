@@ -1840,6 +1840,94 @@ describe("ChatDaemonController ownership safety", () => {
 			expect(spawns).toBe(0);
 		});
 
+		test("recovers only a dead pre-upgrade unavailable owner and replaces its lock", async () => {
+			const agentDir = tempAgentDir();
+			const paths = chatDaemonPaths(agentDir, kind);
+			fs.mkdirSync(paths.dir, { recursive: true });
+			fs.writeFileSync(
+				paths.state,
+				JSON.stringify({
+					version: 1,
+					kind,
+					pid: 96,
+					ownerId: "legacy-owner",
+					identity: identity(),
+					incarnation: "unavailable",
+					startedAt: 1,
+					heartbeatAt: 1,
+					transportHealthy: false,
+				}),
+			);
+			fs.writeFileSync(paths.lock, JSON.stringify({ pid: 96, incarnation: "unavailable", createdAt: 1 }));
+			let spawns = 0;
+			const controller = new ChatDaemonController(configuredSettings(agentDir), kind, {
+				pidAlive: pid => pid === 97,
+				pidIncarnation: pid => (pid === 97 || pid === process.pid ? "linux:12352" : undefined),
+				spawn: (_command, args) => {
+					spawns++;
+					void (async () => {
+						const acquired = await acquireChatDaemonOwnership({
+							agentDir,
+							kind,
+							ownerId: args[args.indexOf("--owner-id") + 1],
+							pid: 97,
+							identity: identity(),
+							incarnation: "linux:12352",
+							pidAlive: pid => pid === 97,
+							pidIncarnation: pid => (pid === 97 || pid === process.pid ? "linux:12352" : undefined),
+						});
+						if (!acquired) return;
+						const owner = JSON.parse(fs.readFileSync(paths.state, "utf8"));
+						fs.writeFileSync(
+							paths.state,
+							JSON.stringify({ ...owner, heartbeatAt: Date.now(), transportHealthy: true }),
+						);
+					})();
+					return { unref() {} };
+				},
+			});
+			expect(await controller.ensure()).toBe("owner_spawned");
+			expect(spawns).toBe(1);
+			expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({
+				pid: 97,
+				incarnation: "linux:12352",
+			});
+			expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toMatchObject({ pid: 97, incarnation: "linux:12352" });
+		});
+
+		test("fails closed for a live pre-upgrade unavailable owner with ambiguous provenance", async () => {
+			const agentDir = tempAgentDir();
+			const paths = chatDaemonPaths(agentDir, kind);
+			fs.mkdirSync(paths.dir, { recursive: true });
+			const legacyState = {
+				version: 1,
+				kind,
+				pid: 96,
+				ownerId: "legacy-owner",
+				identity: identity(),
+				incarnation: "unavailable",
+				startedAt: 1,
+				heartbeatAt: 1,
+				transportHealthy: false,
+			};
+			fs.writeFileSync(paths.state, JSON.stringify(legacyState));
+			fs.writeFileSync(paths.lock, JSON.stringify({ pid: 96, incarnation: "unavailable", createdAt: 1 }));
+			let spawns = 0;
+			const controller = new ChatDaemonController(configuredSettings(agentDir), kind, {
+				pidAlive: pid => pid === 96,
+				pidIncarnation: () => undefined,
+				spawn: () => {
+					spawns++;
+					return { unref() {} };
+				},
+			});
+			expect((await controller.status()).health).toBe("stale");
+			await expect(controller.ensure()).rejects.toThrow("unauthorized");
+			expect(spawns).toBe(0);
+			expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toEqual(legacyState);
+			expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toMatchObject({ pid: 96, incarnation: "unavailable" });
+		});
+
 		test("fails closed without signaling a malformed generation", async () => {
 			const agentDir = tempAgentDir();
 			const paths = chatDaemonPaths(agentDir, kind);

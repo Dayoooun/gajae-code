@@ -844,6 +844,8 @@ export function hasSafeDaemonStateShape(state: unknown): state is DaemonState {
 			Number.isSafeInteger(candidate.startedAt) &&
 			Number.isSafeInteger(candidate.heartbeatAt) &&
 			isProcessIncarnation(candidate.incarnation) &&
+			(candidate.launcherPid === undefined ||
+				(Number.isSafeInteger(candidate.launcherPid) && (candidate.launcherPid as number) > 0)) &&
 			Array.isArray(candidate.roots) &&
 			candidate.roots.every(root => typeof root === "string") &&
 			candidate.version === DAEMON_VERSION &&
@@ -1480,7 +1482,14 @@ async function bindProvisionalDaemonPid(input: {
 		)
 			return false;
 		if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))) return false;
-		await writeJsonAtomic(fsImpl, paths.state, { ...state, pid: input.pid, incarnation: input.incarnation });
+		await writeJsonAtomic(fsImpl, paths.state, {
+			...state,
+			// This durable marker distinguishes a launcher reservation from a PID
+			// the launcher authoritatively rebound to its child.
+			launcherPid: state.launcherPid ?? state.pid,
+			pid: input.pid,
+			incarnation: input.incarnation,
+		});
 		return true;
 	} finally {
 		await releaseDaemonTransitionLock({ fs: fsImpl, path: paths.steal, lock: transition });
@@ -1893,11 +1902,16 @@ export async function ensureTelegramDaemonRunningDetailed(
 	);
 	if (spawned.result === "blocked" && spawned.warnings[0]?.includes("provisional")) {
 		const provisional = await readDaemonState(input.settings, deps.fs);
+		// A launcher-reserved PID can be rebound by the child heartbeat. Only a
+		// state marked by bindProvisionalDaemonPid has an authoritative child PID.
+		const hasAuthoritativeChildPid =
+			Number.isSafeInteger(provisional?.launcherPid) && (provisional?.launcherPid as number) > 0;
 		const ready = await waitForTelegramDaemonReady({
 			settings: input.settings,
 			ownerId: provisional?.ownerId,
 			acquisitionId: provisional?.acquisitionId,
-			pid: provisional?.pid,
+			pid: hasAuthoritativeChildPid ? provisional?.pid : undefined,
+			excludedPid: hasAuthoritativeChildPid ? undefined : provisional?.pid,
 			tokenFingerprint: fp,
 			chatId: cfg.chatId,
 			fs: deps.fs,
