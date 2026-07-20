@@ -2,11 +2,13 @@ import { describe, expect, it } from "bun:test";
 import {
 	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewIntentReview,
+	assertDeepInterviewStructuredResponseWithinLimit,
 	createDeepInterviewIntentManifest,
 	DEEP_INTERVIEW_FREETEXT_FIELDS,
 	deepInterviewObservedIntentDigest,
 	deriveRoundKey,
 	isDeepInterviewFreeTextField,
+	MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH,
 	MAX_INITIAL_CONTEXT_LENGTH,
 	MAX_USER_RESPONSE_LENGTH,
 	mergeDeepInterviewEnvelope,
@@ -403,8 +405,30 @@ describe("deep-interview-state: free-text field allowlist + input size limits", 
 		).not.toThrow();
 	});
 
+	it("bounds one serialized structured response using JavaScript Unicode string length", () => {
+		const propertyOverhead = JSON.stringify({ response: "" }).length;
+		const exact = { response: "한".repeat(MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH - propertyOverhead) };
+		const oversized = { response: "한".repeat(MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH - propertyOverhead + 1) };
+
+		expect(JSON.stringify(exact)).toHaveLength(MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH);
+		expect(() => assertDeepInterviewStructuredResponseWithinLimit(exact)).not.toThrow();
+		expect(JSON.stringify(oversized)).toHaveLength(MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH + 1);
+		expect(() => assertDeepInterviewStructuredResponseWithinLimit(oversized)).toThrow(
+			"structured deep-interview response exceeds max length 100000",
+		);
+	});
+
+	it("rejects non-serializable structured responses", () => {
+		const cyclic: { self?: unknown } = {};
+		cyclic.self = cyclic;
+		expect(() => assertDeepInterviewStructuredResponseWithinLimit(cyclic)).toThrow(
+			"invalid structured deep-interview response",
+		);
+	});
+
 	it("pins the documented cap values", () => {
 		expect(MAX_INITIAL_CONTEXT_LENGTH).toBe(50_000);
 		expect(MAX_USER_RESPONSE_LENGTH).toBe(10_000);
+		expect(MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH).toBe(100_000);
 	});
 });

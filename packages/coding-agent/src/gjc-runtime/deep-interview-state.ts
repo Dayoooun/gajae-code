@@ -426,9 +426,40 @@ export const DEEP_INTERVIEW_FREETEXT_FIELDS: ReadonlySet<string> = new Set([
 /** DoS-prevention character-count caps, matching ask-schema string-length semantics. */
 export const MAX_INITIAL_CONTEXT_LENGTH = 50_000;
 export const MAX_USER_RESPONSE_LENGTH = 10_000;
+/** Maximum serialized JavaScript-string length for one LLM-produced structured response. */
+export const MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH = 100_000;
 
 export function isDeepInterviewFreeTextField(name: string): boolean {
 	return DEEP_INTERVIEW_FREETEXT_FIELDS.has(name);
+}
+
+/**
+ * Assert that one structured deep-interview response is JSON-serializable and
+ * bounded by JavaScript string length. This deliberately does not measure or
+ * cap accumulated persisted interview state.
+ */
+export function assertDeepInterviewStructuredResponseWithinLimit(value: unknown): void {
+	let serialized: string | undefined;
+	try {
+		serialized = JSON.stringify(value, (_key, nestedValue: unknown) => {
+			if (
+				typeof nestedValue === "bigint" ||
+				typeof nestedValue === "function" ||
+				typeof nestedValue === "symbol" ||
+				typeof nestedValue === "undefined" ||
+				(typeof nestedValue === "number" && !Number.isFinite(nestedValue))
+			)
+				throw new Error("invalid structured deep-interview response");
+			return nestedValue;
+		});
+	} catch {
+		throw new Error("invalid structured deep-interview response");
+	}
+	if (typeof serialized !== "string") throw new Error("invalid structured deep-interview response");
+	if (serialized.length > MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH)
+		throw new Error(
+			`structured deep-interview response exceeds max length ${MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH}`,
+		);
 }
 
 /**

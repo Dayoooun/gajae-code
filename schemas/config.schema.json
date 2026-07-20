@@ -71,6 +71,16 @@
 							},
 							"additionalProperties": false
 						},
+						"streaming": {
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"type": "boolean",
+									"default": true
+								}
+							},
+							"additionalProperties": false
+						},
 						"rich": {
 							"type": "object",
 							"properties": {
@@ -89,6 +99,17 @@
 									"type": "boolean",
 									"description": "Include rich draft updates in Telegram notifications.",
 									"default": false
+								}
+							},
+							"additionalProperties": false
+						},
+						"toolActivity": {
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"type": "boolean",
+									"description": "Send Telegram updates for tool starts and completions.",
+									"default": true
 								}
 							},
 							"additionalProperties": false
@@ -460,13 +481,13 @@
 				},
 				"readArtifactSpillThreshold": {
 					"type": "number",
-					"description": "Advanced opt-in only: combined-size cap for `read` output across all requested ranges. Above this the full output is saved as an artifact and a bounded head+tail snippet is kept inline. Live layofflabs/gpt-5.5 medium evidence on 2026-07-07 found no token savings and a lower cache-hit rate at 50 KB, so normal coding sessions should leave this Off unless intentionally measuring large-read behavior.",
-					"default": 0
+					"description": "Explicit large reads above this combined size are saved as an artifact with a bounded head-and-tail snippet inline. Bare reads, directories, and converted-document receipts remain inline.",
+					"default": 256
 				},
 				"fileMentionInlineBytes": {
 					"type": "number",
-					"description": "Inline byte cap for auto-read `@path` file mentions, deliberately below the read-tool cap so an incidental mention injects a smaller snippet than an explicit read. The full file is still available via the read tool.",
-					"default": 20
+					"description": "Inline byte cap for auto-read `@path` file mentions, aligned with the 10 KiB bare-read receipt so incidental mentions stay within the same bounded context budget. The full file is still available via the read tool.",
+					"default": 10
 				},
 				"artifactTailBytes": {
 					"type": "number",
@@ -1492,6 +1513,21 @@
 					"type": "number",
 					"description": "Default number of lines returned when agent calls read without a limit",
 					"default": 300
+				},
+				"receiptBudgetLines": {
+					"type": "number",
+					"description": "Maximum lines included in a bare read receipt before a selector footer is shown",
+					"default": 50
+				},
+				"receiptBudgetBytes": {
+					"type": "number",
+					"description": "Maximum UTF-8 body size for a bare read receipt before a selector footer is shown",
+					"default": 10
+				},
+				"summaryMaxBytes": {
+					"type": "number",
+					"description": "Maximum UTF-8 size for a structural read summary before additional units are elided",
+					"default": 20
 				},
 				"summarize": {
 					"type": "object",

@@ -1,6 +1,64 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+- Added fail-closed managed tmux owner SIGABRT recovery: exact-child supervisor receipts and pre-CLI admission now bind replacement ownership, strict durable Ultragoal/transcript evidence reconciles terminal child yields over stale nonterminal runtime state, recovery hydration remains write-free until an ownership fence, and hostile identity, corruption, concurrency, and path boundaries preserve dirty product files (#2681).
+- Added evidence-preserving recovery for legacy multi-writer SDK session-index corruption: `gjc gc` now diagnoses corrupt prefixes, `--repair-session-index` quarantines the original snapshot/log under the session-index lock before atomically restoring only the checksum-valid monotonic prefix, and append failures point operators to the explicit repair path (#2654).
+- Preserved access to legal SQLite table names beginning with `sqlite` but not reserved `sqlite_`.
+- Malformed selectors on internal read URLs now fail explicitly instead of silently falling back to an unbounded resource read.
+- Newly registered earlier resource-GC policies advance the pending sweep without postponing an already earlier sweep.
+- Provider onboarding wizard completion is now deterministic under CI load: duplicate in-flight confirmation is suppressed, success tests await the real refresh/notification/status boundary instead of fixed sleeps, and the newly configured model is verified through the subsequent model selector.
+- OpenAI-compatible web search now turns malformed successful response bodies into bounded provider errors while preserving normal provider fallback (#2593).
+- Windows session storage now keeps a symlink-resolved drive-letter path for Bun filesystem I/O instead of a native Volume GUID identity path, preventing `ENOENT` failures during resident-cache writes that could drop the final assistant message at turn completion.
+- On platforms with verified retained publication identity support, detached SDK broker processes now stop after durable loss or replacement of their owned publication while preserving warm reuse and protocol/state formats (#2583). Bounded-practical limitation: requests admitted before the first definitive loss observation—or after authoritative same-object recovery and before a later loss observation—may still perform pathname-based index, ledger, lifecycle, cleanup, or child effects. A detached session-host child spawned by an admitted request may outlive broker exit and may continue pathname effects for the session lifetime. Broker self-reap does not cancel or signal that child and does not provide absolute hostile replacement isolation.
+
+- Activated discoverable built-in tools now persist with independent MCP and discovered-built-in authority, preserving explicit empty selections and restoring only eligible built-ins across resumed lifecycle transitions.
+- Session files now use v5 authority records. Do not roll back to a v4 writer after v5 session data has been created: v4 writers cannot preserve independent MCP and discovered-built-in selections.
+
+## [0.11.4] - 2026-07-20
+### Added
+- Bracketed pastes containing complete lists of saved static-image paths can now attach up to 16 images in source order after explicit confirmation. Paste transactions are cancellation-safe, disabled in command modes, enforce source, encoded-output, dimension, and decoded-memory budgets before commit, reject animated, remote, linked, or path-swapped sources, and restore the literal paste on cancellation or failure.
+- Rich tool-call rendering in the transcript viewer: both the session-observer and main-session transcript viewers now share one formatter so tool calls render identically (args summary + intent, then a result block with ✓ done / ✗ error / ⏳ pending states). Fixes a latent bug where a tool call with no result rendered as a false "✓ done"; expanded results cap at 100 source lines with raw/copy exposing the full text (#2656).
+
+### Changed
+- Updated the Kimi Coding Plan Eco, Medium, and Pro presets to Kimi K3 with its supported `low`, `high`, and `max` reasoning efforts.
+
+### Removed
+- Removed the legacy worktree cleanup implementation behind the `@gajae-code/coding-agent/cli/worktree-cli` and `@gajae-code/coding-agent/commands/worktree` package subpaths (base and `.js` forms). The `gjc worktree`/`wt` CLI command has been unregistered since the workflow-surface narrowing; the modules behind it (including the recursive-deletion `clear` path) were only reachable as package imports. The subpaths now resolve to throwing tombstone modules whose error explains the deliberate removal and the supported replacement: inspect leftover managed worktrees under `~/.gjc/wt` manually and use `git worktree remove` / `git worktree prune`.
+
+### Fixed
+- Telegram `/btw` rich-delivery E2E coverage now awaits native and daemon teardown ownership, records exact per-iteration lifecycle phases, and uses an internal exact-tuple terminal-delivery receipt to keep fallback stress deterministic under shard load without extending the original test timeout.
+- Malformed spurious Round-0 review metadata no longer blocks an otherwise valid locked-intent question/gate, while durable intent safety remains fail-closed (#2643).
+- Restricted role-agent `gjc state` command authorization now fails closed on argv-classification disagreement: one shared manifest-aware native state argv grammar (action names, flag arity, positionals, effective modifiers, selector candidates) is consumed by both runtime dispatch and the policy boundary, which rejects ambiguous selectors, malformed flags, destructive actions, and file-backed input (#2665).
+- Browser tab workers now bootstrap through their actual isolated entry without accidentally loading native bindings through broad imports, and startup fails closed instead of falling back to unguarded inline execution; compiled/package smoke now exercises the tab worker, with a PR-head darwin-arm64 CI gate (#2598).
+- Added evidence-preserving recovery for legacy multi-writer SDK session-index corruption: `gjc gc` now diagnoses corrupt prefixes, `--repair-session-index` quarantines the original snapshot/log under the session-index lock before atomically restoring only the checksum-valid monotonic prefix, and append failures point operators to the explicit repair path (#2654).
+- Malformed selectors on internal read URLs now fail explicitly instead of silently falling back to an unbounded resource read.
+- Newly registered earlier resource-GC policies advance the pending sweep without postponing an already earlier sweep.
+- Provider onboarding wizard completion is now deterministic under CI load: duplicate in-flight confirmation is suppressed, success tests await the real refresh/notification/status boundary instead of fixed sleeps, and the newly configured model is verified through the subsequent model selector.
+- OpenAI-compatible web search now turns malformed successful response bodies into bounded provider errors while preserving normal provider fallback (#2593).
+- Windows session storage now keeps a symlink-resolved drive-letter path for Bun filesystem I/O instead of a native Volume GUID identity path, preventing `ENOENT` failures during resident-cache writes that could drop the final assistant message at turn completion.
+- On platforms with verified retained publication identity support, detached SDK broker processes now stop after durable loss or replacement of their owned publication while preserving warm reuse and protocol/state formats (#2583). Bounded-practical limitation: requests admitted before the first definitive loss observation—or after authoritative same-object recovery and before a later loss observation—may still perform pathname-based index, ledger, lifecycle, cleanup, or child effects. A detached session-host child spawned by an admitted request may outlive broker exit and may continue pathname effects for the session lifetime. Broker self-reap does not cancel or signal that child and does not provide absolute hostile replacement isolation.
+### Changed
+- Telegram live-message streaming now defaults on for configured Telegram notifications through one durable global preference, supports live in-session preference refresh without weakening redaction, and keeps Discord and Slack finalized-only; process environment overrides remain available.
+
+## [0.11.3] - 2026-07-19
+### Added
+- Bracketed pastes containing complete lists of saved static-image paths can now attach up to 16 images in source order after explicit confirmation. Paste transactions are cancellation-safe, disabled in command modes, enforce source, encoded-output, dimension, and decoded-memory budgets before commit, reject animated, remote, linked, or path-swapped sources, and restore the literal paste on cancellation or failure.
+
+### Changed
+- Updated the Kimi Coding Plan Eco, Medium, and Pro presets to Kimi K3 with its supported `low`, `high`, and `max` reasoning efforts.
+- The `read` tool is now receipt-by-default: bare and unparseable reads return a bounded receipt (≤50 lines / 10 KiB) with a re-read-with-selector footer only when truncated, `:raw` stays pure verbatim up to a max(2 MiB, spill threshold) ceiling, structural summaries cap unit-granularly at 20 KiB while preserving elision and source-recovery footers, and directories are byte/line capped and never spill. Only an explicit full-content selector (`:raw` or an explicit range) with real content is spill-eligible. Subagent previews now enforce a real byte/code-point cap via per-shape render budgets plus a shape-aware artifact-eligibility tag enforced centrally in output-meta.
+- Telegram tool-activity updates can now be disabled persistently with `/toolactivity off` (and restored with `/toolactivity on`) or from the Notifications preferences UI, without disabling final answers, asks, or other notification delivery.
+
+### Removed
+- Removed the legacy worktree cleanup implementation behind the `@gajae-code/coding-agent/cli/worktree-cli` and `@gajae-code/coding-agent/commands/worktree` package subpaths (base and `.js` forms). The `gjc worktree`/`wt` CLI command has been unregistered since the workflow-surface narrowing; the modules behind it (including the recursive-deletion `clear` path) were only reachable as package imports. The subpaths now resolve to throwing tombstone modules whose error explains the deliberate removal and the supported replacement: inspect leftover managed worktrees under `~/.gjc/wt` manually and use `git worktree remove` / `git worktree prune`.
+
+### Fixed
+- Telegram `/btw` rich-delivery E2E coverage now awaits native and daemon teardown ownership, records exact per-iteration lifecycle phases, and uses an internal exact-tuple terminal-delivery receipt to keep fallback stress deterministic under shard load without extending the original test timeout.
+- Workflow-state handoff no longer self-locks the active-state cache, so a same-turn skill handoff (e.g. ultragoal → ralplan) completes instead of stalling behind a lock the handoff itself still holds (#2638).
+- Malformed spurious Round-0 review metadata no longer blocks an otherwise valid locked-intent question/gate, while durable intent safety remains fail-closed (#2643).
+- SDK host shutdown now retries a failed broker unregister instead of short-circuiting with a stale broker-index entry, while retained startup-cleanup owner-release failures remain isolated from the red extension-error path (#2625).
+- Non-TTY launches now fail fast when stdin is empty and automatically use print mode for positional prompts and `@file` inputs, preventing orphaned interactive TUI processes (#2507).
 
 ## [0.11.2] - 2026-07-19
 
@@ -11,9 +69,9 @@
 - The Python eval runtime now honors the documented `GJC_*` environment variables instead of silently reading only legacy `PI_*` names. `GJC_PY` (tokens `0`/`bash`, `1`/`py`, `js`, `mix`/`both`) overrides the eval backend allowance with precedence over legacy `PI_PY`/`PI_JS`; `GJC_PYTHON_SKIP_CHECK`, `GJC_PYTHON_IPC_TRACE`, and `GJC_PYTHON_INTEGRATION` are read first with `PI_*` fallback (OR semantics, so either truthy name wins). Operators following `docs/environment-variables.md` and `docs/python-repl.md` who set `GJC_PY=py` previously saw no effect — a silent docs/runtime contract break. Legacy `PI_*` names remain supported for backward compatibility.
 
 ### Fixed
-- SDK host shutdown now retries a failed broker unregister instead of short-circuiting with a stale broker-index entry, while retained startup-cleanup owner-release failures remain isolated from the red extension-error path (#2625).
 - Team worker launches now receive the validated owning `GJC_SESSION_ID` for sanctioned session-scoped writes while preserving absent identity, fail-closed resolution, and separate spawn provenance (#2597).
 - Managed and explicit session directories now canonicalize benign ancestor symlinks (e.g. macOS `/var -> /private/var`, a symlinked `$HOME` or project directory) to a symlink-free trusted root before the strict owner-only and reparse guards run, so session creation, moves, resume, and writes no longer fail with `reparse_point` / `Unsafe reparse storage path` under a symlinked temp root or home. The native primitive stays strict and continues to reject symlinked components at or below the trusted root.
+- Browser tab workers now bootstrap through their actual isolated entry without accidentally loading native bindings through broad imports, and startup fails closed instead of falling back to unguarded inline execution; compiled/package smoke now exercises the tab worker, with a PR-head darwin-arm64 CI gate (#2598).
 - Skill invocation failures now list available skill names so agents can recover from typos without a blind retry loop.
 - Workflow state receipts now use canonical session-layout paths, require resolved session identity, and report a `state_path` that matches native write/clear output (#2393).
 - Coordinator MCP operational calls now canonically bootstrap or reuse the agent-global SDK broker when discovery is absent or stale, while coordinator/hermes JSON checks report catalog and broker-discovery readiness separately without mutating broker state (#2552).

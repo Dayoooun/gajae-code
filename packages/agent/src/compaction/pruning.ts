@@ -9,8 +9,9 @@
  */
 
 import type { ToolCall, ToolResultMessage } from "@gajae-code/ai";
+import { sanitizeText } from "@gajae-code/utils";
 import type { AgentMessage } from "../types";
-import { estimateEntryTokens } from "./compaction";
+import { estimateEntryTokens, estimateTextTokensHeuristic } from "./compaction";
 import type { SessionEntry, SessionMessageEntry } from "./entries";
 
 export interface PruneConfig {
@@ -48,6 +49,7 @@ export interface PruneResult {
 }
 
 const DIGEST_NOTICE_TOKEN_CAP_MULTIPLIER = 1.25;
+const ERROR_DIGEST_NOTICE_MIN_CHARS = 240;
 
 function createGenericPrunedNotice(tokens: number): string {
 	return `[Output truncated - ${tokens} tokens]`;
@@ -66,6 +68,17 @@ function firstErrorLine(text: string): string | undefined {
 		?.trim();
 }
 
+function firstNonEmptyLine(text: string): string | undefined {
+	return text
+		.split(/\r?\n/)
+		.find(line => line.trim().length > 0)
+		?.trim();
+}
+
+function lastNonEmptyLine(text: string): string | undefined {
+	return text.trim().split(/\r?\n/).filter(Boolean).at(-1)?.trim();
+}
+
 function truncateField(value: string, maxLength: number): string {
 	if (value.length <= maxLength) return value;
 	if (maxLength <= 1) return "…";
@@ -74,7 +87,7 @@ function truncateField(value: string, maxLength: number): string {
 
 function resultDigest(message: ToolResultMessage): string | undefined {
 	const toolName = message.toolName.toLowerCase();
-	const text = firstTextContent(message);
+	const text = sanitizeText(firstTextContent(message));
 	if (toolName === "bash") {
 		const details = message as { details?: { exitCode?: unknown } };
 		const exitCode =
@@ -99,7 +112,12 @@ function resultDigest(message: ToolResultMessage): string | undefined {
 				.join("; ") || "search digest unavailable"
 		);
 	}
-	return undefined;
+	if (message.isError !== true) return undefined;
+	if (text.trim().length === 0) return "error=tool result failed without text";
+	const error = firstErrorLine(text);
+	if (error) return `error=${error}`;
+	const summary = firstNonEmptyLine(text) ?? lastNonEmptyLine(text);
+	return summary ? `summary=${summary}` : undefined;
 }
 
 function createPrunedNotice(tokens: number, message?: ToolResultMessage): string {
@@ -110,7 +128,9 @@ function createPrunedNotice(tokens: number, message?: ToolResultMessage): string
 	const maxTokens = Math.max(genericTokens, Math.floor(genericTokens * DIGEST_NOTICE_TOKEN_CAP_MULTIPLIER));
 	const prefix = `[Output truncated - ${tokens} tokens; `;
 	const suffix = "]";
-	const maxChars = Math.max(0, maxTokens * 4 - prefix.length - suffix.length);
+	const digestChars = maxTokens * 4 - prefix.length - suffix.length;
+	const maxChars =
+		message?.isError === true ? Math.max(ERROR_DIGEST_NOTICE_MIN_CHARS, digestChars) : Math.max(0, digestChars);
 	return `${prefix}${truncateField(digest, maxChars)}${suffix}`;
 }
 
@@ -122,8 +142,7 @@ function getToolResultMessage(entry: SessionEntry): ToolResultMessage | undefine
 }
 
 function estimatePrunedSavings(tokens: number, notice: string): number {
-	const noticeTokens = Math.ceil(notice.length / 4);
-	return Math.max(0, tokens - noticeTokens);
+	return tokens - estimateTextTokensHeuristic(notice);
 }
 
 export interface AssistantArgumentPruneResult {
@@ -670,11 +689,17 @@ function collectToolOutputPruneCandidates(
 		}
 
 		const notice = createPrunedNotice(tokens, message);
+		const savings = estimatePrunedSavings(tokens, notice);
+		const errorNoticeGrows = message.isError === true && notice.length > firstTextContent(message).length;
+		if (savings <= 0 || errorNoticeGrows) {
+			accumulatedTokens += tokens;
+			continue;
+		}
 		candidates.push({
 			entry: entry as SessionMessageEntry,
 			tokens,
 			notice,
-			savings: estimatePrunedSavings(tokens, notice),
+			savings,
 		});
 		accumulatedTokens += tokens;
 	}

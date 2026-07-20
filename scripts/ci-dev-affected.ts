@@ -7,10 +7,37 @@ import * as fs from "node:fs/promises";
 const repoRoot = path.join(import.meta.dir, "..");
 const ZERO_SHA = /^0+$/;
 const PACKAGE_SCOPES = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
-// The coding-agent package has hundreds of test files; keep dev affected
-// validation below the shard timeout by splitting package-wide/full-workspace
-// TypeScript suites across the matrix instead of one root-test runner.
-const CODING_AGENT_TEST_SHARDS = 8;
+// The coding-agent package has hundreds of test files; keep affected validation
+// below the shard timeout by splitting package-wide/full-workspace TypeScript
+// suites across the matrix. Dev keeps the default; Main CI full mode overrides
+// via CI_CODING_AGENT_TEST_SHARDS to bound the long tail.
+const DEFAULT_CODING_AGENT_TEST_SHARDS = 8;
+
+function codingAgentTestShards(): number {
+	return positiveIntFromEnv("CI_CODING_AGENT_TEST_SHARDS", DEFAULT_CODING_AGENT_TEST_SHARDS);
+}
+
+// Number of nextest partitions the rust-test suite is split into. Dev runs one
+// unpartitioned rust-test task; Main CI full mode raises this to bound the
+// rust-test long tail.
+const DEFAULT_RUST_TEST_PARTITIONS = 1;
+
+function rustTestPartitions(): number {
+	return positiveIntFromEnv("CI_RUST_TEST_PARTITIONS", DEFAULT_RUST_TEST_PARTITIONS);
+}
+
+function positiveIntFromEnv(name: string, fallback: number): number {
+	const raw = Bun.env[name]?.trim();
+	if (!raw) return fallback;
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isInteger(parsed) && parsed >= 1 ? parsed : fallback;
+}
+
+// True when Main CI requests the deterministic full plan via `CI_FORCE_FULL`.
+function isForceFullMode(): boolean {
+	const raw = Bun.env.CI_FORCE_FULL?.trim();
+	return raw === "1" || raw === "true";
+}
 // SDK host lifecycle and coordinator prompt-control changes need the stable first
 // package shard in addition to targeted coverage. Keep this list limited to the
 // stateful surfaces whose regressions depend on broader package ordering.
@@ -199,7 +226,44 @@ export function resolvePlanMode(): PlanMode {
 // Resolve the plan for the current changed paths and CI mode. PR mode builds the
 // targeted plan from a filesystem index of test files (for source→test mapping);
 // push mode reuses the broad affected planner unchanged.
+// Main CI full mode: emit the complete task union regardless of changed paths so
+// every check runs on `main`, and short-circuit the changed-path / canonical-plan
+// machinery entirely. It is deterministic, so the planner and every shard resolve
+// the identical plan without a shared plan artifact.
+export function planFullTasks(packages: readonly WorkspacePackage[]): Task[] {
+	const tasks = new Map<string, Task>();
+	addNativeBuild(tasks);
+	addWorkspaceTestTasks(tasks, packages);
+	add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
+	addRustTestTasks(tasks);
+	add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
+	add(tasks, "runtime-check", "Runtime checks (needs native addon)", ["bun", "run", "check:runtime"], resolvePackageCwd("packages/coding-agent"));
+	// root-check (ci:check:full) is intentionally omitted: Main CI runs it in the
+	// dedicated native-free `check` job, so emitting it here would double-run it.
+	return Array.from(tasks.values());
+}
+
+// Emit the rust-test task, split into nextest partitions when configured. Each
+// partition shards the test set (not a repeated full run) via `cargo nextest run
+// --partition count:i/N`, wired through run-rs-task.ts.
+function addRustTestTasks(tasks: Map<string, Task>): void {
+	const partitions = rustTestPartitions();
+	if (partitions <= 1) {
+		add(tasks, "rust-test", "Rust tests", ["bun", "run", "test:rs"]);
+		return;
+	}
+	for (let index = 1; index <= partitions; index++) {
+		add(
+			tasks,
+			`rust-test:partition-${index}-of-${partitions}`,
+			`Rust tests partition ${index}/${partitions}`,
+			["bun", "scripts/run-rs-task.ts", "test:rs", `count:${index}/${partitions}`],
+		);
+	}
+}
+
 async function resolvePlannedTasks(paths: readonly string[]): Promise<Task[]> {
+	if (isForceFullMode()) return planFullTasks(await getWorkspacePackages());
 	const fromArtifact = await loadCanonicalPlan();
 	if (fromArtifact) return fromArtifact;
 	const normalizedPaths = normalizeChangedPaths(paths);
@@ -269,6 +333,7 @@ function taskNeedsNative(key: string): boolean {
 		key === "root-check" ||
 		key === "check:@gajae-code/coding-agent" ||
 		key === "cli-smoke" ||
+		key === "runtime-check" ||
 		key === "wrapper-version" ||
 		key === "deep-interview-definitions" ||
 		key === "deep-interview-runtime" ||
@@ -277,9 +342,15 @@ function taskNeedsNative(key: string): boolean {
 	);
 }
 
+// rust-test may be split into nextest partitions (`rust-test:partition-i-of-N`)
+// in Main CI full mode; treat every partition like the single rust-test task.
+function isRustTestKey(key: string): boolean {
+	return key === "rust-test" || key.startsWith("rust-test:partition-");
+}
+
 // Tasks that need the Rust toolchain (and nextest) provisioned on their shard.
 function taskNeedsRust(key: string): boolean {
-	return key === "rust-check" || key === "rust-test" || key === "ci-selftest" || key === "ci-dry-run" || key === "affected-selftest" || key === "affected-dry-run";
+	return key === "rust-check" || isRustTestKey(key) || key === "ci-selftest" || key === "ci-dry-run" || key === "affected-selftest" || key === "affected-dry-run";
 }
 
 // Build the machine-readable descriptor list for the current changed-path plan.
@@ -293,18 +364,85 @@ export function describeTasks(tasks: readonly Task[]): TaskMatrixEntry[] {
 		cwd: task.cwd ? path.relative(repoRoot, task.cwd) || "." : undefined,
 		native: task.capabilities?.nativeConsumer ?? taskNeedsNative(task.key),
 		rust: task.capabilities?.rust ?? taskNeedsRust(task.key),
-		nextest: task.capabilities?.nextest ?? task.key === "rust-test",
+		nextest: task.capabilities?.nextest ?? isRustTestKey(task.key),
 		nativeBuild: task.capabilities?.nativeProducer ?? isNativeBuildKey(task.key),
 	}));
 }
 
 // `--matrix-json` prints the planned tasks as a JSON array on stdout (consumed
 // by tests and for debugging). Under GitHub Actions it also appends the dev-ci
-// planner outputs: `matrix` (the shard include list, excluding native-build
-// tasks), `has_tasks`, `has_native`, and the resolved `changed_paths` so every
-// downstream job reuses the planner's exact diff via CI_DEV_CHANGED_PATHS
-// instead of re-resolving the base ref on each runner.
+// planner outputs: `matrix`, `has_tasks`, `has_native`, and the canonical Darwin
+// smoke flag. Downstream jobs reuse the planner's exact diff via
+// CI_DEV_CHANGED_PATHS instead of re-resolving the base ref on each runner.
+// Paths that affect the compiled tab-worker smoke graph. Keep this authoritative
+// predicate in the planner: dev-ci consumes its emitted flag rather than copying
+// path checks into individual jobs.
+export function isDarwinArm64TabWorkerSmokePath(changedPath: string): boolean {
+	// The compiled worker recursively loads browser, eval, scraper, and utility
+	// helpers. Directory ownership is deliberately conservative so a newly-added
+	// helper in those graph roots cannot silently bypass the Darwin smoke.
+	return changedPath.startsWith("packages/coding-agent/src/tools/browser/") ||
+		changedPath.startsWith("packages/coding-agent/src/tools/puppeteer/") ||
+		changedPath.startsWith("packages/coding-agent/src/eval/js/") ||
+		changedPath.startsWith("packages/coding-agent/src/web/scrapers/") ||
+		changedPath.startsWith("packages/coding-agent/src/utils/") ||
+		changedPath.startsWith("packages/utils/src/") ||
+		changedPath === "packages/coding-agent/src/tools/tool-errors.ts" ||
+		changedPath === "packages/coding-agent/src/tools/path-utils.ts" ||
+		changedPath === "packages/coding-agent/src/cli.ts" ||
+		changedPath === "packages/coding-agent/scripts/build-binary.ts" ||
+		changedPath === "packages/coding-agent/scripts/compile-args.ts" ||
+		changedPath.startsWith("packages/natives/") ||
+		changedPath === "scripts/ci-build-native.ts";
+}
+
+export function needsDarwinArm64TabWorkerSmoke(paths: readonly string[]): boolean {
+	return paths.some(isDarwinArm64TabWorkerSmokePath);
+}
+
+// Paths whose Windows drive-letter vs Volume-GUID canonicalization and Bun
+// `node:fs` resident-cache write semantics the fix governs. On Ubuntu the
+// windows-canonical-path regression suite is skipped by `describe.skipIf`, so a
+// Linux shard cannot verify the ENOENT fix; dev-ci consumes this emitted flag to
+// run and require the windows-latest job whenever any of these change.
+export function isWindowsSessionPathRegressionPath(changedPath: string): boolean {
+	return changedPath === "packages/coding-agent/src/session/internal/managed-session-scope.ts" ||
+		changedPath === "packages/coding-agent/src/session/blob-store.ts" ||
+		changedPath === "packages/coding-agent/src/session/session-manager.ts" ||
+		changedPath === "packages/coding-agent/test/session-manager/windows-canonical-path.test.ts";
+}
+
+export function needsWindowsSessionPathRegression(paths: readonly string[]): boolean {
+	return paths.some(isWindowsSessionPathRegressionPath);
+}
+
+// Main CI full mode: emit a lean matrix from the deterministic full plan. It
+// deliberately skips the dev source-sha/checkout asserts, the canonical plan
+// artifact, plan digest, and the Darwin smoke flag — Main CI re-derives the same
+// full plan on every shard and gates on a simple aggregate job, not evidence
+// receipts.
+async function emitFullMatrix(): Promise<void> {
+	const tasks = planFullTasks(await getWorkspacePackages());
+	const entries = describeTasks(tasks);
+	console.log(JSON.stringify(entries));
+
+	const githubOutput = process.env.GITHUB_OUTPUT;
+	if (!githubOutput) return;
+	const shards = entries
+		.filter(entry => !entry.nativeBuild)
+		.map(entry => ({ key: entry.key, identity: entry.identity, description: entry.description, native: entry.native, rust: entry.rust, nextest: entry.nextest }));
+	const hasNative = entries.some(entry => entry.nativeBuild);
+	const lines = [
+		`matrix=${JSON.stringify({ include: shards })}`,
+		`has_tasks=${shards.length > 0}`,
+		`has_native=${hasNative}`,
+		"",
+	];
+	await fs.appendFile(githubOutput, lines.join("\n"));
+}
+
 async function emitMatrix(): Promise<void> {
+	if (isForceFullMode()) return emitFullMatrix();
 	const sourceSha = await resolveSourceSha();
 	await requireCommitObject(sourceSha, "source head");
 	await assertCheckedOutSourceHead(sourceSha);
@@ -323,10 +461,14 @@ async function emitMatrix(): Promise<void> {
 		.filter(entry => !entry.nativeBuild)
 		.map(entry => ({ key: entry.key, identity: entry.identity, description: entry.description, native: entry.native, rust: entry.rust, nextest: entry.nextest }));
 	const hasNative = entries.some(entry => entry.nativeBuild);
+	const hasDarwinArm64TabWorkerSmoke = needsDarwinArm64TabWorkerSmoke(paths);
+	const hasWindowsSessionPath = needsWindowsSessionPathRegression(paths);
 	const lines = [
 		`matrix=${JSON.stringify({ include: shards })}`,
 		`has_tasks=${shards.length > 0}`,
 		`has_native=${hasNative}`,
+		`has_darwin_arm64_tab_worker_smoke=${hasDarwinArm64TabWorkerSmoke}`,
+		`has_windows_session_path=${hasWindowsSessionPath}`,
 		`plan_digest=${digest}`,
 		`plan_source_sha=${sourceSha}`,
 		`plan_mode=${mode}`,
@@ -398,6 +540,7 @@ function printPlan(paths: readonly string[], plannedTasks: readonly Task[]): voi
 }
 
 async function getChangedPaths(): Promise<string[]> {
+	if (isForceFullMode()) return [];
 	const explicitPaths = Bun.env.CI_DEV_CHANGED_PATHS?.trim();
 	if (explicitPaths) {
 		return explicitPaths
@@ -575,6 +718,9 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 			}
 		}
 	}
+	if (needsDarwinArm64TabWorkerSmoke(paths)) {
+		add(tasks, "install-methods", "Install method smoke tests", ["bun", "run", "ci:test:install-methods"]);
+	}
 
 	if (toolingScriptChanged && !fullWorkspace && !ciOnly && !workflowHarnessOnly) {
 		add(tasks, "root-check", "Root TypeScript/tooling check", ["bun", "run", "ci:check:full"]);
@@ -716,6 +862,9 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		}
 	}
 
+	if (needsDarwinArm64TabWorkerSmoke(relevant)) {
+		add(tasks, "install-methods", "Install method smoke tests", ["bun", "run", "ci:test:install-methods"]);
+	}
 	if (needCiSelftest) {
 		add(tasks, "ci-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts"]);
 		add(tasks, "ci-dry-run", "Affected CI selector dry-run", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
@@ -750,17 +899,18 @@ function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: Workspa
 		return;
 	}
 
-	for (let shard = 1; shard <= CODING_AGENT_TEST_SHARDS; shard++) {
-		addCodingAgentTestShard(tasks, shard);
+	const total = codingAgentTestShards();
+	for (let shard = 1; shard <= total; shard++) {
+		addCodingAgentTestShard(tasks, shard, total);
 	}
 }
 
-function addCodingAgentTestShard(tasks: Map<string, Task>, shard: number): void {
+function addCodingAgentTestShard(tasks: Map<string, Task>, shard: number, total: number = codingAgentTestShards()): void {
 	add(
 		tasks,
-		`test:@gajae-code/coding-agent:shard-${shard}-of-${CODING_AGENT_TEST_SHARDS}`,
-		`Test @gajae-code/coding-agent shard ${shard}/${CODING_AGENT_TEST_SHARDS}`,
-		["bun", "test", `--shard=${shard}/${CODING_AGENT_TEST_SHARDS}`],
+		`test:@gajae-code/coding-agent:shard-${shard}-of-${total}`,
+		`Test @gajae-code/coding-agent shard ${shard}/${total}`,
+		["bun", "test", `--shard=${shard}/${total}`],
 		resolvePackageCwd("packages/coding-agent"),
 	);
 }
@@ -1264,7 +1414,7 @@ function serializeTasks(tasks: readonly Task[]): Task[] {
 			cwd,
 			capabilities: task.capabilities ?? {
 				rust: taskNeedsRust(task.key),
-				nextest: task.key === "rust-test",
+				nextest: isRustTestKey(task.key),
 				nativeConsumer: taskNeedsNative(task.key),
 				nativeProducer: isNativeBuildKey(task.key),
 			},
@@ -1286,6 +1436,8 @@ export interface AffectedAggregateResults {
 	windowsDoctorRequired: string;
 	hasNative: string;
 	hasTasks: string;
+	darwinArm64TabWorkerSmoke: string;
+	darwinArm64TabWorkerSmokeRequired: string;
 }
 
 export function validateAffectedAggregate(results: AffectedAggregateResults): void {
@@ -1296,6 +1448,8 @@ export function validateAffectedAggregate(results: AffectedAggregateResults): vo
 	if (results.shards !== (results.hasTasks === "true" ? "success" : "skipped")) throw new Error(results.hasTasks === "true" ? "required affected shards did not succeed" : "unplanned affected shards were not skipped");
 	if (results.windowsDoctorRequired !== "true" && results.windowsDoctorRequired !== "false") throw new Error(`planner emitted invalid windows_doctor_required=${results.windowsDoctorRequired}`);
 	if (results.windowsDoctor !== (results.windowsDoctorRequired === "true" ? "success" : "skipped")) throw new Error(results.windowsDoctorRequired === "true" ? "required Windows dev:doctor did not succeed" : "unplanned Windows dev:doctor was not skipped");
+	if (results.darwinArm64TabWorkerSmokeRequired !== "true" && results.darwinArm64TabWorkerSmokeRequired !== "false") throw new Error(`planner emitted invalid darwin_arm64_tab_worker_smoke_required=${results.darwinArm64TabWorkerSmokeRequired}`);
+	if (results.darwinArm64TabWorkerSmoke !== (results.darwinArm64TabWorkerSmokeRequired === "true" ? "success" : "skipped")) throw new Error(results.darwinArm64TabWorkerSmokeRequired === "true" ? "required Darwin arm64 tab-worker smoke did not succeed" : "unplanned Darwin arm64 tab-worker smoke was not skipped");
 }
 
 async function validateAggregate(): Promise<void> {
@@ -1307,6 +1461,8 @@ async function validateAggregate(): Promise<void> {
 		windowsDoctorRequired: Bun.env.CI_DEV_WINDOWS_DOCTOR_REQUIRED?.trim() || "",
 		hasNative: Bun.env.CI_DEV_HAS_NATIVE?.trim() || "",
 		hasTasks: Bun.env.CI_DEV_HAS_TASKS?.trim() || "",
+		darwinArm64TabWorkerSmoke: Bun.env.CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT?.trim() || "",
+		darwinArm64TabWorkerSmokeRequired: Bun.env.CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED?.trim() || "",
 	};
 
 
@@ -1317,6 +1473,8 @@ async function validateAggregate(): Promise<void> {
 	console.log(`planned shard work: ${results.hasTasks}`);
 	console.log(`windows-dev-doctor: ${results.windowsDoctor}`);
 	console.log(`planned Windows dev:doctor: ${results.windowsDoctorRequired}`);
+	console.log(`darwin-arm64 tab-worker smoke: ${results.darwinArm64TabWorkerSmoke}`);
+	console.log(`planned Darwin arm64 tab-worker smoke: ${results.darwinArm64TabWorkerSmokeRequired}`);
 	validateAffectedAggregate(results);
 	const tasks = await loadCanonicalPlan();
 	if (!tasks) throw new Error("affected-plan-invalid: aggregate requires a canonical plan");
@@ -1395,13 +1553,47 @@ function canonicalReplayScope(): ReplayScope {
 	return { repository: requiredEnv("GITHUB_REPOSITORY"), workflow: requiredEnv("GITHUB_WORKFLOW"), runId: requiredEnv("GITHUB_RUN_ID") };
 }
 function aggregateFromEnv(): AffectedAggregateResults {
-	return { plan: requiredEnv("CI_DEV_PLAN_RESULT"), native: requiredEnv("CI_DEV_NATIVE_RESULT"), shards: requiredEnv("CI_DEV_SHARDS_RESULT"), windowsDoctor: requiredEnv("CI_DEV_WINDOWS_DOCTOR_RESULT"), windowsDoctorRequired: requiredEnv("CI_DEV_WINDOWS_DOCTOR_REQUIRED"), hasNative: requiredEnv("CI_DEV_HAS_NATIVE"), hasTasks: requiredEnv("CI_DEV_HAS_TASKS") };
+	return {
+		plan: requiredEnv("CI_DEV_PLAN_RESULT"),
+		native: requiredEnv("CI_DEV_NATIVE_RESULT"),
+		shards: requiredEnv("CI_DEV_SHARDS_RESULT"),
+		windowsDoctor: requiredEnv("CI_DEV_WINDOWS_DOCTOR_RESULT"),
+		windowsDoctorRequired: requiredEnv("CI_DEV_WINDOWS_DOCTOR_REQUIRED"),
+		hasNative: requiredEnv("CI_DEV_HAS_NATIVE"),
+		hasTasks: requiredEnv("CI_DEV_HAS_TASKS"),
+		darwinArm64TabWorkerSmoke: requiredEnv("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT"),
+		darwinArm64TabWorkerSmokeRequired: requiredEnv("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED"),
+	};
 }
 function parseAggregate(value: unknown): AffectedAggregateResults {
 	if (!isRecord(value)) throw evidenceError("malformed aggregate results");
-	exactKeys(value, ["plan", "native", "shards", "windowsDoctor", "windowsDoctorRequired", "hasNative", "hasTasks"], "unexpected aggregate results field");
+	exactKeys(
+		value,
+		[
+			"plan",
+			"native",
+			"shards",
+			"windowsDoctor",
+			"windowsDoctorRequired",
+			"hasNative",
+			"hasTasks",
+			"darwinArm64TabWorkerSmoke",
+			"darwinArm64TabWorkerSmokeRequired",
+		],
+		"unexpected aggregate results field",
+	);
 	if (!Object.values(value).every(isString)) throw evidenceError("malformed aggregate results");
-	return { plan: value.plan as string, native: value.native as string, shards: value.shards as string, windowsDoctor: value.windowsDoctor as string, windowsDoctorRequired: value.windowsDoctorRequired as string, hasNative: value.hasNative as string, hasTasks: value.hasTasks as string };
+	return {
+		plan: value.plan as string,
+		native: value.native as string,
+		shards: value.shards as string,
+		windowsDoctor: value.windowsDoctor as string,
+		windowsDoctorRequired: value.windowsDoctorRequired as string,
+		hasNative: value.hasNative as string,
+		hasTasks: value.hasTasks as string,
+		darwinArm64TabWorkerSmoke: value.darwinArm64TabWorkerSmoke as string,
+		darwinArm64TabWorkerSmokeRequired: value.darwinArm64TabWorkerSmokeRequired as string,
+	};
 }
 function parseReplayScope(value: unknown): ReplayScope {
 	if (!isRecord(value)) throw evidenceError("malformed replay scope");

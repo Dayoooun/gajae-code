@@ -2,7 +2,7 @@ import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describeTasks, expandWithDependents, loadBuildInventory, normalizeChangedPaths, packageScriptCommand, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
 
 // Matrix planning validates live workspace and Cargo manifests in subprocesses.
 // Hosted runners can need more than Bun's 5s default during their first cold scan.
@@ -97,12 +97,58 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(protectedJob.slice(preparationStart, preparationEnd)).toContain("CI_DEV_EVIDENCE_ROOT: ${{ runner.temp }}/ci-dev-affected-evidence");
 		expect(protectedJob.slice(validationStart)).toContain("CI_DEV_EVIDENCE_ROOT: ${{ runner.temp }}/ci-dev-affected-evidence");
 	});
+	test("gates exact-head Darwin tab-worker evidence through detached affected evidence", async () => {
+		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
+		expect(workflow).toContain("has_darwin_arm64_tab_worker_smoke: ${{ steps.plan.outputs.has_darwin_arm64_tab_worker_smoke }}");
+		expect(workflow).toContain("affected-darwin-arm64-tab-worker-smoke:");
+		expect(workflow).toContain("runs-on: macos-14");
+		expect(workflow).toContain("TARGET_PLATFORM: darwin");
+		expect(workflow).toContain("TARGET_ARCH: arm64");
+		expect(workflow).toContain("process.platform");
+		expect(workflow).toContain("process.arch");
+		expect(workflow).toContain("Write immutable Darwin smoke receipt");
+		expect(workflow).toContain("dev-affected-darwin-receipt-${{ github.run_id }}");
+		const darwinReceiptUploadStart = workflow.indexOf("      - name: Upload Darwin smoke receipt");
+		const darwinReceiptUploadEnd = workflow.indexOf("\n\n  # One shard", darwinReceiptUploadStart);
+		expect(workflow.slice(darwinReceiptUploadStart, darwinReceiptUploadEnd)).toContain("overwrite: true");
+		expect(workflow).toContain("Download Darwin smoke receipt");
+		expect(workflow).toContain("Validate Darwin smoke receipt");
+		expect(workflow).toContain(".ci-dev-darwin-arm64-receipt.json");
+		expect(workflow).toContain("Validate finalized Darwin smoke receipt");
+		expect(workflow).toContain("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT");
+		expect(workflow).toContain("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED");
+	});
+
+	test("routes the Windows session-path regression suite onto windows-latest and requires it", async () => {
+		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
+		expect(workflow).toContain("has_windows_session_path: ${{ steps.plan.outputs.has_windows_session_path }}");
+		const windowsJob = workflow.slice(workflow.indexOf("  windows-dev-doctor:"), workflow.indexOf("\n  affected-native:"));
+		expect(windowsJob).toContain("runs-on: windows-latest");
+		expect(windowsJob).toContain("needs.affected-plan.outputs.has_windows_session_path == 'true'");
+		expect(windowsJob).toContain("Windows session-path canonicalization regression");
+		expect(windowsJob).toContain("bun test packages/coding-agent/test/session-manager/windows-canonical-path.test.ts");
+		// The required predicate must textually match the job gate so the aggregate
+		// invariant (windowsDoctor === required ? success : skipped) never fails closed.
+		const requiredLines = workflow.split("\n").filter(line => line.includes("CI_DEV_WINDOWS_DOCTOR_REQUIRED:"));
+		expect(requiredLines.length).toBe(2);
+		for (const line of requiredLines) expect(line).toContain("|| needs.affected-plan.outputs.has_windows_session_path == 'true'");
+	});
 
 	describe("detached evidence subprocess contract", () => {
 		const scriptPath = path.join(import.meta.dir, "ci-dev-affected.ts");
 		const repoRoot = path.join(import.meta.dir, "..");
 		const sourceSha = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot }).stdout.toString().trim();
-		const baseAggregate = { plan: "success", native: "skipped", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "false", hasTasks: "false" };
+		const baseAggregate = {
+			plan: "success",
+			native: "skipped",
+			shards: "skipped",
+			windowsDoctor: "skipped",
+			windowsDoctorRequired: "false",
+			hasNative: "false",
+			hasTasks: "false",
+			darwinArm64TabWorkerSmoke: "skipped",
+			darwinArm64TabWorkerSmokeRequired: "false",
+		};
 		type EvidenceFixture = { root: string; env: Record<string, string>; plan: string; digest: string };
 
 		async function fixture(tasks: unknown[] = []): Promise<EvidenceFixture> {
@@ -115,6 +161,8 @@ describe("dev-ci canonical-plan workflow contract", () => {
 				CI_DEV_SOURCE_SHA: sourceSha, CI_DEV_PLAN_DIGEST: digest, CI_DEV_PLAN_MODE: "pr", GITHUB_REPOSITORY: "owner/repo", GITHUB_WORKFLOW: "Dev CI", GITHUB_RUN_ID: "42",
 				CI_DEV_PLAN_RESULT: baseAggregate.plan, CI_DEV_NATIVE_RESULT: baseAggregate.native, CI_DEV_SHARDS_RESULT: baseAggregate.shards, CI_DEV_WINDOWS_DOCTOR_RESULT: baseAggregate.windowsDoctor,
 				CI_DEV_WINDOWS_DOCTOR_REQUIRED: baseAggregate.windowsDoctorRequired, CI_DEV_HAS_NATIVE: baseAggregate.hasNative, CI_DEV_HAS_TASKS: baseAggregate.hasTasks,
+				CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT: baseAggregate.darwinArm64TabWorkerSmoke,
+				CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED: baseAggregate.darwinArm64TabWorkerSmokeRequired,
 			};
 			return { root, env, plan, digest };
 		}
@@ -292,10 +340,10 @@ describe("dev-ci canonical-plan workflow contract", () => {
 
 	test("aggregate result truth table rejects every missing, failed, cancelled, and unplanned dependency", () => {
 		const valid: AffectedAggregateResults[] = [
-			{ plan: "success", native: "success", shards: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "true", hasTasks: "true" },
-			{ plan: "success", native: "skipped", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "false", hasTasks: "false" },
-			{ plan: "success", native: "success", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "true", hasTasks: "false" },
-			{ plan: "success", native: "skipped", shards: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "false", hasTasks: "true" },
+			{ plan: "success", native: "success", shards: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "true", hasTasks: "true", darwinArm64TabWorkerSmoke: "success", darwinArm64TabWorkerSmokeRequired: "true" },
+			{ plan: "success", native: "skipped", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "false", hasTasks: "false", darwinArm64TabWorkerSmoke: "skipped", darwinArm64TabWorkerSmokeRequired: "false" },
+			{ plan: "success", native: "success", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "true", hasTasks: "false", darwinArm64TabWorkerSmoke: "skipped", darwinArm64TabWorkerSmokeRequired: "false" },
+			{ plan: "success", native: "skipped", shards: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "false", hasTasks: "true", darwinArm64TabWorkerSmoke: "skipped", darwinArm64TabWorkerSmokeRequired: "false" },
 		];
 		for (const results of valid) expect(() => validateAffectedAggregate(results)).not.toThrow();
 
@@ -310,6 +358,12 @@ describe("dev-ci canonical-plan workflow contract", () => {
 			{ ...valid[0]!, windowsDoctor: "failure" },
 			{ ...valid[0]!, windowsDoctor: "cancelled" },
 			{ ...valid[0]!, windowsDoctor: "skipped" },
+			{ ...valid[0]!, darwinArm64TabWorkerSmoke: "failure" },
+			{ ...valid[0]!, darwinArm64TabWorkerSmoke: "cancelled" },
+			{ ...valid[0]!, darwinArm64TabWorkerSmoke: "skipped" },
+			{ ...valid[1]!, darwinArm64TabWorkerSmoke: "success" },
+			{ ...valid[1]!, darwinArm64TabWorkerSmokeRequired: "" },
+			{ ...valid[1]!, darwinArm64TabWorkerSmokeRequired: "maybe" },
 			{ ...valid[1]!, windowsDoctor: "success" },
 			{ ...valid[1]!, windowsDoctorRequired: "" },
 			{ ...valid[1]!, windowsDoctorRequired: "maybe" },
@@ -648,6 +702,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(pr.exitCode).toBe(0);
 		expect((JSON.parse(pr.stdout.trim()) as Array<{ key: string }>).map(entry => entry.key)).toEqual([
 			"check:@gajae-code/natives",
+			"install-methods",
 			"native-linux-x64",
 			"ts-build:ts:Y29kaW5nLWFnZW50:cGFja2FnZXMvY29kaW5nLWFnZW50",
 			"ts-build:ts:c3RhdHM:cGFja2FnZXMvc3RhdHM",
@@ -665,6 +720,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			"check:@gajae-code/tui", "test:@gajae-code/tui",
 			"check:@gajae-code/typescript-edit-benchmark", "test:@gajae-code/typescript-edit-benchmark",
 			"check:@gajae-code/utils", "test:@gajae-code/utils",
+			"install-methods",
 			"native-linux-x64",
 			"ts-build:ts:Y29kaW5nLWFnZW50:cGFja2FnZXMvY29kaW5nLWFnZW50",
 			"ts-build:ts:c3RhdHM:cGFja2FnZXMvc3RhdHM",
@@ -882,6 +938,58 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			native: true,
 			nativeBuild: false,
 		});
+	});
+
+test("tab-worker graph changes always include install-methods and are Darwin relevant", () => {
+		for (const changedPath of [
+			"packages/coding-agent/src/tools/browser/tab-worker-entry.ts",
+			"packages/coding-agent/src/tools/browser/new-worker-helper.ts",
+			"packages/coding-agent/src/tools/browser/launch.ts",
+			"packages/coding-agent/src/tools/browser/readable.ts",
+			"packages/coding-agent/src/tools/browser/screenshot-format.ts",
+			"packages/coding-agent/src/eval/js/shared/runtime.ts",
+			"packages/coding-agent/src/eval/js/new-eval-helper.ts",
+			"packages/coding-agent/src/web/scrapers/html-to-markdown.ts",
+			"packages/coding-agent/src/web/scrapers/new-scraper-helper.ts",
+			"packages/coding-agent/src/utils/linkedom.ts",
+			"packages/coding-agent/src/utils/new-browser-safe-helper.ts",
+			"packages/utils/src/new-worker-safe-helper.ts",
+			"packages/coding-agent/src/tools/tool-errors.ts",
+			"packages/coding-agent/src/tools/path-utils.ts",
+			"packages/coding-agent/src/cli.ts",
+			"packages/coding-agent/scripts/compile-args.ts",
+			"packages/coding-agent/scripts/build-binary.ts",
+			"packages/natives/native/index.js",
+			"scripts/ci-build-native.ts",
+			"packages/coding-agent/src/tools/puppeteer/00_stealth_tampering.txt",
+			"packages/coding-agent/src/tools/puppeteer/15_stealth_webrtc.txt",
+		]) {
+			expect(isDarwinArm64TabWorkerSmokePath(changedPath)).toBe(true);
+			expect(needsDarwinArm64TabWorkerSmoke([changedPath])).toBe(true);
+			expect(targeted([changedPath]).map(task => task.key)).toContain("install-methods");
+			expect(planTasks([changedPath], targetingPackages).map(task => task.key)).toContain("install-methods");
+		}
+	});
+
+	test("irrelevant changes skip the Darwin smoke and install-methods", () => {
+		const paths = ["packages/coding-agent/src/edit/foo.ts"];
+		expect(needsDarwinArm64TabWorkerSmoke(paths)).toBe(false);
+		expect(targeted(paths).map(task => task.key)).not.toContain("install-methods");
+		expect(planTasks(paths, targetingPackages).map(task => task.key)).not.toContain("install-methods");
+	});
+
+	test("routes the Windows session-path regression for session I/O sources and its regression test", () => {
+		for (const changedPath of [
+			"packages/coding-agent/src/session/internal/managed-session-scope.ts",
+			"packages/coding-agent/src/session/blob-store.ts",
+			"packages/coding-agent/src/session/session-manager.ts",
+			"packages/coding-agent/test/session-manager/windows-canonical-path.test.ts",
+		]) {
+			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
+			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);
+		}
+		expect(isWindowsSessionPathRegressionPath("packages/coding-agent/src/session/session-store.ts")).toBe(false);
+		expect(needsWindowsSessionPathRegression(["packages/coding-agent/src/edit/foo.ts"])).toBe(false);
 	});
 
 	test("a deleted test path is not scheduled as a runnable test shard", () => {
@@ -1181,5 +1289,115 @@ describe("Cargo workspace ambiguity", () => {
 		expect(requiresCargoWorkspaceEmergency([first], supported)).toBe(true);
 		expect(requiresCargoWorkspaceEmergency([first, second], supported)).toBe(true);
 		expect(requiresCargoWorkspaceEmergency([unique], supported)).toBe(false);
+	});
+});
+
+describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
+	const fullModePackages: WorkspacePackage[] = [
+		{
+			name: "@gajae-code/coding-agent",
+			dir: "packages/coding-agent",
+			manifest: { name: "@gajae-code/coding-agent", scripts: { test: "true" } },
+		},
+		{
+			name: "@gajae-code/example",
+			dir: "packages/example",
+			manifest: { name: "@gajae-code/example", scripts: { check: "true", test: "true" } },
+		},
+	];
+
+	function withEnv<T>(env: Record<string, string | undefined>, run: () => T): T {
+		const previous = new Map<string, string | undefined>();
+		for (const [key, value] of Object.entries(env)) {
+			previous.set(key, process.env[key]);
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		try {
+			return run();
+		} finally {
+			for (const [key, value] of previous) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	}
+
+	test("default env emits the complete task union and omits root-check", () => {
+		const keys = withEnv(
+			{ CI_CODING_AGENT_TEST_SHARDS: undefined, CI_RUST_TEST_PARTITIONS: undefined },
+			() => planFullTasks(fullModePackages).map(task => task.key),
+		);
+		// root-check is covered by the dedicated native-free `check` job.
+		expect(keys).not.toContain("root-check");
+		expect(keys).toContain("native-linux-x64");
+		expect(keys).toContain("root-test:release");
+		expect(keys).toContain("rust-check");
+		expect(keys).toContain("cli-smoke");
+		expect(keys).toContain("runtime-check");
+		expect(keys).toContain("test:@gajae-code/example");
+		// Default coding-agent shard count stays 8 (dev parity).
+		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-")).length).toBe(8);
+		expect(keys).toContain("test:@gajae-code/coding-agent:shard-1-of-8");
+		// Default rust-test stays a single unpartitioned task.
+		expect(keys).toContain("rust-test");
+		expect(keys.some(key => key.startsWith("rust-test:partition-"))).toBe(false);
+	});
+
+	test("no full-mode task uses the false-green standalone `bun --cwd` form (issue #622)", () => {
+		const tasks = withEnv({ CI_CODING_AGENT_TEST_SHARDS: "16", CI_RUST_TEST_PARTITIONS: "4" }, () =>
+			planFullTasks(fullModePackages),
+		);
+		for (const task of tasks) {
+			expect(task.command.some(arg => arg.startsWith("--cwd"))).toBe(false);
+		}
+		const runtimeCheck = tasks.find(task => task.key === "runtime-check");
+		expect(runtimeCheck?.command).toEqual(["bun", "run", "check:runtime"]);
+		expect(runtimeCheck?.cwd).toBe(resolvePackageCwd("packages/coding-agent"));
+	});
+
+	test("CI_CODING_AGENT_TEST_SHARDS overrides the coding-agent shard count", () => {
+		const keys = withEnv({ CI_CODING_AGENT_TEST_SHARDS: "16" }, () =>
+			planFullTasks(fullModePackages).map(task => task.key),
+		);
+		const shards = keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"));
+		expect(shards.length).toBe(16);
+		expect(shards).toContain("test:@gajae-code/coding-agent:shard-1-of-16");
+		expect(shards).toContain("test:@gajae-code/coding-agent:shard-16-of-16");
+	});
+
+	test("CI_RUST_TEST_PARTITIONS splits rust-test into nextest partitions", () => {
+		const tasks = withEnv({ CI_RUST_TEST_PARTITIONS: "4" }, () => planFullTasks(fullModePackages));
+		const partitions = tasks.filter(task => task.key.startsWith("rust-test:partition-"));
+		expect(partitions.length).toBe(4);
+		expect(tasks.some(task => task.key === "rust-test")).toBe(false);
+		expect(partitions[0]?.command).toEqual(["bun", "scripts/run-rs-task.ts", "test:rs", "count:1/4"]);
+		expect(partitions[3]?.command).toEqual(["bun", "scripts/run-rs-task.ts", "test:rs", "count:4/4"]);
+		const described = describeTasks(partitions);
+		for (const entry of described) {
+			expect(entry.rust).toBe(true);
+			expect(entry.nextest).toBe(true);
+			expect(entry.native).toBe(false);
+		}
+	});
+
+	test("invalid env values fall back to safe defaults", () => {
+		const keys = withEnv(
+			{ CI_CODING_AGENT_TEST_SHARDS: "0", CI_RUST_TEST_PARTITIONS: "abc" },
+			() => planFullTasks(fullModePackages).map(task => task.key),
+		);
+		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-")).length).toBe(8);
+		expect(keys).toContain("rust-test");
+		expect(keys.some(key => key.startsWith("rust-test:partition-"))).toBe(false);
+	});
+
+	test("the native build task is the only nativeBuild entry and runtime consumers download it", () => {
+		const entries = withEnv({ CI_CODING_AGENT_TEST_SHARDS: "16", CI_RUST_TEST_PARTITIONS: "4" }, () =>
+			describeTasks(planFullTasks(fullModePackages)),
+		);
+		expect(entries.filter(entry => entry.nativeBuild).map(entry => entry.key)).toEqual(["native-linux-x64"]);
+		expect(entries.find(entry => entry.key === "cli-smoke")?.native).toBe(true);
+		expect(entries.find(entry => entry.key === "runtime-check")?.native).toBe(true);
+		expect(entries.find(entry => entry.key === "test:@gajae-code/coding-agent:shard-1-of-16")?.native).toBe(true);
 	});
 });

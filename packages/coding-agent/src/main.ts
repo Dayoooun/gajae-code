@@ -20,9 +20,11 @@ import {
 	VERSION,
 } from "@gajae-code/utils";
 import chalk from "chalk";
+import { runCli } from "./cli";
 import type { Args } from "./cli/args";
 import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
+import { resolveLaunchDisposition } from "./cli/launch-disposition";
 import { runListModelsCommand } from "./cli/list-models";
 import { selectSession } from "./cli/session-picker";
 import { findConfigFile } from "./config";
@@ -35,6 +37,8 @@ import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } 
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
+import { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } from "./gjc-runtime/managed-owner-admission";
+import { isManagedOwnerSupervisorArgv, runManagedOwnerSupervisor } from "./gjc-runtime/managed-owner-supervisor";
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
 import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
 import type { AcpStartupOptions } from "./modes/acp/startup-options";
@@ -282,7 +286,7 @@ export function resolveAcpStartupOptions(
 }
 
 async function readPipedInput(): Promise<string | undefined> {
-	if (process.stdin.isTTY !== false) return undefined;
+	if (process.stdin.isTTY === true) return undefined;
 	try {
 		const text = await Bun.stdin.text();
 		if (text.trim().length === 0) return undefined;
@@ -290,6 +294,30 @@ async function readPipedInput(): Promise<string | undefined> {
 	} catch {
 		return undefined;
 	}
+}
+
+async function readPipedInputIfReady(): Promise<string | undefined> {
+	if (process.stdin.isTTY === true) return undefined;
+
+	const ready = Promise.withResolvers<void>();
+	const onReadable = () => ready.resolve();
+	const onEnd = () => ready.resolve();
+	const onError = () => ready.resolve();
+	process.stdin.once("readable", onReadable);
+	process.stdin.once("end", onEnd);
+	process.stdin.once("error", onError);
+	await Promise.race([ready.promise, new Promise<void>(resolve => setImmediate(resolve))]);
+	process.stdin.removeListener("readable", onReadable);
+	process.stdin.removeListener("end", onEnd);
+	process.stdin.removeListener("error", onError);
+
+	const chunks: Buffer[] = [];
+	for (let chunk = process.stdin.read(); chunk !== null; chunk = process.stdin.read()) {
+		chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+	}
+	if (chunks.length === 0) return undefined;
+	const text = Buffer.concat(chunks).toString("utf8");
+	return text.trim() ? text : undefined;
 }
 
 export interface InteractiveModeNotify {
@@ -1014,6 +1042,7 @@ export interface RunRootCommandDependencies {
 	startupUpdate?: { check: () => Promise<string | undefined> };
 	initTheme?: typeof initTheme;
 	readPipedInput?: typeof readPipedInput;
+	stdinIsTTY?: boolean;
 	runStartupCredentialAutoImportIfNeeded?: typeof runStartupCredentialAutoImportIfNeeded;
 	getChangelogForDisplay?: typeof getChangelogForDisplay;
 	createInteractiveMode?: CreateInteractiveMode;
@@ -1164,8 +1193,16 @@ export async function runRootCommand(
 	if (parsedArgs.noTitle || parsedArgs.mode === "acp") {
 		Bun.env.PI_NO_TITLE = "1";
 	}
+	const hasPreparedInput = parsedArgs.messages.length > 0 || parsedArgs.fileArgs.length > 0;
 	const { pipedInput, fileText, fileImages } = await logger.time("prepareInitialMessage", async () => {
-		const pipedInput = await (deps.readPipedInput ?? readPipedInput)();
+		const pipedInput =
+			parsedArgs.mode === "acp"
+				? undefined
+				: deps.readPipedInput
+					? await deps.readPipedInput()
+					: hasPreparedInput
+						? await readPipedInputIfReady()
+						: await readPipedInput();
 		if (parsedArgs.fileArgs.length === 0) {
 			return { pipedInput, fileText: undefined, fileImages: undefined };
 		}
@@ -1180,14 +1217,25 @@ export async function runRootCommand(
 		fileImages,
 		stdinContent: pipedInput,
 	});
-	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
+	const disposition = resolveLaunchDisposition({
+		stdinIsTTY: deps.stdinIsTTY ?? process.stdin.isTTY,
+		pipedInput,
+		hasPreparedInput,
+		print: Boolean(parsedArgs.print),
+		mode: parsedArgs.mode,
+	});
+	if (disposition.nonInteractiveError) {
+		process.stderr.write(`${chalk.red(disposition.nonInteractiveError)}\n`);
+		process.exit(1);
+	}
+	const autoPrint = disposition.autoPrint;
 	const startupUpdateRoute = classifyStartupUpdateRoute(parsedArgs, autoPrint);
 	const startupUpdate = new StartupUpdateOrchestrator(
 		startupUpdateRoute,
 		() => settingsInstance.get("startup.checkUpdate"),
 		deps.startupUpdate?.check ?? (() => checkForNewVersion(VERSION)),
 	);
-	const isInteractive = startupUpdateRoute === "interactive";
+	const isInteractive = disposition.isInteractive;
 	const mode = parsedArgs.mode || "text";
 
 	// Initialize discovery system with settings for provider persistence
@@ -1319,6 +1367,7 @@ export async function runRootCommand(
 	sessionOptions.modelRegistry = modelRegistry;
 	sessionOptions.hasUI = isInteractive;
 	sessionOptions.notificationHostModeSupported = isInteractive;
+	sessionOptions.sdkHostModeSupported = isInteractive;
 	sessionOptions.settings = settingsInstance;
 	const hasRootStartupProfile = Boolean(settingsInstance.get("modelProfile.default") || parsedArgs.mpreset);
 
@@ -1351,6 +1400,30 @@ export async function runRootCommand(
 		applyCliRuntimeApiKeyOverride(authStorage, parsedArgs.apiKey, sessionOptions.model);
 	}
 
+	if (
+		!deps.suppressProcessExit &&
+		deps.createAgentSession === undefined &&
+		parsedArgs.noSession === true &&
+		!parsedArgs.continue &&
+		parsedArgs.resume === undefined &&
+		parsedArgs.fork === undefined &&
+		!isInteractive &&
+		mode !== "acp" &&
+		!hasRootStartupProfile &&
+		!sessionOptions.model &&
+		!sessionOptions.modelPattern &&
+		modelRegistry.getAvailable().length === 0
+	) {
+		process.stderr.write(`${chalk.red(`No models available. ${formatModelOnboardingGuidance()}`)}\n`);
+		process.stderr.write(
+			`${chalk.yellow(`\nAdvanced manual config remains available at ${ModelsConfigFile.path()}`)}\n`,
+		);
+		process.exitCode = 1;
+		authStorage.close();
+		stopThemeWatcher();
+		await postmortem.cleanup();
+		return;
+	}
 	const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
 	const createSession: CreateSessionForMain = async (options, context): Promise<CreateAgentSessionResult> => {
 		const result = await logger.time("createAgentSession", createAgentSessionImpl, options);
@@ -1365,10 +1438,16 @@ export async function runRootCommand(
 	};
 
 	if (mode === "acp") {
-		await (deps.runAcpMode ?? (await import("./modes/acp")).runAcpMode)({
-			agentDir: settingsInstance.getAgentDir(),
-			...(acpStartupOptions ? { startupOptions: acpStartupOptions } : {}),
-		});
+		try {
+			await (deps.runAcpMode ?? (await import("./modes/acp")).runAcpMode)({
+				agentDir: settingsInstance.getAgentDir(),
+				...(acpStartupOptions ? { startupOptions: acpStartupOptions } : {}),
+			});
+		} finally {
+			authStorage.close();
+			stopThemeWatcher();
+			if (!deps.suppressProcessExit) await postmortem.cleanup();
+		}
 	} else {
 		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager, eventBus } = await createSession(
 			sessionOptions,
@@ -1503,20 +1582,21 @@ export async function runRootCommand(
 			}
 		} else {
 			const runPrint = deps.runPrintMode ?? (await import("./modes/print-mode")).runPrintMode;
-			await runPrint(session, {
-				mode,
-				messages: parsedArgs.messages,
-				initialMessage,
-				initialImages,
-				suppressProcessExit: deps.suppressProcessExit,
-			});
-			if ($env.PI_TIMING) {
-				logger.printTimings();
-			}
-			stopThemeWatcher();
-			if (!deps.suppressProcessExit) {
-				const exitCode = typeof process.exitCode === "number" ? process.exitCode : 0;
-				await postmortem.quit(exitCode);
+			try {
+				await runPrint(session, {
+					mode,
+					messages: parsedArgs.messages,
+					initialMessage,
+					initialImages,
+					suppressProcessExit: deps.suppressProcessExit,
+				});
+				if ($env.PI_TIMING) {
+					logger.printTimings();
+				}
+			} finally {
+				stopThemeWatcher();
+				authStorage.close();
+				if (!deps.suppressProcessExit) await postmortem.cleanup();
 			}
 		}
 	}
@@ -1527,6 +1607,15 @@ export async function main(args: string[]): Promise<void> {
 		await runTmuxOwnerIsolationCliFromStdin();
 		return;
 	}
-	const { runCli } = await import("./cli");
+	if (isManagedOwnerSupervisorArgv(args)) {
+		await runManagedOwnerSupervisor();
+		return;
+	}
+	const admission = await admitManagedOwnerBeforeCli();
+	if (admission.kind === "blocked") return;
+	if (admission.kind === "recovery") {
+		await completeManagedOwnerRecovery(admission.context);
+		return;
+	}
 	await runCli(args.length === 0 ? ["launch"] : args);
 }

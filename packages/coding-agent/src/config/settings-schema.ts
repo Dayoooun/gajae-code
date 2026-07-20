@@ -286,6 +286,7 @@ export const SETTINGS_SCHEMA = {
 	"notifications.telegram.chatId": { type: "string", default: undefined },
 	"notifications.telegram.activation": { type: "record", default: {} as Record<string, unknown> },
 	"notifications.telegram.btw.enabled": { type: "boolean", default: true },
+	"notifications.telegram.streaming.enabled": { type: "boolean", default: true },
 	"notifications.telegram.rich.enabled": {
 		type: "boolean",
 		default: true,
@@ -303,6 +304,16 @@ export const SETTINGS_SCHEMA = {
 			tab: "notifications",
 			label: "Telegram Rich Drafts",
 			description: "Include rich draft updates in Telegram notifications.",
+			editing: "notification-atomic",
+		},
+	},
+	"notifications.telegram.toolActivity.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "notifications",
+			label: "Telegram Tool Activity",
+			description: "Send Telegram updates for tool starts and completions.",
 			editing: "notification-atomic",
 		},
 	},
@@ -669,17 +680,17 @@ export const SETTINGS_SCHEMA = {
 
 	"tools.readArtifactSpillThreshold": {
 		type: "number",
-		default: 0,
+		default: 256,
 		ui: {
 			tab: "tools",
-			label: "Experimental read-tool artifact spill threshold (KB)",
+			label: "Read artifact spill threshold (KB)",
 			description:
-				"Advanced opt-in only: combined-size cap for `read` output across all requested ranges. Above this the full output is saved as an artifact and a bounded head+tail snippet is kept inline. Live layofflabs/gpt-5.5 medium evidence on 2026-07-07 found no token savings and a lower cache-hit rate at 50 KB, so normal coding sessions should leave this Off unless intentionally measuring large-read behavior.",
+				"Explicit large reads above this combined size are saved as an artifact with a bounded head-and-tail snippet inline. Bare reads, directories, and converted-document receipts remain inline.",
 			options: [
-				{ value: "0", label: "Off", description: "Default; no read-specific spill (backstop only)" },
+				{ value: "0", label: "Off", description: "No read-specific spill (backstop only)" },
 				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
 				{ value: "100", label: "100 KB", description: "~25K tokens" },
-				{ value: "256", label: "256 KB", description: "~64K tokens" },
+				{ value: "256", label: "256 KB", description: "Default; ~64K tokens" },
 				{ value: "512", label: "512 KB", description: "~128K tokens" },
 				{ value: "1000", label: "1 MB", description: "~250K tokens" },
 			],
@@ -688,17 +699,17 @@ export const SETTINGS_SCHEMA = {
 
 	"tools.fileMentionInlineBytes": {
 		type: "number",
-		default: 20,
+		default: 10,
 		ui: {
 			tab: "tools",
 			label: "File-mention inline cap (KB)",
 			description:
-				"Inline byte cap for auto-read `@path` file mentions, deliberately below the read-tool cap so an incidental mention injects a smaller snippet than an explicit read. The full file is still available via the read tool.",
+				"Inline byte cap for auto-read `@path` file mentions, aligned with the 10 KiB bare-read receipt so incidental mentions stay within the same bounded context budget. The full file is still available via the read tool.",
 			options: [
 				{ value: "5", label: "5 KB", description: "~1.25K tokens" },
-				{ value: "10", label: "10 KB", description: "~2.5K tokens" },
-				{ value: "20", label: "20 KB", description: "Default; ~5K tokens" },
-				{ value: "50", label: "50 KB", description: "~12.5K tokens (matches read cap)" },
+				{ value: "10", label: "10 KB", description: "Default; ~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens (matches bare-read receipt)" },
 			],
 		},
 	},
@@ -2013,6 +2024,51 @@ export const SETTINGS_SCHEMA = {
 				{ value: "500", label: "500 lines" },
 				{ value: "1000", label: "1000 lines" },
 				{ value: "5000", label: "5000 lines" },
+			],
+		},
+	},
+	"read.receiptBudgetLines": {
+		type: "number",
+		default: 50,
+		ui: {
+			tab: "editing",
+			label: "Read Receipt Line Budget",
+			description: "Maximum lines included in a bare read receipt before a selector footer is shown",
+			options: [
+				{ value: "25", label: "25 lines" },
+				{ value: "50", label: "50 lines", description: "Default" },
+				{ value: "100", label: "100 lines" },
+				{ value: "200", label: "200 lines" },
+			],
+		},
+	},
+	"read.receiptBudgetBytes": {
+		type: "number",
+		default: 10,
+		ui: {
+			tab: "editing",
+			label: "Read Receipt Byte Budget (KB)",
+			description: "Maximum UTF-8 body size for a bare read receipt before a selector footer is shown",
+			options: [
+				{ value: "5", label: "5 KB", description: "~1.25K tokens" },
+				{ value: "10", label: "10 KB", description: "Default; ~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+			],
+		},
+	},
+	"read.summaryMaxBytes": {
+		type: "number",
+		default: 20,
+		ui: {
+			tab: "editing",
+			label: "Read Summary Size Budget (KB)",
+			description: "Maximum UTF-8 size for a structural read summary before additional units are elided",
+			options: [
+				{ value: "10", label: "10 KB", description: "~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "Default; ~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+				{ value: "100", label: "100 KB", description: "~25K tokens" },
 			],
 		},
 	},
@@ -3721,6 +3777,12 @@ export interface NotificationsSettings {
 			enabled: boolean;
 		};
 		richDraft: {
+			enabled: boolean;
+		};
+		toolActivity: {
+			enabled: boolean;
+		};
+		streaming: {
 			enabled: boolean;
 		};
 		topics: {

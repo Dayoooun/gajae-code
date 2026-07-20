@@ -605,6 +605,10 @@ async function spillLargeResultToArtifact(
 	toolName: string,
 	context: AgentToolContext | undefined,
 ): Promise<AgentToolResult> {
+	if (toolName === "read" && (result.details as { spillEligible?: boolean } | undefined)?.spillEligible !== true) {
+		return result;
+	}
+
 	const artifactCapability = artifactCapabilityForContext(context);
 	if (!artifactCapability) return result;
 	const { threshold, readThreshold, tailBytes, tailLines, headBytes } = getSpillConfig(context?.settings);
@@ -709,8 +713,8 @@ async function spillLargeResultToArtifact(
 /**
  * Absolute inline-size backstop enforced after {@link spillLargeResultToArtifact}.
  *
- * The threshold-based spill above has escape hatches: it early-returns for the
- * `read` tool and for results that already carry an `artifactId` (a tool may set
+ * The threshold-based spill above has escape hatches: it skips ineligible `read`
+ * results and results that already carry an `artifactId` (a tool may set
  * partial truncation meta yet still emit oversized inline text). This backstop
  * closes those gaps: when `tools.maxInlineResultBytes` is configured (> 0), any
  * final result whose inline text exceeds the cap is force-saved to an artifact

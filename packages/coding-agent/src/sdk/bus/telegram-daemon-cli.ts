@@ -81,6 +81,8 @@ export function createLightweightDaemonSettings(input: {
 					return snapshot.telegram.chatId;
 				case "notifications.telegram.btw.enabled":
 					return snapshot.telegram.btw.enabled;
+				case "notifications.telegram.streaming.enabled":
+					return snapshot.telegram.streaming.enabled;
 				case "notifications.discord.botToken":
 					return snapshot.discord.botToken;
 				case "notifications.discord.applicationId":
@@ -215,6 +217,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		idleTimeoutMs: cfg.idleTimeoutMs,
 		rich: cfg.rich,
 		richDraft: cfg.richDraft,
+		toolActivity: cfg.toolActivity,
 		topics: cfg.topics,
 		btw: cfg.btw,
 		pid: deps.processPid ?? process.pid,
