@@ -18,7 +18,18 @@ import {
 	parseToolActivityToggleCommand,
 } from "./config-commands";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
-import { acquireDaemonTransitionLock, sanitizeDiagnostic } from "./notification-service";
+import {
+	acquireDaemonTransitionLock,
+	type DaemonTransitionLock,
+	daemonTransitionLockIsHeld,
+	exactUnlinkNotificationFile,
+	type NotificationEndpointFile,
+	type NotificationEndpointFileIdentity,
+	type NotificationExactUnlinkResult,
+	readNotificationEndpointFile,
+	releaseDaemonTransitionLock,
+	sanitizeDiagnostic,
+} from "./notification-service";
 import { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION } from "./telegram-daemon-contract";
 import { type TelegramDaemonControlDeps, TelegramDaemonController } from "./telegram-daemon-control";
 import { withTelegramSetupLease } from "./telegram-setup";
@@ -127,6 +138,8 @@ export interface TelegramDaemonFs {
 	readdir(path: string): Promise<string[]>;
 	chmod(path: string, mode: number): Promise<void>;
 	stat?(path: string): Promise<{ mtimeMs: number }>;
+	readEndpointFile?(path: string): Promise<NotificationEndpointFile>;
+	exactUnlink?(path: string, identity: NotificationEndpointFileIdentity): Promise<NotificationExactUnlinkResult>;
 }
 
 export interface SpawnResult {
@@ -173,7 +186,12 @@ export const ASK_CONTROLS_CAPABILITY = "ask_controls_v1";
 /** Capability required for tool lifecycle and reasoning-summary frames. */
 export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v1";
 
-const nodeFs: TelegramDaemonFs = fs.promises as unknown as TelegramDaemonFs;
+const nodeFs: TelegramDaemonFs = {
+	...(fs.promises as unknown as TelegramDaemonFs),
+	readEndpointFile: readNotificationEndpointFile,
+	exactUnlink: async (file, identity) =>
+		exactUnlinkNotificationFile(file, identity, `.gjc-delete-daemon-transition-${crypto.randomUUID()}.json`),
+};
 
 /**
  * Durably persist a daemon-local Telegram delivery toggle. A real
@@ -442,16 +460,6 @@ async function writeJsonAtomic(fsImpl: TelegramDaemonFs, file: string, data: unk
 	await fsImpl.rename(tmp, file);
 }
 
-async function tryOpenWx(fsImpl: TelegramDaemonFs, file: string): Promise<boolean> {
-	try {
-		const handle = await fsImpl.open(file, "wx", 0o600);
-		await handle.close();
-		return true;
-	} catch (error) {
-		if (["EEXIST", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? "")) return false;
-		throw error;
-	}
-}
 function validDaemonPid(pid: unknown): pid is number {
 	return typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0;
 }
@@ -471,11 +479,21 @@ export async function tryCreateOwnershipLock(
 	}
 }
 
-type OwnershipLockMetadata = { pid: number; incarnation: string; startedAt: number };
-type LegacyOwnershipLockMetadata = Omit<OwnershipLockMetadata, "incarnation">;
+type OwnershipLockMetadata = {
+	pid: number;
+	incarnation: string;
+	ownerId?: string;
+	acquisitionId?: string;
+	startedAt: number;
+};
+type LegacyOwnershipLockMetadata = {
+	pid: number;
+	incarnation?: string;
+	startedAt: number;
+};
 type OwnershipLockRead =
 	| { kind: "missing" }
-	| { kind: "malformed" }
+	| { kind: "malformed"; raw: string; mtimeMs?: number }
 	| { kind: "legacy"; metadata: LegacyOwnershipLockMetadata }
 	| { kind: "valid"; metadata: OwnershipLockMetadata };
 
@@ -494,11 +512,26 @@ export async function readOwnershipLock(fsImpl: TelegramDaemonFs, file: string):
 		const startedAt = value.startedAt;
 		if (validDaemonPid(pid) && typeof startedAt === "number" && Number.isSafeInteger(startedAt)) {
 			if (isProcessIncarnation(value.incarnation))
-				return { kind: "valid", metadata: { pid, incarnation: value.incarnation, startedAt } };
+				return {
+					kind: "valid",
+					metadata: {
+						pid,
+						incarnation: value.incarnation,
+						...(typeof value.ownerId === "string" && value.ownerId.length > 0 ? { ownerId: value.ownerId } : {}),
+						...(typeof value.acquisitionId === "string" && value.acquisitionId.length > 0
+							? { acquisitionId: value.acquisitionId }
+							: {}),
+						startedAt,
+					},
+				};
 			return { kind: "legacy", metadata: { pid, startedAt } };
 		}
 	} catch {}
-	return { kind: "malformed" };
+	const mtimeMs = await fsImpl
+		.stat?.(file)
+		.then(stat => stat.mtimeMs)
+		.catch(() => undefined);
+	return { kind: "malformed", raw, ...(mtimeMs === undefined ? {} : { mtimeMs }) };
 }
 
 /**
@@ -517,11 +550,78 @@ export function liveOwnershipLockDecision(input: {
 	| undefined {
 	if (input.lock.kind !== "valid" && input.lock.kind !== "legacy") return undefined;
 	if (!input.pidAlive(input.lock.metadata.pid)) return undefined;
-	if (input.lock.kind === "legacy") return { acquired: false, attached: false, blocked: true };
+	if (input.lock.kind === "legacy") {
+		if (!isProcessIncarnation(input.lock.metadata.incarnation))
+			return { acquired: false, attached: false, blocked: true };
+		const current = input.pidIncarnation(input.lock.metadata.pid);
+		if (!isProcessIncarnation(current)) return { acquired: false, attached: false, blocked: true };
+		if (current !== input.lock.metadata.incarnation) return undefined;
+		return { acquired: false, attached: false, blocked: true };
+	}
 	const current = input.pidIncarnation(input.lock.metadata.pid);
 	if (!isProcessIncarnation(current)) return { acquired: false, attached: false, blocked: true };
 	if (current !== input.lock.metadata.incarnation) return undefined;
 	return { acquired: false, attached: false, provisional: true };
+}
+
+function ownershipLockMatches(left: OwnershipLockRead, right: OwnershipLockRead): boolean {
+	if (left.kind !== right.kind) return false;
+	if (left.kind === "missing") return true;
+	if (left.kind === "malformed" && right.kind === "malformed")
+		return left.raw === right.raw && left.mtimeMs !== undefined && left.mtimeMs === right.mtimeMs;
+	if ((left.kind !== "valid" && left.kind !== "legacy") || (right.kind !== "valid" && right.kind !== "legacy"))
+		return false;
+	return JSON.stringify(left.metadata) === JSON.stringify(right.metadata);
+}
+
+function ownershipLockMatchesState(lock: OwnershipLockRead, state: DaemonState | undefined): boolean {
+	return Boolean(
+		lock.kind === "valid" &&
+			state &&
+			lock.metadata.ownerId === state.ownerId &&
+			lock.metadata.acquisitionId === state.acquisitionId &&
+			lock.metadata.pid === state.pid &&
+			lock.metadata.incarnation === state.incarnation,
+	);
+}
+
+function ownershipLockMatchesStoppedState(lock: OwnershipLockRead, state: DaemonState | undefined): boolean {
+	return Boolean(state && isExplicitlyStoppedDaemonState(state) && ownershipLockMatchesState(lock, state));
+}
+
+async function transitionLockIsHeldByCaller(input: {
+	fs: TelegramDaemonFs;
+	path: string;
+	lock: DaemonTransitionLock;
+}): Promise<boolean> {
+	return await daemonTransitionLockIsHeld(input);
+}
+
+function ownershipLockMatchesMetadata(lock: OwnershipLockRead, metadata: OwnershipLockMetadata): boolean {
+	return lock.kind === "valid" && JSON.stringify(lock.metadata) === JSON.stringify(metadata);
+}
+
+async function ownershipLockIsReclaimable(input: {
+	fs: TelegramDaemonFs;
+	path: string;
+	lock: OwnershipLockRead;
+	now: number;
+	pidAlive: (pid: number) => boolean;
+	pidIncarnation: (pid: number) => string | undefined;
+}): Promise<boolean> {
+	if (input.lock.kind === "missing") return true;
+	if (input.lock.kind === "malformed") {
+		if (!input.fs.stat) return false;
+		const stat = await input.fs.stat(input.path).catch(() => undefined);
+		return stat !== undefined && input.now - stat.mtimeMs > HEARTBEAT_TTL_MS;
+	}
+	if (!input.pidAlive(input.lock.metadata.pid)) return true;
+	const current = input.pidIncarnation(input.lock.metadata.pid);
+	return (
+		isProcessIncarnation(input.lock.metadata.incarnation) &&
+		isProcessIncarnation(current) &&
+		current !== input.lock.metadata.incarnation
+	);
 }
 
 interface NotificationRootRegistration {
@@ -1036,59 +1136,42 @@ export async function acquireDaemonOwnership(input: {
 	) {
 		return { acquired: false, blocked: true, reason: "identity_mismatch" };
 	}
-	if (!isLegacyParentDaemonState(existing)) {
-		const existingDecision = attachDecision(existing);
-		if (existingDecision) return existingDecision;
-	}
-	if (
-		!isLegacyParentDaemonState(existing) &&
-		(await tryCreateOwnershipLock(fsImpl, paths.lock, { pid, incarnation, startedAt: now() }))
-	) {
-		await writeJsonAtomic(fsImpl, paths.state, {
-			pid,
-			incarnation,
-			ownerId,
-			acquisitionId: ownerId,
-			ownershipPhase: "provisional",
-			tokenFingerprint: input.tokenFingerprint,
-			chatId: input.chatId,
-			startedAt: now(),
-			heartbeatAt: now(),
-			roots,
-			version: DAEMON_VERSION,
-			generation: DAEMON_GENERATION,
-		} satisfies DaemonState);
-		return { acquired: true, ownerId, acquisitionId: ownerId };
-	}
-	const afterLock = await readJson<DaemonState>(fsImpl, paths.state);
-	if (
-		liveOwnerUsesDifferentIdentity({
-			state: afterLock,
-			tokenFingerprint: input.tokenFingerprint,
-			chatId: input.chatId,
-			pidAlive,
-			pidIncarnation,
-		})
-	) {
-		return { acquired: false, blocked: true, reason: "identity_mismatch" };
-	}
-	if (!isLegacyParentDaemonState(afterLock)) {
-		const afterLockDecision = attachDecision(afterLock);
-		if (afterLockDecision) return afterLockDecision;
-	}
-	if (!hasSafeDaemonStateShape(afterLock) && !isExplicitlyStoppedDaemonState(afterLock)) {
-		const lockDecision = liveOwnershipLockDecision({
-			lock: await readOwnershipLock(fsImpl, paths.lock),
-			pidAlive,
-			pidIncarnation,
-		});
-		if (lockDecision) return lockDecision;
-	}
 
-	if (!(await acquireTransitionLock({ fs: fsImpl, path: paths.steal, pidAlive, pidIncarnation })))
-		return { acquired: false, attached: false, provisional: true };
+	const transition = await acquireTransitionLock({ fs: fsImpl, path: paths.steal, pidAlive, pidIncarnation });
+	if (!transition) return { acquired: false, attached: false, provisional: true };
 	try {
 		const rechecked = await readJson<DaemonState>(fsImpl, paths.state);
+		const recheckedLock = await readOwnershipLock(fsImpl, paths.lock);
+		const recheckedDecision = isLegacyParentDaemonState(rechecked) ? undefined : attachDecision(rechecked);
+		if (
+			recheckedDecision &&
+			(recheckedDecision.attached ||
+				recheckedDecision.blocked ||
+				recheckedLock.kind === "missing" ||
+				ownershipLockMatchesState(recheckedLock, rechecked))
+		)
+			return recheckedDecision;
+		// A stopped tombstone authorizes removal only of its own canonical lock.
+		// A newer initializer may have replaced the pathname while that tombstone
+		// remained, and must receive the same liveness/freshness protection as any
+		// other live reservation.
+		const stoppedLockMatches = ownershipLockMatchesStoppedState(recheckedLock, rechecked);
+		const lockDecision = stoppedLockMatches
+			? undefined
+			: liveOwnershipLockDecision({ lock: recheckedLock, pidAlive, pidIncarnation });
+		if (lockDecision) return lockDecision;
+		if (
+			!stoppedLockMatches &&
+			!(await ownershipLockIsReclaimable({
+				fs: fsImpl,
+				path: paths.lock,
+				lock: recheckedLock,
+				now: now(),
+				pidAlive,
+				pidIncarnation,
+			}))
+		)
+			return { acquired: false, attached: false, provisional: true };
 		if (isLegacyParentDaemonState(rechecked)) {
 			const legacyDecision = await legacyParentHandoffDecision({
 				fs: fsImpl,
@@ -1101,16 +1184,9 @@ export async function acquireDaemonOwnership(input: {
 				chatId: input.chatId,
 			});
 			if (legacyDecision) return legacyDecision;
-		} else {
-			const recheckedDecision = attachDecision(rechecked);
-			if (recheckedDecision) return recheckedDecision;
+		} else if (recheckedDecision) {
+			return recheckedDecision;
 		}
-		const recheckedLock = await readOwnershipLock(fsImpl, paths.lock);
-		if (!hasSafeDaemonStateShape(rechecked) && !isExplicitlyStoppedDaemonState(rechecked)) {
-			const lockDecision = liveOwnershipLockDecision({ lock: recheckedLock, pidAlive, pidIncarnation });
-			if (lockDecision) return lockDecision;
-		}
-
 		if (
 			liveOwnerUsesDifferentIdentity({
 				state: rechecked,
@@ -1119,19 +1195,38 @@ export async function acquireDaemonOwnership(input: {
 				pidAlive,
 				pidIncarnation,
 			})
-		) {
+		)
 			return { acquired: false, blocked: true, reason: "identity_mismatch" };
-		}
 		if (
 			hasSafeDaemonStateShape(rechecked) &&
 			rechecked.stoppedAt === undefined &&
 			pidAlive(rechecked.pid) &&
 			ownerProvenanceMatches(rechecked, pidIncarnation)
-		) {
+		)
 			return { acquired: false, attached: false, provisional: true };
+		const currentLock = await readOwnershipLock(fsImpl, paths.lock);
+		if (!ownershipLockMatches(recheckedLock, currentLock))
+			return { acquired: false, attached: false, provisional: true };
+		if (currentLock.kind !== "missing") {
+			if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition })))
+				return { acquired: false, attached: false, provisional: true };
+			await fsImpl.unlink(paths.lock);
 		}
-		await fsImpl.unlink(paths.lock).catch(() => undefined);
-		if (!(await tryCreateOwnershipLock(fsImpl, paths.lock, { pid, incarnation, startedAt: now() })))
+		const ownershipLock: OwnershipLockMetadata = {
+			pid,
+			incarnation,
+			ownerId,
+			acquisitionId: ownerId,
+			startedAt: now(),
+		};
+		if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition })))
+			return { acquired: false, attached: false, provisional: true };
+		if (!(await tryCreateOwnershipLock(fsImpl, paths.lock, ownershipLock)))
+			return { acquired: false, attached: false, provisional: true };
+		if (
+			!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition })) ||
+			!ownershipLockMatchesMetadata(await readOwnershipLock(fsImpl, paths.lock), ownershipLock)
+		)
 			return { acquired: false, attached: false, provisional: true };
 		await writeJsonAtomic(fsImpl, paths.state, {
 			pid,
@@ -1147,9 +1242,14 @@ export async function acquireDaemonOwnership(input: {
 			version: DAEMON_VERSION,
 			generation: DAEMON_GENERATION,
 		} satisfies DaemonState);
+		if (
+			!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition })) ||
+			!ownershipLockMatchesMetadata(await readOwnershipLock(fsImpl, paths.lock), ownershipLock)
+		)
+			return { acquired: false, attached: false, provisional: true };
 		return { acquired: true, ownerId, acquisitionId: ownerId };
 	} finally {
-		await fsImpl.unlink(paths.steal).catch(() => undefined);
+		await releaseDaemonTransitionLock({ fs: fsImpl, path: paths.steal, lock: transition });
 	}
 }
 
@@ -1174,7 +1274,7 @@ export async function renewDaemonHeartbeat(input: {
 	// The steal lock is held only briefly by concurrent lifecycle operations.
 	// A contended lock never proves readiness: only the holder may validate and
 	// publish the exact ready PID/generation state.
-	const acquired = await acquireTransitionLock({
+	const transition = await acquireTransitionLock({
 		fs: fsImpl,
 		path: paths.steal,
 		pidIncarnation: input.pidIncarnation,
@@ -1182,7 +1282,7 @@ export async function renewDaemonHeartbeat(input: {
 		retries: input.stealRetries,
 		retryDelayMs: input.stealRetryDelayMs,
 	});
-	if (!acquired) return false;
+	if (!transition) return false;
 	try {
 		const state = await readJson<DaemonState>(fsImpl, paths.state);
 		const pid = input.pid ?? state?.pid;
@@ -1214,6 +1314,7 @@ export async function renewDaemonHeartbeat(input: {
 			state.ownershipPhase === "retired"
 		)
 			return false;
+		if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))) return false;
 		await writeJsonAtomic(fsImpl, paths.state, {
 			...state,
 			pid,
@@ -1223,7 +1324,7 @@ export async function renewDaemonHeartbeat(input: {
 		});
 		return true;
 	} finally {
-		await fsImpl.unlink(paths.steal).catch(() => undefined);
+		await releaseDaemonTransitionLock({ fs: fsImpl, path: paths.steal, lock: transition });
 	}
 }
 
@@ -1236,11 +1337,10 @@ export async function acquireTransitionLock(input: {
 	sleep?: (ms: number) => Promise<void>;
 	retries?: number;
 	retryDelayMs?: number;
-}): Promise<boolean> {
+}): Promise<DaemonTransitionLock | undefined> {
 	return await acquireDaemonTransitionLock({
 		fs: input.fs,
 		path: input.path,
-		createExclusive: file => tryOpenWx(input.fs, file),
 		pid: process.pid,
 		pidAlive: input.pidAlive ?? defaultPidAlive,
 		pidIncarnation: input.pidIncarnation ?? defaultPidIncarnation,
@@ -1271,18 +1371,16 @@ export async function retireProvisionalDaemonOwnership(input: {
 }): Promise<boolean> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
-	if (
-		!(await acquireTransitionLock({
-			fs: fsImpl,
-			path: paths.steal,
-			pidAlive: input.pidAlive,
-			pidIncarnation: input.pidIncarnation,
-			sleep: input.sleep,
-			retries: input.stealRetries,
-			retryDelayMs: input.stealRetryDelayMs,
-		}))
-	)
-		return false;
+	const transition = await acquireTransitionLock({
+		fs: fsImpl,
+		path: paths.steal,
+		pidAlive: input.pidAlive,
+		pidIncarnation: input.pidIncarnation,
+		sleep: input.sleep,
+		retries: input.stealRetries,
+		retryDelayMs: input.stealRetryDelayMs,
+	});
+	if (!transition) return false;
 	try {
 		const state = await readJson<DaemonState>(fsImpl, paths.state);
 		const acquisitionId = input.acquisitionId ?? input.ownerId;
@@ -1305,15 +1403,17 @@ export async function retireProvisionalDaemonOwnership(input: {
 				!(input.allowReadyWithoutChildPid === true && state.ownershipPhase === "ready"))
 		)
 			return false;
+		if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))) return false;
 		await writeJsonAtomic(fsImpl, paths.state, {
 			...state,
 			ownershipPhase: "retired",
 			stoppedAt: (input.now ?? Date.now)(),
 		});
-		await fsImpl.unlink(paths.lock).catch(() => undefined);
+		if (await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))
+			await fsImpl.unlink(paths.lock).catch(() => undefined);
 		return true;
 	} finally {
-		await fsImpl.unlink(paths.steal).catch(() => undefined);
+		await releaseDaemonTransitionLock({ fs: fsImpl, path: paths.steal, lock: transition });
 	}
 }
 
@@ -1331,16 +1431,14 @@ async function bindProvisionalDaemonPid(input: {
 }): Promise<boolean> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
-	if (
-		!(await acquireTransitionLock({
-			fs: fsImpl,
-			path: paths.steal,
-			sleep: input.sleep,
-			retries: input.stealRetries,
-			retryDelayMs: input.stealRetryDelayMs,
-		}))
-	)
-		return false;
+	const transition = await acquireTransitionLock({
+		fs: fsImpl,
+		path: paths.steal,
+		sleep: input.sleep,
+		retries: input.stealRetries,
+		retryDelayMs: input.stealRetryDelayMs,
+	});
+	if (!transition) return false;
 	try {
 		const state = await readJson<DaemonState>(fsImpl, paths.state);
 		if (
@@ -1353,10 +1451,11 @@ async function bindProvisionalDaemonPid(input: {
 			!isProcessIncarnation(input.incarnation)
 		)
 			return false;
+		if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))) return false;
 		await writeJsonAtomic(fsImpl, paths.state, { ...state, pid: input.pid, incarnation: input.incarnation });
 		return true;
 	} finally {
-		await fsImpl.unlink(paths.steal).catch(() => undefined);
+		await releaseDaemonTransitionLock({ fs: fsImpl, path: paths.steal, lock: transition });
 	}
 }
 
@@ -1504,7 +1603,12 @@ export async function releaseDaemonOwnership(input: {
 }): Promise<void> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
-	if (!(await acquireTransitionLock({ fs: fsImpl, path: paths.steal, pidIncarnation: input.pidIncarnation }))) return;
+	const transition = await acquireTransitionLock({
+		fs: fsImpl,
+		path: paths.steal,
+		pidIncarnation: input.pidIncarnation,
+	});
+	if (!transition) return;
 	try {
 		const state = await readJson<DaemonState>(fsImpl, paths.state);
 		const acquisitionId = input.acquisitionId ?? input.ownerId;
@@ -1524,10 +1628,12 @@ export async function releaseDaemonOwnership(input: {
 			!Number.isSafeInteger(generation)
 		)
 			return;
+		if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))) return;
 		await writeJsonAtomic(fsImpl, paths.state, { ...state, stoppedAt: (input.now ?? Date.now)() });
-		await fsImpl.unlink(paths.lock).catch(() => undefined);
+		if (await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))
+			await fsImpl.unlink(paths.lock).catch(() => undefined);
 	} finally {
-		await fsImpl.unlink(paths.steal).catch(() => undefined);
+		await releaseDaemonTransitionLock({ fs: fsImpl, path: paths.steal, lock: transition });
 	}
 }
 

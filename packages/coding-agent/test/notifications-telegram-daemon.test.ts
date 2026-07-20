@@ -1,4 +1,5 @@
 import { describe, expect, spyOn, test, vi } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -12,7 +13,11 @@ import {
 	TELEGRAM_MESSAGE_LIMIT,
 	TELEGRAM_PARSE_MODE,
 } from "../src/sdk/bus/html-format";
-import { acquireDaemonTransitionLock } from "../src/sdk/bus/notification-service";
+import {
+	acquireDaemonTransitionLock,
+	type NotificationEndpointFileIdentity,
+	releaseDaemonTransitionLock,
+} from "../src/sdk/bus/notification-service";
 import { RateLimitPool } from "../src/sdk/bus/rate-limit-pool";
 import { deliverRichWithFallback } from "../src/sdk/bus/rich-render";
 import {
@@ -63,6 +68,52 @@ test("endpoint authority digest canonicalizes endpoint presentation and binds au
 
 function tempAgentDir(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-daemon-test-"));
+}
+
+function exactTransitionFs(onExactUnlink?: (file: string) => void) {
+	return {
+		readFile: (file: string, encoding: "utf8") => fs.promises.readFile(file, encoding),
+		writeFile: (file: string, data: string, opts?: Parameters<typeof fs.promises.writeFile>[2]) =>
+			fs.promises.writeFile(file, data, opts),
+		stat: async (file: string) => ({ mtimeMs: (await fs.promises.stat(file)).mtimeMs }),
+		readEndpointFile: async (file: string) => {
+			const bytes = await fs.promises.readFile(file);
+			const stat = await fs.promises.lstat(file, { bigint: true });
+			return {
+				bytes,
+				identity: {
+					dev: stat.dev,
+					ino: stat.ino,
+					size: stat.size,
+					mtimeNs: stat.mtimeNs,
+					sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+				},
+			};
+		},
+		exactUnlink: async (file: string, identity: NotificationEndpointFileIdentity) => {
+			onExactUnlink?.(file);
+			const bytes = await fs.promises.readFile(file).catch(() => undefined);
+			if (!bytes) return { ok: false, code: "missing" };
+			const stat = await fs.promises.lstat(file, { bigint: true });
+			const matches =
+				stat.dev === identity.dev &&
+				stat.ino === identity.ino &&
+				stat.size === identity.size &&
+				stat.mtimeNs === identity.mtimeNs &&
+				crypto.createHash("sha256").update(bytes).digest("hex") === identity.sha256;
+			if (!matches) return { ok: false, code: "identity_mismatch" };
+			await fs.promises.unlink(file);
+			return { ok: true };
+		},
+	};
+}
+
+function transitionFsCapabilities(): Pick<TelegramDaemonFs, "readEndpointFile" | "exactUnlink"> {
+	const transitionFs = exactTransitionFs();
+	return {
+		readEndpointFile: transitionFs.readEndpointFile,
+		exactUnlink: transitionFs.exactUnlink,
+	};
 }
 
 function settings(agentDir: string): Settings {
@@ -689,7 +740,7 @@ describe("telegram daemon", () => {
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
 		fs.mkdirSync(paths.dir, { recursive: true });
-		fs.writeFileSync(paths.lock, "");
+		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 999, incarnation: "linux:100", startedAt: 0 }));
 		fs.writeFileSync(
 			paths.state,
 			JSON.stringify({
@@ -722,7 +773,7 @@ describe("telegram daemon", () => {
 		"",
 		"{not json",
 		JSON.stringify({ pid: "invalid", startedAt: 0 }),
-	])("missing state reclaims unusable legacy lock metadata %j", async lockMetadata => {
+	])("fresh malformed lock metadata remains protected", async lockMetadata => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
@@ -741,10 +792,10 @@ describe("telegram daemon", () => {
 
 				randomId: () => "successor",
 			}),
-		).resolves.toMatchObject({ acquired: true, ownerId: "successor" });
-		expect((await readDaemonState(s))?.pid).toBe(222);
+		).resolves.toEqual({ acquired: false, attached: false, provisional: true });
+		expect(fs.readFileSync(paths.lock, "utf8")).toBe(lockMetadata);
 	});
-	test("recovers a malformed state only after its unusable lock is positively stale", async () => {
+	test("fresh malformed lock remains protected even with malformed state", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
@@ -762,8 +813,8 @@ describe("telegram daemon", () => {
 				pidAlive: () => false,
 				randomId: () => "successor",
 			}),
-		).resolves.toMatchObject({ acquired: true, ownerId: "successor" });
-		expect((await readDaemonState(s))?.pid).toBe(222);
+		).resolves.toEqual({ acquired: false, attached: false, provisional: true });
+		expect(fs.readFileSync(paths.lock, "utf8")).toBe("{not json");
 	});
 	test("keeps legacy PID-only live initializer artifacts blocked and unchanged", async () => {
 		const agentDir = tempAgentDir();
@@ -794,12 +845,23 @@ describe("telegram daemon", () => {
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
 		fs.mkdirSync(paths.dir, { recursive: true });
-		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, startedAt: 0 }));
+		fs.writeFileSync(
+			paths.lock,
+			JSON.stringify({
+				pid: 111,
+				incarnation: "linux:103",
+				ownerId: "stopped",
+				acquisitionId: "stopped",
+				startedAt: 0,
+			}),
+		);
 		fs.writeFileSync(
 			paths.state,
 			JSON.stringify({
 				pid: 111,
+				incarnation: "linux:103",
 				ownerId: "stopped",
+				acquisitionId: "stopped",
 				tokenFingerprint: "fp",
 				chatId: "42",
 				startedAt: 0,
@@ -843,6 +905,7 @@ describe("telegram daemon", () => {
 			continueRelease = resolve;
 		});
 		const pausedFs: TelegramDaemonFs = {
+			...exactTransitionFs(),
 			mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
 			readFile: (file, encoding) => fs.promises.readFile(file, encoding),
 			writeFile: async (file, data, opts) => {
@@ -936,6 +999,7 @@ describe("telegram daemon", () => {
 		const paths = daemonPaths(agentDir);
 		let failStateWrite = true;
 		const crashingFs: TelegramDaemonFs = {
+			...transitionFsCapabilities(),
 			mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
 			readFile: (file, encoding) => fs.promises.readFile(file, encoding),
 			writeFile: async (file, data, opts) => {
@@ -957,6 +1021,7 @@ describe("telegram daemon", () => {
 				tokenFingerprint: "fp",
 				chatId: "42",
 				pid: 111,
+				ownerId: "crashed",
 				now: () => 0,
 				pidIncarnation: () => "linux:111",
 				fs: crashingFs,
@@ -966,6 +1031,8 @@ describe("telegram daemon", () => {
 		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toEqual({
 			pid: 111,
 			incarnation: "linux:111",
+			ownerId: "crashed",
+			acquisitionId: "crashed",
 			startedAt: 0,
 		});
 		expect(fs.existsSync(paths.state)).toBe(false);
@@ -987,7 +1054,16 @@ describe("telegram daemon", () => {
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
 		fs.mkdirSync(paths.dir, { recursive: true });
-		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, incarnation: "linux:111", startedAt: 0 }));
+		fs.writeFileSync(
+			paths.lock,
+			JSON.stringify({
+				pid: 111,
+				incarnation: "linux:111",
+				ownerId: "initializer",
+				acquisitionId: "initializer",
+				startedAt: 0,
+			}),
+		);
 
 		await expect(
 			acquireDaemonOwnership({
@@ -1007,7 +1083,16 @@ describe("telegram daemon", () => {
 		const paths = daemonPaths(agentDir);
 		const cwd = path.join(agentDir, "concurrent-session");
 		fs.mkdirSync(paths.dir, { recursive: true });
-		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, incarnation: "linux:111", startedAt: 100 }));
+		fs.writeFileSync(
+			paths.lock,
+			JSON.stringify({
+				pid: 111,
+				incarnation: "linux:111",
+				ownerId: "initializer",
+				acquisitionId: "initializer",
+				startedAt: 100,
+			}),
+		);
 		let published = false;
 
 		await expect(
@@ -1055,7 +1140,16 @@ describe("telegram daemon", () => {
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
 		fs.mkdirSync(paths.dir, { recursive: true });
-		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, incarnation: "linux:111", startedAt: 100 }));
+		fs.writeFileSync(
+			paths.lock,
+			JSON.stringify({
+				pid: 111,
+				incarnation: "linux:111",
+				ownerId: "initializer",
+				acquisitionId: "initializer",
+				startedAt: 100,
+			}),
+		);
 		let sleeps = 0;
 
 		await expect(
@@ -1119,29 +1213,204 @@ describe("telegram daemon", () => {
 		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toMatchObject({ pid: 222, incarnation: "linux:222" });
 	});
 
-	test("recovers a lock written before its owner state", async () => {
+	test("serializes provisional lock publication and reclaims only a proven-dead owner", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
 		fs.mkdirSync(paths.dir, { recursive: true });
-		fs.writeFileSync(paths.lock, "");
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				pid: 999,
+				incarnation: "linux:old",
+				ownerId: "old",
+				acquisitionId: "old",
+				ownershipPhase: "ready",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				startedAt: 0,
+				heartbeatAt: 0,
+				roots: [],
+				version: DAEMON_VERSION,
+				generation: DAEMON_GENERATION,
+			}),
+		);
+		let publicationStarted!: () => void;
+		const publicationReached = new Promise<void>(resolve => {
+			publicationStarted = resolve;
+		});
+		let releasePublication!: () => void;
+		const publicationReleased = new Promise<void>(resolve => {
+			releasePublication = resolve;
+		});
+		let paused = true;
+		const pausedFs: TelegramDaemonFs = {
+			...transitionFsCapabilities(),
+			mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
+			readFile: (file, encoding) => fs.promises.readFile(file, encoding),
+			writeFile: async (file, data, opts) => {
+				if (paused && file.startsWith(`${paths.state}.`) && file.endsWith(".tmp")) {
+					publicationStarted();
+					await publicationReleased;
+				}
+				await fs.promises.writeFile(file, data, opts);
+			},
+			rename: (oldPath, newPath) => fs.promises.rename(oldPath, newPath).then(() => undefined),
+			unlink: file => fs.promises.unlink(file),
+			open: async (file, flags, mode) => fs.promises.open(file, flags, mode),
+			readdir: file => fs.promises.readdir(file),
+			chmod: (file, mode) => fs.promises.chmod(file, mode),
+			stat: file => fs.promises.stat(file),
+		};
+		const provenance = (pid: number) => `linux:${pid}`;
+		const first = acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: 111,
+			ownerId: "first",
+			now: () => 30_000,
+			pidAlive: pid => pid === 111 || pid === process.pid,
+			pidIncarnation: provenance,
+			fs: pausedFs,
+		});
+		await publicationReached;
+		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toMatchObject({
+			pid: 111,
+			ownerId: "first",
+			acquisitionId: "first",
+		});
+		const second = await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: 222,
+			ownerId: "second",
+			now: () => 30_000,
+			pidAlive: pid => pid === 111 || pid === process.pid,
+			pidIncarnation: provenance,
+			fs: pausedFs,
+		});
+		expect(second).toEqual({ acquired: false, attached: false, provisional: true });
+		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toMatchObject({ ownerId: "first" });
+		paused = false;
+		releasePublication();
+		expect(await first).toMatchObject({ acquired: true, ownerId: "first" });
+		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({ ownerId: "first" });
 
-		await expect(
-			acquireDaemonOwnership({
+		expect(
+			await acquireDaemonOwnership({
 				settings: s,
 				tokenFingerprint: "fp",
 				chatId: "42",
 				pid: 222,
-				pidAlive: () => true,
-				pidIncarnation: () => "linux:100",
-				randomId: () => "recovered",
+				ownerId: "recovered",
+				now: () => 60_000,
+				pidAlive: () => false,
+				pidIncarnation: provenance,
 			}),
-		).resolves.toMatchObject({ acquired: true, ownerId: "recovered" });
-		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({
-			ownerId: "recovered",
-			pid: 222,
-			incarnation: "linux:100",
+		).toMatchObject({ acquired: true, ownerId: "recovered" });
+	});
+	test.each([
+		"valid",
+		"partial",
+	] as const)("keeps a new %s initializer protected from an older stopped tombstone past transition TTL", async publication => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.lock,
+			JSON.stringify({ pid: 999, incarnation: "linux:old", ownerId: "old", acquisitionId: "old", startedAt: 0 }),
+		);
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				pid: 999,
+				incarnation: "linux:old",
+				ownerId: "old",
+				acquisitionId: "old",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				startedAt: 0,
+				heartbeatAt: 0,
+				stoppedAt: 1,
+				roots: [],
+				version: DAEMON_VERSION,
+				generation: DAEMON_GENERATION,
+			}),
+		);
+		let reached!: () => void;
+		const reachedPublication = new Promise<void>(resolve => {
+			reached = resolve;
 		});
+		let resume!: () => void;
+		const publicationGate = new Promise<void>(resolve => {
+			resume = resolve;
+		});
+		let paused = true;
+		const pausedFs: TelegramDaemonFs = {
+			...transitionFsCapabilities(),
+			mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
+			readFile: (file, encoding) => fs.promises.readFile(file, encoding),
+			writeFile: async (file, data, opts) => {
+				const pauseOnLock =
+					publication === "partial" &&
+					file === paths.lock &&
+					typeof opts === "object" &&
+					opts !== null &&
+					"flag" in opts &&
+					opts.flag === "wx";
+				const pauseOnState = publication === "valid" && file.startsWith(`${paths.state}.`) && file.endsWith(".tmp");
+				if (paused && (pauseOnLock || pauseOnState)) {
+					if (pauseOnLock) await fs.promises.writeFile(file, "{", { mode: 0o600 });
+					reached();
+					await publicationGate;
+					if (pauseOnLock) await fs.promises.writeFile(file, data, { mode: 0o600 });
+					else await fs.promises.writeFile(file, data, opts);
+					return;
+				}
+				await fs.promises.writeFile(file, data, opts);
+			},
+			rename: (oldPath, newPath) => fs.promises.rename(oldPath, newPath).then(() => undefined),
+			unlink: file => fs.promises.unlink(file),
+			open: async (file, flags, mode) => fs.promises.open(file, flags, mode),
+			readdir: file => fs.promises.readdir(file),
+			chmod: (file, mode) => fs.promises.chmod(file, mode),
+			stat: file => fs.promises.stat(file),
+		};
+		const provenance = (pid: number) => `linux:${pid}`;
+		const first = acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: 111,
+			ownerId: "first",
+			now: () => 30_000,
+			pidAlive: pid => pid === 111 || pid === process.pid,
+			pidIncarnation: provenance,
+			fs: pausedFs,
+		});
+		await reachedPublication;
+		const second = await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: 222,
+			ownerId: "second",
+			now: () => 60_000,
+			pidAlive: pid => pid === 111 || pid === process.pid,
+			pidIncarnation: provenance,
+			fs: pausedFs,
+		});
+		expect(second).toEqual({ acquired: false, attached: false, provisional: true });
+		paused = false;
+		resume();
+		expect(await first).toMatchObject({ acquired: true, ownerId: "first" });
+		const lock = JSON.parse(fs.readFileSync(paths.lock, "utf8"));
+		const state = JSON.parse(fs.readFileSync(paths.state, "utf8"));
+		expect(lock).toMatchObject({ ownerId: "first", acquisitionId: "first", pid: 111 });
+		expect(state).toMatchObject({ ownerId: "first", acquisitionId: "first", pid: 111 });
 	});
 
 	test("fresh heartbeat is not stolen", async () => {
@@ -1149,7 +1418,6 @@ describe("telegram daemon", () => {
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
 		fs.mkdirSync(paths.dir, { recursive: true });
-		fs.writeFileSync(paths.lock, "");
 		fs.writeFileSync(
 			paths.state,
 			JSON.stringify({
@@ -1183,7 +1451,6 @@ describe("telegram daemon", () => {
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
 		fs.mkdirSync(paths.dir, { recursive: true });
-		fs.writeFileSync(paths.lock, "");
 		fs.writeFileSync(
 			paths.state,
 			JSON.stringify({
@@ -1198,6 +1465,7 @@ describe("telegram daemon", () => {
 				version: DAEMON_VERSION,
 			}),
 		);
+		fs.writeFileSync(paths.lock, "");
 		const beforeState = fs.readFileSync(paths.state, "utf8");
 		const signals: Array<[number, string]> = [];
 		const unlinked: string[] = [];
@@ -1267,13 +1535,23 @@ describe("telegram daemon", () => {
 
 	function writeLiveOwner(agentDir: string, extra: Partial<DaemonState> = {}): void {
 		const paths = daemonPaths(agentDir);
+		const state = liveOwnerState(extra);
 		fs.mkdirSync(paths.dir, { recursive: true });
-		fs.writeFileSync(paths.state, JSON.stringify(liveOwnerState(extra)));
-		fs.writeFileSync(paths.lock, "");
+		fs.writeFileSync(paths.state, JSON.stringify(state));
+		fs.writeFileSync(
+			paths.lock,
+			JSON.stringify({
+				pid: state.pid,
+				incarnation: state.incarnation,
+				ownerId: state.ownerId,
+				acquisitionId: state.acquisitionId ?? state.ownerId,
+				startedAt: state.startedAt,
+			}),
+		);
 	}
-	test("keeps the wire protocol at 3 while reload ownership and owner-lock authority use generation 6", () => {
+	test("keeps the wire protocol at 3 while identity-atomic transitions use generation 7", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		expect(DAEMON_GENERATION).toBe(6);
+		expect(DAEMON_GENERATION).toBe(7);
 	});
 
 	test("#2028 acquire flags a reload for a live pre-upgrade owner missing the generation field", async () => {
@@ -1321,7 +1599,6 @@ describe("telegram daemon", () => {
 			version: 1,
 		};
 		fs.writeFileSync(paths.state, JSON.stringify(parent));
-		fs.writeFileSync(paths.lock, "");
 		const input = {
 			settings: s,
 			tokenFingerprint: "e60b05c186ca",
@@ -1360,7 +1637,6 @@ describe("telegram daemon", () => {
 			const paths = daemonPaths(agentDir);
 			fs.mkdirSync(paths.dir, { recursive: true });
 			fs.writeFileSync(paths.state, JSON.stringify(parent));
-			fs.writeFileSync(paths.lock, "");
 			const result = await acquireDaemonOwnership({
 				settings: s,
 				tokenFingerprint: parent.tokenFingerprint,
@@ -1393,7 +1669,6 @@ describe("telegram daemon", () => {
 				version: 1,
 			}),
 		);
-		fs.writeFileSync(paths.lock, "");
 
 		expect(
 			await acquireDaemonOwnership({
@@ -1409,71 +1684,202 @@ describe("telegram daemon", () => {
 		).toMatchObject({ acquired: true });
 	});
 
-	test("transition lock reclaims a stale marker and writes owner metadata", async () => {
+	test.each([
+		"",
+		"{",
+	])("malformed legacy transition reservation %p remains blocked after TTL for manual cleanup", async legacyReservation => {
 		const agentDir = tempAgentDir();
 		const marker = path.join(agentDir, "transition.steal");
-		fs.writeFileSync(marker, "");
+		const state = path.join(agentDir, "telegram-daemon.json");
+
+		const stateBefore = JSON.stringify({ ownerId: "existing-owner", pid: 111 });
+		fs.writeFileSync(marker, legacyReservation);
+		fs.writeFileSync(state, stateBefore);
 		fs.utimesSync(marker, 0, 0);
-		const transitionFs = {
-			readFile: (file: string, encoding: "utf8") => fs.promises.readFile(file, encoding),
-			writeFile: (file: string, data: string, opts?: Parameters<typeof fs.promises.writeFile>[2]) =>
-				fs.promises.writeFile(file, data, opts),
-			unlink: (file: string) => fs.promises.unlink(file),
-			stat: async (file: string) => ({ mtimeMs: (await fs.promises.stat(file)).mtimeMs }),
-		};
-		expect(
-			await acquireDaemonTransitionLock({
-				fs: transitionFs,
+
+		await expect(
+			acquireDaemonTransitionLock({
+				fs: exactTransitionFs(),
 				path: marker,
-				createExclusive: async file => {
-					try {
-						const handle = await fs.promises.open(file, "wx", 0o600);
-						await handle.close();
-						return true;
-					} catch {
-						return false;
-					}
-				},
 				pid: 222,
 				pidAlive: () => false,
 				pidIncarnation: () => "linux:100",
 				now: () => 100_000,
+				randomToken: () => "transition-token",
 				retries: 1,
 				retryDelayMs: 0,
 				sleep: async () => undefined,
 			}),
-		).toBe(true);
-		expect(JSON.parse(fs.readFileSync(marker, "utf8"))).toEqual({
+		).resolves.toBeUndefined();
+		expect(fs.readFileSync(marker, "utf8")).toBe(legacyReservation);
+		expect(fs.readFileSync(state, "utf8")).toBe(stateBefore);
+	});
+
+	test("a paused generation-6 writer cannot overwrite generation-7 authority after blocked recovery", async () => {
+		const agentDir = tempAgentDir();
+		const marker = path.join(agentDir, "transition.steal");
+		const state = path.join(agentDir, "telegram-daemon.json");
+		const legacyReservation = "";
+		const legacyPublication = JSON.stringify({ pid: 111, startedAt: 1 });
+		const stateBefore = JSON.stringify({ ownerId: "existing-owner", pid: 111 });
+		fs.writeFileSync(marker, legacyReservation);
+		fs.writeFileSync(state, stateBefore);
+		fs.utimesSync(marker, 0, 0);
+
+		const transition = await acquireDaemonTransitionLock({
+			fs: exactTransitionFs(),
+			path: marker,
 			pid: 222,
-			incarnation: "linux:100",
-			createdAt: 100_000,
+			pidAlive: () => false,
+			pidIncarnation: () => "linux:222",
+			now: () => 100_000,
+			randomToken: () => "generation-7-token",
+			retries: 1,
+			retryDelayMs: 0,
+			sleep: async () => undefined,
 		});
+		expect(transition).toBeUndefined();
+		expect(fs.readFileSync(marker, "utf8")).toBe(legacyReservation);
+
+		// This models the old second pathname write resuming after generation 7 was
+		// blocked. No generation-7 authority was published for it to overwrite.
+		fs.writeFileSync(marker, legacyPublication);
+		expect(fs.readFileSync(marker, "utf8")).toBe(legacyPublication);
+		expect(fs.readFileSync(state, "utf8")).toBe(stateBefore);
+	});
+	test("transition stale reclaim preserves a successor installed after exact validation", async () => {
+		const agentDir = tempAgentDir();
+		const marker = path.join(agentDir, "transition.steal");
+		const stale = JSON.stringify({ pid: 999, incarnation: "linux:old", createdAt: 0, token: "stale-token" });
+		const fresh = JSON.stringify({ pid: 111, incarnation: "linux:fresh", createdAt: 1, token: "fresh-token" });
+		fs.writeFileSync(marker, stale);
+		fs.utimesSync(marker, 0, 0);
+		const transitionFs = exactTransitionFs(file => {
+			fs.unlinkSync(file);
+			fs.writeFileSync(file, fresh);
+		});
+
+		await expect(
+			acquireDaemonTransitionLock({
+				fs: transitionFs,
+				path: marker,
+				pid: 222,
+				pidAlive: pid => pid === 222,
+				pidIncarnation: pid => (pid === 222 ? "linux:222" : undefined),
+				now: () => 100_000,
+				retries: 0,
+			}),
+		).resolves.toBeUndefined();
+		expect(fs.readFileSync(marker, "utf8")).toBe(fresh);
+	});
+	test("transition reclaim retains a live marker when a later probe would be unavailable", async () => {
+		const agentDir = tempAgentDir();
+		const marker = path.join(agentDir, "transition.steal");
+		const live = JSON.stringify({ pid: 999, incarnation: "linux:live", createdAt: 0, token: "live-token" });
+		fs.writeFileSync(marker, live);
+		let liveProbeCount = 0;
+		let liveCheckCount = 0;
+
+		await expect(
+			acquireDaemonTransitionLock({
+				fs: exactTransitionFs(),
+				path: marker,
+				pid: 222,
+				pidAlive: pid => {
+					liveCheckCount++;
+					return pid === 999;
+				},
+				pidIncarnation: pid => {
+					if (pid === 222) return "linux:222";
+					liveProbeCount++;
+					return liveProbeCount === 1 ? "linux:live" : undefined;
+				},
+				retries: 0,
+			}),
+		).resolves.toBeUndefined();
+		expect(liveProbeCount).toBe(1);
+		expect(liveCheckCount).toBe(1);
+		expect(fs.readFileSync(marker, "utf8")).toBe(live);
+	});
+
+	test("atomic transition publication cannot overwrite a successor installed while a creator is stalled", async () => {
+		const agentDir = tempAgentDir();
+		const marker = path.join(agentDir, "transition.steal");
+		const fresh = JSON.stringify({ pid: 111, incarnation: "linux:fresh", createdAt: 1, token: "fresh-token" });
+		const transitionFs = exactTransitionFs();
+		let stalled = true;
+		const writeFile = transitionFs.writeFile;
+		transitionFs.writeFile = async (file, data, opts) => {
+			if (stalled) {
+				stalled = false;
+				fs.writeFileSync(file, fresh, { flag: "wx" });
+			}
+			await writeFile(file, data, opts);
+		};
+
+		await expect(
+			acquireDaemonTransitionLock({
+				fs: transitionFs,
+				path: marker,
+				pid: 222,
+				pidAlive: pid => pid === 111,
+				pidIncarnation: () => "linux:222",
+				retries: 0,
+			}),
+		).resolves.toBeUndefined();
+		expect(fs.readFileSync(marker, "utf8")).toBe(fresh);
+	});
+	test("transition acquisition requires an identity-capable releaser", async () => {
+		const agentDir = tempAgentDir();
+		const marker = path.join(agentDir, "transition.steal");
+		await expect(
+			acquireDaemonTransitionLock({
+				fs: {
+					readFile: (file: string, encoding: "utf8") => fs.promises.readFile(file, encoding),
+					writeFile: (file: string, data: string, opts?: Parameters<typeof fs.promises.writeFile>[2]) =>
+						fs.promises.writeFile(file, data, opts),
+				},
+				path: marker,
+				pid: 222,
+				pidAlive: () => false,
+				pidIncarnation: () => "linux:222",
+			}),
+		).resolves.toBeUndefined();
+		expect(fs.existsSync(marker)).toBe(false);
+	});
+
+	test("exact-token release cannot remove a successor", async () => {
+		const agentDir = tempAgentDir();
+		const marker = path.join(agentDir, "transition.steal");
+		const lock = { pid: 222, incarnation: "linux:222", createdAt: 1, token: "owner-token" };
+		const fresh = JSON.stringify({ pid: 111, incarnation: "linux:fresh", createdAt: 2, token: "fresh-token" });
+		fs.writeFileSync(marker, `${JSON.stringify(lock)}\n`);
+		const transitionFs = exactTransitionFs(file => {
+			fs.unlinkSync(file);
+			fs.writeFileSync(file, fresh);
+		});
+
+		await expect(releaseDaemonTransitionLock({ fs: transitionFs, path: marker, lock })).resolves.toBe(false);
+		expect(fs.readFileSync(marker, "utf8")).toBe(fresh);
 	});
 	test("transition lock retains a live non-canonical owner", async () => {
 		const agentDir = tempAgentDir();
 		const marker = path.join(agentDir, "transition.steal");
 		const legacy = JSON.stringify({ pid: 999, incarnation: "darwin:Thu Jul 17 10:00:00 2025", createdAt: 1 });
 		fs.writeFileSync(marker, legacy);
-		const transitionFs = {
-			readFile: (file: string, encoding: "utf8") => fs.promises.readFile(file, encoding),
-			writeFile: (file: string, data: string, opts?: Parameters<typeof fs.promises.writeFile>[2]) =>
-				fs.promises.writeFile(file, data, opts),
-			unlink: (file: string) => fs.promises.unlink(file),
-			stat: async (file: string) => ({ mtimeMs: (await fs.promises.stat(file)).mtimeMs }),
-		};
+		const transitionFs = exactTransitionFs();
 
-		expect(
-			await acquireDaemonTransitionLock({
+		await expect(
+			acquireDaemonTransitionLock({
 				fs: transitionFs,
 				path: marker,
-				createExclusive: async () => false,
 				pid: 222,
 				pidAlive: () => true,
 				pidIncarnation: () => "linux:222",
 				now: () => 100_000,
 				retries: 0,
 			}),
-		).toBe(false);
+		).resolves.toBeUndefined();
 		expect(fs.readFileSync(marker, "utf8")).toBe(legacy);
 	});
 
@@ -1598,7 +2004,7 @@ describe("telegram daemon", () => {
 				pidAlive: () => true,
 				pidIncarnation: () => "linux:4242",
 			}),
-		).resolves.toEqual({ acquired: false, attached: false, blocked: true });
+		).resolves.toEqual({ acquired: false, attached: false, provisional: true });
 		expect(fs.readFileSync(paths.state, "utf8")).toBe(stateBefore);
 		expect(fs.readFileSync(paths.lock, "utf8")).toBe(lockBefore);
 		expect(fs.readFileSync(paths.steal, "utf8")).toBe(transitionLockBefore);
@@ -1704,7 +2110,7 @@ describe("telegram daemon", () => {
 		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({ ownershipPhase: "provisional" });
 	});
 
-	test("transition lock protects a fresh wx crash marker and reclaims it after TTL", async () => {
+	test("transition lock keeps an aged malformed crash marker blocked pending manual cleanup", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		await acquireDaemonOwnership({
@@ -1736,7 +2142,9 @@ describe("telegram daemon", () => {
 				stealRetries: 1,
 				stealRetryDelayMs: 0,
 			}),
-		).toBe(true);
+		).toBe(false);
+		expect(fs.readFileSync(paths.steal, "utf8")).toBe("");
+		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({ ownershipPhase: "provisional" });
 	});
 
 	test("#2028 heartbeat retries through a released transition lock before publishing ready", async () => {

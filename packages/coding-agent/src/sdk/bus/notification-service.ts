@@ -71,6 +71,51 @@ export interface NotificationExactUnlinkResult {
 	detachedPath?: string;
 }
 
+/** Read one regular file together with the identity required for exact removal. */
+export async function readNotificationEndpointFile(file: string): Promise<NotificationEndpointFile> {
+	const before = await fsPromises.lstat(file, { bigint: true });
+	if (!before.isFile() || before.isSymbolicLink()) throw new Error("Endpoint is not a regular file");
+	const noFollow = fsSync.constants.O_NOFOLLOW;
+	const handle = await fsPromises.open(file, fsSync.constants.O_RDONLY | (noFollow ?? 0));
+	try {
+		const opened = await handle.stat({ bigint: true });
+		if (!opened.isFile() || !sameEndpointFileMetadata(before, opened))
+			throw new Error("Endpoint changed before it was opened");
+		const bytes = await handle.readFile();
+		const after = await handle.stat({ bigint: true });
+		const pathname = await fsPromises.lstat(file, { bigint: true });
+		if (
+			!after.isFile() ||
+			!pathname.isFile() ||
+			pathname.isSymbolicLink() ||
+			!sameEndpointFileMetadata(opened, after) ||
+			!sameEndpointFileMetadata(opened, pathname)
+		)
+			throw new Error("Endpoint changed while it was read");
+		return {
+			bytes,
+			identity: {
+				dev: opened.dev,
+				ino: opened.ino,
+				size: opened.size,
+				mtimeNs: opened.mtimeNs,
+				sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+			},
+		};
+	} finally {
+		await handle.close();
+	}
+}
+
+export function exactUnlinkNotificationFile(
+	file: string,
+	identity: NotificationEndpointFileIdentity,
+	quarantineName: string,
+): NotificationExactUnlinkResult {
+	const result = native.exactUnlink(file, { ...identity, quarantineName });
+	return { ok: result.ok, code: result.code, detachedPath: result.detachedPath };
+}
+
 /** Minimal filesystem surface the service needs; injectable for tests. */
 export interface NotificationServiceFs {
 	readdir(dir: string): Promise<string[]>;
@@ -78,13 +123,6 @@ export interface NotificationServiceFs {
 	readEndpointFile(file: string): Promise<NotificationEndpointFile>;
 	exactUnlink(file: string, identity: NotificationEndpointFileIdentity): Promise<NotificationExactUnlinkResult>;
 	unlink(file: string): Promise<void>;
-	/**
-	 * Atomically create `file` with O_EXCL semantics: resolves `true` when this
-	 * call created it, `false` when it already existed. Used to hold the daemon
-	 * steal-mutex ({@link DaemonPaths.steal}) during owner-bound lock removal so
-	 * recovery and a concurrent daemon takeover are mutually exclusive.
-	 */
-	createExclusive(file: string): Promise<boolean>;
 	writeFile?(file: string, data: string, opts?: WriteFileOptions): Promise<void>;
 	stat?(file: string): Promise<{ mtimeMs: number }>;
 }
@@ -92,57 +130,10 @@ export interface NotificationServiceFs {
 const nodeServiceFs: NotificationServiceFs = {
 	readdir: dir => fsPromises.readdir(dir),
 	readFile: (file, encoding) => fsPromises.readFile(file, encoding),
-	readEndpointFile: async file => {
-		const before = await fsPromises.lstat(file, { bigint: true });
-		if (!before.isFile() || before.isSymbolicLink()) throw new Error("Endpoint is not a regular file");
-		const noFollow = fsSync.constants.O_NOFOLLOW;
-		const handle = await fsPromises.open(file, fsSync.constants.O_RDONLY | (noFollow ?? 0));
-		try {
-			const opened = await handle.stat({ bigint: true });
-			if (!opened.isFile() || !sameEndpointFileMetadata(before, opened))
-				throw new Error("Endpoint changed before it was opened");
-			const bytes = await handle.readFile();
-			const after = await handle.stat({ bigint: true });
-			const pathname = await fsPromises.lstat(file, { bigint: true });
-			if (
-				!after.isFile() ||
-				!pathname.isFile() ||
-				pathname.isSymbolicLink() ||
-				!sameEndpointFileMetadata(opened, after) ||
-				!sameEndpointFileMetadata(opened, pathname)
-			)
-				throw new Error("Endpoint changed while it was read");
-			return {
-				bytes,
-				identity: {
-					dev: opened.dev,
-					ino: opened.ino,
-					size: opened.size,
-					mtimeNs: opened.mtimeNs,
-					sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
-				},
-			};
-		} finally {
-			await handle.close();
-		}
-	},
-	exactUnlink: async (file, identity) => {
-		const result = native.exactUnlink(file, {
-			...identity,
-			quarantineName: `.gjc-delete-notification-endpoint-${crypto.randomUUID()}.json`,
-		});
-		return { ok: result.ok, code: result.code, detachedPath: result.detachedPath };
-	},
+	readEndpointFile: readNotificationEndpointFile,
+	exactUnlink: async (file, identity) =>
+		exactUnlinkNotificationFile(file, identity, `.gjc-delete-notification-endpoint-${crypto.randomUUID()}.json`),
 	unlink: file => fsPromises.unlink(file),
-	createExclusive: async file => {
-		try {
-			const handle = await fsPromises.open(file, "wx", 0o600);
-			await handle.close();
-			return true;
-		} catch {
-			return false;
-		}
-	},
 	writeFile: (file, data, opts) => fsPromises.writeFile(file, data, opts),
 	stat: file => fsPromises.stat(file),
 };
@@ -786,12 +777,12 @@ export interface RecoveryOptions {
 	deps?: NotificationServiceDeps;
 }
 
-const TRANSITION_LOCK_STALE_MS = HEARTBEAT_TTL_MS;
-
-interface DaemonTransitionLock {
+export interface DaemonTransitionLock {
 	pid: number;
 	incarnation: string;
 	createdAt: number;
+	/** Unique fencing generation for this particular transition acquisition. */
+	token: string;
 }
 
 function isDaemonTransitionLock(value: unknown): value is DaemonTransitionLock {
@@ -801,24 +792,100 @@ function isDaemonTransitionLock(value: unknown): value is DaemonTransitionLock {
 		Number.isSafeInteger(candidate.pid) &&
 		(candidate.pid as number) > 0 &&
 		typeof candidate.incarnation === "string" &&
-		typeof candidate.createdAt === "number"
+		typeof candidate.createdAt === "number" &&
+		typeof candidate.token === "string" &&
+		candidate.token.length > 0
 	);
+}
+
+interface TransitionMarkerSnapshot {
+	raw: string;
+	identity?: NotificationEndpointFileIdentity;
+}
+
+type TransitionMarkerFs = {
+	readFile(file: string, encoding: "utf8"): Promise<string>;
+	writeFile?(file: string, data: string, opts?: WriteFileOptions): Promise<void>;
+	readEndpointFile?(file: string): Promise<NotificationEndpointFile>;
+	exactUnlink?(file: string, identity: NotificationEndpointFileIdentity): Promise<NotificationExactUnlinkResult>;
+};
+
+async function readTransitionMarker(
+	fs: TransitionMarkerFs,
+	path: string,
+): Promise<TransitionMarkerSnapshot | undefined> {
+	if (fs.readEndpointFile) {
+		const exact = await fs.readEndpointFile(path).catch(() => undefined);
+		if (!exact) return undefined;
+		return { raw: exact.bytes.toString("utf8"), identity: exact.identity };
+	}
+	const raw = await fs.readFile(path, "utf8").catch(() => undefined);
+	if (raw === undefined) return undefined;
+	return { raw };
+}
+
+function transitionMarkerMatchesLock(snapshot: TransitionMarkerSnapshot, lock: DaemonTransitionLock): boolean {
+	try {
+		const current = JSON.parse(snapshot.raw);
+		return (
+			isDaemonTransitionLock(current) &&
+			current.pid === lock.pid &&
+			current.incarnation === lock.incarnation &&
+			current.token === lock.token
+		);
+	} catch {
+		return false;
+	}
+}
+
+/** True only while the exact transition acquisition still occupies the marker path. */
+export async function daemonTransitionLockIsHeld(input: {
+	fs: Pick<TransitionMarkerFs, "readFile" | "readEndpointFile">;
+	path: string;
+	lock: DaemonTransitionLock;
+}): Promise<boolean> {
+	const snapshot = await readTransitionMarker(input.fs, input.path);
+	return Boolean(snapshot && transitionMarkerMatchesLock(snapshot, input.lock));
+}
+
+/** Atomically detaches only the captured transition marker, never a pathname successor. */
+async function detachTransitionMarker(
+	fs: TransitionMarkerFs,
+	path: string,
+	snapshot: TransitionMarkerSnapshot,
+): Promise<boolean> {
+	if (!snapshot.identity || !fs.exactUnlink) return false;
+	try {
+		return (await fs.exactUnlink(path, snapshot.identity)).ok;
+	} catch {
+		return false;
+	}
+}
+
+/** Removes only the caller's exact marker through the identity-bound detach primitive. */
+export async function releaseDaemonTransitionLock(input: {
+	fs: TransitionMarkerFs;
+	path: string;
+	lock: DaemonTransitionLock;
+}): Promise<boolean> {
+	const snapshot = await readTransitionMarker(input.fs, input.path);
+	if (!snapshot || !transitionMarkerMatchesLock(snapshot, input.lock)) return false;
+	return await detachTransitionMarker(input.fs, input.path, snapshot);
 }
 
 /**
  * Acquire the daemon lifecycle transition lock using durable owner metadata.
- * Reclaims only dead, PID-reused, or TTL-expired markers; fresh unknown markers
- * are retained because they may be a creator between exclusive open and write.
+ * The full marker is published in the single O_EXCL write which reserves it;
+ * canonical markers are detached only through their captured filesystem identity.
+ *
+ * Malformed and empty markers deliberately remain blocked regardless of age. They
+ * have no owner provenance, so reclaiming them could detach a generation-6 empty
+ * reservation while its paused legacy writer can still resume. Operators must
+ * manually clean up such legacy debris after confirming no legacy process remains.
  */
 export async function acquireDaemonTransitionLock(input: {
-	fs: {
-		readFile(file: string, encoding: "utf8"): Promise<string>;
-		writeFile?(file: string, data: string, opts?: WriteFileOptions): Promise<void>;
-		unlink(file: string): Promise<void>;
-		stat?(file: string): Promise<{ mtimeMs: number }>;
-	};
+	fs: TransitionMarkerFs;
 	path: string;
-	createExclusive: (file: string) => Promise<boolean>;
 	pid: number;
 	pidAlive: (pid: number) => boolean;
 	pidIncarnation: (pid: number) => string | undefined;
@@ -826,44 +893,48 @@ export async function acquireDaemonTransitionLock(input: {
 	sleep?: (ms: number) => Promise<void>;
 	retries?: number;
 	retryDelayMs?: number;
-}): Promise<boolean> {
+	randomToken?: () => string;
+}): Promise<DaemonTransitionLock | undefined> {
 	const sleep = input.sleep ?? (async (ms: number) => await Bun.sleep(ms));
 	const now = input.now ?? Date.now;
 	const retries = Math.max(input.retries ?? 5, 0);
 	const retryDelayMs = Math.max(input.retryDelayMs ?? 20, 0);
 	const incarnation = input.pidIncarnation(input.pid);
-	if (!isProcessIncarnation(incarnation)) return false;
-	const owner: DaemonTransitionLock = { pid: input.pid, incarnation, createdAt: now() };
+	if (!isProcessIncarnation(incarnation)) return undefined;
+	const token = input.randomToken?.() ?? crypto.randomUUID();
+	if (!token || !input.fs.writeFile || !input.fs.readEndpointFile || !input.fs.exactUnlink) return undefined;
+	const owner: DaemonTransitionLock = { pid: input.pid, incarnation, createdAt: now(), token };
 	for (let attempt = 0; attempt <= retries; attempt++) {
-		if (await input.createExclusive(input.path)) {
-			await input.fs.writeFile?.(input.path, `${JSON.stringify(owner)}\n`, { mode: 0o600 });
-			return true;
+		try {
+			await input.fs.writeFile(input.path, `${JSON.stringify(owner)}\n`, { mode: 0o600, flag: "wx" });
+			return owner;
+		} catch (error) {
+			if (["EEXIST", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			} else throw error;
 		}
-		const raw = await input.fs.readFile(input.path, "utf8").catch(() => undefined);
+		const snapshot = await readTransitionMarker(input.fs, input.path);
 		let current: unknown;
 		try {
-			current = raw === undefined ? undefined : JSON.parse(raw);
+			current = snapshot === undefined ? undefined : JSON.parse(snapshot.raw);
 		} catch {
 			current = undefined;
 		}
-		if (isDaemonTransitionLock(current)) {
-			const currentIncarnation = input.pidIncarnation(current.pid);
-			if (
-				!input.pidAlive(current.pid) ||
+		// Only canonical owner records prove which process may be reclaimed. An
+		// unreadable or empty legacy reservation is intentionally not age-reclaimed:
+		// it may belong to a paused generation-6 two-step publisher.
+		const ownerAlive = isDaemonTransitionLock(current) && input.pidAlive(current.pid);
+		const ownerIncarnation = isDaemonTransitionLock(current) ? input.pidIncarnation(current.pid) : undefined;
+		const reclaimable =
+			isDaemonTransitionLock(current) &&
+			(!ownerAlive ||
 				(isProcessIncarnation(current.incarnation) &&
-					isProcessIncarnation(currentIncarnation) &&
-					currentIncarnation !== current.incarnation) ||
-				(isProcessIncarnation(current.incarnation) && now() - current.createdAt >= TRANSITION_LOCK_STALE_MS)
-			)
-				await input.fs.unlink(input.path).catch(() => undefined);
-		} else {
-			const metadata = await input.fs.stat?.(input.path).catch(() => undefined);
-			if (metadata && now() - metadata.mtimeMs >= TRANSITION_LOCK_STALE_MS)
-				await input.fs.unlink(input.path).catch(() => undefined);
-		}
+					isProcessIncarnation(ownerIncarnation) &&
+					ownerIncarnation !== current.incarnation));
+		if (snapshot && reclaimable) await detachTransitionMarker(input.fs, input.path, snapshot);
 		if (attempt < retries) await sleep(retryDelayMs);
 	}
-	return false;
+	return undefined;
 }
 
 function defaultTransitionPidAlive(pid: number): boolean {
@@ -894,23 +965,21 @@ async function removeDeadOwnerLock(
 	pidAlive: (pid: number) => boolean,
 	expected: NormalizedDaemonState,
 ): Promise<"cleared" | "contended" | "superseded" | "now-alive" | "unlink-failed"> {
-	if (
-		!(await acquireDaemonTransitionLock({
-			fs,
-			path: paths.steal,
-			createExclusive: fs.createExclusive,
-			pid: process.pid,
-			pidAlive: defaultTransitionPidAlive,
-			pidIncarnation: defaultTransitionPidIncarnation,
-		}))
-	)
-		return "contended";
+	const transition = await acquireDaemonTransitionLock({
+		fs,
+		path: paths.steal,
+		pid: process.pid,
+		pidAlive: defaultTransitionPidAlive,
+		pidIncarnation: defaultTransitionPidIncarnation,
+	});
+	if (!transition) return "contended";
 	try {
 		const current = await readDaemonStateFile(fs, paths.state);
 		if (!current || current.ownerId !== expected.ownerId || current.pid !== expected.pid) {
 			return "superseded";
 		}
 		if (pidAlive(current.pid)) return "now-alive";
+		if (!(await daemonTransitionLockIsHeld({ fs, path: paths.steal, lock: transition }))) return "contended";
 		try {
 			await fs.unlink(paths.lock);
 			return "cleared";
@@ -918,7 +987,7 @@ async function removeDeadOwnerLock(
 			return "unlink-failed";
 		}
 	} finally {
-		await fs.unlink(paths.steal).catch(() => undefined);
+		await releaseDaemonTransitionLock({ fs, path: paths.steal, lock: transition });
 	}
 }
 

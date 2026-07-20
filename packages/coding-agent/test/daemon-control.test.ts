@@ -76,6 +76,19 @@ function writeState(agentDir: string, state: Record<string, unknown>): void {
 	fs.writeFileSync(paths.state, JSON.stringify(state));
 }
 
+function writeOwnershipLock(agentDir: string, state: Record<string, unknown>): void {
+	fs.writeFileSync(
+		daemonPaths(agentDir).lock,
+		`${JSON.stringify({
+			pid: state.pid,
+			incarnation: state.incarnation,
+			ownerId: state.ownerId,
+			acquisitionId: state.acquisitionId,
+			startedAt: state.startedAt,
+		})}\n`,
+	);
+}
+
 function freshState(extra: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
 	return {
 		pid: 999,
@@ -415,8 +428,9 @@ describe("TelegramDaemonController.reload", () => {
 	test("cooperatively stops the old owner and spawns a fresh one", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
-		writeState(agentDir, freshState({ generation: DAEMON_GENERATION - 1 }));
-		fs.writeFileSync(daemonPaths(agentDir).lock, "");
+		const state = freshState({ generation: DAEMON_GENERATION - 1 });
+		writeState(agentDir, state);
+		writeOwnershipLock(agentDir, state);
 
 		const alive = new Set<number>([999, 4242]);
 		const signals: Array<[number, string]> = [];
@@ -489,8 +503,9 @@ describe("TelegramDaemonController.reload", () => {
 	test("escalates to SIGKILL when the old owner ignores SIGTERM", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
-		writeState(agentDir, freshState());
-		fs.writeFileSync(daemonPaths(agentDir).lock, "");
+		const state = freshState();
+		writeState(agentDir, state);
+		writeOwnershipLock(agentDir, state);
 
 		const alive = new Set<number>([999, 4242]);
 		const signals: Array<[number, string]> = [];
@@ -634,8 +649,9 @@ describe("TelegramDaemonController.reload", () => {
 	test("spawns the fresh owner only after the old pid is confirmed dead (no poll overlap)", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
-		writeState(agentDir, freshState());
-		fs.writeFileSync(daemonPaths(agentDir).lock, "");
+		const state = freshState();
+		writeState(agentDir, state);
+		writeOwnershipLock(agentDir, state);
 		const alive = new Set<number>([999, 4242]);
 		let oldAliveAtSpawn: boolean | undefined;
 		const child = readyTelegramSpawnFixture({
@@ -703,8 +719,9 @@ describe("TelegramDaemonController.reload", () => {
 		const s = settings(agentDir);
 		// Physically alive (pid 999) but heartbeat far past the TTL: status is "stale",
 		// not "running". A forced reload must still cooperatively signal and replace it.
-		writeState(agentDir, freshState({ heartbeatAt: Date.now() - 60 * 60_000 }));
-		fs.writeFileSync(daemonPaths(agentDir).lock, "");
+		const state = freshState({ heartbeatAt: Date.now() - 60 * 60_000 });
+		writeState(agentDir, state);
+		writeOwnershipLock(agentDir, state);
 
 		const alive = new Set<number>([999, 4242]);
 		const signals: Array<[number, string]> = [];
@@ -886,8 +903,9 @@ describe("cooperative handoff when the captured owner exits before the recheck",
 	test("reload spawns the replacement when the owner exits before the signal recheck", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
-		writeState(agentDir, freshState());
-		fs.writeFileSync(daemonPaths(agentDir).lock, "");
+		const state = freshState();
+		writeState(agentDir, state);
+		writeOwnershipLock(agentDir, state);
 		let ownerAlive = true;
 		const alive = new Set<number>([4242]);
 		const spawns: Array<{ command: string; args: string[] }> = [];
@@ -1864,23 +1882,26 @@ describe("ChatDaemonController ownership safety", () => {
 });
 
 describe("Chat daemon owner-lock publication", () => {
-	test("does not reclaim a fresh empty owner lock before state publication", async () => {
+	test("a paused owner publisher cannot reclaim or overwrite a published contender", async () => {
 		const agentDir = tempAgentDir();
 		const paths = chatDaemonPaths(agentDir, "discord");
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const originalOpen = fs.promises.open;
+		const originalLink = fs.promises.link;
 		let paused = false;
-		fs.promises.open = (async (...args: Parameters<typeof fs.promises.open>) => {
-			const handle = await originalOpen(...args);
-			if (!paused && args[0] === paths.lock && args[1] === "wx") {
+		const originalNow = Date.now;
+		let elapsed = 0;
+		Date.now = () => originalNow() + elapsed;
+		fs.promises.link = (async (...args: Parameters<typeof fs.promises.link>) => {
+			if (!paused && args[1] === paths.lock) {
 				paused = true;
 				entered.resolve();
 				await release.promise;
 			}
-			return handle;
-		}) as typeof fs.promises.open;
+			return await originalLink(...args);
+		}) as typeof fs.promises.link;
 		try {
+			const probe = { pidAlive: () => true, pidIncarnation: () => "linux:12350" };
 			const first = acquireChatDaemonOwnership({
 				agentDir,
 				kind: "discord",
@@ -1888,23 +1909,26 @@ describe("Chat daemon owner-lock publication", () => {
 				pid: process.pid,
 				identity: "identity",
 				incarnation: "linux:12350",
+				...probe,
 			});
 			await entered.promise;
-			expect(
-				await acquireChatDaemonOwnership({
-					agentDir,
-					kind: "discord",
-					ownerId: "owner-b",
-					pid: process.pid,
-					identity: "identity",
-					incarnation: "linux:12350",
-				}),
-			).toBe(false);
+			elapsed = 20_001;
+			const second = await acquireChatDaemonOwnership({
+				agentDir,
+				kind: "discord",
+				ownerId: "owner-b",
+				pid: process.pid,
+				identity: "identity",
+				incarnation: "linux:12350",
+				...probe,
+			});
+			expect(second).toBe(true);
 			release.resolve();
-			expect(await first).toBe(true);
-			expect(JSON.parse(fs.readFileSync(paths.state, "utf8")).ownerId).toBe("owner-a");
+			expect(await first).toBe(false);
+			expect(JSON.parse(fs.readFileSync(paths.state, "utf8")).ownerId).toBe("owner-b");
 		} finally {
-			fs.promises.open = originalOpen;
+			fs.promises.link = originalLink;
+			Date.now = originalNow;
 		}
 	});
 

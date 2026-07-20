@@ -23,8 +23,8 @@ export type ChatDaemonAction = "stop" | "reload";
  * These are intentionally separate from per-session endpoint generations.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 3,
-	slack: 3,
+	discord: 4,
+	slack: 4,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
@@ -124,7 +124,6 @@ export interface ChatDaemonControlDeps {
 const HEARTBEAT_TTL_MS = 20_000;
 const DEFAULT_GRACEFUL_TIMEOUT_MS = 8_000;
 const DEFAULT_KILL_TIMEOUT_MS = 3_000;
-const UNPUBLISHED_OWNER_LOCK_STALE_MS = HEARTBEAT_TTL_MS;
 /** Covers Discord READY plus its first 5-second heartbeat; tests inject a smaller timeout. */
 const DEFAULT_SPAWN_READY_TIMEOUT_MS = 8_000;
 
@@ -132,6 +131,12 @@ interface ChatDaemonOwnerLock {
 	pid: number;
 	incarnation: string;
 	createdAt: number;
+}
+
+interface ChatDaemonOwnerLockLease {
+	content: string;
+	dev: number;
+	ino: number;
 }
 
 interface ChatDaemonOwnershipProbe {
@@ -701,43 +706,68 @@ export async function acquireChatDaemonOwnership(input: {
 		)
 			return false;
 	}
-	if (!(await createChatDaemonOwnerLock(paths.lock, { pid, incarnation, createdAt: Date.now() }))) {
+	const owner = { pid, incarnation, createdAt: Date.now() };
+	let lock = await createChatDaemonOwnerLock(paths.lock, owner);
+	if (!lock) {
 		if (!(await reclaimChatDaemonOwnerLock(paths.lock, paths.state, probe))) return false;
-		if (!(await createChatDaemonOwnerLock(paths.lock, { pid, incarnation, createdAt: Date.now() }))) return false;
+		lock = await createChatDaemonOwnerLock(paths.lock, owner);
+		if (!lock) return false;
 	}
-
-	await withStateWriteLock(
-		paths.state,
-		async () =>
-			await writeJson(paths.state, {
-				version: 1,
-				kind: input.kind,
-				pid,
-				ownerId: input.ownerId,
-				identity: input.identity,
-				incarnation,
-				startedAt: Date.now(),
-				heartbeatAt: Date.now(),
-				transportHealthy: false,
-				generation: chatDaemonGeneration(input.kind),
-			} satisfies ChatDaemonState),
-	);
-	return true;
+	return await withStateWriteLock(paths.state, async () => {
+		if (!(await ownsChatDaemonOwnerLock(paths.lock, lock))) return false;
+		await writeJson(paths.state, {
+			version: 1,
+			kind: input.kind,
+			pid,
+			ownerId: input.ownerId,
+			identity: input.identity,
+			incarnation,
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+			transportHealthy: false,
+			generation: chatDaemonGeneration(input.kind),
+		} satisfies ChatDaemonState);
+		return true;
+	});
 }
 
-async function createChatDaemonOwnerLock(lock: string, owner: ChatDaemonOwnerLock): Promise<boolean> {
+async function createChatDaemonOwnerLock(
+	lock: string,
+	owner: ChatDaemonOwnerLock,
+): Promise<ChatDaemonOwnerLockLease | undefined> {
+	const content = `${JSON.stringify(owner)}\n`;
+	const temporary = `${lock}.${process.pid}.${crypto.randomUUID()}.tmp`;
 	try {
-		const handle = await fs.promises.open(lock, "wx", 0o600);
+		const handle = await fs.promises.open(temporary, "wx", 0o600);
 		try {
-			await handle.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
+			await handle.writeFile(content, "utf8");
 			await handle.sync();
 		} finally {
 			await handle.close();
 		}
-		return true;
-	} catch (error) {
-		if (isAlreadyExists(error)) return false;
-		throw error;
+		try {
+			await fs.promises.link(temporary, lock);
+		} catch (error) {
+			if (isAlreadyExists(error)) return undefined;
+			throw error;
+		}
+		const metadata = await fs.promises.stat(lock);
+		return { content, dev: metadata.dev, ino: metadata.ino };
+	} finally {
+		await fs.promises.unlink(temporary).catch(() => undefined);
+	}
+}
+
+async function ownsChatDaemonOwnerLock(lock: string, lease: ChatDaemonOwnerLockLease): Promise<boolean> {
+	try {
+		const metadata = await fs.promises.stat(lock);
+		return (
+			metadata.dev === lease.dev &&
+			metadata.ino === lease.ino &&
+			(await fs.promises.readFile(lock, "utf8")) === lease.content
+		);
+	} catch {
+		return false;
 	}
 }
 
@@ -788,8 +818,9 @@ async function isStaleChatDaemonLock(lock: string, probe: ChatDaemonOwnershipPro
 		const currentIncarnation = probe.pidIncarnation(owner.pid);
 		return hasProcessIncarnationAuthority(currentIncarnation) && currentIncarnation !== owner.incarnation;
 	}
-	const stat = await fs.promises.stat(lock).catch(() => undefined);
-	return Boolean(stat && Date.now() - stat.mtimeMs >= UNPUBLISHED_OWNER_LOCK_STALE_MS);
+	// Complete lock records are published atomically; malformed reservations have
+	// no provenance that can authorize destructive recovery.
+	return false;
 }
 
 async function canReclaimChatDaemonOwnerLock(

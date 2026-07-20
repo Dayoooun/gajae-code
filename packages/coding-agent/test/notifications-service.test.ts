@@ -107,12 +107,16 @@ function mockFs(
 			store.delete(file);
 			unlinked.push(file);
 		},
-		async createExclusive(file) {
-			if (store.has(file)) return false;
-			store.set(file, "");
-			created.push(file);
-			opts.onAcquireExclusive?.(file, store);
-			return true;
+		async writeFile(file, data, writeOpts) {
+			const exclusive =
+				typeof writeOpts === "object" && writeOpts !== null && "flag" in writeOpts && writeOpts.flag === "wx";
+			if (exclusive && store.has(file)) throw Object.assign(new Error("EEXIST"), { code: "EEXIST" });
+			store.set(file, data.toString());
+			revisions.set(file, (revisions.get(file) ?? 0) + 1);
+			if (exclusive) {
+				created.push(file);
+				opts.onAcquireExclusive?.(file, store);
+			}
 		},
 	};
 	return { fs, unlinked, created, store };

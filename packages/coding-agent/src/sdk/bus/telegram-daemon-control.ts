@@ -23,6 +23,7 @@ import type {
 import { OWNERSHIP_MISMATCH_MESSAGE, ownershipMismatchRecovery } from "../../daemon/operator-contract";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
 import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
+import { exactUnlinkNotificationFile, readNotificationEndpointFile } from "./notification-service";
 import {
 	confirmTelegramDaemonSpawn,
 	type DaemonState,
@@ -39,7 +40,12 @@ import {
 	type TelegramSpawnOwnerResult,
 } from "./telegram-daemon";
 
-const nodeFs: TelegramDaemonFs = fs.promises as unknown as TelegramDaemonFs;
+const nodeFs: TelegramDaemonFs = {
+	...(fs.promises as unknown as TelegramDaemonFs),
+	readEndpointFile: readNotificationEndpointFile,
+	exactUnlink: async (file, identity) =>
+		exactUnlinkNotificationFile(file, identity, `.gjc-delete-daemon-transition-${crypto.randomUUID()}.json`),
+};
 const DEFAULT_GRACEFUL_TIMEOUT_MS = 8_000;
 const DEFAULT_KILL_TIMEOUT_MS = 3_000;
 const DEFAULT_WAIT_STEP_MS = 25;
