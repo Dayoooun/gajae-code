@@ -336,20 +336,20 @@ describe("deep-interview structured metadata red-team", () => {
 		expect(askSchema.safeParse({ questions: [base] }).success).toBe(true);
 	});
 
-	it("accepts non-ASCII adapter metadata using the schema's character-count limits", () => {
-		const term = "한".repeat(256);
-		const longText = "한".repeat(2048);
+	it("accepts emoji adapter metadata using the schema's code-point limits", () => {
+		const term = "😀".repeat(256);
+		const longText = "😀".repeat(2048);
 		const parsed = askSchema.safeParse({
 			questions: [
 				{
-					id: "q-korean-boundary",
+					id: "q-emoji-boundary",
 					question: "Q?",
 					options: [{ label: "A" }],
 					deepInterview: {
-						round_id: "한".repeat(128),
+						round_id: "😀".repeat(128),
 						round: 1,
-						component: "한".repeat(128),
-						dimension: "한".repeat(128),
+						component: "😀".repeat(128),
+						dimension: "😀".repeat(128),
 						ambiguity: 0.5,
 						confused_terms: [term],
 						references: [{ reference_id: term, label: term, origin: term, url: longText, excerpt: longText }],
@@ -361,7 +361,7 @@ describe("deep-interview structured metadata red-team", () => {
 		expect(parsed.success).toBe(true);
 	});
 
-	it("rejects non-ASCII deep-interview core metadata beyond 128 characters", () => {
+	it("rejects emoji deep-interview core metadata beyond 128 code points", () => {
 		const base = { id: "q-core-overflow", question: "Q?", options: [{ label: "A" }] };
 		for (const field of ["round_id", "component", "dimension"] as const) {
 			const deepInterview = {
@@ -370,9 +370,30 @@ describe("deep-interview structured metadata red-team", () => {
 				component: "c",
 				dimension: "goal",
 				ambiguity: 0.5,
-				[field]: "한".repeat(129),
+				[field]: "😀".repeat(129),
 			};
 			expect(askSchema.safeParse({ questions: [{ ...base, deepInterview }] }).success).toBe(false);
+		}
+	});
+
+	it("rejects emoji reference URL and excerpt values one code point beyond their limits", () => {
+		const base = { id: "q-reference-overflow", question: "Q?", options: [{ label: "A" }] };
+		for (const field of ["url", "excerpt"] as const) {
+			const parsed = askSchema.safeParse({
+				questions: [
+					{
+						...base,
+						deepInterview: {
+							round: 1,
+							component: "intake",
+							dimension: "goal",
+							ambiguity: 0.5,
+							references: [{ reference_id: "r1", label: "label", origin: "user", [field]: "😀".repeat(2049) }],
+						},
+					},
+				],
+			});
+			expect(parsed.success).toBe(false);
 		}
 	});
 

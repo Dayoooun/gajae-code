@@ -429,6 +429,13 @@ export const MAX_USER_RESPONSE_LENGTH = 10_000;
 /** Maximum serialized JavaScript-string length for one LLM-produced structured response. */
 export const MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH = 100_000;
 
+/** Count Unicode code points without allocating an intermediate character array. */
+export function deepInterviewCharacterCount(value: string): number {
+	let count = 0;
+	for (const _character of value) count++;
+	return count;
+}
+
 export function isDeepInterviewFreeTextField(name: string): boolean {
 	return DEEP_INTERVIEW_FREETEXT_FIELDS.has(name);
 }
@@ -456,7 +463,7 @@ export function assertDeepInterviewStructuredResponseWithinLimit(value: unknown)
 		throw new Error("invalid structured deep-interview response");
 	}
 	if (typeof serialized !== "string") throw new Error("invalid structured deep-interview response");
-	if (serialized.length > MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH)
+	if (deepInterviewCharacterCount(serialized) > MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH)
 		throw new Error(
 			`structured deep-interview response exceeds max length ${MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH}`,
 		);
@@ -468,7 +475,7 @@ export function assertDeepInterviewStructuredResponseWithinLimit(value: unknown)
  */
 export function assertDeepInterviewInputWithinLimit(value: string, max: number, fieldName = "input"): void {
 	if (typeof value !== "string") throw new Error(`${fieldName} must be a string`);
-	if (value.length > max) throw new Error(`${fieldName} exceeds max length ${max}`);
+	if (deepInterviewCharacterCount(value) > max) throw new Error(`${fieldName} exceeds max length ${max}`);
 }
 
 /** Validate user-supplied initial context fields before a deep-interview envelope is persisted. */
@@ -523,7 +530,7 @@ export function isCanonicalDeepInterviewAnswerHash(value: unknown): value is str
 function isEvidenceReference(value: unknown, answerHashValue: string): value is string {
 	return (
 		typeof value === "string" &&
-		value.length <= MAX_INTENT_EVIDENCE_LENGTH &&
+		deepInterviewCharacterCount(value) <= MAX_INTENT_EVIDENCE_LENGTH &&
 		value === `answer_hash:${answerHashValue}`
 	);
 }
@@ -537,7 +544,11 @@ function assertIntentItem(value: unknown): asserts value is DeepInterviewIntentI
 		!id.startsWith(`${category}:`)
 	)
 		throw new Error("invalid intent category");
-	if (typeof statement !== "string" || !statement.trim() || statement.length > MAX_INTENT_STATEMENT_LENGTH)
+	if (
+		typeof statement !== "string" ||
+		!statement.trim() ||
+		deepInterviewCharacterCount(statement) > MAX_INTENT_STATEMENT_LENGTH
+	)
 		throw new Error(`intent item ${id} requires a bounded statement`);
 }
 
@@ -627,7 +638,7 @@ export function reviewDeepInterviewIntent(
 			substitution.replacement_ids.some(id => typeof id !== "string" || !observedIds.has(id)) ||
 			typeof substitution.rationale !== "string" ||
 			!substitution.rationale.trim() ||
-			substitution.rationale.length > MAX_INTENT_RATIONALE_LENGTH
+			deepInterviewCharacterCount(substitution.rationale) > MAX_INTENT_RATIONALE_LENGTH
 		)
 			throw new Error("invalid intent substitution");
 	}

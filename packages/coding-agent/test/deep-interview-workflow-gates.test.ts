@@ -294,18 +294,18 @@ describe("questionToGate confused_terms + references adapter context", () => {
 		expect((state.references as Array<Record<string, unknown>>)[0]?.reference_id).toBe("r1");
 	});
 
-	it("accepts non-ASCII adapter metadata at character-count boundaries", () => {
-		const term = "한".repeat(256);
-		const longText = "한".repeat(2048);
+	it("accepts emoji adapter metadata at code-point boundaries", () => {
+		const term = "😀".repeat(256);
+		const longText = "😀".repeat(2048);
 		const gate = questionToGate({
 			id: "q-non-ascii-boundary",
 			question: "Round 1 | Ambiguity: 50%",
 			options: [{ label: "x" }],
 			deepInterview: {
-				round_id: "한".repeat(128),
+				round_id: "😀".repeat(128),
 				round: 1,
-				component: "한".repeat(128),
-				dimension: "한".repeat(128),
+				component: "😀".repeat(128),
+				dimension: "😀".repeat(128),
 				ambiguity: 0.5,
 				confused_terms: [term],
 				references: [{ reference_id: term, label: term, origin: term, url: longText, excerpt: longText }],
@@ -317,7 +317,7 @@ describe("questionToGate confused_terms + references adapter context", () => {
 		expect(state.references).toEqual([
 			{ reference_id: term, label: term, origin: term, url: longText, excerpt: longText },
 		]);
-		expect(state.round_id).toBe("한".repeat(128));
+		expect(state.round_id).toBe("😀".repeat(128));
 	});
 
 	it("rejects adapter metadata beyond character-count boundaries", () => {
@@ -331,13 +331,13 @@ describe("questionToGate confused_terms + references adapter context", () => {
 					component: "intake",
 					dimension: "goal",
 					ambiguity: 0.5,
-					confused_terms: ["한".repeat(257)],
+					confused_terms: ["😀".repeat(257)],
 				},
 			}),
 		).toThrow(/confused_terms/);
 	});
 
-	it("rejects non-ASCII core metadata beyond 128 characters", () => {
+	it("rejects emoji core metadata beyond 128 code points", () => {
 		const base = {
 			id: "q-core-overflow",
 			question: "Round 1 | Ambiguity: 50%",
@@ -353,7 +353,7 @@ describe("questionToGate confused_terms + references adapter context", () => {
 						component: "c",
 						dimension: "goal",
 						ambiguity: 0.5,
-						[field]: "한".repeat(129),
+						[field]: "😀".repeat(129),
 					},
 				}),
 			).toThrow(new RegExp(field));
@@ -457,7 +457,7 @@ describe("questionToGate confused_terms + references adapter context", () => {
 						component: "intake",
 						dimension: "goal",
 						ambiguity: 0.5,
-						references: [{ reference_id: "r1", label: "label", origin: "user", [field]: "한".repeat(257) }],
+						references: [{ reference_id: "r1", label: "label", origin: "user", [field]: "😀".repeat(257) }],
 					},
 				}),
 			).toThrow(/references/);
@@ -470,7 +470,7 @@ describe("questionToGate confused_terms + references adapter context", () => {
 						component: "intake",
 						dimension: "goal",
 						ambiguity: 0.5,
-						references: [{ reference_id: "r1", label: "label", origin: "user", [field]: "한".repeat(2049) }],
+						references: [{ reference_id: "r1", label: "label", origin: "user", [field]: "😀".repeat(2049) }],
 					},
 				}),
 			).toThrow(/references/);

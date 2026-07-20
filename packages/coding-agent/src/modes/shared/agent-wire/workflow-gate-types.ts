@@ -1,3 +1,5 @@
+import { deepInterviewCharacterCount } from "../../../gjc-runtime/deep-interview-state";
+
 /** Transport-neutral workflow gate contract used by SDK workflow coordination. */
 
 /** Lifecycle stages that emit machine-addressable SDK workflow gates. */
@@ -54,7 +56,11 @@ export interface AskGateSchemaInput {
 }
 
 function isBoundedAskGateString(value: unknown): value is string {
-	return typeof value === "string" && value.length > 0 && new TextEncoder().encode(value).byteLength <= 256;
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		deepInterviewCharacterCount(value) <= MAX_ASK_GATE_ADAPTER_STRING_LENGTH
+	);
 }
 
 /** Max characters for adapter metadata identifiers and confused terms. */
@@ -66,15 +72,27 @@ const MAX_ASK_GATE_CONFUSED_TERMS = 32;
 const MAX_ASK_GATE_REFERENCES = 32;
 
 function isBoundedAskGateAdapterString(value: unknown): value is string {
-	return typeof value === "string" && value.length > 0 && value.length <= MAX_ASK_GATE_ADAPTER_STRING_LENGTH;
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		deepInterviewCharacterCount(value) <= MAX_ASK_GATE_ADAPTER_STRING_LENGTH
+	);
 }
 
 function isBoundedAskGateDeepInterviewString(value: unknown): value is string {
-	return typeof value === "string" && value.length > 0 && value.length <= MAX_ASK_GATE_DEEP_INTERVIEW_STRING_LENGTH;
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		deepInterviewCharacterCount(value) <= MAX_ASK_GATE_DEEP_INTERVIEW_STRING_LENGTH
+	);
 }
 
 function isBoundedAskGateLongString(value: unknown): value is string {
-	return typeof value === "string" && value.length > 0 && value.length <= MAX_ASK_GATE_LONG_STRING_LENGTH;
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		deepInterviewCharacterCount(value) <= MAX_ASK_GATE_LONG_STRING_LENGTH
+	);
 }
 
 function isDenseArray(value: unknown[]): boolean {

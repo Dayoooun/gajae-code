@@ -32,6 +32,7 @@ import {
 	assertDeepInterviewEnvelopeInputLimits,
 	assertDeepInterviewIntentManifest,
 	assertDeepInterviewIntentReview,
+	assertDeepInterviewStructuredResponseWithinLimit,
 	type DeepInterviewIntentManifest,
 	mergeDeepInterviewEnvelope,
 	normalizeDeepInterviewEnvelope,
@@ -993,6 +994,7 @@ async function reconcileWorkflowSkillStateUnlocked(
 ): Promise<{ stateFile: string }> {
 	const { cwd, mode, threadId, turnId, active, payload } = options;
 	const filePath = modeStateFile(cwd, mode, sessionId);
+	if (mode === "deep-interview") assertDeepInterviewStructuredResponseWithinLimit(payload);
 	const existingRead = await readExistingStateForMutation(filePath);
 	const existingPayload = existingRead.kind === "valid" ? existingRead.value : {};
 	const nowIsoStr = nowIso();
@@ -1179,6 +1181,13 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 			"gjc state write requires --mode <skill>, positional <skill>, input.skill, or an active workflow in the current session active state",
 		);
 
+	if (mode === "deep-interview") {
+		try {
+			assertDeepInterviewStructuredResponseWithinLimit(payload);
+		} catch (error) {
+			throw new StateCommandError(2, error instanceof Error ? error.message : String(error));
+		}
+	}
 	const filePath = modeStateFile(cwd, mode, sessionId);
 	const forced = hasFlag(args, "--force");
 	return await withWorkflowStateLock(

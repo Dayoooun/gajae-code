@@ -40,6 +40,7 @@ import { deepInterviewStatePath } from "../gjc-runtime/deep-interview-runtime";
 import {
 	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewStructuredResponseWithinLimit,
+	deepInterviewCharacterCount,
 	MAX_USER_RESPONSE_LENGTH,
 } from "../gjc-runtime/deep-interview-state";
 import {
@@ -47,6 +48,7 @@ import {
 	gateAnswerToResult,
 	questionToGate,
 } from "../modes/shared/agent-wire/deep-interview-gate";
+
 import { getMarkdownTheme, type Theme, theme } from "../modes/theme/theme";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
 import { renderStatusLine } from "../tui";
@@ -68,6 +70,19 @@ import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
 // Types
 // =============================================================================
 
+function deepInterviewBoundedString(maximum: number) {
+	return z.string().superRefine((value, context) => {
+		if (deepInterviewCharacterCount(value) > maximum)
+			context.addIssue({
+				code: "too_big",
+				maximum,
+				inclusive: true,
+				origin: "string",
+				message: `Too big: expected string to have <=${maximum} characters`,
+			});
+	});
+}
+
 const OptionItem = z.object({
 	label: z.string().describe("display label"),
 });
@@ -76,7 +91,7 @@ const DeepInterviewIntentItem = z
 	.object({
 		id: z.string().regex(/^(artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}$/),
 		category: z.enum(["artifact", "surface", "integration", "constraint"]),
-		statement: z.string().min(1).max(1_000),
+		statement: deepInterviewBoundedString(1_000).min(1),
 	})
 	.strict()
 	.superRefine((value, context) => {
@@ -87,7 +102,7 @@ const DeepInterviewIntentItem = z
 const DeepInterviewIntentContract = z
 	.object({
 		items: z.array(DeepInterviewIntentItem).min(1).max(64),
-		confirmation_options: z.array(z.string().min(1).max(200)).min(1).max(5),
+		confirmation_options: z.array(deepInterviewBoundedString(200).min(1)).min(1).max(5),
 	})
 	.strict();
 
@@ -105,24 +120,24 @@ const DeepInterviewIntentReview = z
 							.array(z.string().regex(/^(artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}$/))
 							.min(1)
 							.max(64),
-						rationale: z.string().min(1).max(500),
+						rationale: deepInterviewBoundedString(500).min(1),
 					})
 					.strict(),
 			)
 			.max(64),
-		approval_options: z.array(z.string().min(1).max(200)).min(1).max(5),
+		approval_options: z.array(deepInterviewBoundedString(200).min(1)).min(1).max(5),
 	})
 	.strict();
 
 /** Optional structured deep-interview round metadata; when present the round is recorded automatically. */
 const DeepInterviewMetadata = z.object({
-	round_id: z.string().max(128).describe("stable optional round identity").optional(),
+	round_id: deepInterviewBoundedString(128).describe("stable optional round identity").optional(),
 	round: z.number().int().nonnegative().describe("round number"),
-	component: z.string().min(1).max(128).describe("targeted topology component"),
-	dimension: z.string().min(1).max(128).describe("targeted clarity dimension"),
+	component: deepInterviewBoundedString(128).min(1).describe("targeted topology component"),
+	dimension: deepInterviewBoundedString(128).min(1).describe("targeted clarity dimension"),
 	ambiguity: z.number().min(0).max(1).describe("ambiguity at ask time (0..1)"),
 	confused_terms: z
-		.array(z.string().min(1).max(256))
+		.array(deepInterviewBoundedString(256).min(1))
 		.max(32)
 		.describe("explicit terms the user does not understand; glossary help only, never inferred")
 		.optional(),
@@ -130,11 +145,11 @@ const DeepInterviewMetadata = z.object({
 		.array(
 			z
 				.object({
-					reference_id: z.string().min(1).max(256),
-					label: z.string().min(1).max(256),
-					origin: z.string().min(1).max(256),
-					url: z.string().min(1).max(2048).optional(),
-					excerpt: z.string().min(1).max(2048).optional(),
+					reference_id: deepInterviewBoundedString(256).min(1),
+					label: deepInterviewBoundedString(256).min(1),
+					origin: deepInterviewBoundedString(256).min(1),
+					url: deepInterviewBoundedString(2048).min(1).optional(),
+					excerpt: deepInterviewBoundedString(2048).min(1).optional(),
 				})
 				.strict(),
 		)
@@ -1343,6 +1358,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					timedOut: false,
 				};
 			}
+			let leaveRemotePending = false;
 			try {
 				const deepInterviewPrompt = formatDeepInterviewSelectorPrompt(q.question);
 				const isDeepInterviewQuestion = deepInterviewPrompt !== null || q.deepInterview !== undefined;
@@ -1424,6 +1440,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 							return displayIndex >= 0 ? (rawOptionLabels[displayIndex] ?? selected) : selected;
 						})
 					: displaySelectedOptions;
+				if (isDeepInterviewQuestion && customInput !== undefined) {
+					leaveRemotePending = true;
+					assertDeepInterviewInputWithinLimit(customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
+				}
 				if (activeRemoteReceipt) {
 					const settlement: AskSettlement =
 						clarificationQuestion !== undefined
@@ -1458,10 +1478,12 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					timedOut,
 				};
 			} catch (error) {
-				await settleActiveRemote({
-					kind: "resolve_without_commit",
-					reason: error instanceof Error && error.name === "AbortError" ? "aborted" : "exception",
-				});
+				if (!leaveRemotePending) {
+					await settleActiveRemote({
+						kind: "resolve_without_commit",
+						reason: error instanceof Error && error.name === "AbortError" ? "aborted" : "exception",
+					});
+				}
 				activeRemoteRequest = undefined;
 				if (error instanceof Error && error.name === "AbortError") {
 					throw new ToolAbortError("Ask input was cancelled");

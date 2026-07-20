@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { deepInterviewCharacterCount } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import {
 	activeSnapshotPath,
 	modeStatePath,
@@ -479,6 +480,76 @@ describe("native gjc state runtime", () => {
 		);
 		expect(oversizedUpdate.status).toBe(2);
 		expect(await fs.readFile(statePath, "utf-8")).toBe(before);
+	});
+
+	it("counts emoji as code points and rejects oversized scoring payloads before state mutation", async () => {
+		const root = await tempDir();
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		const exactInitialContext = "😀".repeat(50_000);
+		expect(
+			(
+				await runNativeStateCommand(
+					[
+						"write",
+						"--input",
+						JSON.stringify({ state: { initial_idea: exactInitialContext } }),
+						"--mode",
+						"deep-interview",
+					],
+					root,
+				)
+			).status,
+		).toBe(0);
+		const before = await fs.readFile(statePath, "utf-8");
+
+		const structuredBase = { state: { ontology_snapshots: [""] } };
+		const exactStructured = {
+			state: {
+				ontology_snapshots: ["😀".repeat(100_000 - deepInterviewCharacterCount(JSON.stringify(structuredBase)))],
+			},
+		};
+		expect(deepInterviewCharacterCount(JSON.stringify(exactStructured))).toBe(100_000);
+		expect(
+			(
+				await runNativeStateCommand(
+					["write", "--input", JSON.stringify(exactStructured), "--mode", "deep-interview"],
+					root,
+				)
+			).status,
+		).toBe(0);
+		const afterExact = await fs.readFile(statePath, "utf-8");
+
+		const oversizedStructured = {
+			state: {
+				ontology_snapshots: ["😀".repeat(100_001 - deepInterviewCharacterCount(JSON.stringify(structuredBase)))],
+			},
+		};
+		expect(deepInterviewCharacterCount(JSON.stringify(oversizedStructured))).toBe(100_001);
+		const rejected = await runNativeStateCommand(
+			["write", "--input", JSON.stringify(oversizedStructured), "--mode", "deep-interview"],
+			root,
+		);
+		expect(rejected.status).toBe(2);
+		expect(rejected.stderr).toContain("structured deep-interview response exceeds max length 100000");
+		expect(await fs.readFile(statePath, "utf-8")).toBe(afterExact);
+
+		const scoringBase = { state: { rounds: [{ scores: { scope: "" } }] } };
+		const oversizedScoring = {
+			state: {
+				rounds: [
+					{ scores: { scope: "😀".repeat(100_001 - deepInterviewCharacterCount(JSON.stringify(scoringBase))) } },
+				],
+			},
+		};
+		expect(deepInterviewCharacterCount(JSON.stringify(oversizedScoring))).toBe(100_001);
+		const rejectedScoring = await runNativeStateCommand(
+			["write", "--input", JSON.stringify(oversizedScoring), "--mode", "deep-interview"],
+			root,
+		);
+		expect(rejectedScoring.status).toBe(2);
+		expect(rejectedScoring.stderr).toContain("structured deep-interview response exceeds max length 100000");
+		expect(await fs.readFile(statePath, "utf-8")).toBe(afterExact);
+		expect(afterExact).not.toBe(before);
 	});
 
 	it("preserves both writers' disjoint keys under interleaved write calls", async () => {

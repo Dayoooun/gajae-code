@@ -462,7 +462,7 @@ describe("AskTool cancellation", () => {
 	it("rejects oversized deep-interview custom input before recorder persistence", async () => {
 		const appendSpy = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
 		const tool = new AskTool(createSession());
-		const oversized = "한".repeat(10_001);
+		const oversized = "😀".repeat(10_001);
 		const context = createContext({
 			select: async (_prompt, options, dialogOptions) => {
 				dialogOptions?.customInput?.onSubmit(oversized);
@@ -479,6 +479,59 @@ describe("AskTool cancellation", () => {
 				context,
 			),
 		).rejects.toThrow("user_response exceeds max length 10000");
+		expect(appendSpy).not.toHaveBeenCalled();
+	});
+
+	it("accepts exactly 10000 emoji custom-input characters and keeps a 10001-character remote reply pending", async () => {
+		const appendSpy = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
+			action: "created",
+			record: {} as AppendOrMergeResult["record"],
+		});
+		const exact = "😀".repeat(10_000);
+		const local = new AskTool(createSession());
+		const localContext = createContext({
+			select: async (_prompt, options, dialogOptions) => {
+				dialogOptions?.customInput?.onSubmit(exact);
+				return options[2];
+			},
+		});
+		await expect(
+			local.execute(
+				"call-exact-emoji-deep-input",
+				{ questions: [singleDeepInterviewQuestion()] },
+				undefined,
+				undefined,
+				localContext,
+			),
+		).resolves.toBeDefined();
+		appendSpy.mockClear();
+
+		const settlements: unknown[] = [];
+		const remote = new AskTool(
+			createSession({
+				getAskAnswerSource: () => ({
+					awaitAnswer: async () => undefined,
+					awaitAnswerRequest: async () => ({
+						source: "remote" as const,
+						interaction: { kind: "value" as const, value: "😀".repeat(10_001) },
+						settle: async settlement => {
+							settlements.push(settlement);
+							return { kind: "resolved_without_commit" as const };
+						},
+					}),
+				}),
+			}),
+		);
+		await expect(
+			remote.execute(
+				"call-remote-oversized-emoji-deep-input",
+				{ questions: [singleDeepInterviewQuestion()] },
+				undefined,
+				undefined,
+				createContext({ select: () => new Promise<string | undefined>(() => {}) }),
+			),
+		).rejects.toThrow("user_response exceeds max length 10000");
+		expect(settlements).toEqual([]);
 		expect(appendSpy).not.toHaveBeenCalled();
 	});
 
@@ -2767,6 +2820,29 @@ describe("AskTool deep-interview recorder persistence", () => {
 						question: "Which contrast should we explore?",
 						options: [{ label: "Continue" }],
 						deepInterview: { ...deepInterviewMeta(), confused_terms: ["x".repeat(257)] },
+					},
+				],
+			}).success,
+		).toBe(false);
+	});
+
+	it("uses code-point limits for deep-interview metadata strings", () => {
+		const metadata = { ...deepInterviewMeta(), component: "😀".repeat(128), dimension: "😀".repeat(128) };
+		expect(
+			askSchema.safeParse({
+				questions: [
+					{ id: "emoji-metadata", question: "Pick?", options: [{ label: "A" }], deepInterview: metadata },
+				],
+			}).success,
+		).toBe(true);
+		expect(
+			askSchema.safeParse({
+				questions: [
+					{
+						id: "oversized-emoji-metadata",
+						question: "Pick?",
+						options: [{ label: "A" }],
+						deepInterview: { ...metadata, component: "😀".repeat(129) },
 					},
 				],
 			}).success,
