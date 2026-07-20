@@ -12,6 +12,8 @@ const stableEntries = (value: Record<string, string>) => JSON.stringify(Object.e
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
+const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
+const config = "packages/coding-agent/src/sdk/bus/config.ts";
 const inventory = {
 	telegram: { [telegramContract]: ["DAEMON_GENERATION"], [telegramDaemon]: ["acquireDaemonOwnership"] },
 	discord: {
@@ -40,7 +42,16 @@ const inventory = {
 	},
 } as const;
 
-const telegramHandoffHelpers = ["rebindOwnershipLock", "rollbackOwnershipLockRebind"] as const;
+const telegramHandoffHelpers = [
+	"writeJsonAtomic",
+	"ownershipLockMatchesState",
+	"ownershipLockMatchesMetadata",
+	"ownershipLockIsReclaimable",
+	"isLegacyParentDaemonState",
+	"legacyParentHandoffDecision",
+	"rebindOwnershipLock",
+	"rollbackOwnershipLockRebind",
+] as const;
 const chatTakeoverHelpers = [
 	"identityFor",
 	"fingerprint",
@@ -50,6 +61,11 @@ const chatTakeoverHelpers = [
 	"readJson",
 	"writeJson",
 ] as const;
+const chatCliHelpers = ["defaultPidAlive", "loadConfig", "ownerPid"] as const;
+const chatConfigHelpers = {
+	discord: ["getNotificationConfig", "notificationConfigFromFile", "isDiscordConfigured", "tokenFingerprint"],
+	slack: ["getNotificationConfig", "notificationConfigFromFile", "isSlackConfigured", "tokenFingerprint"],
+} as const;
 const helperInventory = {
 	telegram: { [telegramContract]: ["DAEMON_GENERATION"], [telegramDaemon]: [...telegramHandoffHelpers] },
 	discord: { [chatControl]: ["CHAT_DAEMON_GENERATIONS.discord", ...chatTakeoverHelpers] },
@@ -84,6 +100,29 @@ function helperMutation(kind: "telegram" | "discord" | "slack", name: string, ge
 	const file = kind === "telegram" ? telegramDaemon : chatControl;
 	head.set(file, mutateHelper(head.get(file) ?? "", name));
 	return evaluate(base, head, helperInventory);
+}
+
+function mappedHelperMutation(input: {
+	family: "telegram" | "discord" | "slack";
+	file: string;
+	name: string;
+	generationBumped: boolean;
+}): ReturnType<typeof evaluate> {
+	const base = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
+	const head = files({
+		telegramGeneration: input.family === "telegram" && input.generationBumped ? 7 : 6,
+		discordGeneration: input.family === "discord" && input.generationBumped ? 5 : 4,
+		slackGeneration: input.family === "slack" && input.generationBumped ? 5 : 4,
+	});
+	const before = `export function ${input.name}() { return "before"; }`;
+	base.set(input.file, before);
+	head.set(input.file, before.replace("before", "after"));
+	const inventory = {
+		telegram: input.family === "telegram" ? { [input.file]: [input.name] } : {},
+		discord: input.family === "discord" ? { [input.file]: [input.name] } : {},
+		slack: input.family === "slack" ? { [input.file]: [input.name] } : {},
+	} as const;
+	return evaluate(base, head, inventory);
 }
 
 function files(input: {
@@ -146,22 +185,39 @@ describe("daemon generation release guard", () => {
 		expect(bumped.telegramGenerationBumped).toBe(true);
 	});
 
-	test("requires mapped generation bumps for every ownership handoff and chat takeover helper", () => {
-		for (const name of telegramHandoffHelpers) {
-			const missing = helperMutation("telegram", name, false);
-			expect(missing.protectedChanges).toContain(`telegram:${telegramDaemon}:${name}`);
-			expect(missing.telegramGenerationBumped).toBe(false);
-			expect(helperMutation("telegram", name, true).telegramGenerationBumped).toBe(true);
+test("requires mapped generation bumps for every ownership handoff and chat takeover helper", () => {
+	for (const name of telegramHandoffHelpers) {
+		const missing = helperMutation("telegram", name, false);
+		expect(missing.protectedChanges).toContain(`telegram:${telegramDaemon}:${name}`);
+		expect(missing.telegramGenerationBumped).toBe(false);
+		expect(helperMutation("telegram", name, true).telegramGenerationBumped).toBe(true);
+	}
+	for (const kind of ["discord", "slack"] as const) {
+		for (const name of chatTakeoverHelpers) {
+			const missing = helperMutation(kind, name, false);
+			expect(missing.protectedChanges).toContain(`${kind}:${chatControl}:${name}`);
+			expect(missing.chatGenerationBumped[kind]).toBe(false);
+			expect(helperMutation(kind, name, true).chatGenerationBumped[kind]).toBe(true);
 		}
-		for (const kind of ["discord", "slack"] as const) {
-			for (const name of chatTakeoverHelpers) {
-				const missing = helperMutation(kind, name, false);
-				expect(missing.protectedChanges).toContain(`${kind}:${chatControl}:${name}`);
-				expect(missing.chatGenerationBumped[kind]).toBe(false);
-				expect(helperMutation(kind, name, true).chatGenerationBumped[kind]).toBe(true);
-			}
-		}
-	});
+	}
+});
+
+test("requires mapped generation bumps for Telegram lease, chat CLI, and configuration helpers", () => {
+	const helpers = [
+		...telegramHandoffHelpers.map(name => ({ family: "telegram" as const, file: telegramDaemon, name })),
+		...(["discord", "slack"] as const).flatMap(family => chatCliHelpers.map(name => ({ family, file: chatCli, name }))),
+		...(["discord", "slack"] as const).flatMap(family => chatConfigHelpers[family].map(name => ({ family, file: config, name }))),
+	];
+	for (const helper of helpers) {
+		const missing = mappedHelperMutation({ ...helper, generationBumped: false });
+		expect(missing.protectedChanges).toContain(`${helper.family}:${helper.file}:${helper.name}`);
+		if (helper.family === "telegram") expect(missing.telegramGenerationBumped).toBe(false);
+		else expect(missing.chatGenerationBumped[helper.family]).toBe(false);
+		const bumped = mappedHelperMutation({ ...helper, generationBumped: true });
+		if (helper.family === "telegram") expect(bumped.telegramGenerationBumped).toBe(true);
+		else expect(bumped.chatGenerationBumped[helper.family]).toBe(true);
+	}
+});
 
 	test("requires a bump for the affected chat kind, not the other kind", () => {
 		const missingBump = decide(files({ discordGeneration: 1, slackGeneration: 1, chatLifecycle: "return true;" }), files({ discordGeneration: 1, slackGeneration: 2, chatLifecycle: "return false;" }));
@@ -372,7 +428,19 @@ describe("daemon generation release guard", () => {
 		expect(() => validateManifest({ contractVersion: GUARD_CONTRACT_VERSION, inventory: moved })).toThrow("does not match the protected inventory");
 		const narrowed = mutableInventory();
 		narrowed.telegram[telegramDaemon]!.pop();
-		expect(() => validateManifest({ contractVersion: GUARD_CONTRACT_VERSION, inventory: narrowed })).toThrow("does not match the protected inventory");
+		expect(() => validateManifest({ contractVersion: GUARD_CONTRACT_VERSION, inventory: narrowed })).toThrow("Telegram owner-lock handoff primitives");
+	});
+
+	test("rejects inventories missing required Telegram lease, chat CLI, or provider configuration authorities", () => {
+		const telegram = mutableInventory();
+		telegram.telegram[telegramDaemon] = telegram.telegram[telegramDaemon]!.filter(name => name !== "writeJsonAtomic");
+		expect(() => validateInventory(telegram)).toThrow("Telegram owner-lock handoff primitives");
+		const cli = mutableInventory();
+		cli.discord[chatCli] = cli.discord[chatCli]!.filter(name => name !== "ownerPid");
+		expect(() => validateInventory(cli)).toThrow("chat CLI ownership primitives");
+		const providerConfig = mutableInventory();
+		providerConfig.slack[config] = providerConfig.slack[config]!.filter(name => name !== "isSlackConfigured");
+		expect(() => validateInventory(providerConfig)).toThrow("chat configuration primitives");
 	});
 
 	test("protects Telegram provenance and signaling authorities", () => {
@@ -393,6 +461,12 @@ describe("daemon generation release guard", () => {
 				"waitForTelegramDaemonReady",
 				"hasSafeDaemonStateShape",
 				"isPhysicalMatchingOwner",
+				"writeJsonAtomic",
+				"ownershipLockMatchesState",
+				"ownershipLockMatchesMetadata",
+				"ownershipLockIsReclaimable",
+				"isLegacyParentDaemonState",
+				"legacyParentHandoffDecision",
 			]),
 		);
 		const control = protectedInventory.telegram["packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts"] ?? [];
@@ -414,6 +488,10 @@ describe("daemon generation release guard", () => {
 					"writeJson",
 				]),
 			);
+			const cli = protectedInventory[family][chatCli] ?? [];
+			expect(cli).toEqual(expect.arrayContaining(chatCliHelpers));
+			const providerConfig = protectedInventory[family][config] ?? [];
+			expect(providerConfig).toEqual(expect.arrayContaining(chatConfigHelpers[family]));
 		}
 	});
 

@@ -2119,6 +2119,46 @@ describe("ChatDaemonController ownership safety", () => {
 			expect(spawns).toBe(action === "reload" ? 1 : 0);
 		});
 
+		test.each([
+			"stop",
+			"reload",
+		] as const)("refuses %s of a live newer owner without changing its state", async action => {
+			const agentDir = tempAgentDir();
+			const paths = chatDaemonPaths(agentDir, kind);
+			fs.mkdirSync(paths.dir, { recursive: true });
+			const state = {
+				version: 1,
+				kind,
+				pid: 95,
+				ownerId: "newer-owner",
+				identity: identity(),
+				incarnation: "linux:12346",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+				transportHealthy: true,
+				generation: chatDaemonGeneration(kind) + 1,
+			};
+			const serializedState = JSON.stringify(state);
+			fs.writeFileSync(paths.state, serializedState);
+			const signals: NodeJS.Signals[] = [];
+			let spawns = 0;
+			const result = await new ChatDaemonController(configuredSettings(agentDir), kind, {
+				pidAlive: pid => pid === state.pid,
+				pidIncarnation: () => state.incarnation,
+				processReference: testChatProcessReference((_pid, signal) => signals.push(signal)),
+				spawn: () => {
+					spawns++;
+					return { unref() {} };
+				},
+			})[action]();
+			expect(result.ok).toBe(false);
+			expect(result.message).toContain("newer than this controller");
+			expect(result.message).toContain("upgrade this controller");
+			expect(signals).toEqual([]);
+			expect(spawns).toBe(0);
+			expect(fs.readFileSync(paths.state, "utf8")).toBe(serializedState);
+		});
+
 		test("refuses replacement when the captured generation changes before TERM", async () => {
 			const agentDir = tempAgentDir();
 			const paths = chatDaemonPaths(agentDir, kind);

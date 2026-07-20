@@ -376,7 +376,14 @@ export function buildChatDaemonSpawnArgs(input: {
 	};
 }
 
-type ChatDaemonStateClassification = "absent" | "replaceable" | "compatible" | "malformed" | "unauthorized" | "stopped";
+type ChatDaemonStateClassification =
+	| "absent"
+	| "replaceable"
+	| "compatible"
+	| "newer"
+	| "malformed"
+	| "unauthorized"
+	| "stopped";
 
 export class ChatDaemonController implements BuiltInDaemonController {
 	readonly kind: ChatDaemonKind;
@@ -424,13 +431,15 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		if (classification === "malformed" || classification === "unauthorized")
 			throw new Error(`Unable to replace unauthorized ${this.kind} daemon owner`);
 		if (existing && this.isSignalableMatchingOwner(existing)) {
-			if (classification === "compatible") {
+			if (classification === "compatible" || classification === "newer") {
 				// A compatible, physically-live owner may be mid-startup: a concurrent
 				// ensure can have just acquired ownership and published transportHealthy:false
 				// before its transport heartbeats healthy. Wait bounded for that owner to
 				// become attachable instead of failing a racing startup outright.
 				if (this.isHealthyFreshState(existing) || (await this.waitForOwnership(existing.ownerId, identity)))
 					return "attached";
+				if (classification === "newer")
+					throw new Error(`Unable to replace newer ${this.kind} daemon owner; upgrade this controller`);
 				throw new Error(`Unable to replace unhealthy ${this.kind} daemon owner`);
 			}
 			await this.stopForReplacement(existing);
@@ -449,6 +458,15 @@ export class ChatDaemonController implements BuiltInDaemonController {
 			return this.result(action, false, `${this.kind} notifications are not configured`, before, before, warnings);
 		const state = await readChatDaemonState(this.settings.getAgentDir(), this.kind);
 		const classification = this.classify(state, this.identity());
+		if (classification === "newer")
+			return this.result(
+				action,
+				false,
+				`${this.kind} daemon is newer than this controller; upgrade this controller before ${action}`,
+				before,
+				before,
+				warnings,
+			);
 		if (classification === "malformed" || classification === "unauthorized")
 			return this.result(
 				action,
@@ -589,16 +607,19 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		if (!hasSafeChatDaemonOwnerShape(state)) return "malformed";
 		if (this.isDefinitelyStoppedState(state)) return "stopped";
 		if (!identity || state.kind !== this.kind || state.identity !== identity) return "unauthorized";
-		if (hasSafeChatDaemonStateShape(state))
-			return state.generation < chatDaemonGeneration(this.kind) ? "replaceable" : "compatible";
+		if (hasSafeChatDaemonStateShape(state)) {
+			if (state.generation < chatDaemonGeneration(this.kind)) return "replaceable";
+			return state.generation > chatDaemonGeneration(this.kind) ? "newer" : "compatible";
+		}
 		const generation = (state as { generation?: unknown }).generation;
 		return isRecognizedLegacyGeneration(generation) ? "replaceable" : "malformed";
 	}
 	private isCurrentCompatibleState(state: ChatDaemonState, identity: string): boolean {
+		const classification = this.classify(state, identity);
 		return (
 			this.isSignalableMatchingOwner(state) &&
 			this.isHealthyFreshState(state) &&
-			this.classify(state, identity) === "compatible"
+			(classification === "compatible" || classification === "newer")
 		);
 	}
 
