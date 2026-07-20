@@ -226,6 +226,35 @@ Two guards prevent low-signal handoffs:
 
 This avoids creating a new session with empty/near-empty handoff context.
 
+## Concurrency: the shared session-transition lease
+
+`handoff()` does not run concurrently with any other session-identity transition.
+A single synchronously-acquired lease (`#beginSessionTransition` / `#endSessionTransition`)
+serializes every operation that replaces or rewrites session identity/history:
+
+- `handoff()`
+- `compact()`
+- `newSession()` / `switchSession()` / `branch()` / `clearContext()`
+- `fork()`
+- `navigateTree()`
+
+Each of these acquires the lease at its entry (before its first `await`) and releases
+it in its `finally`. Because acquisition is synchronous and up front, exclusion is
+**symmetric**: whichever transition starts first owns the lease, and any peer that
+starts while it is held is rejected with an `Error` carrying `code: "busy"` and a
+message of the form `Cannot start <kind> while a <holder> transition is in progress.`
+The rejection happens at the peer's own lease-acquisition point, i.e. **before any
+session mutation**, so a losing transition never partially mutates the session.
+
+Auto-triggered handoff acquires the lease through `handoff()` itself; the maintenance
+orchestrator does not hold the lease, so an auto-handoff running inside post-turn
+maintenance does not self-deadlock even while auto-compaction owns its own abort
+controller.
+
+This lease is distinct from the turn-start guard (`#assertNoHandoffTransition`), which
+fences external turn starters (prompt / steer / follow-up / continuation) for the whole
+handoff transition and rejects them with `Cannot start a turn while a handoff is in progress.`
+
 ## State transition summary
 
 High-level state flow:

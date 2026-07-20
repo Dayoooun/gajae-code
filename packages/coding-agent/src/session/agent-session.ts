@@ -1859,6 +1859,31 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Single, synchronously-acquired mutex for session-identity transitions
+	 * (handoff, compact, new/switch/branch/clear, fork, tree navigation). Acquired
+	 * BEFORE any await at each transition's entry and released in its finally, so
+	 * exclusion is symmetric regardless of which transition starts first — an
+	 * operation that began earlier and yielded still owns the lease when a peer
+	 * tries to start. Auto-handoff acquires it via handoff() (the maintenance
+	 * orchestrator does not hold it), so there is no self-deadlock.
+	 */
+	#sessionTransitionKind: string | undefined;
+
+	#beginSessionTransition(kind: string): void {
+		if (this.#sessionTransitionKind !== undefined) {
+			throw Object.assign(
+				new Error(`Cannot start ${kind} while a ${this.#sessionTransitionKind} transition is in progress.`),
+				{ code: "busy" },
+			);
+		}
+		this.#sessionTransitionKind = kind;
+	}
+
+	#endSessionTransition(): void {
+		this.#sessionTransitionKind = undefined;
+	}
+
 	#activateNextSessionAdmission(): void {
 		if (this.#activeSessionAdmission || this.#sessionAdmissionClosed) return;
 		const next = this.#sessionAdmissionQueue.shift();
@@ -8826,14 +8851,16 @@ export class AgentSession {
 	 * @returns true if completed, false if cancelled by hook
 	 */
 	newSession(options?: NewSessionOptions): Promise<boolean> {
-		this.#assertNoHandoffTransition();
 		if (this.#newSessionTransition) return this.#newSessionTransition;
-
+		// Acquire the shared transition lease only when starting a fresh transition
+		// (the dedup above returns the in-flight promise without re-acquiring).
+		this.#beginSessionTransition("new-session");
 		const transition = this.#runNewSessionTransition(options);
 		this.#newSessionTransition = transition;
 		void transition
 			.finally(() => {
 				if (this.#newSessionTransition === transition) this.#newSessionTransition = undefined;
+				this.#endSessionTransition();
 			})
 			.catch(() => {});
 		return transition;
@@ -9028,7 +9055,8 @@ export class AgentSession {
 	 * session identity and durable history trail.
 	 */
 	async clearContext(): Promise<boolean> {
-		this.#assertNoHandoffTransition();
+		this.#beginSessionTransition("clear-context");
+		try {
 		const sessionId = this.sessionId;
 		this.#disconnectFromAgent();
 		await this.abort();
@@ -9057,6 +9085,9 @@ export class AgentSession {
 		this.#planReferencePath = "local://PLAN.md";
 		this.#reconnectToAgent();
 		return true;
+		} finally {
+			this.#endSessionTransition();
+		}
 	}
 
 	/**
@@ -9073,8 +9104,12 @@ export class AgentSession {
 	 * @returns true if completed, false if cancelled by hook or not persisting
 	 */
 	async fork(): Promise<boolean> {
-		const previousSessionFile = this.sessionFile;
-		const previousWorkflowGateSessionId = this.sessionId;
+		// Fork replaces session identity/file and publishes session_switch; serialize
+		// it with handoff and the other transitions via the shared lease.
+		this.#beginSessionTransition("fork");
+		try {
+			const previousSessionFile = this.sessionFile;
+			const previousWorkflowGateSessionId = this.sessionId;
 
 		// Emit session_before_switch event with reason "fork" (can be cancelled)
 		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
@@ -9114,6 +9149,9 @@ export class AgentSession {
 		}
 
 		return true;
+		} finally {
+			this.#endSessionTransition();
+		}
 	}
 
 	// =========================================================================
@@ -10113,9 +10151,11 @@ export class AgentSession {
 	 * @param options Optional callbacks for completion/error handling
 	 */
 	async compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
-		// A handoff transition owns the session manager/agent; a concurrent compaction
-		// would mutate the same state during handoff's reversible window.
-		this.#assertNoHandoffTransition();
+		// Serialize with every other session-identity transition via the shared lease
+		// (bidirectional mutual exclusion with handoff/new/switch/branch/clear/fork/
+		// navigateTree). Released in the outer finally below.
+		this.#beginSessionTransition("compact");
+		try {
 		if (this.#compactionAbortController) {
 			throw new Error("Compaction already in progress");
 		}
@@ -10259,6 +10299,9 @@ export class AgentSession {
 			}
 			this.#reconnectToAgent();
 		}
+		} finally {
+			this.#endSessionTransition();
+		}
 	}
 
 	/**
@@ -10377,16 +10420,14 @@ export class AgentSession {
 				{ code: "busy" },
 			);
 		}
-		// Do not begin a MANUAL/external handoff while another session transition owns
-		// the manager/agent (compaction or a new/switch/branch/clear transition); they
-		// mutate the same state that handoff's reversible prepare window depends on.
-		// Auto-triggered handoff IS the maintenance action and runs within that flow,
-		// so it is exempt.
-		if (!options?.autoTriggered && (this.isCompacting || this.#newSessionTransition)) {
-			throw Object.assign(new Error("Cannot hand off while another session transition is in progress."), {
-				code: "busy",
-			});
-		}
+		// Acquire the shared session-transition lease so handoff is mutually exclusive
+		// with compact/new/switch/branch/clear/fork/navigateTree in BOTH directions —
+		// a transition that started first and yielded still owns the lease here, and a
+		// peer that starts after us is rejected at its own entry. Auto-triggered
+		// handoff still runs while auto-compaction owns its abort controller, but the
+		// maintenance orchestrator does not hold this lease, so acquiring it here does
+		// not self-deadlock. Released in the outer finally below.
+		this.#beginSessionTransition("handoff");
 
 		this.#skipPostTurnMaintenanceAssistantTimestamp = undefined;
 		// Fence background async-job delivery for the whole transition (generation
@@ -10650,6 +10691,7 @@ export class AgentSession {
 			// preserved MCP notification) so it is not stranded until an unrelated
 			// enqueue or the next agent yield.
 			this.yieldQueue.rearmIdle();
+			this.#endSessionTransition();
 		}
 	}
 
@@ -14243,7 +14285,8 @@ export class AgentSession {
 	 * @returns true if switch completed, false if cancelled by hook
 	 */
 	async switchSession(sessionPath: string): Promise<boolean> {
-		this.#assertNoHandoffTransition();
+		this.#beginSessionTransition("switch-session");
+		try {
 		const previousSessionFile = this.sessionManager.getSessionFile();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
@@ -14440,6 +14483,9 @@ export class AgentSession {
 			}
 			throw error;
 		}
+		} finally {
+			this.#endSessionTransition();
+		}
 	}
 
 	/**
@@ -14455,7 +14501,8 @@ export class AgentSession {
 		selectedText: string;
 		cancelled: boolean;
 	}> {
-		this.#assertNoHandoffTransition();
+		this.#beginSessionTransition("branch");
+		try {
 		const previousSessionFile = this.sessionFile;
 		const previousWorkflowGateSessionId = this.sessionId;
 		const selectedEntry = this.sessionManager.getEntryForFidelity(entryId);
@@ -14524,6 +14571,9 @@ export class AgentSession {
 		}
 
 		return { selectedText, cancelled: false };
+		} finally {
+			this.#endSessionTransition();
+		}
 	}
 
 	// =========================================================================
@@ -14550,6 +14600,11 @@ export class AgentSession {
 		/** Raw session context built during navigation — pass to renderInitialMessages to skip a second O(N) walk. */
 		sessionContext?: SessionContext;
 	}> {
+		// Serialize with every other session-identity transition via the shared
+		// lease (handoff/compact/new/switch/branch/clear/fork). navigateTree rewrites
+		// live history in place, so a concurrent transition would race the same state.
+		this.#beginSessionTransition("navigate-tree");
+		try {
 		const oldLeafId = this.sessionManager.getLeafId();
 
 		// No-op if already at target
@@ -14709,6 +14764,9 @@ export class AgentSession {
 			return { editorText, cancelled: false, summaryEntry, sessionContext: refreshedContext };
 		}
 		return { editorText, cancelled: false, summaryEntry, sessionContext: displayContext };
+		} finally {
+			this.#endSessionTransition();
+		}
 	}
 
 	/**

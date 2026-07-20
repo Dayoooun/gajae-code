@@ -910,4 +910,108 @@ describe("AgentSession handoff", () => {
 		}
 		expect(String((rejection as Error | undefined)?.message ?? "")).not.toMatch(/handoff is in progress/i);
 	});
+
+	it("owns the shared transition lease and rejects every other identity transition (handoff → others)", async () => {
+		const gate = Promise.withResolvers<void>();
+		vi.spyOn(compactionModule, "generateHandoff").mockImplementation(async () => {
+			await gate.promise;
+			return "## Goal\nContinue";
+		});
+		const handoffPromise = session.handoff();
+		await Bun.sleep(5); // let handoff acquire the shared session-transition lease
+
+		// Every session-identity transition acquires the same lease at its entry, so
+		// each is rejected as "busy" while the handoff owns it. This proves the lease
+		// is shared (not a handoff-only guard) and covers the newly-wrapped fork /
+		// clearContext / navigateTree paths alongside compact / new / switch / branch.
+		const attempts: Array<[string, () => Promise<unknown>]> = [
+			["compact", () => session.compact()],
+			["newSession", () => session.newSession()],
+			["switchSession", () => session.switchSession(path.join(tempDir.path(), "other.session"))],
+			["branch", () => session.branch("missing-entry")],
+			["clearContext", () => session.clearContext()],
+			["fork", () => session.fork()],
+			["navigateTree", () => session.navigateTree("missing-target")],
+		];
+		for (const [name, run] of attempts) {
+			let caught: unknown;
+			try {
+				await run();
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught, `${name} should reject while a handoff owns the lease`).toBeInstanceOf(Error);
+			expect((caught as { code?: string }).code).toBe("busy");
+			expect(String((caught as Error).message)).toMatch(/while a handoff transition is in progress/i);
+		}
+
+		// No competing transition mutated the session: still no successor/handoff entry.
+		expect(
+			sessionManager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),
+		).toHaveLength(0);
+
+		gate.resolve();
+		await handoffPromise;
+	});
+
+	it("rejects a handoff before mutation while a non-handoff transition owns the lease (compact → handoff)", async () => {
+		session.settings.set("compaction.keepRecentTokens", 1);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "large response" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			stopReason: "stop",
+			usage: {
+				input: 4000,
+				output: 100,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 4100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		sessionManager.appendMessage({ role: "user", content: "u".repeat(8000), timestamp: Date.now() });
+		sessionManager.appendMessage(assistant);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		const branch = sessionManager.getBranch();
+		const firstKeptEntryId = branch[branch.length - 1]!.id;
+		const gate = Promise.withResolvers<void>();
+		// Deferred compaction call: compact() has already acquired the shared lease and
+		// awaits here, so the lease is held deterministically without any timing race.
+		vi.spyOn(compactionModule, "compact").mockImplementation(async () => {
+			await gate.promise;
+			return {
+				summary: "compacted",
+				shortSummary: "short",
+				firstKeptEntryId,
+				tokensBefore: 4100,
+				details: {},
+			};
+		});
+
+		const compactPromise = session.compact();
+		await Bun.sleep(5); // compact acquires the lease, then suspends on the deferred call
+
+		let caught: unknown;
+		try {
+			await session.handoff();
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(Error);
+		expect((caught as { code?: string }).code).toBe("busy");
+		expect(String((caught as Error).message)).toMatch(/while a compact transition is in progress/i);
+		// Reverse-direction symmetry: handoff is rejected at its own lease acquisition,
+		// before any session mutation — no compaction entry was appended yet.
+		expect(sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
+
+		gate.resolve();
+		await compactPromise.catch(() => {});
+	});
 });
