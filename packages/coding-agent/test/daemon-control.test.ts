@@ -1791,6 +1791,35 @@ describe("ChatDaemonController ownership safety", () => {
 			expect(spawns).toBe(expected === "attached" ? 0 : 1);
 		});
 
+		test("attaches when a newer-generation owner becomes healthy during the wait", async () => {
+			const agentDir = tempAgentDir();
+			const paths = chatDaemonPaths(agentDir, kind);
+			fs.mkdirSync(paths.dir, { recursive: true });
+			const state = {
+				version: 1,
+				kind,
+				pid: 91,
+				ownerId: "owner-a",
+				identity: identity(),
+				incarnation: "linux:12345",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+				transportHealthy: false,
+				generation: chatDaemonGeneration(kind) + 1,
+			};
+			fs.writeFileSync(paths.state, JSON.stringify(state));
+			let sleeps = 0;
+			const controller = new ChatDaemonController(configuredSettings(agentDir), kind, {
+				pidAlive: pid => pid === 91,
+				pidIncarnation: () => "linux:12345",
+				sleep: async () => {
+					if (++sleeps === 1) fs.writeFileSync(paths.state, JSON.stringify({ ...state, transportHealthy: true }));
+				},
+			});
+			expect(await controller.ensure()).toBe("attached");
+			expect(sleeps).toBe(1);
+		});
+
 		test.each([
 			["version", 2],
 			["kind", "telegram"],

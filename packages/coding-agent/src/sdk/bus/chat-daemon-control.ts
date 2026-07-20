@@ -749,10 +749,11 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		const maxPolls = Math.ceil(timeoutMs / 25);
 		for (let poll = 0; poll <= maxPolls; poll++) {
 			const state = await readChatDaemonState(this.settings.getAgentDir(), this.kind);
+			const classification = state ? this.classify(state, identity) : undefined;
 			if (
 				state &&
 				state.ownerId === ownerId &&
-				this.classify(state, identity) === "compatible" &&
+				(classification === "compatible" || classification === "newer") &&
 				this.isCurrentCompatibleState(state, identity)
 			)
 				return true;
