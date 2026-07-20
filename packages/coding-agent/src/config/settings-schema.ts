@@ -286,6 +286,7 @@ export const SETTINGS_SCHEMA = {
 	"notifications.telegram.chatId": { type: "string", default: undefined },
 	"notifications.telegram.activation": { type: "record", default: {} as Record<string, unknown> },
 	"notifications.telegram.btw.enabled": { type: "boolean", default: true },
+	"notifications.telegram.streaming.enabled": { type: "boolean", default: true },
 	"notifications.telegram.rich.enabled": {
 		type: "boolean",
 		default: true,
@@ -303,6 +304,16 @@ export const SETTINGS_SCHEMA = {
 			tab: "notifications",
 			label: "Telegram Rich Drafts",
 			description: "Include rich draft updates in Telegram notifications.",
+			editing: "notification-atomic",
+		},
+	},
+	"notifications.telegram.toolActivity.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "notifications",
+			label: "Telegram Tool Activity",
+			description: "Send Telegram updates for tool starts and completions.",
 			editing: "notification-atomic",
 		},
 	},
@@ -3766,6 +3777,12 @@ export interface NotificationsSettings {
 			enabled: boolean;
 		};
 		richDraft: {
+			enabled: boolean;
+		};
+		toolActivity: {
+			enabled: boolean;
+		};
+		streaming: {
 			enabled: boolean;
 		};
 		topics: {

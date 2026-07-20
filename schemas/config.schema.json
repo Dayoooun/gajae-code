@@ -71,6 +71,16 @@
 							},
 							"additionalProperties": false
 						},
+						"streaming": {
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"type": "boolean",
+									"default": true
+								}
+							},
+							"additionalProperties": false
+						},
 						"rich": {
 							"type": "object",
 							"properties": {
@@ -89,6 +99,17 @@
 									"type": "boolean",
 									"description": "Include rich draft updates in Telegram notifications.",
 									"default": false
+								}
+							},
+							"additionalProperties": false
+						},
+						"toolActivity": {
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"type": "boolean",
+									"description": "Send Telegram updates for tool starts and completions.",
+									"default": true
 								}
 							},
 							"additionalProperties": false

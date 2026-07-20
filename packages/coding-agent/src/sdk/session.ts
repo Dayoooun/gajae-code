@@ -126,7 +126,7 @@ import {
 } from "../system-prompt";
 import { AgentOutputManager } from "../task/output-manager";
 import { parseThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
-import { isMCPBridgeTool } from "../tool-discovery/tool-index";
+import { isMCPBridgeTool, selectRestorableDiscoveredBuiltinToolNames } from "../tool-discovery/tool-index";
 import {
 	applyConfiguredSearchTimeout,
 	BashTool,
@@ -1427,6 +1427,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return sessionManager.getCwd();
 			},
 			hasUI: options.hasUI ?? false,
+			workflowGateEligible: true,
 			enableLsp,
 			get hasEditTool() {
 				const requestedToolNames = options.toolNames
@@ -2121,15 +2122,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
-		const requestedToolNames = options.toolNames
+		const hasExplicitToolNames = options.toolNames !== undefined;
+		const requestedToolNames = hasExplicitToolNames
 			? [
 					...new Set([
-						...options.toolNames.map(name => name.toLowerCase()),
+						...options.toolNames!.map(name => name.toLowerCase()),
 						...(settings.get("goal.enabled") ? ["goal"] : []),
 					]),
 				]
 			: toolNamesFromRegistry;
 		const normalizedRequested = requestedToolNames.filter(name => toolRegistry.has(name));
+		const explicitRequestedToolNames = hasExplicitToolNames ? normalizedRequested : [];
 		const requestedToolNameSet = new Set(normalizedRequested);
 		// Normalize the user-facing mcp.discoveryMode alias once at session construction.
 		const toolsDiscoveryModeSetting = settings.get("tools.discoveryMode");
@@ -2152,12 +2155,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const discoveryDefaultServerToolNames: string[] = [];
 		let initialSelectedMCPToolNames: string[] = [];
 		let defaultSelectedMCPToolNames: string[] = [];
+		let initialBaselineDiscoveredBuiltinToolNames: string[] = [];
+		let initialSelectedDiscoveredBuiltinToolNames: string[] = [];
+		let hasExplicitMCPToolSelection = false;
+		let hasExplicitDiscoveredBuiltinToolSelection = false;
+		let explicitlyRequestedDiscoveredBuiltinToolNames: string[] = [];
 		if (mcpDiscoveryEnabled) {
 			const defaultServerNames = new Set(settings.get("mcp.discoveryDefaultServers") ?? []);
 			for (const tool of toolRegistry.values()) {
 				if (!isMCPBridgeTool(tool)) continue;
 				discoverableMCPToolNames.add(tool.name);
-				if (initialRequestedActiveToolNames.includes(tool.name)) {
+				if (explicitRequestedToolNames.includes(tool.name)) {
 					explicitlyRequestedMCPToolNames.push(tool.name);
 				}
 				const serverName = (tool as AgentTool & { mcpServerName?: string }).mcpServerName;
@@ -2174,13 +2182,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			defaultSelectedMCPToolNames = [
 				...new Set([
 					...discoveryDefaultServerToolNames,
-					...explicitlyRequestedMCPToolNames,
 					...(explicitMcpConfigPath !== undefined ? exactMcpToolNames : []),
 				]),
 			];
+			hasExplicitMCPToolSelection =
+				hasExplicitToolNames && (options.toolNames!.length === 0 || explicitlyRequestedMCPToolNames.length > 0);
 			initialSelectedMCPToolNames = existingSession.hasPersistedMCPToolSelection
 				? restoredSelectedMCPToolNames
-				: [...new Set([...restoredSelectedMCPToolNames, ...defaultSelectedMCPToolNames])];
+				: hasExplicitMCPToolSelection
+					? explicitlyRequestedMCPToolNames
+					: defaultSelectedMCPToolNames;
 			initialToolNames = [
 				...new Set([
 					...initialRequestedActiveToolNames.filter(name => !discoverableMCPToolNames.has(name)),
@@ -2208,19 +2219,39 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// The model finds them via search_tool_bm25 and activates them on demand.
 		if (effectiveDiscoveryMode === "all") {
 			const essentialBuiltinNames = new Set(computeEssentialBuiltinNames(settings));
-			const explicitlyRequestedToolNames = new Set(options.toolNames?.map(name => name.toLowerCase()) ?? []);
-			// Back-compat: persisted activations live under selectedMCPToolNames today (built-in
-			// activation persistence is a follow-up). MCP names won't collide with built-in names.
-			const restoredDiscoveredNames = new Set(existingSession.selectedMCPToolNames);
-			initialToolNames = initialToolNames.filter(name => {
+			const allowedDiscoveredBuiltinNames = options.discoverableToolAllowedNames
+				? new Set(options.discoverableToolAllowedNames.map(name => name.toLowerCase()))
+				: undefined;
+			const baselineInitialToolNames = initialToolNames.filter(name => {
 				const tool = toolRegistry.get(name);
 				if (!tool?.loadMode) return true; // not a built-in — leave MCP/custom/extension to existing logic
 				if (tool.loadMode === "essential") return true;
-				if (essentialBuiltinNames.has(name)) return true;
-				if (explicitlyRequestedToolNames.has(name)) return true;
-				if (restoredDiscoveredNames.has(name)) return true;
-				return false;
+				return essentialBuiltinNames.has(name);
 			});
+			explicitlyRequestedDiscoveredBuiltinToolNames = selectRestorableDiscoveredBuiltinToolNames(
+				explicitRequestedToolNames,
+				toolRegistry,
+				allowedDiscoveredBuiltinNames,
+			).filter(name => !essentialBuiltinNames.has(name));
+			const requestedDiscoveredBuiltinToolNameSet = new Set(explicitlyRequestedDiscoveredBuiltinToolNames);
+			initialBaselineDiscoveredBuiltinToolNames = selectRestorableDiscoveredBuiltinToolNames(
+				baselineInitialToolNames.filter(name => !requestedDiscoveredBuiltinToolNameSet.has(name)),
+				toolRegistry,
+				allowedDiscoveredBuiltinNames,
+			);
+			const restoredDiscoveredNames = selectRestorableDiscoveredBuiltinToolNames(
+				existingSession.selectedDiscoveredBuiltinToolNames ?? [],
+				toolRegistry,
+				allowedDiscoveredBuiltinNames,
+				essentialBuiltinNames,
+			);
+			initialSelectedDiscoveredBuiltinToolNames = existingSession.hasPersistedDiscoveredBuiltinToolSelection
+				? restoredDiscoveredNames
+				: explicitlyRequestedDiscoveredBuiltinToolNames;
+			initialToolNames = [...new Set([...baselineInitialToolNames, ...initialSelectedDiscoveredBuiltinToolNames])];
+			hasExplicitDiscoveredBuiltinToolSelection =
+				hasExplicitToolNames &&
+				(options.toolNames!.length === 0 || explicitlyRequestedDiscoveredBuiltinToolNames.length > 0);
 		}
 
 		// Pre-register in the global agent registry BEFORE building the system prompt,
@@ -2521,8 +2552,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			mcpDiscoveryEnabled,
 			discoveryMode: effectiveDiscoveryMode,
 			initialSelectedMCPToolNames,
+			initialMCPToolSelectionIsExplicit: hasExplicitMCPToolSelection,
+			initialDiscoveredBuiltinToolSelectionIsExplicit: hasExplicitDiscoveredBuiltinToolSelection,
+			initialSelectedDiscoveredBuiltinToolNames,
+			initialBaselineDiscoveredBuiltinToolNames,
 			defaultSelectedMCPToolNames,
-			persistInitialMCPToolSelection: !hasExistingSession,
+			persistInitialMCPToolSelection: !hasExistingSession && hasExplicitMCPToolSelection,
+			persistInitialDiscoveredBuiltinToolSelection: !hasExistingSession && hasExplicitDiscoveredBuiltinToolSelection,
+			initialPersistedMCPToolNames: explicitlyRequestedMCPToolNames,
+			initialPersistedDiscoveredBuiltinToolNames: explicitlyRequestedDiscoveredBuiltinToolNames,
 			defaultSelectedMCPServerNames: settings.get("mcp.discoveryDefaultServers") ?? [],
 			ttsrManager,
 			obfuscator,

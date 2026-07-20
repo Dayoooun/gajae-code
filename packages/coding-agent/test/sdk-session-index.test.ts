@@ -11,6 +11,10 @@ const event = (sessionId: string) => ({
 	endpointGeneration: 1,
 	pid: process.pid,
 });
+
+function deferred<T = void>() {
+	return Promise.withResolvers<T>();
+}
 describe("SDK session index", () => {
 	it("diagnoses a missing index without creating session directories", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-missing-"));
@@ -20,6 +24,80 @@ describe("SDK session index", () => {
 			snapshotSeq: 0,
 		});
 		expect(await fs.exists(path.join(dir, "sdk", "sessions"))).toBe(false);
+	});
+	it("coordinates concurrent opens for one normalized index path", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-open-"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const entered = deferred();
+		const release = deferred();
+		const chmod = fs.chmod.bind(fs);
+		let chmodCalls = 0;
+		const spy = vi.spyOn(fs, "chmod").mockImplementation(async (file, mode) => {
+			if (path.resolve(file.toString()) === path.resolve(sessionsDir)) {
+				chmodCalls++;
+				entered.resolve();
+				await release.promise;
+			}
+			return await chmod(file, mode);
+		});
+		try {
+			const first = new SessionIndex(dir).open();
+			await entered.promise;
+			const second = new SessionIndex(path.join(dir, ".")).open();
+			release.resolve();
+			const [one, two] = await Promise.all([first, second]);
+			expect(chmodCalls).toBe(1);
+			expect(one).not.toBe(two);
+			expect(one.indexSeq).toBe(0);
+			expect(two.indexSeq).toBe(0);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+	it("clears a failed open group so a later open can retry", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-open-failure-"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const chmod = fs.chmod.bind(fs);
+		let fail = true;
+		const error = new Error("chmod failed");
+		const spy = vi.spyOn(fs, "chmod").mockImplementation(async (file, mode) => {
+			if (fail && path.resolve(file.toString()) === path.resolve(sessionsDir)) {
+				fail = false;
+				throw error;
+			}
+			return await chmod(file, mode);
+		});
+		try {
+			await expect(new SessionIndex(dir).open()).rejects.toBe(error);
+			await expect(new SessionIndex(dir).open()).resolves.toBeInstanceOf(SessionIndex);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+	it("does not serialize opens for different index paths", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-open-isolation-"));
+		const firstDir = path.join(root, "first");
+		const secondDir = path.join(root, "second");
+		const firstSessionsDir = path.join(firstDir, "sdk", "sessions");
+		const entered = deferred();
+		const release = deferred();
+		const chmod = fs.chmod.bind(fs);
+		const spy = vi.spyOn(fs, "chmod").mockImplementation(async (file, mode) => {
+			if (path.resolve(file.toString()) === path.resolve(firstSessionsDir)) {
+				entered.resolve();
+				await release.promise;
+			}
+			return await chmod(file, mode);
+		});
+		try {
+			const first = new SessionIndex(firstDir).open();
+			await entered.promise;
+			await expect(new SessionIndex(secondDir).open()).resolves.toBeInstanceOf(SessionIndex);
+			release.resolve();
+			await first;
+		} finally {
+			spy.mockRestore();
+		}
 	});
 	it("replays only rows after the snapshotted prefix", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
@@ -210,6 +288,65 @@ describe("SDK session index", () => {
 		} finally {
 			spy.mockRestore();
 			if (platform) Object.defineProperty(process, "platform", platform);
+		}
+	});
+	it("holds refresh at a filesystem barrier while queued replay, append, and snapshot preserve monotonic state", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-mutation-race-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("before"));
+		const log = path.join(dir, "sdk", "sessions", "index.jsonl");
+		const entered = deferred();
+		const release = deferred();
+		const open = fs.open.bind(fs);
+		let holdLogRead = true;
+		const spy = vi.spyOn(fs, "open").mockImplementation((async (file: string, ...rest: unknown[]) => {
+			if (holdLogRead && path.resolve(file) === path.resolve(log) && rest[0] === "r") {
+				holdLogRead = false;
+				entered.resolve();
+				await release.promise;
+			}
+			return await (open as (file: string, ...args: unknown[]) => Promise<fs.FileHandle>)(file, ...rest);
+		}) as typeof fs.open);
+		const receipt = <T>(promise: Promise<T>) => {
+			const result: { status: "pending" | "fulfilled" | "rejected" } = { status: "pending" };
+			void promise.then(
+				() => {
+					result.status = "fulfilled";
+				},
+				() => {
+					result.status = "rejected";
+				},
+			);
+			return result;
+		};
+		try {
+			const refresh = index.refresh();
+			await entered.promise;
+			const replay = index.replay();
+			const append = index.append(event("after"));
+			const snapshot = index.snapshot();
+			const receipts = [receipt(replay), receipt(append), receipt(snapshot)];
+
+			expect(receipts).toEqual([{ status: "pending" }, { status: "pending" }, { status: "pending" }]);
+
+			release.resolve();
+			const [, , appended] = await Promise.all([refresh, replay, append, snapshot]);
+			expect(receipts).toEqual([{ status: "fulfilled" }, { status: "fulfilled" }, { status: "fulfilled" }]);
+			expect(appended.indexSeq).toBe(2);
+			expect(index.indexSeq).toBe(2);
+			expect(index.listSessions().sessions.map(session => session.sessionId)).toEqual(["before", "after"]);
+
+			const snapshotContents = JSON.parse(
+				await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"),
+			);
+			expect(snapshotContents.indexSeq).toBe(2);
+			expect(snapshotContents.events.map((item: SessionIndexEvent) => item.indexSeq)).toEqual([1, 2]);
+			const reopened = await new SessionIndex(dir).open();
+			expect(reopened.indexSeq).toBe(2);
+			expect(reopened.listSessions().sessions.map(session => session.sessionId)).toEqual(["before", "after"]);
+		} finally {
+			release.resolve();
+			spy.mockRestore();
 		}
 	});
 	it("serializes concurrent writers and replays a strictly monotonic log", async () => {
@@ -558,13 +695,32 @@ describe("SDK session index", () => {
 			`${JSON.stringify({ ...inverted, checksum: sessionIndexChecksum(inverted as Parameters<typeof sessionIndexChecksum>[0]) })}\n`,
 		);
 		const corrupt = await new SessionIndex(dir).open();
+		const repairEntered = Promise.withResolvers<void>();
+		const resumeRepair = Promise.withResolvers<void>();
+		const quarantineRepairPrefix = path.join(dir, "sdk", "sessions", "quarantine", "repair-");
+		const originalMkdir = fs.mkdir.bind(fs);
+		const mkdir = vi.spyOn(fs, "mkdir").mockImplementation(async (target, options) => {
+			if (typeof target === "string" && target.startsWith(quarantineRepairPrefix)) {
+				repairEntered.resolve();
+				await resumeRepair.promise;
+			}
+			await originalMkdir(target, options);
+		});
 		const repairing = corrupt.repair();
-		const writer = new SessionIndex(dir);
-		const appended = await writer.append(event("racing-writer"));
-		expect((await repairing).validPrefixSeq).toBe(2);
-		expect(appended.indexSeq).toBe(3);
-		const replay = await new SessionIndex(dir).open();
-		expect(replay.indexSeq).toBe(3);
-		expect((await replay.diagnose()).status).toBe("healthy");
+		try {
+			await repairEntered.promise;
+			const writer = new SessionIndex(dir);
+			const appending = writer.append(event("racing-writer"));
+			resumeRepair.resolve();
+			const [repair, appended] = await Promise.all([repairing, appending]);
+			expect(repair.validPrefixSeq).toBe(2);
+			expect(appended.indexSeq).toBe(3);
+			const replay = await new SessionIndex(dir).open();
+			expect(replay.indexSeq).toBe(3);
+			expect((await replay.diagnose()).status).toBe("healthy");
+		} finally {
+			resumeRepair.resolve();
+			mkdir.mockRestore();
+		}
 	});
 });

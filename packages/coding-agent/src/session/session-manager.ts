@@ -87,12 +87,11 @@ import type {
 } from "./session-storage";
 import { FileSessionStorage, MemorySessionStorage } from "./session-storage";
 
-export const CURRENT_SESSION_VERSION = 4;
+export const CURRENT_SESSION_VERSION = 5;
 
 /**
- * Version 4 adds append-only patch records. New writers emit v4 headers; v1–v3
- * transcripts remain readable. Older builds do not apply these records, so they
- * must not be used to edit a session after a v4 writer has updated it.
+ * Version 5 separates persisted MCP and discovered-built-in selection authority.
+ * Version 4 patch records remain readable; older writers must not edit v5 sessions.
  */
 
 function isUnderProjectGjc(cwd: string, targetPath: string): boolean {
@@ -326,6 +325,18 @@ export interface MCPToolSelectionEntry extends SessionEntryBase {
 	type: "mcp_tool_selection";
 	/** MCP tool names selected for visibility in discovery mode. */
 	selectedToolNames: string[];
+	/** Legacy v4 combined built-in authority, retained for read compatibility. */
+	selectedDiscoveredBuiltinToolNames?: string[];
+	/** Correlates the ordered MCP and built-in entries emitted by one combined activation. */
+	mutationCorrelationId?: string;
+}
+
+/** Persisted discovered-built-in selection state, independent of MCP authority. */
+export interface DiscoveredBuiltinToolSelectionEntry extends SessionEntryBase {
+	type: "discovered_builtin_tool_selection";
+	selectedToolNames: string[];
+	/** Correlates the ordered MCP and built-in entries emitted by one combined activation. */
+	mutationCorrelationId?: string;
 }
 
 /** Session init entry - captures initial context for subagent sessions (debugging/replay). */
@@ -389,6 +400,7 @@ export type SessionEntry =
 	| LabelEntry
 	| TtsrInjectionEntry
 	| MCPToolSelectionEntry
+	| DiscoveredBuiltinToolSelectionEntry
 	| SessionInitEntry
 	| ModeChangeEntry
 	| ConfiguredModelChainEntry;
@@ -456,8 +468,12 @@ export interface SessionContext {
 
 	/** MCP tool names selected through discovery for this session branch. */
 	selectedMCPToolNames: string[];
+	/** Built-in discoverable tool names activated through discovery, when explicitly persisted. */
+	selectedDiscoveredBuiltinToolNames?: string[];
 	/** Whether this branch contains an explicit persisted MCP selection entry. */
 	hasPersistedMCPToolSelection: boolean;
+	/** Whether this branch contains an explicit persisted discovered-built-in selection entry. */
+	hasPersistedDiscoveredBuiltinToolSelection?: boolean;
 	/** Active mode (e.g. "plan") or "none" if no special mode is active */
 	mode: string;
 	/** Mode-specific data from the last mode_change entry */
@@ -521,7 +537,7 @@ export interface StrictSessionOpenSuccess {
 
 export interface StrictSessionOpenFailure {
 	kind: "error";
-	reason: ResumeTailError["reason"] | "identity-mismatch";
+	reason: ResumeTailError["reason"] | "identity-mismatch" | "migration-required";
 }
 
 /** Exact transcript bytes and authority captured from one descriptor-bound read. */
@@ -540,6 +556,27 @@ export type StrictSessionForkResult = { kind: "forked"; manager: SessionManager 
 
 /** Result of opening an inspected session without create-or-rewrite fallback. */
 export type StrictSessionOpenResult = StrictSessionOpenSuccess | StrictSessionOpenFailure;
+
+/**
+ * Capability returned only by a strict recovery hydration open. It represents
+ * immutable transcript authority and is consumed by the promotion seam.
+ */
+export interface RecoveryHydrationContext {
+	readonly identity: ResumeSessionIdentity;
+}
+
+export interface RecoveryHydrationOpenSuccess {
+	readonly kind: "hydrated";
+	readonly manager: SessionManager;
+	readonly context: RecoveryHydrationContext;
+}
+
+export type RecoveryHydrationOpenResult = RecoveryHydrationOpenSuccess | StrictSessionOpenFailure;
+
+export interface RecoveryHydrationPromotionFence {
+	/** The caller has durably published ownership and acquired its writer lease. */
+	readonly ownershipReady: true;
+}
 
 export interface SessionInfo {
 	path: string;
@@ -805,24 +842,34 @@ function resolveManagedSessionRoot(sessionDir: string, cwd: string): string | un
 	return path.resolve(sessionDir) === path.resolve(resolved.scope.directoryPath) ? sessionsRoot : undefined;
 }
 
+function isSupportedSessionVersion(version: unknown): boolean {
+	return (
+		version === undefined ||
+		(typeof version === "number" && Number.isInteger(version) && version <= CURRENT_SESSION_VERSION)
+	);
+}
+
 /** Exported for compaction.test.ts */
 export function parseSessionEntries(content: string): FileEntry[] {
 	const records = parseJsonlLenient<FileEntry | SessionPatchRecord>(content);
+	const rawHeader = records.find((record): record is SessionHeader => record.type === "session");
+	if (!isSupportedSessionVersion(rawHeader?.version)) {
+		throw new Error(`Unsupported session version: ${String(rawHeader?.version)}`);
+	}
 	const entries: FileEntry[] = [];
 	const entriesById = new Map<string, SessionEntry>();
 	let header: SessionHeader | undefined;
 
 	for (const record of records) {
-		// Patch records are defined only by v4 transcripts. Ignore them before a
-		// v4 header as well: a truncated or malicious prefix must not mutate a
-		// later header/entry when replay catches up.
+		// Patch records are valid in v4 and v5 only. Ignore patches before a valid
+		// header so malformed prefixes cannot affect later records.
 		if (record.type === "header_patch") {
-			if (header?.version === CURRENT_SESSION_VERSION && isHeaderPatchRecord(record))
+			if (header?.version !== undefined && header.version >= 4 && isHeaderPatchRecord(record))
 				applyHeaderPatch(header, record.patch);
 			continue;
 		}
 		if (record.type === "entry_patch") {
-			if (header?.version === CURRENT_SESSION_VERSION && isEntryPatchRecord(record)) {
+			if (header?.version !== undefined && header.version >= 4 && isEntryPatchRecord(record)) {
 				const entry = entriesById.get(record.entryId);
 				if (entry?.type === "message" && record.patch.message) entry.message = record.patch.message;
 			}
@@ -939,6 +986,7 @@ export function buildSessionContext(
 
 			selectedMCPToolNames: [],
 			hasPersistedMCPToolSelection: false,
+			hasPersistedDiscoveredBuiltinToolSelection: false,
 			mode: "none",
 		};
 	}
@@ -963,6 +1011,7 @@ export function buildSessionContext(
 			ttsrMessageCount: 0,
 			selectedMCPToolNames: [],
 			hasPersistedMCPToolSelection: false,
+			hasPersistedDiscoveredBuiltinToolSelection: false,
 			mode: "none",
 		};
 	}
@@ -992,6 +1041,8 @@ export function buildSessionContext(
 
 	let selectedMCPToolNames: string[] = [];
 	let hasPersistedMCPToolSelection = false;
+	let selectedDiscoveredBuiltinToolNames: string[] | undefined;
+	let hasPersistedDiscoveredBuiltinToolSelection = false;
 	let mode = "none";
 	let modeData: Record<string, unknown> | undefined;
 	// Track whether an explicit `model_change` with role="default" has been
@@ -1052,7 +1103,14 @@ export function buildSessionContext(
 			}
 		} else if (entry.type === "mcp_tool_selection") {
 			selectedMCPToolNames = [...entry.selectedToolNames];
+			if (entry.selectedDiscoveredBuiltinToolNames !== undefined) {
+				selectedDiscoveredBuiltinToolNames = [...entry.selectedDiscoveredBuiltinToolNames];
+				hasPersistedDiscoveredBuiltinToolSelection = true;
+			}
 			hasPersistedMCPToolSelection = true;
+		} else if (entry.type === "discovered_builtin_tool_selection") {
+			selectedDiscoveredBuiltinToolNames = [...entry.selectedToolNames];
+			hasPersistedDiscoveredBuiltinToolSelection = true;
 		} else if (entry.type === "mode_change") {
 			mode = entry.mode;
 			modeData = entry.data;
@@ -1176,7 +1234,9 @@ export function buildSessionContext(
 		ttsrMessageCount,
 
 		selectedMCPToolNames,
+		selectedDiscoveredBuiltinToolNames,
 		hasPersistedMCPToolSelection,
+		hasPersistedDiscoveredBuiltinToolSelection,
 		mode,
 		modeData,
 	};
@@ -1201,6 +1261,9 @@ function cloneSessionContext(context: SessionContext): SessionContext {
 		ttsrMessageCount: context.ttsrMessageCount,
 
 		selectedMCPToolNames: [...context.selectedMCPToolNames],
+		selectedDiscoveredBuiltinToolNames: context.selectedDiscoveredBuiltinToolNames
+			? [...context.selectedDiscoveredBuiltinToolNames]
+			: undefined,
 		modeData: cloneJsonSemantic(context.modeData),
 	};
 }
@@ -1475,7 +1538,19 @@ function hasStrictSessionSchema(entries: FileEntry[]): boolean {
 			case "mcp_tool_selection":
 				if (
 					!Array.isArray(value.selectedToolNames) ||
-					!value.selectedToolNames.every(name => typeof name === "string")
+					!value.selectedToolNames.every(name => typeof name === "string") ||
+					(value.selectedDiscoveredBuiltinToolNames !== undefined &&
+						(!Array.isArray(value.selectedDiscoveredBuiltinToolNames) ||
+							!value.selectedDiscoveredBuiltinToolNames.every(name => typeof name === "string"))) ||
+					(value.mutationCorrelationId !== undefined && typeof value.mutationCorrelationId !== "string")
+				)
+					return false;
+				break;
+			case "discovered_builtin_tool_selection":
+				if (
+					!Array.isArray(value.selectedToolNames) ||
+					!value.selectedToolNames.every(name => typeof name === "string") ||
+					(value.mutationCorrelationId !== undefined && typeof value.mutationCorrelationId !== "string")
 				)
 					return false;
 				break;
@@ -1806,8 +1881,13 @@ async function getSortedSessions(sessionDir: string, storage: SessionStorage): P
 					const entries = parseJsonlLenient<Record<string, unknown>>(content);
 					if (entries.length === 0) return;
 					const header = entries[0] as Record<string, unknown>;
-					if (header.type !== "session" || typeof header.id !== "string") return;
-					if (header.version === CURRENT_SESSION_VERSION) {
+					if (
+						header.type !== "session" ||
+						typeof header.id !== "string" ||
+						!isSupportedSessionVersion(header.version)
+					)
+						return;
+					if (typeof header.version === "number" && header.version >= 4) {
 						for (const patch of await readSessionListTrailingPatches(path, storage, buffer)) {
 							applySessionListHeaderPatch(header as unknown as SessionListHeader, patch);
 						}
@@ -3489,7 +3569,7 @@ async function collectSessionFromFile(
 		const entries = parseSessionEntries(content).map(entry => entry as unknown as Record<string, unknown>);
 		const header = parseSessionListHeader(content, entries);
 		if (!header) return undefined;
-		if (header.version === CURRENT_SESSION_VERSION) {
+		if (typeof header.version === "number" && header.version >= 4 && header.version <= CURRENT_SESSION_VERSION) {
 			for (const patch of await readSessionListTrailingPatches(file, storage, buffer)) {
 				applySessionListHeaderPatch(header, patch);
 			}
@@ -3653,6 +3733,7 @@ export class SessionManager {
 	#flushed: boolean = false;
 	#needsFullRewriteOnNextPersist: boolean = false;
 	#ensuredOnDisk: boolean = false;
+	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
 	#fileEntries: FileEntry[] = [];
 	#byId: Map<string, SessionEntry> = new Map();
 	#labelsById: Map<string, string> = new Map();
@@ -5446,18 +5527,29 @@ export class SessionManager {
 	// TTSR (Time Traveling Stream Rules)
 	// =========================================================================
 
-	/**
-	 * Append an MCP tool selection entry recording the discovery-selected MCP tools.
-	 * @param selectedToolNames MCP tool names selected for this branch
-	 * @returns Entry id
-	 */
-	appendMCPToolSelection(selectedToolNames: string[]): string {
+	/** Append MCP discovery selection authority without altering discovered built-in authority. */
+	appendMCPToolSelection(selectedToolNames: string[], mutationCorrelationId?: string): string {
 		const entry: MCPToolSelectionEntry = {
 			type: "mcp_tool_selection",
 			id: generateId(this.#byId),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			selectedToolNames: [...selectedToolNames],
+			mutationCorrelationId,
+		};
+		this.#appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Append discovered built-in selection authority without altering MCP authority. */
+	appendDiscoveredBuiltinToolSelection(selectedToolNames: string[], mutationCorrelationId?: string): string {
+		const entry: DiscoveredBuiltinToolSelectionEntry = {
+			type: "discovered_builtin_tool_selection",
+			id: generateId(this.#byId),
+			parentId: this.#leafId,
+			timestamp: new Date().toISOString(),
+			selectedToolNames: [...selectedToolNames],
+			mutationCorrelationId,
 		};
 		this.#appendEntry(entry);
 		return entry.id;
@@ -6671,6 +6763,62 @@ export class SessionManager {
 		return canContinuePersistedHistory(inspected.context.messages)
 			? { kind: "resumable", identity: inspected.identity }
 			: { kind: "terminal", identity: inspected.identity };
+	}
+
+	/**
+	 * Hydrate an existing predecessor transcript for recovery without taking any
+	 * write-capable action. The caller must retain the returned context and use
+	 * the explicit promotion seam only after its ownership-ready fence and writer
+	 * lease are durable.
+	 */
+	static async openExistingForRecoveryHydrationStrict(
+		identity: ResumeSessionIdentity,
+		sessionDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): Promise<RecoveryHydrationOpenResult> {
+		const inspected = inspectResumeSessionFile(identity.canonicalPath, storage);
+		if ("kind" in inspected) return inspected;
+		if (!sameResumeIdentity(identity, inspected.identity)) return { kind: "error", reason: "identity-mismatch" };
+		if (inspected.migrationApplied) return { kind: "error", reason: "migration-required" };
+
+		const header = inspected.entries[0] as SessionHeader;
+		const manager = new SessionManager(
+			header.cwd || getProjectDir(),
+			sessionDir ?? path.resolve(identity.canonicalPath, ".."),
+			true,
+			storage,
+		);
+		await manager.#hydrateExistingSession(identity.canonicalPath, inspected.entries, false);
+		const revalidated = inspectResumeSessionFile(identity.canonicalPath, storage);
+		if ("kind" in revalidated || !sameResumeIdentity(identity, revalidated.identity)) {
+			await manager.close();
+			return "kind" in revalidated ? revalidated : { kind: "error", reason: "identity-mismatch" };
+		}
+		const context: RecoveryHydrationContext = Object.freeze({
+			identity: Object.freeze({ ...identity }),
+		});
+		manager.#recoveryHydrationContext = context;
+		return { kind: "hydrated", manager, context };
+	}
+
+	/**
+	 * Allows the normal post-open metadata sanitation only after the caller has
+	 * fsynced its external ownership-ready fence and acquired the writer lease.
+	 */
+	async promoteRecoveryHydrationAfterOwnershipReadyFence(
+		context: RecoveryHydrationContext,
+		fence: RecoveryHydrationPromotionFence,
+	): Promise<void> {
+		if (fence.ownershipReady !== true || this.#recoveryHydrationContext !== context) {
+			throw new Error("Recovery hydration promotion requires the original ownership-ready context.");
+		}
+		const inspected = inspectResumeSessionFile(context.identity.canonicalPath, this.storage);
+		if ("kind" in inspected || !sameResumeIdentity(context.identity, inspected.identity)) {
+			throw new Error("Recovery transcript authority changed before promotion.");
+		}
+		await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
+		writeTerminalBreadcrumb(this.cwd, context.identity.canonicalPath);
+		this.#recoveryHydrationContext = undefined;
 	}
 
 	/**

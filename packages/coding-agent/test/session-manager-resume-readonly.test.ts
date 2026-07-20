@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { deleteSessionPickerCandidate } from "@gajae-code/coding-agent/cli/session-picker";
 import {
 	createReadonlySessionManager,
+	parseSessionEntries,
 	type ResumeSessionIdentity,
 	SessionManager,
 	type StrictSessionOpenResult,
@@ -215,27 +216,17 @@ describe("SessionManager read-only resume", () => {
 		expect(storage.writes).toBe(0);
 	});
 
-	it("reads v4 entry patches without changing the selected transcript", async () => {
+	it("opens an immutable v4 patch fixture with its final header and message state", async () => {
 		const root = makeTempDir();
 		const sessionDir = path.join(root, "sessions");
 		const filePath = path.join(sessionDir, "v4.jsonl");
-		const records = [
-			{ type: "session", version: 4, id: "v4", timestamp: new Date(0).toISOString(), cwd: root },
-			{
-				type: "message",
-				id: "message",
-				parentId: null,
-				timestamp: new Date(0).toISOString(),
-				message: { role: "user", content: "before patch", timestamp: 0 },
-			},
-			{
-				type: "entry_patch",
-				entryId: "message",
-				patch: { message: { role: "user", content: "after patch", timestamp: 0 } },
-			},
-		];
+		const immutableV4Fixture = `{"type":"session","version":4,"id":"v4","title":"Initial title","timestamp":"1970-01-01T00:00:00.000Z","cwd":"/fixture-v4"}
+{"type":"message","id":"message","parentId":null,"timestamp":"1970-01-01T00:00:01.000Z","message":{"role":"user","content":"before patch","timestamp":0}}
+{"type":"header_patch","patch":{"title":"Patched title","cwd":"/fixture-v4-patched"}}
+{"type":"entry_patch","entryId":"message","patch":{"message":{"role":"user","content":"after patch","timestamp":0}}}
+`;
 		fs.mkdirSync(sessionDir);
-		fs.writeFileSync(filePath, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		fs.writeFileSync(filePath, immutableV4Fixture);
 		const before = fs.readFileSync(filePath);
 		const beforeMtimeNs = fs.statSync(filePath, { bigint: true }).mtimeNs;
 
@@ -244,6 +235,8 @@ describe("SessionManager read-only resume", () => {
 		if (inspection.kind === "error") throw new Error("Expected v4 inspection");
 		const opened = await SessionManager.openExistingStrict(inspection.identity, sessionDir);
 		if (opened.kind === "error") throw new Error("Expected v4 strict open");
+		expect(opened.manager.getHeader()).toMatchObject({ title: "Patched title", cwd: "/fixture-v4-patched" });
+		expect(opened.manager.getCwd()).toBe("/fixture-v4-patched");
 		expect(opened.manager.getEntries()).toMatchObject([
 			{ type: "message", message: { role: "user", content: "after patch" } },
 		]);
@@ -251,6 +244,20 @@ describe("SessionManager read-only resume", () => {
 
 		expect(fs.readFileSync(filePath)).toEqual(before);
 		expect(fs.statSync(filePath, { bigint: true }).mtimeNs).toBe(beforeMtimeNs);
+	});
+
+	it("rejects future-version patch records before replay", () => {
+		const content = [
+			JSON.stringify({
+				type: "session",
+				version: 6,
+				id: "future",
+				timestamp: new Date(0).toISOString(),
+				cwd: "/cwd",
+			}),
+			JSON.stringify({ type: "header_patch", patch: { title: "must-not-apply" } }),
+		].join("\n");
+		expect(() => parseSessionEntries(content)).toThrow("Unsupported session version: 6");
 	});
 
 	it("exposes descriptor-bound device and inode identity", async () => {
@@ -412,7 +419,83 @@ describe("SessionManager read-only resume", () => {
 		});
 	});
 
-	it("preserves inspected migration state until the first v4 persistence rewrite", async () => {
+	it("rejects malformed v5 dedicated discovered built-in selections without writes", async () => {
+		for (const selectedToolNames of [undefined, "search", ["search", 42]]) {
+			const storage = new WriteTrackingStorage();
+			const filePath = `/sessions/malformed-dedicated-${String(selectedToolNames)}.jsonl`;
+			const header = {
+				type: "session",
+				id: `malformed-dedicated-${String(selectedToolNames)}`,
+				timestamp: new Date(0).toISOString(),
+				cwd: "/cwd",
+				version: 5,
+			};
+			const entry = {
+				type: "discovered_builtin_tool_selection",
+				id: "bad-selection",
+				parentId: "message",
+				timestamp: new Date(0).toISOString(),
+				...(selectedToolNames === undefined ? {} : { selectedToolNames }),
+			};
+			storage.writeTextSync(
+				filePath,
+				`${JSON.stringify(header)}\n${sessionText("ignored").split("\n").slice(1, 2)[0]}\n${JSON.stringify(entry)}\n`,
+			);
+			storage.writes = 0;
+			const inspection = await SessionManager.inspectSessionTailReadOnly(filePath, storage);
+			expect(inspection).toEqual({ kind: "error", reason: "malformed" });
+			const stat = storage.statSync(filePath);
+			const identity: ResumeSessionIdentity = {
+				canonicalPath: filePath,
+				sessionId: header.id,
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size,
+				mtimeMs: stat.mtimeMs,
+				mtimeNs: stat.mtimeNs,
+				sha256: "ignored",
+			};
+			expectStrictFailure(await SessionManager.openExistingStrict(identity, "/sessions", storage), "malformed");
+			expect(storage.writes).toBe(0);
+		}
+	});
+
+	it("preserves an explicit empty v5 dedicated discovered built-in selection without writes", async () => {
+		const storage = new WriteTrackingStorage();
+		const filePath = "/sessions/empty-discovered-builtins.jsonl";
+		const header = {
+			type: "session",
+			id: "empty-discovered-builtins",
+			timestamp: new Date(0).toISOString(),
+			cwd: "/cwd",
+			version: 5,
+		};
+		const entry = {
+			type: "discovered_builtin_tool_selection",
+			id: "empty-selection",
+			parentId: "message",
+			timestamp: new Date(0).toISOString(),
+			selectedToolNames: [],
+		};
+		storage.writeTextSync(
+			filePath,
+			`${JSON.stringify(header)}\n${sessionText("ignored").split("\n").slice(1, 2)[0]}\n${JSON.stringify(entry)}\n`,
+		);
+		storage.writes = 0;
+		const inspection = await SessionManager.inspectSessionTailReadOnly(filePath, storage);
+		expect(inspection.kind).toBe("resumable");
+		if (inspection.kind === "error") throw new Error("Expected resumable inspection");
+		const opened = await SessionManager.openExistingStrict(inspection.identity, "/sessions", storage);
+		expect(opened.kind).toBe("opened");
+		if (opened.kind === "error") throw new Error("Expected opened session");
+		expect(opened.manager.buildSessionContext()).toMatchObject({
+			hasPersistedDiscoveredBuiltinToolSelection: true,
+			selectedDiscoveredBuiltinToolNames: [],
+		});
+		expect(storage.writes).toBe(0);
+	});
+
+	it("preserves inspected migration state until the first v5 persistence rewrite", async () => {
 		const storage = new WriteTrackingStorage();
 		const filePath = "/sessions/legacy-v2.jsonl";
 		const header = {
@@ -447,7 +530,7 @@ describe("SessionManager read-only resume", () => {
 			.trim()
 			.split("\n")
 			.map(line => JSON.parse(line));
-		expect(rewritten[0]).toMatchObject({ type: "session", version: 4 });
+		expect(rewritten[0]).toMatchObject({ type: "session", version: 5 });
 		expect(rewritten).toHaveLength(3);
 		expect(rewritten.every(line => line.type === "session" || typeof line.id === "string")).toBe(true);
 	});
