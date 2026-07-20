@@ -262,17 +262,19 @@ export function createToolTranscriptRenderDescriptor(input: {
 	hasResult?: unknown;
 	inputTruncated?: unknown;
 }): ToolTranscriptRenderDescriptor {
+	const argsTruncated = exceedsStructuredInputBudget(input.args);
+	const detailsDataTruncated = exceedsStructuredInputBudget(input.detailsData);
 	return freezeDisplayValue({
 		name: sanitizeString(input.name),
-		args: (sanitizeDisplayValue(input.args) ?? {}) as Record<string, unknown>,
+		args: argsTruncated ? {} : ((sanitizeDisplayValue(input.args) ?? {}) as Record<string, unknown>),
 		intent: typeof input.intent === "string" ? sanitizeString(input.intent) : undefined,
 		resultContent: sanitizeString(input.resultContent),
 		details: typeof input.details === "string" ? sanitizeString(input.details) : undefined,
-		detailsData: sanitizeDisplayValue(input.detailsData),
+		detailsData: detailsDataTruncated ? undefined : sanitizeDisplayValue(input.detailsData),
 		isError: Boolean(input.isError),
 		isPartial: Boolean(input.isPartial),
 		hasResult: Boolean(input.hasResult),
-		inputTruncated: Boolean(input.inputTruncated),
+		inputTruncated: Boolean(input.inputTruncated) || argsTruncated || detailsDataTruncated,
 	});
 }
 

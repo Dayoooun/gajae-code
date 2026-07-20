@@ -159,8 +159,12 @@ describe("G006 WS2 red-team", () => {
 		const structuralBoundaries = [depth32, depth33, nodeLimit, nodeOver].map(isDetailsTruncated);
 		const deep = depth33;
 		const wide = Object.fromEntries(Array.from({ length: 100_000 }, (_, index) => [`key-${index}`, index]));
+		const cyclic: Record<string, unknown> = {};
+		cyclic.self = cyclic;
 		expect(() => renderToolDisplayLines(descriptor({ detailsData: deep }), 80, theme)).not.toThrow();
 		expect(() => renderToolDisplayLines(descriptor({ detailsData: wide }), 80, theme)).not.toThrow();
+		expect(() => renderToolDisplayLines(descriptor({ args: cyclic, detailsData: cyclic }), 80, theme)).not.toThrow();
+		expect(descriptor({ args: cyclic, detailsData: cyclic }).inputTruncated).toBe(true);
 		expect(scalarBoundaries).toEqual([false, true, false, true, false, true, true, true]);
 		expect(structuralBoundaries).toEqual([false, true, false, true]);
 	});
