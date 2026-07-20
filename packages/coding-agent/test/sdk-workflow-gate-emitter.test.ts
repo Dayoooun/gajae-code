@@ -17,6 +17,7 @@ import {
 } from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import type { WorkflowGate } from "../src/modes/shared/agent-wire/workflow-gate-types";
 import { initTheme } from "../src/modes/theme/theme";
+import { AuthStorage } from "../src/session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
 import { registerWorkflowGateEmitterListener } from "../src/tools/ask-answer-registry";
@@ -274,11 +275,16 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		await sessionManager.ensureOnDisk();
 		const originalSessionFile = sessionManager.getSessionFile();
 		if (!originalSessionFile) throw new Error("Expected persisted workflow session");
+		// Switch-back re-resolves the recorded session model with auth; a runtime
+		// key keeps that deterministic on hosts without OpenAI credentials.
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
+		authStorage.setRuntimeApiKey("openai", "test-key");
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager,
 			settings,
+			authStorage,
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
 			disableExtensionDiscovery: true,
@@ -310,14 +316,18 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			expect(session.getActiveToolNames()).toContain("ask");
 		} finally {
 			await session.dispose();
+			authStorage.close();
 		}
 
 		const resumedManager = await SessionManager.open(originalSessionFile, tempDir);
+		const resumedAuthStorage = await AuthStorage.create(path.join(tempDir, "testauth-resume.db"));
+		resumedAuthStorage.setRuntimeApiKey("openai", "test-key");
 		const { session: resumedSession } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: resumedManager,
 			settings: Settings.isolated({ "mcp.discoveryMode": "mcp-only" }),
+			authStorage: resumedAuthStorage,
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
 			disableExtensionDiscovery: true,
@@ -332,6 +342,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			expect(resumedSession.getActiveToolNames()).toContain("ask");
 		} finally {
 			await resumedSession.dispose();
+			resumedAuthStorage.close();
 		}
 	}, 15_000);
 	it("keeps workflow-gate restoration settled after factory return and dispose", async () => {
