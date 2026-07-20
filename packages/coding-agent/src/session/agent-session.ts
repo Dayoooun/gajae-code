@@ -2239,16 +2239,23 @@ export class AgentSession {
 		// SDK ToolSession callbacks capture the just-constructed session. Defer the
 		// initial ask-tool registration until that capture has been assigned by the
 		// session factory, while retaining the durable emitter created above.
-		this.#workflowGateToolRestoration = new Promise<void>(resolve => {
+		this.#workflowGateToolRestoration = new Promise<void>((resolve, reject) => {
 			queueMicrotask(() => {
 				if (this.#isDisposed) {
 					resolve();
 					return;
 				}
-				this.#registerWorkflowGateAskTool();
-				this.#attachAskToolIfWorkflowActive().finally(resolve);
+				try {
+					this.#registerWorkflowGateAskTool();
+					this.#attachAskToolIfWorkflowActive().then(resolve, reject);
+				} catch (error) {
+					reject(error instanceof Error ? error : new Error(String(error)));
+				}
 			});
 		});
+		// Non-SDK embedders may never observe the getter; a swallowed handler
+		// prevents an unhandled rejection while later awaits still reject.
+		this.#workflowGateToolRestoration.catch(() => {});
 	}
 
 	#workflowGateToolRestoration: Promise<void> = Promise.resolve();

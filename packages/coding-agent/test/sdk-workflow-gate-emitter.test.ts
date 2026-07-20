@@ -334,6 +334,33 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			await resumedSession.dispose();
 		}
 	}, 15_000);
+	it("settles workflow-gate restoration deterministically on success and failure", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-restoration-settlement-"));
+		tempDirs.push(tempDir);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			// createAgentSession returned, so the readiness promise must already
+			// be settled (resolved) — awaiting it again must not hang or reject.
+			await expect(session.workflowGateToolRestoration).resolves.toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+		// Dispose-before-microtask settles instead of hanging: dispose resolves
+		// the already-settled promise path; a second await stays resolved.
+		await expect(session.workflowGateToolRestoration).resolves.toBeUndefined();
+	});
 	it("attaches ask for a canonical workflow skill even when state sync fails", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-workflow-skill-statefail-"));
 		tempDirs.push(tempDir);
