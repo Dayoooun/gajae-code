@@ -803,8 +803,13 @@ function validBotToken(token: unknown): token is string {
 	return typeof token === "string" && token.length > 0;
 }
 
-function isExplicitlyStoppedDaemonState(state: unknown): boolean {
-	return Boolean(state && typeof state === "object" && Number.isSafeInteger((state as DaemonState).stoppedAt));
+function isExplicitlyStoppedDaemonState(state: unknown): state is DaemonState {
+	return Boolean(
+		hasSafeDaemonStateShape(state) &&
+			state.stoppedAt !== undefined &&
+			typeof state.acquisitionId === "string" &&
+			state.acquisitionId.length > 0,
+	);
 }
 
 function ownerIdentityMatches(
@@ -820,29 +825,31 @@ function ownerProvenanceMatches(state: DaemonState, pidIncarnation?: (pid: numbe
 	return isProcessIncarnation(state.incarnation) && isProcessIncarnation(current) && current === state.incarnation;
 }
 
-export function hasSafeDaemonStateShape(state: DaemonState | undefined): state is DaemonState {
+export function hasSafeDaemonStateShape(state: unknown): state is DaemonState {
+	if (!state || typeof state !== "object" || Array.isArray(state)) return false;
+	const candidate = state as Partial<DaemonState>;
 	return Boolean(
-		state &&
-			Number.isSafeInteger(state.pid) &&
-			state.pid > 0 &&
-			typeof state.ownerId === "string" &&
-			state.ownerId.length > 0 &&
-			(state.acquisitionId === undefined ||
-				(typeof state.acquisitionId === "string" && state.acquisitionId.length > 0)) &&
-			(state.ownershipPhase === undefined ||
-				state.ownershipPhase === "provisional" ||
-				state.ownershipPhase === "ready" ||
-				state.ownershipPhase === "retired") &&
-			typeof state.tokenFingerprint === "string" &&
-			typeof state.chatId === "string" &&
-			Number.isSafeInteger(state.startedAt) &&
-			Number.isSafeInteger(state.heartbeatAt) &&
-			isProcessIncarnation(state.incarnation) &&
-			Array.isArray(state.roots) &&
-			state.roots.every(root => typeof root === "string") &&
-			state.version === DAEMON_VERSION &&
-			(state.generation === undefined || (Number.isSafeInteger(state.generation) && state.generation > 0)) &&
-			(state.stoppedAt === undefined || Number.isSafeInteger(state.stoppedAt)),
+		Number.isSafeInteger(candidate.pid) &&
+			(candidate.pid as number) > 0 &&
+			typeof candidate.ownerId === "string" &&
+			candidate.ownerId.length > 0 &&
+			(candidate.acquisitionId === undefined ||
+				(typeof candidate.acquisitionId === "string" && candidate.acquisitionId.length > 0)) &&
+			(candidate.ownershipPhase === undefined ||
+				candidate.ownershipPhase === "provisional" ||
+				candidate.ownershipPhase === "ready" ||
+				candidate.ownershipPhase === "retired") &&
+			typeof candidate.tokenFingerprint === "string" &&
+			typeof candidate.chatId === "string" &&
+			Number.isSafeInteger(candidate.startedAt) &&
+			Number.isSafeInteger(candidate.heartbeatAt) &&
+			isProcessIncarnation(candidate.incarnation) &&
+			Array.isArray(candidate.roots) &&
+			candidate.roots.every(root => typeof root === "string") &&
+			candidate.version === DAEMON_VERSION &&
+			(candidate.generation === undefined ||
+				(Number.isSafeInteger(candidate.generation) && (candidate.generation as number) > 0)) &&
+			(candidate.stoppedAt === undefined || Number.isSafeInteger(candidate.stoppedAt)),
 	);
 }
 
@@ -936,30 +943,33 @@ function isRecognizedLegacyGeneration(generation: number | undefined): boolean {
 }
 
 /**
- * Classifies a physically live daemon with a different Telegram identity.
+ * Classifies a physically live daemon record before any replacement action.
  *
- * A differing canonical incarnation is the only authoritative proof that the
- * persisted PID has been reused. Missing or non-canonical provenance cannot
- * authorize replacing a foreign live owner's artifacts.
+ * A canonical, differing incarnation is the only authoritative proof that a
+ * live PID is no longer the recorded owner. This applies equally to matching
+ * and foreign Telegram identities: identity never substitutes for provenance.
  */
 function classifyForeignLiveOwner(input: {
-	state: DaemonState | undefined;
+	state: unknown;
 	tokenFingerprint: string;
 	chatId: string;
 	pidAlive: (pid: number) => boolean;
 	pidIncarnation?: (pid: number) => string | undefined;
 }): "identity_mismatch" | "ambiguous" | undefined {
-	const { state } = input;
-	// Establish live foreign-owner authority before requiring the full current
-	// state schema. A malformed live record cannot authorize replacement: only
-	// canonical, differing process incarnations prove that its PID was reused.
+	const state = input.state as Partial<DaemonState> | undefined;
 	// Validate before probing so malformed PIDs never reach the liveness source.
-	if (!state || !validDaemonPid(state.pid) || state.stoppedAt !== undefined || !input.pidAlive(state.pid))
-		return undefined;
-	if (ownerIdentityMatches(state, input.tokenFingerprint, input.chatId)) return undefined;
+	if (!state || !validDaemonPid(state.pid) || !input.pidAlive(state.pid)) return undefined;
+	// A stopped tombstone with a canonical acquisition is not a live owner.
+	if (isExplicitlyStoppedDaemonState(state) || isLegacyParentDaemonState(state)) return undefined;
 	const currentIncarnation = input.pidIncarnation?.(state.pid) ?? defaultPidIncarnation(state.pid);
-	if (!isProcessIncarnation(state.incarnation) || !isProcessIncarnation(currentIncarnation)) return "ambiguous";
-	return currentIncarnation === state.incarnation ? "identity_mismatch" : undefined;
+	if (
+		!hasSafeDaemonStateShape(state) ||
+		!isProcessIncarnation(state.incarnation) ||
+		!isProcessIncarnation(currentIncarnation)
+	)
+		return "ambiguous";
+	if (currentIncarnation !== state.incarnation) return undefined;
+	return ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) ? undefined : "identity_mismatch";
 }
 
 /** True for a physically live owner with this configuration, including legacy generations. */
@@ -1149,8 +1159,8 @@ export async function acquireDaemonOwnership(input: {
 	});
 	if (foreignOwner) {
 		return foreignOwner === "identity_mismatch"
-			? { acquired: false, blocked: true, reason: "identity_mismatch" }
-			: { acquired: false, blocked: true };
+			? { acquired: false, attached: false, blocked: true, reason: "identity_mismatch" }
+			: { acquired: false, attached: false, blocked: true };
 	}
 
 	const transition = await acquireTransitionLock({ fs: fsImpl, path: paths.steal, pidAlive, pidIncarnation });
@@ -1212,8 +1222,8 @@ export async function acquireDaemonOwnership(input: {
 		});
 		if (recheckedForeignOwner) {
 			return recheckedForeignOwner === "identity_mismatch"
-				? { acquired: false, blocked: true, reason: "identity_mismatch" }
-				: { acquired: false, blocked: true };
+				? { acquired: false, attached: false, blocked: true, reason: "identity_mismatch" }
+				: { acquired: false, attached: false, blocked: true };
 		}
 		if (
 			hasSafeDaemonStateShape(rechecked) &&

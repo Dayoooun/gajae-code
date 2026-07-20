@@ -114,7 +114,7 @@ export interface ChatDaemonControlRequest {
 
 export interface ChatDaemonProcessReference {
 	incarnation: string;
-	signal(signal: NodeJS.Signals): void;
+	signalRoot(signal: NodeJS.Signals): void;
 }
 
 function defaultProcessReference(pid: number, platform = os.platform()): ChatDaemonProcessReference | undefined {
@@ -127,10 +127,11 @@ function defaultProcessReference(pid: number, platform = os.platform()): ChatDae
 		if (!processRef || !hasProcessIncarnationAuthority(processRef.incarnation)) return undefined;
 		return {
 			incarnation: processRef.incarnation,
-			signal: signal => {
+			signalRoot: signal => {
 				const nativeSignal = os.constants.signals[signal];
 				if (nativeSignal === undefined) throw new Error(`Unsupported signal: ${signal}`);
-				processRef.killTree(nativeSignal);
+				const rootProcess = processRef as typeof processRef & { signalRoot(signal: number): boolean };
+				if (!rootProcess.signalRoot(nativeSignal)) throw new Error("Pinned process is already gone");
 			},
 		};
 	} catch {
@@ -609,7 +610,7 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		// native stable reference may perform this privileged signal operation.
 		if (!processRef || processRef.incarnation !== state.incarnation) return false;
 		try {
-			processRef.signal(signal);
+			processRef.signalRoot(signal);
 			return true;
 		} catch {
 			return false;

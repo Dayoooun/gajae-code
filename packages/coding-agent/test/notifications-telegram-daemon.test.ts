@@ -1560,6 +1560,107 @@ describe("telegram daemon", () => {
 		if (beforeLock !== undefined) expect(fs.readFileSync(paths.lock, "utf8")).toBe(beforeLock);
 		expect(fs.existsSync(paths.roots)).toBe(false);
 	});
+	test.each([
+		"missing",
+		"aged-malformed",
+	])("same-identity live owner with a non-string incarnation and a %s lock remains unchanged", async lockKind => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				pid: 999,
+				incarnation: 100,
+				ownerId: "same-owner",
+				tokenFingerprint: tokenFingerprint("123456:secret-token"),
+				chatId: "42",
+				startedAt: 100,
+				heartbeatAt: 100,
+				roots: [],
+				version: DAEMON_VERSION,
+			}),
+		);
+		if (lockKind === "aged-malformed") {
+			fs.writeFileSync(paths.lock, "{");
+			fs.utimesSync(paths.lock, 0, 0);
+		}
+		const beforeState = fs.readFileSync(paths.state, "utf8");
+		const beforeLock = fs.existsSync(paths.lock) ? fs.readFileSync(paths.lock, "utf8") : undefined;
+		let spawns = 0;
+
+		const result = await ensureTelegramDaemonRunning(
+			{ settings: s, cwd: path.join(agentDir, "new-session"), sessionId: "new-session" },
+			{
+				pid: 4242,
+				pidAlive: pid => pid === 999,
+				pidIncarnation: pid => (pid === 999 ? "linux:100" : "linux:200"),
+				spawn: () => {
+					spawns++;
+					return { unref() {} };
+				},
+			},
+		);
+
+		expect(result).toBe("blocked");
+		expect(spawns).toBe(0);
+		expect(fs.readFileSync(paths.state, "utf8")).toBe(beforeState);
+		expect(fs.existsSync(paths.lock)).toBe(beforeLock !== undefined);
+		if (beforeLock !== undefined) expect(fs.readFileSync(paths.lock, "utf8")).toBe(beforeLock);
+		expect(fs.existsSync(paths.roots)).toBe(false);
+	});
+	test.each([
+		"missing",
+		"aged-malformed",
+	])("foreign live owner with malformed stoppedAt and a %s lock remains unchanged", async lockKind => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				pid: 999,
+				incarnation: "linux:100",
+				ownerId: "foreign-owner",
+				tokenFingerprint: "foreign-fp",
+				chatId: "foreign-chat",
+				startedAt: 100,
+				heartbeatAt: 100,
+				roots: [],
+				version: DAEMON_VERSION,
+				stoppedAt: "not-a-time",
+			}),
+		);
+		if (lockKind === "aged-malformed") {
+			fs.writeFileSync(paths.lock, "{");
+			fs.utimesSync(paths.lock, 0, 0);
+		}
+		const beforeState = fs.readFileSync(paths.state, "utf8");
+		const beforeLock = fs.existsSync(paths.lock) ? fs.readFileSync(paths.lock, "utf8") : undefined;
+		let spawns = 0;
+
+		const result = await ensureTelegramDaemonRunning(
+			{ settings: s, cwd: path.join(agentDir, "new-session"), sessionId: "new-session" },
+			{
+				pid: 4242,
+				pidAlive: pid => pid === 999,
+				pidIncarnation: pid => (pid === 999 ? "linux:100" : "linux:200"),
+				spawn: () => {
+					spawns++;
+					return { unref() {} };
+				},
+			},
+		);
+
+		expect(result).toBe("blocked");
+		expect(spawns).toBe(0);
+		expect(fs.readFileSync(paths.state, "utf8")).toBe(beforeState);
+		expect(fs.existsSync(paths.lock)).toBe(beforeLock !== undefined);
+		if (beforeLock !== undefined) expect(fs.readFileSync(paths.lock, "utf8")).toBe(beforeLock);
+		expect(fs.existsSync(paths.roots)).toBe(false);
+	});
 
 	test("foreign live owner with a canonical mismatched incarnation is reclaimed", async () => {
 		const agentDir = tempAgentDir();
@@ -2095,7 +2196,7 @@ describe("telegram daemon", () => {
 				pidAlive: () => true,
 				pidIncarnation: () => "linux:4242",
 			}),
-		).resolves.toEqual({ acquired: false, attached: false, provisional: true });
+		).resolves.toEqual({ acquired: false, attached: false, blocked: true });
 		expect(fs.readFileSync(paths.state, "utf8")).toBe(stateBefore);
 		expect(fs.readFileSync(paths.lock, "utf8")).toBe(lockBefore);
 		expect(fs.readFileSync(paths.steal, "utf8")).toBe(transitionLockBefore);
@@ -2350,7 +2451,7 @@ describe("telegram daemon", () => {
 					pid === 999
 						? {
 								incarnation: "linux:100",
-								signal: sig => {
+								signalRoot: sig => {
 									signals.push([pid, sig]);
 									if (sig === "SIGTERM") alive.delete(pid);
 								},
@@ -2395,7 +2496,7 @@ describe("telegram daemon", () => {
 					pid === 999
 						? {
 								incarnation: "linux:100",
-								signal: sig => {
+								signalRoot: sig => {
 									signals.push([pid, sig]);
 									if (sig === "SIGTERM") alive.delete(pid);
 								},

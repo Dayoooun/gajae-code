@@ -69,6 +69,7 @@ export interface NotificationExactUnlinkResult {
 	ok: boolean;
 	code?: string;
 	detachedPath?: string;
+	retainedSuccessorPath?: string;
 }
 
 /** Read one regular file together with the identity required for exact removal. */
@@ -115,7 +116,12 @@ export function exactUnlinkNotificationFile(
 	quarantineName: string,
 ): NotificationExactUnlinkResult {
 	const result = native.exactUnlink(file, { ...identity, quarantineName });
-	return { ok: result.ok, code: result.code, detachedPath: result.detachedPath };
+	return {
+		ok: result.ok,
+		code: result.code,
+		detachedPath: result.detachedPath,
+		retainedSuccessorPath: result.retainedSuccessorPath,
+	};
 }
 
 /** Minimal filesystem surface the service needs; injectable for tests. */

@@ -308,6 +308,15 @@ export declare class Process {
   /** Launch arguments for this process. */
   args(): Array<string>
   /**
+   * Send `signal` only to this pinned process reference.
+   *
+   * On Linux this uses the owned pidfd; on Windows it uses the owned process
+   * handle. It deliberately never discovers descendants or signals a process
+   * group. Returns `false` when the pinned process has already exited or the
+   * operating system rejects delivery.
+   */
+  signalRoot(signal: number): boolean
+  /**
    * Send `signal` to this process and its descendants, children first.
    *
    * On Linux and macOS the signal is forwarded as-is. On Windows there is no
@@ -1635,6 +1644,7 @@ export interface NativeExactUnlinkResult {
   ok: boolean
   code?: string
   detachedPath?: string
+  retainedSuccessorPath?: string
 }
 
 /** Result of applying or checking owner-only path security. */

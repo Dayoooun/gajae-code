@@ -109,7 +109,7 @@ export async function clearTelegramControlRequest(
 
 export interface DaemonProcessReference {
 	incarnation: string;
-	signal(signal: NodeJS.Signals): void;
+	signalRoot(signal: NodeJS.Signals): void;
 }
 
 function defaultProcessReference(pid: number, platform = os.platform()): DaemonProcessReference | undefined {
@@ -122,10 +122,11 @@ function defaultProcessReference(pid: number, platform = os.platform()): DaemonP
 		if (!processRef || !isProcessIncarnation(processRef.incarnation)) return undefined;
 		return {
 			incarnation: processRef.incarnation,
-			signal: signal => {
+			signalRoot: signal => {
 				const nativeSignal = os.constants.signals[signal];
 				if (nativeSignal === undefined) throw new Error(`Unsupported signal: ${signal}`);
-				processRef.killTree(nativeSignal);
+				const rootProcess = processRef as typeof processRef & { signalRoot(signal: number): boolean };
+				if (!rootProcess.signalRoot(nativeSignal)) throw new Error("Pinned process is already gone");
 			},
 		};
 	} catch {
@@ -341,7 +342,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		// Its identity must still be the exact persisted incarnation before use.
 		if (!processRef || processRef.incarnation !== captured.incarnation) return "ownership_changed";
 		try {
-			processRef.signal(signal);
+			processRef.signalRoot(signal);
 		} catch {
 			return "already_gone";
 		}

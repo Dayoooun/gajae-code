@@ -3121,9 +3121,10 @@ mod platform {
 			Ok(handle) => handle,
 			Err(result) => {
 				return NativeExactUnlinkResult {
-					ok:            false,
-					code:          result.code,
+					ok: false,
+					code: result.code,
 					detached_path: None,
+					retained_successor_path: None,
 				};
 			},
 		};
@@ -3187,9 +3188,10 @@ mod platform {
 			Ok(handle) => handle,
 			Err(result) => {
 				return NativeExactUnlinkResult {
-					ok:            false,
-					code:          result.code,
+					ok: false,
+					code: result.code,
 					detached_path: None,
+					retained_successor_path: None,
 				};
 			},
 		};

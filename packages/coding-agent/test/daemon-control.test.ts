@@ -44,12 +44,18 @@ import {
 import { TopicRegistry } from "../src/sdk/bus/topic-registry";
 
 const BOT_TOKEN = "123456:secret-token";
-function testProcessReference(signal: (pid: number, value: NodeJS.Signals) => void) {
-	return (pid: number) => ({ incarnation: "linux:100", signal: (value: NodeJS.Signals) => signal(pid, value) });
+function testProcessReference(signalRoot: (pid: number, value: NodeJS.Signals) => void) {
+	return (pid: number) => ({
+		incarnation: "linux:100",
+		signalRoot: (value: NodeJS.Signals) => signalRoot(pid, value),
+	});
 }
 
-function testChatProcessReference(signal: (pid: number, value: NodeJS.Signals) => void) {
-	return (pid: number) => ({ incarnation: "linux:12345", signal: (value: NodeJS.Signals) => signal(pid, value) });
+function testChatProcessReference(signalRoot: (pid: number, value: NodeJS.Signals) => void) {
+	return (pid: number) => ({
+		incarnation: "linux:12345",
+		signalRoot: (value: NodeJS.Signals) => signalRoot(pid, value),
+	});
 }
 
 function tempAgentDir(): string {
@@ -1003,8 +1009,8 @@ describe.each([
 	["linux", "linux:100", "linux:101"],
 	["darwin", "darwin:100:1", "darwin:101:1"],
 	["win32", "windows:100", "windows:101"],
-] as const)("stable injected %s process signaling", (platform, incarnation, successor) => {
-	test("never signals the numeric PID successor that appears immediately before signaling", async () => {
+] as const)("stable injected %s root-only process signaling", (platform, incarnation, successor) => {
+	test("never signals a PID successor or uses tree/process-group helpers", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
 		const state = freshState({ incarnation });
@@ -1023,9 +1029,18 @@ describe.each([
 				currentIncarnation = successor;
 				return {
 					incarnation,
-					signal: signal => {
+					signalRoot: signal => {
 						stableSignals.push(signal);
 						oldOwnerAlive = false;
+					},
+					killTree: () => {
+						throw new Error("tree signaling must never be used");
+					},
+					groupId: () => {
+						throw new Error("process-group signaling must never be used");
+					},
+					children: () => {
+						throw new Error("descendant discovery must never be used");
 					},
 				};
 			},
@@ -1275,9 +1290,18 @@ describe("ChatDaemonController ownership safety", () => {
 				currentIncarnation = "linux:12346";
 				return {
 					incarnation: "linux:12345",
-					signal: signal => {
+					signalRoot: signal => {
 						stableSignals.push(signal);
 						oldOwnerAlive = false;
+					},
+					killTree: () => {
+						throw new Error("tree signaling must never be used");
+					},
+					groupId: () => {
+						throw new Error("process-group signaling must never be used");
+					},
+					children: () => {
+						throw new Error("descendant discovery must never be used");
 					},
 				};
 			},
