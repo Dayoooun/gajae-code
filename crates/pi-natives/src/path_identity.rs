@@ -1263,6 +1263,8 @@ mod platform {
 		// An empty directory cannot be replaced by a regular-file rename. Keeping it
 		// at the canonical name prevents both O_EXCL creators and rename-published
 		// successors from winning before detach commits or restores.
+		// SAFETY: `parent_fd` is a live directory descriptor and `name` is a live,
+		// NUL-terminated pathname relative to that descriptor.
 		if unsafe { libc::mkdirat(parent_fd, name.as_ptr(), 0o700) } != 0 {
 			return match std::io::Error::last_os_error().raw_os_error() {
 				Some(libc::EEXIST) => Err("quarantine_collision"),
@@ -1570,19 +1572,19 @@ mod platform {
 			// object remains available at its quarantine path.
 			let result = match remove_exchange_placeholder(parent_fd, &name, placeholder) {
 				ExchangePlaceholderRemoval::Removed => {
-					NativeExactUnlinkResult::detached_failure("identity_mismatch", detached_path.clone())
+					NativeExactUnlinkResult::detached_failure("identity_mismatch", detached_path)
 				},
 				ExchangePlaceholderRemoval::RestoredMismatch | ExchangePlaceholderRemoval::Failed => {
 					NativeExactUnlinkResult::detached_failure_with_unknown(
 						"identity_mismatch",
-						detached_path.clone(),
+						detached_path,
 						path.to_string_lossy().into_owned(),
 					)
 				},
 				ExchangePlaceholderRemoval::RetainedMismatch(retained_name) => {
 					NativeExactUnlinkResult::detached_failure_with_unknown(
 						"identity_mismatch",
-						detached_path.clone(),
+						detached_path,
 						path
 							.parent()
 							.unwrap_or_else(|| Path::new("."))
@@ -1594,7 +1596,7 @@ mod platform {
 				ExchangePlaceholderRemoval::RetainedFailure(retained_name, code) => {
 					NativeExactUnlinkResult::detached_failure_with_placeholder(
 						code,
-						detached_path.clone(),
+						detached_path,
 						path
 							.parent()
 							.unwrap_or_else(|| Path::new("."))
@@ -1648,6 +1650,8 @@ mod platform {
 			return result;
 		}
 		// Delete the proven detached object before freeing the canonical placeholder.
+		// SAFETY: `parent_fd` remains a live directory descriptor and `quarantine`
+		// is a live, NUL-terminated detached filename relative to it.
 		let result = if unsafe { libc::unlinkat(parent_fd, quarantine.as_ptr(), 0) } == 0 {
 			match remove_exchange_placeholder(parent_fd, &name, placeholder) {
 				ExchangePlaceholderRemoval::Removed => NativeExactUnlinkResult::success(),
@@ -1694,7 +1698,7 @@ mod platform {
 
 	fn open_parent_no_follow(
 		path: &Path,
-	) -> Result<(libc::c_int, CString), NativeExactUnlinkResult> {
+	) -> Result<(libc::c_int, CString), Box<NativeExactUnlinkResult>> {
 		let base = if path.is_absolute() { b"/\0" } else { b".\0" };
 		// SAFETY: the live descriptor, where used, and NUL-terminated path remain
 		// valid.
@@ -1702,9 +1706,9 @@ mod platform {
 			libc::open(base.as_ptr().cast(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
 		};
 		if parent_fd < 0 {
-			return Err(NativeExactUnlinkResult::failure(security_code(
+			return Err(Box::new(NativeExactUnlinkResult::failure(security_code(
 				&std::io::Error::last_os_error(),
-			)));
+			))));
 		}
 		let mut segments = Vec::new();
 		for component in path.components() {
@@ -1714,20 +1718,20 @@ mod platform {
 				Component::ParentDir | Component::Prefix(_) => {
 					// SAFETY: this branch owns the live descriptor and closes it exactly once.
 					unsafe { libc::close(parent_fd) };
-					return Err(NativeExactUnlinkResult::failure("io_error"));
+					return Err(Box::new(NativeExactUnlinkResult::failure("io_error")));
 				},
 			}
 		}
 		let Some((name_bytes, ancestors)) = segments.split_last() else {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent_fd) };
-			return Err(NativeExactUnlinkResult::failure("io_error"));
+			return Err(Box::new(NativeExactUnlinkResult::failure("io_error")));
 		};
 		for segment_bytes in ancestors {
 			let Ok(segment) = CString::new(segment_bytes.as_slice()) else {
 				// SAFETY: this branch owns the live descriptor and closes it exactly once.
 				unsafe { libc::close(parent_fd) };
-				return Err(NativeExactUnlinkResult::failure("io_error"));
+				return Err(Box::new(NativeExactUnlinkResult::failure("io_error")));
 			};
 			// SAFETY: zero is a valid initialized representation for this output struct.
 			let mut named: libc::stat = unsafe { std::mem::zeroed() };
@@ -1740,12 +1744,12 @@ mod platform {
 				let error = std::io::Error::last_os_error();
 				// SAFETY: this branch owns the live descriptor and closes it exactly once.
 				unsafe { libc::close(parent_fd) };
-				return Err(NativeExactUnlinkResult::failure(security_code(&error)));
+				return Err(Box::new(NativeExactUnlinkResult::failure(security_code(&error))));
 			}
 			if named.st_mode & libc::S_IFMT == libc::S_IFLNK {
 				// SAFETY: this branch owns the live descriptor and closes it exactly once.
 				unsafe { libc::close(parent_fd) };
-				return Err(NativeExactUnlinkResult::failure("reparse_point"));
+				return Err(Box::new(NativeExactUnlinkResult::failure("reparse_point")));
 			}
 			// SAFETY: the live descriptor, where used, and NUL-terminated path remain
 			// valid.
@@ -1759,16 +1763,16 @@ mod platform {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent_fd) };
 			if next_fd < 0 {
-				return Err(NativeExactUnlinkResult::failure(security_code(
+				return Err(Box::new(NativeExactUnlinkResult::failure(security_code(
 					&std::io::Error::last_os_error(),
-				)));
+				))));
 			}
 			parent_fd = next_fd;
 		}
 		let Ok(name) = CString::new(name_bytes.as_slice()) else {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent_fd) };
-			return Err(NativeExactUnlinkResult::failure("io_error"));
+			return Err(Box::new(NativeExactUnlinkResult::failure("io_error")));
 		};
 		Ok((parent_fd, name))
 	}
@@ -1779,7 +1783,7 @@ mod platform {
 	) -> NativeExactUnlinkResult {
 		let (source_parent, source_name) = match open_parent_no_follow(source_path) {
 			Ok(value) => value,
-			Err(result) => return result,
+			Err(result) => return *result,
 		};
 		let (destination_parent, destination_name) = match open_parent_no_follow(destination_path) {
 			Ok(value) => value,
@@ -1788,7 +1792,7 @@ mod platform {
 				// error branch transfers it nowhere and closes it exactly once before
 				// returning.
 				unsafe { libc::close(source_parent) };
-				return result;
+				return *result;
 			},
 		};
 		let result =
@@ -1816,7 +1820,7 @@ mod platform {
 		}
 		let (parent_fd, detached_name) = match open_parent_no_follow(detached_path) {
 			Ok(value) => value,
-			Err(result) => return result,
+			Err(result) => return *result,
 		};
 		let Some(original_name_bytes) = original_path.file_name().map(|name| name.as_bytes()) else {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
@@ -2353,7 +2357,7 @@ mod platform {
 		let final_path = format!("{planned_path}.removing");
 		let (parent, name) = match open_parent_no_follow(path) {
 			Ok(value) => value,
-			Err(result) => return result,
+			Err(result) => return *result,
 		};
 		let mut final_bytes = name.as_bytes().to_vec();
 		final_bytes.extend_from_slice(b".removing");

@@ -885,7 +885,7 @@ describe("telegram daemon", () => {
 			}),
 		).resolves.toMatchObject({ acquired: true });
 	});
-	test("release paused after stopped write cannot unlink a successor lock", async () => {
+	test("release serializes a successor acquisition behind the transition fence", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		await acquireDaemonOwnership({
@@ -937,9 +937,18 @@ describe("telegram daemon", () => {
 			pid: 222,
 			ownerId: "new",
 		});
+		await expect(successor).resolves.toMatchObject({ acquired: false, attached: false, provisional: true });
 		continueRelease();
 		await release;
-		await expect(successor).resolves.toMatchObject({ acquired: true, ownerId: "new" });
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 222,
+				ownerId: "new",
+			}),
+		).resolves.toMatchObject({ acquired: true, ownerId: "new" });
 		expect((await readDaemonState(s))?.ownerId).toBe("new");
 		expect(fs.existsSync(paths.lock)).toBe(true);
 	});
@@ -1167,10 +1176,13 @@ describe("telegram daemon", () => {
 			},
 		);
 		expect(first).toMatchObject({ result: "owner_spawned", acquisition: { launcherPid: 4242, pid: 4243 } });
+		if (first.result !== "owner_spawned") throw new Error(`Expected owner_spawned, received ${first.result}`);
+		const boundOwnerId = first.acquisition.ownerId;
+		const boundAcquisitionId = first.acquisition.acquisitionId;
 		expect(await readDaemonState(s)).toMatchObject({
 			pid: 4242,
-			ownerId: acquisitionId,
-			acquisitionId,
+			ownerId: boundOwnerId,
+			acquisitionId: boundAcquisitionId,
 			ownershipPhase: "provisional",
 		});
 
@@ -1188,8 +1200,8 @@ describe("telegram daemon", () => {
 					expect(
 						await renewDaemonHeartbeat({
 							settings: s,
-							ownerId: acquisitionId,
-							acquisitionId,
+							ownerId: boundOwnerId,
+							acquisitionId: boundAcquisitionId,
 							pid: 4243,
 							pidIncarnation,
 						}),
@@ -1231,8 +1243,8 @@ describe("telegram daemon", () => {
 		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toMatchObject({
 			pid: 4243,
 			incarnation: "linux:4243",
-			ownerId: acquisitionId,
-			acquisitionId,
+			ownerId: boundOwnerId,
+			acquisitionId: boundAcquisitionId,
 		});
 
 		const state = await readDaemonState(s);
@@ -1241,7 +1253,7 @@ describe("telegram daemon", () => {
 			waitForTelegramDaemonReady({
 				settings: s,
 				ownerId: state?.ownerId,
-				acquisitionId: `${acquisitionId}-foreign`,
+				acquisitionId: `${boundAcquisitionId}-foreign`,
 				tokenFingerprint: fp,
 				chatId: "42",
 				pidAlive,
@@ -1253,7 +1265,7 @@ describe("telegram daemon", () => {
 			waitForTelegramDaemonReady({
 				settings: s,
 				ownerId: state?.ownerId,
-				acquisitionId,
+				acquisitionId: boundAcquisitionId,
 				tokenFingerprint: "foreign-token",
 				chatId: "42",
 				pidAlive,
@@ -1300,12 +1312,14 @@ describe("telegram daemon", () => {
 		).resolves.toBe("spawned");
 		expect(spawned).toBe(2);
 		expect(replacementPublished).toBe(true);
-		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toMatchObject({
-			pid: 4245,
-			incarnation: "linux:4245",
-			ownerId: "replacement-acquisition",
-			acquisitionId: "replacement-acquisition",
-		});
+		const replacementLock = JSON.parse(fs.readFileSync(paths.lock, "utf8")) as {
+			pid: number;
+			incarnation: string;
+			ownerId: string;
+			acquisitionId: string;
+		};
+		expect(replacementLock).toMatchObject({ pid: 4245, incarnation: "linux:4245" });
+		expect(replacementLock.ownerId).toBe(replacementLock.acquisitionId);
 	});
 	test("times out a canonical initializer that never publishes ready state without registering its root", async () => {
 		const agentDir = tempAgentDir();
