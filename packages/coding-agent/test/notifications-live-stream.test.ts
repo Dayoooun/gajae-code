@@ -131,7 +131,7 @@ async function bootSession(
 	if (typeof botToken === "string" && typeof chatId === "string") {
 		fs.writeFileSync(
 			path.join(agentDir, "config.yml"),
-			`notifications:\n  enabled: true\n  telegram:\n    botToken: ${JSON.stringify(botToken)}\n    chatId: ${JSON.stringify(chatId)}\n`,
+			`notifications:\n  enabled: true\n  daemon:\n    idleTimeoutMs: 20\n  telegram:\n    botToken: ${JSON.stringify(botToken)}\n    chatId: ${JSON.stringify(chatId)}\n`,
 		);
 	}
 	const settings = isolatedNotificationSettings(agentDir, settingsOverrides);
