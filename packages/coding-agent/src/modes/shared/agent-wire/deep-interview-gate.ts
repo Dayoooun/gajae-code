@@ -10,6 +10,7 @@
  * This is the pure mapping primitive used by SDK-native workflow gate emitters.
  */
 
+import { isDeepInterviewAskQuestion } from "../../../deep-interview/render-middleware";
 import {
 	assertDeepInterviewInputWithinLimit,
 	MAX_USER_RESPONSE_LENGTH,
@@ -142,7 +143,10 @@ export function questionToGate(question: AskGateQuestion): OpenGateInput {
 		{
 			multi: question.multi,
 			allowEmpty: question.allowEmpty,
-			customMaxLength: question.deepInterview ? MAX_USER_RESPONSE_LENGTH : undefined,
+			customMaxLength:
+				question.deepInterview || isDeepInterviewAskQuestion(question.question)
+					? MAX_USER_RESPONSE_LENGTH
+					: undefined,
 		},
 		labels,
 	);
@@ -240,7 +244,11 @@ export function gateAnswerToResult(question: AskGateQuestion, answer: unknown): 
 	if (other && (answer.custom === undefined || answer.custom.trim() === "")) {
 		throw new DeepInterviewGateError("missing_custom", "custom text is required when `other` is true");
 	}
-	if (other && question.deepInterview && answer.custom !== undefined)
+	if (
+		other &&
+		(question.deepInterview || isDeepInterviewAskQuestion(question.question)) &&
+		answer.custom !== undefined
+	)
 		assertDeepInterviewInputWithinLimit(answer.custom, MAX_USER_RESPONSE_LENGTH, "user_response");
 	return {
 		id: question.id,
