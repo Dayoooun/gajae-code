@@ -334,7 +334,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			await resumedSession.dispose();
 		}
 	}, 15_000);
-	it("settles workflow-gate restoration deterministically on success and failure", async () => {
+	it("keeps workflow-gate restoration settled after factory return and dispose", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-restoration-settlement-"));
 		tempDirs.push(tempDir);
 		const { session } = await createAgentSession({
@@ -357,8 +357,8 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		} finally {
 			await session.dispose();
 		}
-		// Dispose-before-microtask settles instead of hanging: dispose resolves
-		// the already-settled promise path; a second await stays resolved.
+		// Restoration observed after dispose remains settled (no hang, no
+		// late rejection surfacing from the already-completed microtask).
 		await expect(session.workflowGateToolRestoration).resolves.toBeUndefined();
 	});
 	it("attaches ask for a canonical workflow skill even when state sync fails", async () => {
