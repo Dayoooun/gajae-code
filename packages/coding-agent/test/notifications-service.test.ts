@@ -856,6 +856,32 @@ describe("notification-service recovery", () => {
 		);
 		expect(unlinked).toEqual([]);
 	});
+	test("reports an unverified retained cleanup entry separately from stale objects and verified placeholders", async () => {
+		const endpoint = path.join(epDir, "unknown.json");
+		const unknown = path.join(epDir, ".gjc-exact-unlink-placeholder-mismatch");
+		const { fs, unlinked } = mockFs(
+			{
+				[endpoint]: JSON.stringify({ sessionId: "unknown", url: "ws://x", token: "t", pid: 999 }),
+				[unknown]: JSON.stringify({ unverified: true }),
+			},
+			{
+				exactUnlinkResult: file =>
+					file === endpoint ? { ok: false, code: "identity_mismatch", retainedUnknownPath: unknown } : undefined,
+			},
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot,
+			deps: { fs, pidAlive: () => false },
+		});
+
+		expect(report.endpointsDetached).toEqual([]);
+		expect(report.endpointsRetainedSuccessors).toEqual([]);
+		expect(report.endpointsRetainedPlaceholders).toEqual([]);
+		expect(report.endpointsRetainedUnknown).toEqual([unknown]);
+		expect(formatNotificationRecoveryReport(report)).toContain(`retained unverified cleanup path ${unknown}`);
+		expect(unlinked).toEqual([]);
+	});
 
 	test("leaves a lock untouched when required daemon ownership metadata is invalid", async () => {
 		const { fs, unlinked } = mockFs({

@@ -40,6 +40,52 @@ const inventory = {
 	},
 } as const;
 
+const telegramHandoffHelpers = ["rebindOwnershipLock", "rollbackOwnershipLockRebind"] as const;
+const chatTakeoverHelpers = [
+	"identityFor",
+	"fingerprint",
+	"defaultPidAlive",
+	"defaultPidIncarnation",
+	"withStateWriteLock",
+	"readJson",
+	"writeJson",
+] as const;
+const helperInventory = {
+	telegram: { [telegramContract]: ["DAEMON_GENERATION"], [telegramDaemon]: [...telegramHandoffHelpers] },
+	discord: { [chatControl]: ["CHAT_DAEMON_GENERATIONS.discord", ...chatTakeoverHelpers] },
+	slack: { [chatControl]: ["CHAT_DAEMON_GENERATIONS.slack", ...chatTakeoverHelpers] },
+} as const;
+
+function helperFiles(input: { telegramGeneration: number; discordGeneration: number; slackGeneration: number }): Map<string, string> {
+	return new Map([
+		[telegramContract, `export const DAEMON_GENERATION = ${input.telegramGeneration};`],
+		[telegramDaemon, telegramHandoffHelpers.map(name => `export async function ${name}() { return "${name}"; }`).join("\n")],
+		[
+			chatControl,
+			[
+				`export const CHAT_DAEMON_GENERATIONS = { discord: ${input.discordGeneration}, slack: ${input.slackGeneration} } as const;`,
+				...chatTakeoverHelpers.map(name => `export function ${name}() { return "${name}"; }`),
+			].join("\n"),
+		],
+	]);
+}
+
+function mutateHelper(source: string, name: string): string {
+	return source.replace(`return "${name}"`, `return "${name}:changed"`);
+}
+
+function helperMutation(kind: "telegram" | "discord" | "slack", name: string, generationBumped: boolean): ReturnType<typeof evaluate> {
+	const base = helperFiles({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
+	const head = helperFiles({
+		telegramGeneration: kind === "telegram" && generationBumped ? 7 : 6,
+		discordGeneration: kind === "discord" && generationBumped ? 5 : 4,
+		slackGeneration: kind === "slack" && generationBumped ? 5 : 4,
+	});
+	const file = kind === "telegram" ? telegramDaemon : chatControl;
+	head.set(file, mutateHelper(head.get(file) ?? "", name));
+	return evaluate(base, head, helperInventory);
+}
+
 function files(input: {
 	telegramGeneration?: number;
 	discordGeneration?: number;
@@ -98,6 +144,23 @@ describe("daemon generation release guard", () => {
 
 		const bumped = decide(files({ telegramGeneration: 4, telegramOwnership: "return true;" }), files({ telegramGeneration: 5, telegramOwnership: "return false;" }));
 		expect(bumped.telegramGenerationBumped).toBe(true);
+	});
+
+	test("requires mapped generation bumps for every ownership handoff and chat takeover helper", () => {
+		for (const name of telegramHandoffHelpers) {
+			const missing = helperMutation("telegram", name, false);
+			expect(missing.protectedChanges).toContain(`telegram:${telegramDaemon}:${name}`);
+			expect(missing.telegramGenerationBumped).toBe(false);
+			expect(helperMutation("telegram", name, true).telegramGenerationBumped).toBe(true);
+		}
+		for (const kind of ["discord", "slack"] as const) {
+			for (const name of chatTakeoverHelpers) {
+				const missing = helperMutation(kind, name, false);
+				expect(missing.protectedChanges).toContain(`${kind}:${chatControl}:${name}`);
+				expect(missing.chatGenerationBumped[kind]).toBe(false);
+				expect(helperMutation(kind, name, true).chatGenerationBumped[kind]).toBe(true);
+			}
+		}
 	});
 
 	test("requires a bump for the affected chat kind, not the other kind", () => {
@@ -322,6 +385,8 @@ describe("daemon generation release guard", () => {
 				"defaultPidIncarnation",
 				"tryCreateOwnershipLock",
 				"readOwnershipLock",
+				"rebindOwnershipLock",
+				"rollbackOwnershipLockRebind",
 				"liveOwnershipLockDecision",
 				"acquireTransitionLock",
 				"bindProvisionalDaemonPid",
@@ -340,6 +405,13 @@ describe("daemon generation release guard", () => {
 					"isRecognizedLegacyGeneration",
 					"hasProcessIncarnationAuthority",
 					"isDefinitelyStoppedState",
+					"identityFor",
+					"fingerprint",
+					"defaultPidAlive",
+					"defaultPidIncarnation",
+					"withStateWriteLock",
+					"readJson",
+					"writeJson",
 				]),
 			);
 		}

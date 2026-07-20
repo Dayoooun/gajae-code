@@ -1427,6 +1427,9 @@ export async function renewDaemonHeartbeat(input: {
 		try {
 			await writeJsonAtomic(fsImpl, paths.state, {
 				...state,
+				// Preserve the source launcher PID so concurrent ensures can recognize
+				// this ready PID as its child rather than excluding it as the launcher.
+				launcherPid: state.pid,
 				pid,
 				incarnation,
 				ownershipPhase: "ready",

@@ -1135,7 +1135,7 @@ describe("telegram daemon", () => {
 			sessions: { "concurrent-session": expect.any(String) },
 		});
 	});
-	test("concurrent ensure follows an unbound launcher acquisition when its child heartbeat rebinds, then reclaims the dead child lock after a crash or forced kill", async () => {
+	test("concurrent ensure follows a child that self-binds between provisional acquisition and its state snapshot, then reclaims the dead child lock after a crash or forced kill", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
@@ -1175,6 +1175,35 @@ describe("telegram daemon", () => {
 		});
 
 		let published = false;
+		let stateReads = 0;
+		let boundAtStateRead: number | undefined;
+		const bindingFs: TelegramDaemonFs = {
+			...transitionFsCapabilities(),
+			mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
+			readFile: async (file, encoding) => {
+				if (file === paths.state && ++stateReads === 3) {
+					boundAtStateRead = stateReads;
+					published = true;
+					childProvenanceAvailable = true;
+					expect(
+						await renewDaemonHeartbeat({
+							settings: s,
+							ownerId: acquisitionId,
+							acquisitionId,
+							pid: 4243,
+							pidIncarnation,
+						}),
+					).toBe(true);
+				}
+				return await fs.promises.readFile(file, encoding);
+			},
+			writeFile: (file, data, opts) => fs.promises.writeFile(file, data, opts).then(() => undefined),
+			rename: (oldPath, newPath) => fs.promises.rename(oldPath, newPath).then(() => undefined),
+			unlink: file => fs.promises.unlink(file),
+			open: async (file, flags, mode) => fs.promises.open(file, flags, mode),
+			readdir: file => fs.promises.readdir(file),
+			chmod: (file, mode) => fs.promises.chmod(file, mode),
+		};
 		await expect(
 			ensureTelegramDaemonRunningDetailed(
 				{ settings: s, cwd: root, sessionId: "concurrent-rebound" },
@@ -1182,29 +1211,18 @@ describe("telegram daemon", () => {
 					pid: 4244,
 					pidAlive,
 					pidIncarnation,
+					fs: bindingFs,
 					spawn: () => {
 						spawned++;
 						return { pid: 4245, unref() {} };
 					},
 					readinessTimeoutMs: 25,
 					waitStepMs: 5,
-					sleep: async () => {
-						if (published) return;
-						published = true;
-						childProvenanceAvailable = true;
-						expect(
-							await renewDaemonHeartbeat({
-								settings: s,
-								ownerId: acquisitionId,
-								acquisitionId,
-								pid: 4243,
-								pidIncarnation,
-							}),
-						).toBe(true);
-					},
+					sleep: async () => undefined,
 				},
 			),
 		).resolves.toBe("attached");
+		expect(boundAtStateRead).toBe(3);
 		expect(spawned).toBe(1);
 		expect(published).toBe(true);
 		expect(JSON.parse(fs.readFileSync(paths.roots, "utf8"))).toMatchObject({
@@ -1218,6 +1236,7 @@ describe("telegram daemon", () => {
 		});
 
 		const state = await readDaemonState(s);
+		expect(state).toMatchObject({ launcherPid: 4242, pid: 4243, ownershipPhase: "ready" });
 		await expect(
 			waitForTelegramDaemonReady({
 				settings: s,

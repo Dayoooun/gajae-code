@@ -1651,6 +1651,11 @@ export interface NativeExactUnlinkResult {
    * remains recoverable only at this path.
    */
   retainedPlaceholderPath?: string
+  /**
+   * A retained cleanup entry whose identity could not be verified. This is
+   * neither a stale detached object nor a publisher successor.
+   */
+  retainedUnknownPath?: string
 }
 
 /** Result of applying or checking owner-only path security. */

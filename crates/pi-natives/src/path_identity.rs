@@ -148,6 +148,9 @@ pub struct NativeExactUnlinkResult {
 	/// could not complete. This is never a canonical publisher successor and
 	/// remains recoverable only at this path.
 	pub retained_placeholder_path: Option<String>,
+	/// A retained cleanup entry whose identity could not be verified. This is
+	/// neither a stale detached object nor a publisher successor.
+	pub retained_unknown_path: Option<String>,
 }
 
 /// A deterministic, no-follow description of a directory tree. `relative_path`
@@ -198,6 +201,7 @@ impl NativeExactUnlinkResult {
 			detached_path: None,
 			retained_successor_path: None,
 			retained_placeholder_path: None,
+			retained_unknown_path: None,
 		}
 	}
 
@@ -208,6 +212,7 @@ impl NativeExactUnlinkResult {
 			detached_path: Some(path),
 			retained_successor_path: None,
 			retained_placeholder_path: None,
+			retained_unknown_path: None,
 		}
 	}
 
@@ -218,16 +223,7 @@ impl NativeExactUnlinkResult {
 			detached_path: Some(path),
 			retained_successor_path: None,
 			retained_placeholder_path: None,
-		}
-	}
-
-	fn detached_failure_with_successor(code: &str, path: String, successor_path: String) -> Self {
-		Self {
-			ok: false,
-			code: Some(code.to_owned()),
-			detached_path: Some(path),
-			retained_successor_path: Some(successor_path),
-			retained_placeholder_path: None,
+			retained_unknown_path: None,
 		}
 	}
 
@@ -242,18 +238,18 @@ impl NativeExactUnlinkResult {
 			detached_path: Some(path),
 			retained_successor_path: None,
 			retained_placeholder_path: Some(placeholder_path),
+			retained_unknown_path: None,
 		}
 	}
 
-	/// The original stale object was removed, but a successor displaced the
-	/// exchange placeholder and remains recoverable at its own quarantine path.
-	fn retained_successor_failure(code: &str, successor_path: String) -> Self {
+	fn detached_failure_with_unknown(code: &str, path: String, unknown_path: String) -> Self {
 		Self {
 			ok: false,
 			code: Some(code.to_owned()),
-			detached_path: None,
-			retained_successor_path: Some(successor_path),
+			detached_path: Some(path),
+			retained_successor_path: None,
 			retained_placeholder_path: None,
+			retained_unknown_path: Some(unknown_path),
 		}
 	}
 
@@ -264,6 +260,18 @@ impl NativeExactUnlinkResult {
 			detached_path: None,
 			retained_successor_path: None,
 			retained_placeholder_path: Some(placeholder_path),
+			retained_unknown_path: None,
+		}
+	}
+
+	fn retained_unknown_failure(code: &str, unknown_path: String) -> Self {
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			detached_path: None,
+			retained_successor_path: None,
+			retained_placeholder_path: None,
+			retained_unknown_path: Some(unknown_path),
 		}
 	}
 
@@ -274,6 +282,7 @@ impl NativeExactUnlinkResult {
 			detached_path: None,
 			retained_successor_path: None,
 			retained_placeholder_path: None,
+			retained_unknown_path: None,
 		}
 	}
 }
@@ -1280,7 +1289,7 @@ mod platform {
 		Removed,
 		RestoredMismatch,
 		RetainedMismatch(CString),
-		Failed(&'static str),
+		Failed,
 		RetainedFailure(CString, &'static str),
 	}
 
@@ -1298,8 +1307,8 @@ mod platform {
 		// Atomically detach the mutable canonical entry before inspecting it. The
 		// no-replace destination prevents a concurrent publisher from being
 		// overwritten, and all subsequent deletion targets this detached pathname.
-		if let Err(code) = rename_no_replace(parent_fd, parent_fd, name, &detached_name) {
-			return ExchangePlaceholderRemoval::Failed(code);
+		if rename_no_replace(parent_fd, parent_fd, name, &detached_name).is_err() {
+			return ExchangePlaceholderRemoval::Failed;
 		}
 		#[cfg(test)]
 		pause_after_placeholder_detach_for_test();
@@ -1498,8 +1507,18 @@ mod platform {
 			unsafe { libc::close(parent_fd) };
 			return match cleanup {
 				ExchangePlaceholderRemoval::Removed => NativeExactUnlinkResult::failure(code),
-				ExchangePlaceholderRemoval::RetainedMismatch(retained_name)
-				| ExchangePlaceholderRemoval::RetainedFailure(retained_name, _) => {
+				ExchangePlaceholderRemoval::RetainedMismatch(retained_name) => {
+					NativeExactUnlinkResult::retained_unknown_failure(
+						"cleanup_failed",
+						path
+							.parent()
+							.unwrap_or_else(|| Path::new("."))
+							.join(retained_name.to_string_lossy().as_ref())
+							.to_string_lossy()
+							.into_owned(),
+					)
+				},
+				ExchangePlaceholderRemoval::RetainedFailure(retained_name, _) => {
 					NativeExactUnlinkResult::retained_placeholder_failure(
 						"cleanup_failed",
 						path
@@ -1510,8 +1529,17 @@ mod platform {
 							.into_owned(),
 					)
 				},
-				ExchangePlaceholderRemoval::RestoredMismatch
-				| ExchangePlaceholderRemoval::Failed(_) => NativeExactUnlinkResult::failure("cleanup_failed"),
+				ExchangePlaceholderRemoval::RestoredMismatch | ExchangePlaceholderRemoval::Failed => {
+					NativeExactUnlinkResult::retained_unknown_failure(
+						"cleanup_failed",
+						path
+							.parent()
+							.unwrap_or_else(|| Path::new("."))
+							.join(quarantine.to_string_lossy().as_ref())
+							.to_string_lossy()
+							.into_owned(),
+					)
+				},
 			};
 		}
 		#[cfg(test)]
@@ -1541,11 +1569,18 @@ mod platform {
 			// canonical path or reports its retained recovery path while the stale
 			// object remains available at its quarantine path.
 			let result = match remove_exchange_placeholder(parent_fd, &name, placeholder) {
-				ExchangePlaceholderRemoval::Removed | ExchangePlaceholderRemoval::RestoredMismatch => {
+				ExchangePlaceholderRemoval::Removed => {
 					NativeExactUnlinkResult::detached_failure("identity_mismatch", detached_path.clone())
 				},
+				ExchangePlaceholderRemoval::RestoredMismatch | ExchangePlaceholderRemoval::Failed => {
+					NativeExactUnlinkResult::detached_failure_with_unknown(
+						"identity_mismatch",
+						detached_path.clone(),
+						path.to_string_lossy().into_owned(),
+					)
+				},
 				ExchangePlaceholderRemoval::RetainedMismatch(retained_name) => {
-					NativeExactUnlinkResult::detached_failure_with_successor(
+					NativeExactUnlinkResult::detached_failure_with_unknown(
 						"identity_mismatch",
 						detached_path.clone(),
 						path
@@ -1567,9 +1602,6 @@ mod platform {
 							.to_string_lossy()
 							.into_owned(),
 					)
-				},
-				ExchangePlaceholderRemoval::Failed(code) => {
-					NativeExactUnlinkResult::detached_failure(code, detached_path.clone())
 				},
 			};
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
@@ -1579,11 +1611,15 @@ mod platform {
 		if identity.directory || identity.detach_only {
 			let result = match remove_exchange_placeholder(parent_fd, &name, placeholder) {
 				ExchangePlaceholderRemoval::Removed => NativeExactUnlinkResult::detached(detached_path),
-				ExchangePlaceholderRemoval::RestoredMismatch => {
-					NativeExactUnlinkResult::detached_failure("identity_mismatch", detached_path)
+				ExchangePlaceholderRemoval::RestoredMismatch | ExchangePlaceholderRemoval::Failed => {
+					NativeExactUnlinkResult::detached_failure_with_unknown(
+						"identity_mismatch",
+						detached_path,
+						path.to_string_lossy().into_owned(),
+					)
 				},
 				ExchangePlaceholderRemoval::RetainedMismatch(retained_name) => {
-					NativeExactUnlinkResult::detached_failure_with_successor(
+					NativeExactUnlinkResult::detached_failure_with_unknown(
 						"identity_mismatch",
 						detached_path,
 						path
@@ -1605,9 +1641,6 @@ mod platform {
 							.to_string_lossy()
 							.into_owned(),
 					)
-				},
-				ExchangePlaceholderRemoval::Failed(code) => {
-					NativeExactUnlinkResult::detached_failure(code, detached_path)
 				},
 			};
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
@@ -1618,11 +1651,14 @@ mod platform {
 		let result = if unsafe { libc::unlinkat(parent_fd, quarantine.as_ptr(), 0) } == 0 {
 			match remove_exchange_placeholder(parent_fd, &name, placeholder) {
 				ExchangePlaceholderRemoval::Removed => NativeExactUnlinkResult::success(),
-				ExchangePlaceholderRemoval::RestoredMismatch => {
-					NativeExactUnlinkResult::failure("identity_mismatch")
+				ExchangePlaceholderRemoval::RestoredMismatch | ExchangePlaceholderRemoval::Failed => {
+					NativeExactUnlinkResult::retained_unknown_failure(
+						"identity_mismatch",
+						path.to_string_lossy().into_owned(),
+					)
 				},
 				ExchangePlaceholderRemoval::RetainedMismatch(retained_name) => {
-					NativeExactUnlinkResult::retained_successor_failure(
+					NativeExactUnlinkResult::retained_unknown_failure(
 						"identity_mismatch",
 						path
 							.parent()
@@ -1643,7 +1679,6 @@ mod platform {
 							.into_owned(),
 					)
 				},
-				ExchangePlaceholderRemoval::Failed(code) => NativeExactUnlinkResult::failure(code),
 			}
 		} else {
 			NativeExactUnlinkResult::detached_failure(
@@ -3219,6 +3254,7 @@ mod platform {
 					detached_path: None,
 					retained_successor_path: None,
 					retained_placeholder_path: None,
+					retained_unknown_path: None,
 				};
 			},
 		};
@@ -3287,6 +3323,7 @@ mod platform {
 					detached_path: None,
 					retained_successor_path: None,
 					retained_placeholder_path: None,
+					retained_unknown_path: None,
 				};
 			},
 		};
@@ -4093,6 +4130,7 @@ mod platform {
 							detached_path: None,
 							retained_successor_path: None,
 							retained_placeholder_path: None,
+							retained_unknown_path: None,
 						};
 					},
 				}
@@ -4104,6 +4142,7 @@ mod platform {
 					detached_path: None,
 					retained_successor_path: None,
 					retained_placeholder_path: None,
+					retained_unknown_path: None,
 				};
 			},
 		};
@@ -4642,7 +4681,7 @@ mod exact_unlink_placeholder_tests {
 		preserves_directory_successor_after_placeholder_identity_verification(true);
 	}
 
-	fn retained_successor_after_stale_removal_is_reported_separately(detach_only: bool) {
+	fn retained_unknown_after_placeholder_mismatch_is_reported_separately(detach_only: bool) {
 		let _guard = exchange_hook_test_guard();
 		let root = std::env::temp_dir().join(format!(
 			"gjc-exact-unlink-retained-successor-{}-{}",
@@ -4701,12 +4740,14 @@ mod exact_unlink_placeholder_tests {
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
 		assert!(result.retained_placeholder_path.is_none());
+		assert!(result.retained_successor_path.is_none());
 		let retained = result
-			.retained_successor_path
-			.expect("first successor recovery path");
-		assert!(Path::new(&retained).is_dir(), "first successor was not retained");
+			.retained_unknown_path
+			.expect("unverified cleanup recovery path");
+		assert!(Path::new(&retained).is_dir(), "unverified cleanup entry was not retained");
 		assert_eq!(
-			fs::read(Path::new(&retained).join("owner")).expect("read first successor"),
+			fs::read(Path::new(&retained).join("owner"))
+				.expect("read retained unverified cleanup entry"),
 			b"first"
 		);
 		assert_eq!(fs::read(target.join("owner")).expect("read second successor"), b"second");
@@ -4721,13 +4762,13 @@ mod exact_unlink_placeholder_tests {
 	}
 
 	#[test]
-	fn retained_successor_after_stale_removal_has_no_detached_path() {
-		retained_successor_after_stale_removal_is_reported_separately(false);
+	fn retained_unknown_after_stale_removal_has_no_detached_path() {
+		retained_unknown_after_placeholder_mismatch_is_reported_separately(false);
 	}
 
 	#[test]
-	fn retained_successor_and_stale_quarantine_are_reported_separately() {
-		retained_successor_after_stale_removal_is_reported_separately(true);
+	fn retained_unknown_and_stale_quarantine_are_reported_separately() {
+		retained_unknown_after_placeholder_mismatch_is_reported_separately(true);
 	}
 
 	#[test]

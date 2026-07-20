@@ -73,6 +73,8 @@ export interface NotificationExactUnlinkResult {
 	retainedSuccessorPath?: string;
 	/** An internal exchange placeholder whose verified cleanup failed. */
 	retainedPlaceholderPath?: string;
+	/** A cleanup entry whose identity could not be verified after a race. */
+	retainedUnknownPath?: string;
 }
 
 /** Read one regular file together with the identity required for exact removal. */
@@ -125,6 +127,7 @@ export function exactUnlinkNotificationFile(
 		detachedPath: result.detachedPath,
 		retainedSuccessorPath: result.retainedSuccessorPath,
 		retainedPlaceholderPath: result.retainedPlaceholderPath,
+		retainedUnknownPath: result.retainedUnknownPath,
 	};
 }
 
@@ -779,6 +782,8 @@ export interface NotificationRecoveryReport {
 	endpointsRetainedSuccessors?: string[];
 	/** Internal exchange placeholders retained after verified cleanup failure. */
 	endpointsRetainedPlaceholders?: string[];
+	/** Cleanup entries retained with unverified or mismatching identity. */
+	endpointsRetainedUnknown?: string[];
 	daemon: {
 		action: DaemonRecoveryAction;
 		detail: string;
@@ -1029,6 +1034,7 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 	const detached: string[] = [];
 	const retainedSuccessors: string[] = [];
 	const retainedPlaceholders: string[] = [];
+	const retainedUnknown: string[] = [];
 	let recoveryFailures = 0;
 	let kept = 0;
 	let unreadable = 0;
@@ -1055,7 +1061,14 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 				if (result.detachedPath) detached.push(result.detachedPath);
 				if (result.retainedSuccessorPath) retainedSuccessors.push(result.retainedSuccessorPath);
 				if (result.retainedPlaceholderPath) retainedPlaceholders.push(result.retainedPlaceholderPath);
-				if (!result.detachedPath && !result.retainedSuccessorPath && !result.retainedPlaceholderPath) kept += 1;
+				if (result.retainedUnknownPath) retainedUnknown.push(result.retainedUnknownPath);
+				if (
+					!result.detachedPath &&
+					!result.retainedSuccessorPath &&
+					!result.retainedPlaceholderPath &&
+					!result.retainedUnknownPath
+				)
+					kept += 1;
 				continue;
 			}
 			removed.push({
@@ -1135,6 +1148,7 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 		endpointsDetached: detached,
 		endpointsRetainedSuccessors: retainedSuccessors,
 		endpointsRetainedPlaceholders: retainedPlaceholders,
+		endpointsRetainedUnknown: retainedUnknown,
 		daemon,
 	};
 }
@@ -1143,7 +1157,7 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 export function formatNotificationRecoveryReport(report: NotificationRecoveryReport): string {
 	const lines = ["Notification recovery"];
 	lines.push(
-		`  endpoints: scanned ${report.endpointsScanned}, removed ${report.endpointsRemoved.length}, kept ${report.endpointsKept}, unreadable ${report.endpointsUnreadable}, detached ${report.endpointsDetached?.length ?? 0}, retained successors ${report.endpointsRetainedSuccessors?.length ?? 0}, retained placeholders ${report.endpointsRetainedPlaceholders?.length ?? 0}`,
+		`  endpoints: scanned ${report.endpointsScanned}, removed ${report.endpointsRemoved.length}, kept ${report.endpointsKept}, unreadable ${report.endpointsUnreadable}, detached ${report.endpointsDetached?.length ?? 0}, retained successors ${report.endpointsRetainedSuccessors?.length ?? 0}, retained placeholders ${report.endpointsRetainedPlaceholders?.length ?? 0}, retained unknown ${report.endpointsRetainedUnknown?.length ?? 0}`,
 	);
 	for (const ep of report.endpointsRemoved) {
 		lines.push(`    - removed ${ep.sessionId} (pid ${ep.pid ?? "?"}, ${ep.reason})`);
@@ -1153,6 +1167,8 @@ export function formatNotificationRecoveryReport(report: NotificationRecoveryRep
 		lines.push(`    - retained successor endpoint ${successor}`);
 	for (const placeholder of report.endpointsRetainedPlaceholders ?? [])
 		lines.push(`    - retained exchange placeholder cleanup path ${placeholder}`);
+	for (const unknown of report.endpointsRetainedUnknown ?? [])
+		lines.push(`    - retained unverified cleanup path ${unknown}`);
 	lines.push(`  daemon: ${report.daemon.action} — ${report.daemon.detail}`);
 	return lines.join("\n");
 }
