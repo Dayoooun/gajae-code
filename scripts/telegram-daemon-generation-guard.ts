@@ -8,13 +8,18 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 13;
+export const GUARD_CONTRACT_VERSION = 14;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
-const nativePathIdentity = "crates/pi-natives/src/path_identity.rs";
+const nativeAuthoritySources = [
+	"crates/pi-natives/src/path_identity.rs",
+	"crates/pi-natives/src/ps.rs",
+	"crates/pi-shell/src/process.rs",
+	"packages/natives/native/index.d.ts",
+] as const;
 
 type Family = "telegram" | "discord" | "slack";
 type Inventory = Readonly<Record<Family, Readonly<Record<string, readonly string[]>>>>;
@@ -23,7 +28,7 @@ type GuardManifest = {
 	contractVersion: number;
 	inventory: Inventory;
 	digests: Readonly<Record<string, string>>;
-	nativePathIdentitySha256: string;
+	nativeAuthoritySha256: Readonly<Record<(typeof nativeAuthoritySources)[number], string>>;
 };
 
 
@@ -33,7 +38,7 @@ type GuardManifest = {
  * endpoint or provider generations: they do not replace daemon owners.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "17d5535fc5e4cf88adb244963004712fbacea9ff5928177ccbab791737bb5e59";
+const PROTECTED_INVENTORY_SHA256 = "53228244fe0e74e5c9ef401006b0a83e2a476edf8bd53b4edf9931f444e59196";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -82,7 +87,7 @@ function inventoryHash(inventory: Inventory): string {
 }
 
 export function validateInventory(inventory: Inventory = protectedInventory): void {
-	if (GUARD_CONTRACT_VERSION !== 13) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
+	if (GUARD_CONTRACT_VERSION !== 14) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
 	for (const [family, files] of Object.entries(inventory)) {
 		for (const [file, symbols] of Object.entries(files)) {
 			if (!file || symbols.length === 0 || new Set(symbols).size !== symbols.length)
@@ -114,8 +119,14 @@ export function validateManifest(value: unknown = manifest): asserts value is Gu
 	const digestKeys = Object.keys(contract.digests).sort();
 	if (digestKeys.join("\n") !== qualified.join("\n") || digestKeys.some(key => !/^[0-9a-f]{64}$/.test(contract.digests[key])))
 		throw new Error("telegram-daemon-generation-guard: semantic manifest declaration digests must be exact and qualified");
-	if (!/^[0-9a-f]{64}$/.test(contract.nativePathIdentitySha256))
-		throw new Error("telegram-daemon-generation-guard: native path-identity digest must be exact");
+	const nativeDigests = contract.nativeAuthoritySha256;
+	if (
+		!nativeDigests ||
+		typeof nativeDigests !== "object" ||
+		Object.keys(nativeDigests).sort().join("\n") !== [...nativeAuthoritySources].sort().join("\n") ||
+		Object.values(nativeDigests).some(digest => typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest))
+	)
+		throw new Error("telegram-daemon-generation-guard: native authority digests must be exact");
 }
 
 
@@ -136,12 +147,19 @@ export async function currentTreeDigests(): Promise<Record<string, string>> {
 
 export async function manifestForCurrentTree(): Promise<GuardManifest> {
 	validateManifest();
-	const nativeSource = await Bun.file(path.join(root, nativePathIdentity)).text();
+	const nativeAuthoritySha256 = Object.fromEntries(
+		await Promise.all(
+			nativeAuthoritySources.map(async source => [
+				source,
+				crypto.createHash("sha256").update(await Bun.file(path.join(root, source)).text()).digest("hex"),
+			]),
+		),
+	) as GuardManifest["nativeAuthoritySha256"];
 	return {
 		contractVersion: manifest.contractVersion,
 		inventory: manifest.inventory as Inventory,
 		digests: Object.fromEntries(Object.entries(await currentTreeDigests()).sort()),
-		nativePathIdentitySha256: crypto.createHash("sha256").update(nativeSource).digest("hex"),
+		nativeAuthoritySha256,
 	};
 }
 
@@ -162,8 +180,8 @@ export async function validateCurrentTreeManifest(): Promise<void> {
 	const expected = JSON.stringify(Object.entries(manifest.digests).sort());
 	if (JSON.stringify(Object.entries(actual.digests).sort()) !== expected)
 		throw new Error("telegram-daemon-generation-guard: semantic manifest declaration digests do not byte-match the current tree");
-	if (actual.nativePathIdentitySha256 !== manifest.nativePathIdentitySha256)
-		throw new Error("telegram-daemon-generation-guard: native path-identity digest does not byte-match the current tree");
+	if (JSON.stringify(actual.nativeAuthoritySha256) !== JSON.stringify(manifest.nativeAuthoritySha256))
+		throw new Error("telegram-daemon-generation-guard: native authority digests do not byte-match the current tree");
 }
 
 function bootstrapGuardContract(): void {
@@ -324,10 +342,10 @@ function stableJson(value: unknown): string {
 
 /**
  * Canonical signature of the manifest's guard *policy* — its contract version and
- * protected inventory — with the declaration-digest attestations removed. Every
- * legitimate protected lifecycle edit MUST refresh those digests to keep the
- * manifest byte-matching the tree; such a refresh is not a policy change and must
- * not force a GUARD_CONTRACT_VERSION bump. Returns undefined for an absent or
+ * protected inventory — with the declaration and native-authority attestations
+ * removed. Every legitimate protected lifecycle edit MUST refresh those digests to
+ * keep the manifest byte-matching the tree; such a refresh is not a policy change
+ * and must not force a GUARD_CONTRACT_VERSION bump. Returns undefined for an absent or
  * unparseable manifest so a genuine policy edit still fails closed.
  */
 function manifestPolicySignature(source: string | undefined): string | undefined {
@@ -335,7 +353,7 @@ function manifestPolicySignature(source: string | undefined): string | undefined
 	try {
 		const parsed = JSON.parse(source);
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
-		const { digests: _digests, ...policy } = parsed as Record<string, unknown>;
+		const { digests: _digests, nativeAuthoritySha256: _nativeAuthoritySha256, ...policy } = parsed as Record<string, unknown>;
 		return stableJson(policy);
 	} catch {
 		return undefined;

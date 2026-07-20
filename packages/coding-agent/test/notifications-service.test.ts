@@ -791,6 +791,41 @@ describe("notification-service recovery", () => {
 		expect(unlinked).toEqual([]);
 		expect(store.has(detached)).toBe(true);
 	});
+	test("reports detached stale endpoints and retained successors as separate recovery paths", async () => {
+		const endpoint = path.join(epDir, "raced.json");
+		const detached = path.join(epDir, ".gjc-delete-notification-endpoint-raced.json");
+		const successor = path.join(epDir, ".gjc-exact-unlink-placeholder-raced.json");
+		const { fs, unlinked } = mockFs(
+			{
+				[endpoint]: JSON.stringify({ sessionId: "raced", url: "ws://x", token: "t", pid: 999 }),
+				[detached]: JSON.stringify({ stale: true }),
+				[successor]: JSON.stringify({ live: true }),
+			},
+			{
+				exactUnlinkResult: file =>
+					file === endpoint
+						? {
+								ok: false,
+								code: "identity_mismatch",
+								detachedPath: detached,
+								retainedSuccessorPath: successor,
+							}
+						: undefined,
+			},
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot,
+			deps: { fs, pidAlive: () => false },
+		});
+
+		expect(report.endpointsDetached).toEqual([detached]);
+		expect(report.endpointsRetainedSuccessors).toEqual([successor]);
+		expect(report.endpointsKept).toBe(0);
+		expect(formatNotificationRecoveryReport(report)).toContain(`retained detached endpoint ${detached}`);
+		expect(formatNotificationRecoveryReport(report)).toContain(`retained successor endpoint ${successor}`);
+		expect(unlinked).toEqual([]);
+	});
 
 	test("leaves a lock untouched when required daemon ownership metadata is invalid", async () => {
 		const { fs, unlinked } = mockFs({

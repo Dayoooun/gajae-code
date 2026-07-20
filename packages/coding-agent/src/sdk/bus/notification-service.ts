@@ -771,6 +771,8 @@ export interface NotificationRecoveryReport {
 	endpointsKept: number;
 	endpointsUnreadable: number;
 	endpointsDetached?: string[];
+	/** Successor paths retained after an exact-unlink race, distinct from stale quarantines. */
+	endpointsRetainedSuccessors?: string[];
 	daemon: {
 		action: DaemonRecoveryAction;
 		detail: string;
@@ -1019,6 +1021,7 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 	const files = await listEndpointFiles(fs, dir);
 	const removed: RecoveredEndpoint[] = [];
 	const detached: string[] = [];
+	const retainedSuccessors: string[] = [];
 	let kept = 0;
 	let unreadable = 0;
 	for (const name of files) {
@@ -1041,7 +1044,8 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 			const result = await fs.exactUnlink(file, record.identity);
 			if (!result.ok) {
 				if (result.detachedPath) detached.push(result.detachedPath);
-				else kept += 1;
+				if (result.retainedSuccessorPath) retainedSuccessors.push(result.retainedSuccessorPath);
+				if (!result.detachedPath && !result.retainedSuccessorPath) kept += 1;
 				continue;
 			}
 			removed.push({
@@ -1119,6 +1123,7 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 		endpointsKept: kept,
 		endpointsUnreadable: unreadable,
 		endpointsDetached: detached,
+		endpointsRetainedSuccessors: retainedSuccessors,
 		daemon,
 	};
 }
@@ -1127,12 +1132,14 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 export function formatNotificationRecoveryReport(report: NotificationRecoveryReport): string {
 	const lines = ["Notification recovery"];
 	lines.push(
-		`  endpoints: scanned ${report.endpointsScanned}, removed ${report.endpointsRemoved.length}, kept ${report.endpointsKept}, unreadable ${report.endpointsUnreadable}, detached ${report.endpointsDetached?.length ?? 0}`,
+		`  endpoints: scanned ${report.endpointsScanned}, removed ${report.endpointsRemoved.length}, kept ${report.endpointsKept}, unreadable ${report.endpointsUnreadable}, detached ${report.endpointsDetached?.length ?? 0}, retained successors ${report.endpointsRetainedSuccessors?.length ?? 0}`,
 	);
 	for (const ep of report.endpointsRemoved) {
 		lines.push(`    - removed ${ep.sessionId} (pid ${ep.pid ?? "?"}, ${ep.reason})`);
 	}
 	for (const detached of report.endpointsDetached ?? []) lines.push(`    - retained detached endpoint ${detached}`);
+	for (const successor of report.endpointsRetainedSuccessors ?? [])
+		lines.push(`    - retained successor endpoint ${successor}`);
 	lines.push(`  daemon: ${report.daemon.action} — ${report.daemon.detail}`);
 	return lines.join("\n");
 }

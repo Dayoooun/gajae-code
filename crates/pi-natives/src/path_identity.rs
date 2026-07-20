@@ -214,6 +214,17 @@ impl NativeExactUnlinkResult {
 		}
 	}
 
+	/// The original stale object was removed, but a successor displaced the
+	/// exchange placeholder and remains recoverable at its own quarantine path.
+	fn retained_successor_failure(code: &str, successor_path: String) -> Self {
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			detached_path: None,
+			retained_successor_path: Some(successor_path),
+		}
+	}
+
 	fn failure(code: &str) -> Self {
 		Self {
 			ok: false,
@@ -1222,6 +1233,8 @@ mod platform {
 		if let Err(code) = rename_no_replace(parent_fd, parent_fd, name, &detached_name) {
 			return ExchangePlaceholderRemoval::Failed(code);
 		}
+		#[cfg(test)]
+		pause_after_placeholder_detach_for_test();
 		// SAFETY: zero is a valid initialized representation for this output struct.
 		let mut detached: libc::stat = unsafe { std::mem::zeroed() };
 		// SAFETY: the descriptor and CString are live; the initialized output struct is
@@ -1237,8 +1250,6 @@ mod platform {
 				Err(_) => ExchangePlaceholderRemoval::RetainedMismatch(detached_name),
 			};
 		}
-		#[cfg(test)]
-		pause_after_placeholder_detach_for_test();
 		// SAFETY: the verified placeholder has already been detached from the
 		// canonical pathname; cleanup cannot delete a successor published there.
 		if unsafe { libc::unlinkat(parent_fd, detached_name.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
@@ -1492,8 +1503,9 @@ mod platform {
 					NativeExactUnlinkResult::detached_failure("identity_mismatch", detached_path)
 				},
 				ExchangePlaceholderRemoval::RetainedMismatch(retained_name) => {
-					NativeExactUnlinkResult::detached_failure(
+					NativeExactUnlinkResult::detached_failure_with_successor(
 						"identity_mismatch",
+						detached_path,
 						path
 							.parent()
 							.unwrap_or_else(|| Path::new("."))
@@ -1503,8 +1515,9 @@ mod platform {
 					)
 				},
 				ExchangePlaceholderRemoval::RetainedFailure(retained_name, code) => {
-					NativeExactUnlinkResult::detached_failure(
+					NativeExactUnlinkResult::detached_failure_with_successor(
 						code,
+						detached_path,
 						path
 							.parent()
 							.unwrap_or_else(|| Path::new("."))
@@ -1529,7 +1542,7 @@ mod platform {
 					NativeExactUnlinkResult::failure("identity_mismatch")
 				},
 				ExchangePlaceholderRemoval::RetainedMismatch(retained_name) => {
-					NativeExactUnlinkResult::detached_failure(
+					NativeExactUnlinkResult::retained_successor_failure(
 						"identity_mismatch",
 						path
 							.parent()
@@ -1540,7 +1553,7 @@ mod platform {
 					)
 				},
 				ExchangePlaceholderRemoval::RetainedFailure(retained_name, code) => {
-					NativeExactUnlinkResult::detached_failure(
+					NativeExactUnlinkResult::retained_successor_failure(
 						code,
 						path
 							.parent()
@@ -4287,6 +4300,7 @@ mod exact_unlink_placeholder_tests {
 	use std::{
 		fs,
 		os::unix::fs::MetadataExt,
+		path::Path,
 		sync::{Mutex, MutexGuard, OnceLock, mpsc},
 		thread,
 		time::{SystemTime, UNIX_EPOCH},
@@ -4542,6 +4556,93 @@ mod exact_unlink_placeholder_tests {
 	#[test]
 	fn directory_target_preserves_directory_successor_after_placeholder_identity_verification() {
 		preserves_directory_successor_after_placeholder_identity_verification(true);
+	}
+
+	fn retained_successor_after_stale_removal_is_reported_separately(detach_only: bool) {
+		let _guard = exchange_hook_test_guard();
+		let root = std::env::temp_dir().join(format!(
+			"gjc-exact-unlink-retained-successor-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+		let target = root.join("target");
+		let first_successor = root.join("first-successor");
+		let second_successor = root.join("second-successor");
+		let stale = root.join(".quarantine");
+		fs::write(&target, b"stale").expect("write stale target");
+		fs::create_dir(&first_successor).expect("create first successor");
+		fs::write(first_successor.join("owner"), b"first").expect("write first successor owner");
+		fs::create_dir(&second_successor).expect("create second successor");
+		fs::write(second_successor.join("owner"), b"second").expect("write second successor owner");
+		let metadata = fs::metadata(&target).expect("stat target");
+		let identity = ExactFileIdentity {
+			dev: metadata.dev(),
+			ino: metadata.ino(),
+			size: metadata.size(),
+			mtime_ns: metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory: false,
+			detach_only,
+			quarantine_name: Some(".quarantine".to_owned()),
+			sha256: Some(sha256(b"stale")),
+		};
+		let (exchange_entered_tx, exchange_entered_rx) = mpsc::channel();
+		let (exchange_resume_tx, exchange_resume_rx) = mpsc::channel();
+		platform::set_after_exchange_hook(Some((exchange_entered_tx, exchange_resume_rx)));
+		let (placeholder_entered_tx, placeholder_entered_rx) = mpsc::channel();
+		let (placeholder_resume_tx, placeholder_resume_rx) = mpsc::channel();
+		platform::set_after_placeholder_detach_hook(Some((
+			placeholder_entered_tx,
+			placeholder_resume_rx,
+		)));
+		let target_for_unlink = target.clone();
+		let unlink = thread::spawn(move || platform::exact_unlink(&target_for_unlink, &identity));
+		exchange_entered_rx.recv().expect("wait for exchange");
+		fs::rename(&first_successor, &target).expect("first successor replaces placeholder");
+		exchange_resume_tx.send(()).expect("resume exchange");
+		placeholder_entered_rx
+			.recv()
+			.expect("wait for first successor detach");
+		fs::rename(&second_successor, &target).expect("second successor prevents restoration");
+		placeholder_resume_tx
+			.send(())
+			.expect("resume placeholder cleanup");
+		let result = unlink.join().expect("exact unlink thread");
+		platform::set_after_exchange_hook(None);
+		platform::set_after_placeholder_detach_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		let retained = result
+			.retained_successor_path
+			.expect("first successor recovery path");
+		assert!(Path::new(&retained).is_dir(), "first successor was not retained");
+		assert_eq!(
+			fs::read(Path::new(&retained).join("owner")).expect("read first successor"),
+			b"first"
+		);
+		assert_eq!(fs::read(target.join("owner")).expect("read second successor"), b"second");
+		if detach_only {
+			assert_eq!(result.detached_path.as_deref(), Some(stale.to_string_lossy().as_ref()));
+			assert_eq!(fs::read(&stale).expect("read detached stale object"), b"stale");
+		} else {
+			assert!(result.detached_path.is_none());
+			assert!(!stale.exists(), "removed stale object was reported as detached");
+		}
+		fs::remove_dir_all(root).expect("remove temporary directory");
+	}
+
+	#[test]
+	fn retained_successor_after_stale_removal_has_no_detached_path() {
+		retained_successor_after_stale_removal_is_reported_separately(false);
+	}
+
+	#[test]
+	fn retained_successor_and_stale_quarantine_are_reported_separately() {
+		retained_successor_after_stale_removal_is_reported_separately(true);
 	}
 }
 #[cfg(test)]
