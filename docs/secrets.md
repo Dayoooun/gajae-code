@@ -34,10 +34,10 @@ Define custom secret entries in YAML. Two locations are checked:
 
 | Level   | Path                       | Purpose                     |
 | ------- | -------------------------- | --------------------------- |
-| Global  | `~/.gjc/agent/secrets.yml` | Secrets across all projects |
-| Project | `<cwd>/.gjc/secrets.yml`   | Project-specific secrets    |
+| Global  | `~/.gjc/agent/secrets.yml` | Plain and regex secrets across all projects |
+| Project | `<cwd>/.gjc/secrets.yml`   | Project-specific plain secrets              |
 
-Project entries override global entries with matching `content`.
+Project plain entries override global plain entries with matching `content`; a global regex with the same `content` remains active. Project-scope regex entries are ignored because workspace-contained files are not trusted to supply executable regex patterns. This project scope includes `<cwd>/.gjc/secrets.yml` and any caller-supplied agent directory whose lexical or canonical path is contained within the workspace.
 
 ### Schema
 
@@ -69,6 +69,8 @@ Each entry in the array has these fields:
 
 #### Regex secrets
 
+Regex entries are supported only by agent configuration outside the current workspace (normally `~/.gjc/agent/secrets.yml`). Use `type: plain` for workspace-contained configuration.
+
 ```yaml
 # Obfuscate any AWS-style key
 - type: regex
@@ -84,7 +86,7 @@ Each entry in the array has these fields:
   content: "/bearer\\s+[a-zA-Z0-9._~+\\/=-]+/i"
 ```
 
-Regex entries always scan globally (the `g` flag is enforced automatically). The regex literal syntax `/pattern/flags` is supported as an alternative to separate `content` + `flags` fields. Escaped slashes within the pattern (`\\/`) are handled correctly.
+Regex entries always scan globally (the `g` flag is enforced automatically). The regex literal syntax `/pattern/flags` is supported as an alternative to separate `content` + `flags` fields. Escaped slashes within the pattern (`\\/`) are handled correctly. The sticky `y` flag is rejected because it would prevent global scanning.
 
 #### Replace mode with regex
 
