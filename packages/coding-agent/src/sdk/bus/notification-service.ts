@@ -69,7 +69,10 @@ export interface NotificationExactUnlinkResult {
 	ok: boolean;
 	code?: string;
 	detachedPath?: string;
+	/** A live publisher successor retained after an exact-unlink race. */
 	retainedSuccessorPath?: string;
+	/** An internal exchange placeholder whose verified cleanup failed. */
+	retainedPlaceholderPath?: string;
 }
 
 /** Read one regular file together with the identity required for exact removal. */
@@ -121,6 +124,7 @@ export function exactUnlinkNotificationFile(
 		code: result.code,
 		detachedPath: result.detachedPath,
 		retainedSuccessorPath: result.retainedSuccessorPath,
+		retainedPlaceholderPath: result.retainedPlaceholderPath,
 	};
 }
 
@@ -773,6 +777,8 @@ export interface NotificationRecoveryReport {
 	endpointsDetached?: string[];
 	/** Successor paths retained after an exact-unlink race, distinct from stale quarantines. */
 	endpointsRetainedSuccessors?: string[];
+	/** Internal exchange placeholders retained after verified cleanup failure. */
+	endpointsRetainedPlaceholders?: string[];
 	daemon: {
 		action: DaemonRecoveryAction;
 		detail: string;
@@ -1022,6 +1028,8 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 	const removed: RecoveredEndpoint[] = [];
 	const detached: string[] = [];
 	const retainedSuccessors: string[] = [];
+	const retainedPlaceholders: string[] = [];
+	let recoveryFailures = 0;
 	let kept = 0;
 	let unreadable = 0;
 	for (const name of files) {
@@ -1043,9 +1051,11 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 		try {
 			const result = await fs.exactUnlink(file, record.identity);
 			if (!result.ok) {
+				recoveryFailures += 1;
 				if (result.detachedPath) detached.push(result.detachedPath);
 				if (result.retainedSuccessorPath) retainedSuccessors.push(result.retainedSuccessorPath);
-				if (!result.detachedPath && !result.retainedSuccessorPath) kept += 1;
+				if (result.retainedPlaceholderPath) retainedPlaceholders.push(result.retainedPlaceholderPath);
+				if (!result.detachedPath && !result.retainedSuccessorPath && !result.retainedPlaceholderPath) kept += 1;
 				continue;
 			}
 			removed.push({
@@ -1118,12 +1128,13 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 	}
 
 	return {
-		endpointsScanned: removed.length + kept + unreadable + detached.length,
+		endpointsScanned: removed.length + kept + unreadable + recoveryFailures,
 		endpointsRemoved: removed,
 		endpointsKept: kept,
 		endpointsUnreadable: unreadable,
 		endpointsDetached: detached,
 		endpointsRetainedSuccessors: retainedSuccessors,
+		endpointsRetainedPlaceholders: retainedPlaceholders,
 		daemon,
 	};
 }
@@ -1132,7 +1143,7 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 export function formatNotificationRecoveryReport(report: NotificationRecoveryReport): string {
 	const lines = ["Notification recovery"];
 	lines.push(
-		`  endpoints: scanned ${report.endpointsScanned}, removed ${report.endpointsRemoved.length}, kept ${report.endpointsKept}, unreadable ${report.endpointsUnreadable}, detached ${report.endpointsDetached?.length ?? 0}, retained successors ${report.endpointsRetainedSuccessors?.length ?? 0}`,
+		`  endpoints: scanned ${report.endpointsScanned}, removed ${report.endpointsRemoved.length}, kept ${report.endpointsKept}, unreadable ${report.endpointsUnreadable}, detached ${report.endpointsDetached?.length ?? 0}, retained successors ${report.endpointsRetainedSuccessors?.length ?? 0}, retained placeholders ${report.endpointsRetainedPlaceholders?.length ?? 0}`,
 	);
 	for (const ep of report.endpointsRemoved) {
 		lines.push(`    - removed ${ep.sessionId} (pid ${ep.pid ?? "?"}, ${ep.reason})`);
@@ -1140,6 +1151,8 @@ export function formatNotificationRecoveryReport(report: NotificationRecoveryRep
 	for (const detached of report.endpointsDetached ?? []) lines.push(`    - retained detached endpoint ${detached}`);
 	for (const successor of report.endpointsRetainedSuccessors ?? [])
 		lines.push(`    - retained successor endpoint ${successor}`);
+	for (const placeholder of report.endpointsRetainedPlaceholders ?? [])
+		lines.push(`    - retained exchange placeholder cleanup path ${placeholder}`);
 	lines.push(`  daemon: ${report.daemon.action} — ${report.daemon.detail}`);
 	return lines.join("\n");
 }

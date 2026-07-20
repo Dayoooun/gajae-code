@@ -821,9 +821,39 @@ describe("notification-service recovery", () => {
 
 		expect(report.endpointsDetached).toEqual([detached]);
 		expect(report.endpointsRetainedSuccessors).toEqual([successor]);
+		expect(report.endpointsRetainedPlaceholders).toEqual([]);
 		expect(report.endpointsKept).toBe(0);
 		expect(formatNotificationRecoveryReport(report)).toContain(`retained detached endpoint ${detached}`);
 		expect(formatNotificationRecoveryReport(report)).toContain(`retained successor endpoint ${successor}`);
+		expect(unlinked).toEqual([]);
+	});
+	test("reports a retained internal exchange placeholder separately from stale objects and live successors", async () => {
+		const endpoint = path.join(epDir, "placeholder.json");
+		const placeholder = path.join(epDir, ".gjc-exact-unlink-placeholder-verified");
+		const { fs, unlinked } = mockFs(
+			{
+				[endpoint]: JSON.stringify({ sessionId: "placeholder", url: "ws://x", token: "t", pid: 999 }),
+				[placeholder]: JSON.stringify({ internal: true }),
+			},
+			{
+				exactUnlinkResult: file =>
+					file === endpoint ? { ok: false, code: "io_error", retainedPlaceholderPath: placeholder } : undefined,
+			},
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot,
+			deps: { fs, pidAlive: () => false },
+		});
+
+		expect(report.endpointsScanned).toBe(1);
+		expect(report.endpointsDetached).toEqual([]);
+		expect(report.endpointsRetainedSuccessors).toEqual([]);
+		expect(report.endpointsRetainedPlaceholders).toEqual([placeholder]);
+		expect(report.endpointsKept).toBe(0);
+		expect(formatNotificationRecoveryReport(report)).toContain(
+			`retained exchange placeholder cleanup path ${placeholder}`,
+		);
 		expect(unlinked).toEqual([]);
 	});
 

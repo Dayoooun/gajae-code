@@ -144,6 +144,9 @@ pub struct NativeExactUnlinkResult {
 	pub code: Option<String>,
 	pub detached_path: Option<String>,
 	pub retained_successor_path: Option<String>,
+	/// An internal exchange placeholder whose verified cleanup failed. This is
+	/// never a publisher successor and remains recoverable only at this path.
+	pub retained_placeholder_path: Option<String>,
 }
 
 /// A deterministic, no-follow description of a directory tree. `relative_path`
@@ -186,14 +189,25 @@ impl NativeDirectoryTreeResult {
 		Self { ok: false, code: Some(code.to_owned()), snapshot: None }
 	}
 }
-
 impl NativeExactUnlinkResult {
 	const fn success() -> Self {
-		Self { ok: true, code: None, detached_path: None, retained_successor_path: None }
+		Self {
+			ok: true,
+			code: None,
+			detached_path: None,
+			retained_successor_path: None,
+			retained_placeholder_path: None,
+		}
 	}
 
 	const fn detached(path: String) -> Self {
-		Self { ok: true, code: None, detached_path: Some(path), retained_successor_path: None }
+		Self {
+			ok: true,
+			code: None,
+			detached_path: Some(path),
+			retained_successor_path: None,
+			retained_placeholder_path: None,
+		}
 	}
 
 	fn detached_failure(code: &str, path: String) -> Self {
@@ -202,6 +216,7 @@ impl NativeExactUnlinkResult {
 			code: Some(code.to_owned()),
 			detached_path: Some(path),
 			retained_successor_path: None,
+			retained_placeholder_path: None,
 		}
 	}
 
@@ -211,6 +226,21 @@ impl NativeExactUnlinkResult {
 			code: Some(code.to_owned()),
 			detached_path: Some(path),
 			retained_successor_path: Some(successor_path),
+			retained_placeholder_path: None,
+		}
+	}
+
+	fn detached_failure_with_placeholder(
+		code: &str,
+		path: String,
+		placeholder_path: String,
+	) -> Self {
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			detached_path: Some(path),
+			retained_successor_path: None,
+			retained_placeholder_path: Some(placeholder_path),
 		}
 	}
 
@@ -222,6 +252,17 @@ impl NativeExactUnlinkResult {
 			code: Some(code.to_owned()),
 			detached_path: None,
 			retained_successor_path: Some(successor_path),
+			retained_placeholder_path: None,
+		}
+	}
+
+	fn retained_placeholder_failure(code: &str, placeholder_path: String) -> Self {
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			detached_path: None,
+			retained_successor_path: None,
+			retained_placeholder_path: Some(placeholder_path),
 		}
 	}
 
@@ -231,6 +272,7 @@ impl NativeExactUnlinkResult {
 			code: Some(code.to_owned()),
 			detached_path: None,
 			retained_successor_path: None,
+			retained_placeholder_path: None,
 		}
 	}
 }
@@ -1477,7 +1519,7 @@ mod platform {
 					)
 				},
 				ExchangePlaceholderRemoval::RetainedFailure(retained_name, code) => {
-					NativeExactUnlinkResult::detached_failure_with_successor(
+					NativeExactUnlinkResult::detached_failure_with_placeholder(
 						code,
 						detached_path.clone(),
 						path
@@ -1515,7 +1557,7 @@ mod platform {
 					)
 				},
 				ExchangePlaceholderRemoval::RetainedFailure(retained_name, code) => {
-					NativeExactUnlinkResult::detached_failure_with_successor(
+					NativeExactUnlinkResult::detached_failure_with_placeholder(
 						code,
 						detached_path,
 						path
@@ -1553,7 +1595,7 @@ mod platform {
 					)
 				},
 				ExchangePlaceholderRemoval::RetainedFailure(retained_name, code) => {
-					NativeExactUnlinkResult::retained_successor_failure(
+					NativeExactUnlinkResult::retained_placeholder_failure(
 						code,
 						path
 							.parent()
@@ -3138,6 +3180,7 @@ mod platform {
 					code: result.code,
 					detached_path: None,
 					retained_successor_path: None,
+					retained_placeholder_path: None,
 				};
 			},
 		};
@@ -3205,6 +3248,7 @@ mod platform {
 					code: result.code,
 					detached_path: None,
 					retained_successor_path: None,
+					retained_placeholder_path: None,
 				};
 			},
 		};
@@ -4010,6 +4054,7 @@ mod platform {
 							code: result.code,
 							detached_path: None,
 							retained_successor_path: None,
+							retained_placeholder_path: None,
 						};
 					},
 				}
@@ -4020,6 +4065,7 @@ mod platform {
 					code: result.code,
 					detached_path: None,
 					retained_successor_path: None,
+					retained_placeholder_path: None,
 				};
 			},
 		};
@@ -4306,7 +4352,7 @@ mod exact_unlink_placeholder_tests {
 		time::{SystemTime, UNIX_EPOCH},
 	};
 
-	use super::{ExactFileIdentity, platform, sha256};
+	use super::{ExactFileIdentity, NativeExactUnlinkResult, platform, sha256};
 
 	fn exchange_hook_test_guard() -> MutexGuard<'static, ()> {
 		static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
@@ -4616,6 +4662,7 @@ mod exact_unlink_placeholder_tests {
 
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert!(result.retained_placeholder_path.is_none());
 		let retained = result
 			.retained_successor_path
 			.expect("first successor recovery path");
@@ -4643,6 +4690,21 @@ mod exact_unlink_placeholder_tests {
 	#[test]
 	fn retained_successor_and_stale_quarantine_are_reported_separately() {
 		retained_successor_after_stale_removal_is_reported_separately(true);
+	}
+
+	#[test]
+	fn retained_internal_placeholder_is_not_reported_as_a_successor() {
+		let result = NativeExactUnlinkResult::retained_placeholder_failure(
+			"io_error",
+			"/tmp/.gjc-exact-unlink-placeholder-verified".to_owned(),
+		);
+		assert!(!result.ok);
+		assert!(result.detached_path.is_none());
+		assert!(result.retained_successor_path.is_none());
+		assert_eq!(
+			result.retained_placeholder_path.as_deref(),
+			Some("/tmp/.gjc-exact-unlink-placeholder-verified")
+		);
 	}
 }
 #[cfg(test)]

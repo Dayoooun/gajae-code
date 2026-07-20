@@ -8,18 +8,20 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 14;
+export const GUARD_CONTRACT_VERSION = 15;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
-const nativeAuthoritySources = [
-	"crates/pi-natives/src/path_identity.rs",
-	"crates/pi-natives/src/ps.rs",
-	"crates/pi-shell/src/process.rs",
-	"packages/natives/native/index.d.ts",
-] as const;
+const nativeAuthorityFamilies = {
+	"crates/pi-natives/src/path_identity.rs": ["telegram"],
+	"crates/pi-natives/src/ps.rs": ["telegram", "discord", "slack"],
+	"crates/pi-shell/src/process.rs": ["telegram", "discord", "slack"],
+	"packages/natives/native/index.d.ts": ["telegram", "discord", "slack"],
+	"packages/coding-agent/src/sdk/broker/process-incarnation.ts": ["telegram", "discord", "slack"],
+} as const satisfies Record<string, readonly Family[]>;
+const nativeAuthoritySources = Object.keys(nativeAuthorityFamilies) as Array<keyof typeof nativeAuthorityFamilies>;
 
 type Family = "telegram" | "discord" | "slack";
 type Inventory = Readonly<Record<Family, Readonly<Record<string, readonly string[]>>>>;
@@ -87,7 +89,7 @@ function inventoryHash(inventory: Inventory): string {
 }
 
 export function validateInventory(inventory: Inventory = protectedInventory): void {
-	if (GUARD_CONTRACT_VERSION !== 14) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
+	if (GUARD_CONTRACT_VERSION !== 15) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
 	for (const [family, files] of Object.entries(inventory)) {
 		for (const [file, symbols] of Object.entries(files)) {
 			if (!file || symbols.length === 0 || new Set(symbols).size !== symbols.length)
@@ -443,10 +445,11 @@ export function isLegacyBootstrapBase(base: ReadonlyMap<string, string | undefin
 		const generationDeclaration = generation?.declarations?.find((item: any) => item.id?.name === "DAEMON_GENERATION");
 		const controller = declarationNode(chatProgram, "ChatDaemonController");
 		const hasOperate = controller?.type === "ClassDeclaration" && controller.body?.body.some((member: any) => member.type === "ClassMethod" && nodeName(member) === "operate");
-		return protocolDeclaration?.init?.type === "NumericLiteral" &&
-			protocolDeclaration.init.value === 3 &&
-			generationDeclaration?.init?.type === "Identifier" &&
-			generationDeclaration.init.name === "NOTIFICATION_PROTOCOL_VERSION" &&
+		const protocol3 = protocolDeclaration?.init?.type === "NumericLiteral" && protocolDeclaration.init.value === 3;
+		const aliasGeneration = generationDeclaration?.init?.type === "Identifier" && generationDeclaration.init.name === "NOTIFICATION_PROTOCOL_VERSION";
+		const numericGeneration6 = generationDeclaration?.init?.type === "NumericLiteral" && generationDeclaration.init.value === 6;
+		return protocol3 &&
+			(aliasGeneration || numericGeneration6) &&
 			!declarationNode(chatProgram, "CHAT_DAEMON_GENERATIONS") &&
 			!declarationNode(chatProgram, "chatDaemonGeneration") &&
 			hasOperate;
@@ -457,12 +460,17 @@ export function isLegacyBootstrapBase(base: ReadonlyMap<string, string | undefin
 
 export type Evaluation = {
 	protectedChanges: string[];
+	nativeAuthorityChanges: string[];
 	telegramGenerationBumped: boolean;
 	chatGenerationBumped: Record<"discord" | "slack", boolean>;
 	malformedDeclarations: string[];
 	guardPolicyChanged: boolean;
 	guardContractBumped: boolean;
 };
+
+function authorityDigest(source: string | undefined): string | undefined {
+	return source === undefined ? undefined : crypto.createHash("sha256").update(source).digest("hex");
+}
 
 export function evaluate(
 	base: ReadonlyMap<string, string | undefined>,
@@ -486,6 +494,11 @@ export function evaluate(
 			}
 		}
 	}
+	for (const source of nativeAuthoritySources) {
+		if (authorityDigest(base.get(source)) === authorityDigest(head.get(source))) continue;
+		for (const family of nativeAuthorityFamilies[source]) protectedChanges.push(`${family}:${source}:authority`);
+	}
+	const nativeAuthorityChanges = protectedChanges.filter(change => change.endsWith(":authority"));
 	const guardPolicyChanged =
 		!bootstrapping &&
 		(canonicalSource(base.get(guardScript) ?? "") !== canonicalSource(head.get(guardScript) ?? "") ||
@@ -510,7 +523,7 @@ export function evaluate(
 			];
 		}),
 	) as Evaluation["chatGenerationBumped"];
-	return { protectedChanges, telegramGenerationBumped, chatGenerationBumped, malformedDeclarations, guardPolicyChanged, guardContractBumped };
+	return { protectedChanges, nativeAuthorityChanges, telegramGenerationBumped, chatGenerationBumped, malformedDeclarations, guardPolicyChanged, guardContractBumped };
 }
 
 async function git(args: string[]): Promise<string> {
@@ -556,7 +569,7 @@ export async function run(baseInput: string | undefined, headInput: string | und
 	// no-op policy change.
 	await validateCurrentTreeManifest();
 	if (process.env.GJC_DAEMON_GUARD_DEBUG === "1") console.error("daemon-generation-guard: objects verified");
-	const files = [guardScript, manifestScript, ...new Set(Object.values(protectedInventory).flatMap(inventory => Object.keys(inventory)))];
+	const files = [guardScript, manifestScript, ...new Set([...Object.values(protectedInventory).flatMap(inventory => Object.keys(inventory)), ...nativeAuthoritySources])];
 	const baseFiles: Array<readonly [string, string | undefined]> = [];
 	const headFiles: Array<readonly [string, string | undefined]> = [];
 	for (const file of files) {

@@ -1,5 +1,5 @@
 {
-  "contractVersion": 14,
+  "contractVersion": 15,
   "inventory": {
     "telegram": {
       "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts": [
@@ -358,7 +358,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:daemonGenerationRelation": "508f3f02dc8fb94199a27604c8caa1864ec308a19824be3b92456d807b8d761d",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:daemonTransitionLockIsHeld": "6c71abc9a4ee7079db817d0acbc94b9fe398d2bd63bf9a3fe0edb399325b1f47",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:detachTransitionMarker": "c2bc3beb65542bb532830fab2e26bd14d1f4074fad25277bdcc8cca44c9d90b6",
-    "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:exactUnlinkNotificationFile": "d920e8aa144d4fb7b8f23b9ba3b21fb3567b0a68461ff5d38a4da036ce8671f9",
+    "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:exactUnlinkNotificationFile": "d529b0c324da6e6fdec43a776274aa6b5eb24c3dca346f6dc7db9d9d991b1f5c",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:isDaemonTransitionLock": "dfcef896a49029a1b5c3ab21fd4b2e9a66eca314e93bbdfe122e666510f9f81a",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:readTransitionMarker": "d6d33240a8e45e54d72c78ee7857fd4c7eb78b32854ed32c6bb3cc51cb24a22e",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:releaseDaemonTransitionLock": "d60f7568bee003dac6d31b936c98a3366d96d483f3a79afe5a28bb65475b65fa",
@@ -417,9 +417,10 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:waitForTelegramDaemonReady": "fe21962bdcf6501a7ba4ea7e04bf442394e35cba4f296fd3469c680730b1cdfb"
   },
   "nativeAuthoritySha256": {
-    "crates/pi-natives/src/path_identity.rs": "2396522e85423ce0f2e5df1aceef9845b3d30b7183d059fd742fb041fd98999e",
+    "crates/pi-natives/src/path_identity.rs": "329b44c5f02ae85047999016bdd450dc1080f7208ecbc56931c20810f8f9c96a",
     "crates/pi-natives/src/ps.rs": "3c8a28d1daf84e91c3db0d29fa05a6231b871903800428ca1acbb2ddecea5f6b",
     "crates/pi-shell/src/process.rs": "3f74458492c16fff24ecc234c74efd29d2a7f5f5c5a7c879c68b00a2e4f08274",
-    "packages/natives/native/index.d.ts": "06098eb6c12d2dbeb2ab1675f9b7b88eb3d47de7f859b2d1d7245ca6e3f0a203"
+    "packages/natives/native/index.d.ts": "132601ce73e10da97d97d763d8537bd98596f8e68397e4dc1ee0db23c0b9ab0e",
+    "packages/coding-agent/src/sdk/broker/process-incarnation.ts": "72aac66e149e8a5e411728e2e17469a7c444b252e4fd776316461b8672de68c5"
   }
 }

@@ -167,6 +167,74 @@ describe("daemon generation release guard", () => {
 		}
 	});
 
+	test("bootstraps the exact guard-less numeric-generation-6 legacy topology", () => {
+		const base = files({ telegramOwnership: "return true;" });
+		base.delete(guardScript);
+		base.set(telegramContract, "export const NOTIFICATION_PROTOCOL_VERSION = 3;\nexport const DAEMON_GENERATION = 6;");
+		base.set(chatControl, legacyChatDaemonControl);
+		const head = files({ telegramGeneration: 7, discordGeneration: 2, slackGeneration: 2, telegramOwnership: "return true;", chatLifecycle: "return true;" });
+		expect(isLegacyBootstrapBase(base)).toBe(true);
+		expect(decide(base, head).malformedDeclarations).toEqual([]);
+
+		for (const mutate of [
+			(candidate: Map<string, string>) => candidate.set(telegramContract, "export const NOTIFICATION_PROTOCOL_VERSION = 3;\nexport const DAEMON_GENERATION = 5;"),
+			(candidate: Map<string, string>) => candidate.set(telegramContract, "export const NOTIFICATION_PROTOCOL_VERSION = 4;\nexport const DAEMON_GENERATION = 6;"),
+			(candidate: Map<string, string>) => candidate.set(telegramDaemon, "export function acquireDaemonOwnership() { return true; }\nconst acquisitionId = 'unexpected';"),
+		]) {
+			const candidate = new Map(base);
+			mutate(candidate);
+			expect(isLegacyBootstrapBase(candidate)).toBe(false);
+		}
+	});
+
+	test("requires mapped family generation bumps for native lifecycle authority changes", () => {
+		const sources = [
+			["crates/pi-natives/src/path_identity.rs", ["telegram"]],
+			["crates/pi-natives/src/ps.rs", ["telegram", "discord", "slack"]],
+			["crates/pi-shell/src/process.rs", ["telegram", "discord", "slack"]],
+			["packages/natives/native/index.d.ts", ["telegram", "discord", "slack"]],
+			["packages/coding-agent/src/sdk/broker/process-incarnation.ts", ["telegram", "discord", "slack"]],
+		] as const;
+		for (const [source, families] of sources) {
+			const base = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
+			const head = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
+			base.set(source, "authority: base");
+			head.set(source, "authority: head");
+			const missingBumps = decide(base, head);
+			expect(missingBumps.nativeAuthorityChanges).toEqual(families.map(family => `${family}:${source}:authority`));
+			expect(missingBumps.telegramGenerationBumped).toBe(false);
+			for (const family of ["discord", "slack"] as const) expect(missingBumps.chatGenerationBumped[family]).toBe(false);
+
+			const bumped = files({
+				telegramGeneration: families.includes("telegram") ? 7 : 6,
+				discordGeneration: families.includes("discord") ? 5 : 4,
+				slackGeneration: families.includes("slack") ? 5 : 4,
+			});
+			bumped.set(source, "authority: head");
+			const verified = decide(base, bumped);
+			if (families.includes("telegram")) expect(verified.telegramGenerationBumped).toBe(true);
+			for (const family of ["discord", "slack"] as const) {
+				if (families.includes(family)) expect(verified.chatGenerationBumped[family]).toBe(true);
+			}
+		}
+	});
+
+	test("does not require generation bumps when native lifecycle authorities are unchanged", () => {
+		const base = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
+		const head = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
+		for (const source of [
+			"crates/pi-natives/src/path_identity.rs",
+			"crates/pi-natives/src/ps.rs",
+			"crates/pi-shell/src/process.rs",
+			"packages/natives/native/index.d.ts",
+			"packages/coding-agent/src/sdk/broker/process-incarnation.ts",
+		]) {
+			base.set(source, "same authority");
+			head.set(source, "same authority");
+		}
+		expect(decide(base, head).nativeAuthorityChanges).toEqual([]);
+	});
+
 	test("semantic manifest rejects duplicate, moved, and narrowed inventories", () => {
 		expect(() => validateManifest()).not.toThrow();
 		const duplicate = mutableInventory();

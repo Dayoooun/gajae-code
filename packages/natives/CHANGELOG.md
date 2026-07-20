@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+- `Process.signalRoot` exposes stable root-only process signaling, and identity-bound exact unlink reports stale quarantines, live successors, and retained internal exchange-placeholder cleanup paths as distinct recovery evidence.
 
 ### Added
 
