@@ -2237,10 +2237,10 @@ export class AgentSession {
 		// Re-evaluate append-only context mode when the setting changes at runtime.
 		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
 		// SDK ToolSession callbacks capture the just-constructed session. Defer the
-		// initial ask-tool attachment until that capture has been assigned by the
+		// initial ask-tool registration until that capture has been assigned by the
 		// session factory, while retaining the durable emitter created above.
 		queueMicrotask(() => {
-			if (!this.#isDisposed) this.#ensureWorkflowGateAskTool();
+			if (!this.#isDisposed) this.#registerWorkflowGateAskTool();
 		});
 	}
 
@@ -6475,11 +6475,11 @@ export class AgentSession {
 		this.#workflowGateEmitter = emitter;
 		notifyWorkflowGateEmitterChanged(this.sessionId, emitter);
 		if (emitter) {
-			this.#ensureWorkflowGateAskTool();
+			this.#registerWorkflowGateAskTool();
 		}
 	}
 
-	#ensureWorkflowGateAskTool(): void {
+	#registerWorkflowGateAskTool(): void {
 		if (!this.#workflowGateToolSession) return;
 
 		let askTool = this.#toolRegistry.get("ask");
@@ -6491,7 +6491,21 @@ export class AgentSession {
 			this.#toolRegistry.set(askTool.name, askTool);
 		}
 
-		if (this.getActiveToolNames().includes(askTool.name)) return;
+		try {
+			if ((this.#workflowGateEmitter?.listPendingGates?.().length ?? 0) > 0) {
+				this.#attachAskTool();
+			}
+		} catch (error) {
+			logger.warn("Failed to inspect pending workflow gates; activating ask tool conservatively", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			this.#attachAskTool();
+		}
+	}
+
+	#attachAskTool(): void {
+		const askTool = this.#toolRegistry.get("ask");
+		if (!askTool || this.getActiveToolNames().includes(askTool.name)) return;
 		this.#setGuardedAgentTools([...this.agent.state.tools, askTool]);
 		this.#invalidateDiscoveryCaches();
 		void this.refreshBaseSystemPrompt().catch(error => {
@@ -6996,6 +7010,11 @@ export class AgentSession {
 		const name = (details as { name?: unknown }).name;
 		if (typeof name !== "string" || !name.trim()) return;
 		const skill = name.trim();
+		// Functional tool availability must not depend on the best-effort
+		// observational state-sync below (whose failures are swallowed by
+		// #syncSkillPromptActiveStateSafely): attach ask first so canonical
+		// workflow skills can always call it.
+		if (active && isCanonicalGjcWorkflowSkill(skill)) this.#attachAskTool();
 		const sessionId = this.sessionManager.getSessionId();
 		// Canonical GJC workflow skills (deep-interview, ralplan, ultragoal, team)
 		// own their `.gjc/state/skill-active-state.json` row through the
@@ -10719,6 +10738,8 @@ export class AgentSession {
 			});
 			return;
 		}
+
+		this.#attachAskTool();
 
 		const reminder = prompt.render(planModeToolDecisionReminderPrompt, {
 			askToolName: "ask",

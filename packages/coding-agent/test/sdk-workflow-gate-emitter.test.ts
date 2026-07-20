@@ -15,7 +15,9 @@ import {
 	type OpenGateInput,
 	type WorkflowGateEmitter,
 } from "../src/modes/shared/agent-wire/workflow-gate-broker";
+import type { WorkflowGate } from "../src/modes/shared/agent-wire/workflow-gate-types";
 import { initTheme } from "../src/modes/theme/theme";
+import { SKILL_PROMPT_MESSAGE_TYPE } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
 import { registerWorkflowGateEmitterListener } from "../src/tools/ask-answer-registry";
 
@@ -128,7 +130,8 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			expect(session.getWorkflowGateEmitter()).toBe(emitter);
 			const askTool = session.getToolByName("ask");
 			expect(askTool).toBeDefined();
-			expect(session.getActiveToolNames()).toContain("ask");
+			// Registered-not-attached contract: ask is registered for gate use but not resident by default.
+			expect(session.getActiveToolNames()).not.toContain("ask");
 
 			const ctx = {
 				hasUI: false,
@@ -153,6 +156,158 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			await session.dispose();
 		}
 	}, 15_000);
+	it("attaches ask when a newly registered emitter reports a pending gate", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-pending-gate-"));
+		tempDirs.push(tempDir);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			const pendingGate: WorkflowGate = {
+				type: "workflow_gate",
+				gate_id: "pending-gate",
+				stage: "ralplan",
+				kind: "approval",
+				schema: { type: "string" },
+				schema_hash: "test",
+				context: {},
+				created_at: new Date().toISOString(),
+				required: true,
+			};
+			const emitter: WorkflowGateEmitter = {
+				isUnattended: () => true,
+				emitGate: () => Promise.resolve(undefined),
+				listPendingGates: () => [pendingGate],
+			};
+
+			session.setWorkflowGateEmitter(emitter);
+
+			expect(session.getActiveToolNames()).toContain("ask");
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("conservatively attaches ask when pending-gate introspection throws", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-throwing-pending-gates-"));
+		tempDirs.push(tempDir);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			const emitter: WorkflowGateEmitter = {
+				isUnattended: () => true,
+				emitGate: () => Promise.resolve(undefined),
+				listPendingGates: () => {
+					throw new Error("pending gate lookup failed");
+				},
+			};
+
+			expect(() => session.setWorkflowGateEmitter(emitter)).not.toThrow();
+			expect(session.getToolByName("ask")).toBeDefined();
+			expect(session.getActiveToolNames()).toContain("ask");
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("attaches ask when a canonical workflow skill prompt starts", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-workflow-skill-"));
+		tempDirs.push(tempDir);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			expect(session.getActiveToolNames()).not.toContain("ask");
+			session.agent.emitExternalEvent({
+				type: "message_start",
+				message: {
+					role: "custom",
+					customType: SKILL_PROMPT_MESSAGE_TYPE,
+					content: "# Ultragoal",
+					display: true,
+					details: { name: "ultragoal" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				},
+			});
+			for (let attempt = 0; attempt < 20 && !session.getActiveToolNames().includes("ask"); attempt += 1)
+				await Bun.sleep(1);
+			expect(session.getActiveToolNames()).toContain("ask");
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("attaches ask for a canonical workflow skill even when state sync fails", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-workflow-skill-statefail-"));
+		tempDirs.push(tempDir);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			// Poison the durable skill-state location AFTER session boot: `.gjc`
+			// replaced by a FILE makes the observational state-sync writes throw
+			// while attach must still succeed.
+			fs.rmSync(path.join(tempDir, ".gjc"), { recursive: true, force: true });
+			fs.writeFileSync(path.join(tempDir, ".gjc"), "not-a-directory");
+			expect(session.getActiveToolNames()).not.toContain("ask");
+			session.agent.emitExternalEvent({
+				type: "message_start",
+				message: {
+					role: "custom",
+					customType: SKILL_PROMPT_MESSAGE_TYPE,
+					content: "# Ultragoal",
+					display: true,
+					details: { name: "ultragoal" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				},
+			});
+			for (let attempt = 0; attempt < 20 && !session.getActiveToolNames().includes("ask"); attempt += 1)
+				await Bun.sleep(1);
+			expect(session.getActiveToolNames()).toContain("ask");
+		} finally {
+			await session.dispose();
+		}
+	});
 	it("provides a durable SDK-native emitter without extension injection", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-production-"));
 		tempDirs.push(tempDir);
