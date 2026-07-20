@@ -4489,7 +4489,9 @@ export function createNotificationsExtension(
 		if (awaitStartup) {
 			const result = await startup;
 			if (!lifecycleStartupCapability && result.status === "failed")
-				throw new Error(`notifications: SDK startup failed: ${result.failure?.message ?? "Unknown startup failure."}`);
+				throw new Error(
+					`notifications: SDK startup failed: ${result.failure?.message ?? "Unknown startup failure."}`,
+				);
 			if (extensionShuttingDown) {
 				await stopSession(newId);
 				return;
