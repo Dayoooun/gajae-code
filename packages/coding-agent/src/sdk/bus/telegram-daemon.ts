@@ -950,14 +950,13 @@ function classifyForeignLiveOwner(input: {
 	pidIncarnation?: (pid: number) => string | undefined;
 }): "identity_mismatch" | "ambiguous" | undefined {
 	const { state } = input;
-	if (
-		!state ||
-		!hasSafeDaemonStateShape(state) ||
-		state.stoppedAt !== undefined ||
-		ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) ||
-		!input.pidAlive(state.pid)
-	)
+	// Establish live foreign-owner authority before requiring the full current
+	// state schema. A malformed live record cannot authorize replacement: only
+	// canonical, differing process incarnations prove that its PID was reused.
+	// Validate before probing so malformed PIDs never reach the liveness source.
+	if (!state || !validDaemonPid(state.pid) || state.stoppedAt !== undefined || !input.pidAlive(state.pid))
 		return undefined;
+	if (ownerIdentityMatches(state, input.tokenFingerprint, input.chatId)) return undefined;
 	const currentIncarnation = input.pidIncarnation?.(state.pid) ?? defaultPidIncarnation(state.pid);
 	if (!isProcessIncarnation(state.incarnation) || !isProcessIncarnation(currentIncarnation)) return "ambiguous";
 	return currentIncarnation === state.incarnation ? "identity_mismatch" : undefined;

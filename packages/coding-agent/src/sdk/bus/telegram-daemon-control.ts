@@ -112,7 +112,11 @@ export interface DaemonProcessReference {
 	signal(signal: NodeJS.Signals): void;
 }
 
-function defaultProcessReference(pid: number): DaemonProcessReference | undefined {
+function defaultProcessReference(pid: number, platform = os.platform()): DaemonProcessReference | undefined {
+	// Process.fromPid on Darwin still resolves identity and then signals a numeric
+	// PID. A process can exit and its PID be reused in that interval, so daemon
+	// control must not use it as privileged signaling authority.
+	if (platform === "darwin") return undefined;
 	try {
 		const processRef = Process.fromPid(pid);
 		if (!processRef || !isProcessIncarnation(processRef.incarnation)) return undefined;
@@ -135,6 +139,8 @@ export interface TelegramDaemonControlDeps {
 	pidAlive?: (pid: number) => boolean;
 	processReference?: (pid: number) => DaemonProcessReference | undefined;
 	pidIncarnation?: (pid: number) => string | undefined;
+	/** Test seam for platform-specific default stable-process authority. */
+	platform?: NodeJS.Platform;
 	spawn?: TelegramDaemonDeps["spawn"];
 	execPath?: string;
 	/**
@@ -180,7 +186,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		this.fsImpl = deps.fs ?? nodeFs;
 		this.now = deps.now ?? Date.now;
 		this.pidAlive = deps.pidAlive ?? defaultPidAlive;
-		this.processReference = deps.processReference ?? defaultProcessReference;
+		this.processReference = deps.processReference ?? (pid => defaultProcessReference(pid, deps.platform));
 		this.waitStepMs = deps.waitStepMs ?? DEFAULT_WAIT_STEP_MS;
 	}
 

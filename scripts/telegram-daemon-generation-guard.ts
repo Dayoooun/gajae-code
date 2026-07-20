@@ -8,17 +8,23 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 12;
+export const GUARD_CONTRACT_VERSION = 13;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
+const nativePathIdentity = "crates/pi-natives/src/path_identity.rs";
 
 type Family = "telegram" | "discord" | "slack";
 type Inventory = Readonly<Record<Family, Readonly<Record<string, readonly string[]>>>>;
 type Declaration = { text: string; canonical: string; valid: boolean } | undefined;
-type GuardManifest = { contractVersion: number; inventory: Inventory; digests: Readonly<Record<string, string>> };
+type GuardManifest = {
+	contractVersion: number;
+	inventory: Inventory;
+	digests: Readonly<Record<string, string>>;
+	nativePathIdentitySha256: string;
+};
 
 
 
@@ -76,7 +82,7 @@ function inventoryHash(inventory: Inventory): string {
 }
 
 export function validateInventory(inventory: Inventory = protectedInventory): void {
-	if (GUARD_CONTRACT_VERSION !== 12) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
+	if (GUARD_CONTRACT_VERSION !== 13) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
 	for (const [family, files] of Object.entries(inventory)) {
 		for (const [file, symbols] of Object.entries(files)) {
 			if (!file || symbols.length === 0 || new Set(symbols).size !== symbols.length)
@@ -108,6 +114,8 @@ export function validateManifest(value: unknown = manifest): asserts value is Gu
 	const digestKeys = Object.keys(contract.digests).sort();
 	if (digestKeys.join("\n") !== qualified.join("\n") || digestKeys.some(key => !/^[0-9a-f]{64}$/.test(contract.digests[key])))
 		throw new Error("telegram-daemon-generation-guard: semantic manifest declaration digests must be exact and qualified");
+	if (!/^[0-9a-f]{64}$/.test(contract.nativePathIdentitySha256))
+		throw new Error("telegram-daemon-generation-guard: native path-identity digest must be exact");
 }
 
 
@@ -128,10 +136,12 @@ export async function currentTreeDigests(): Promise<Record<string, string>> {
 
 export async function manifestForCurrentTree(): Promise<GuardManifest> {
 	validateManifest();
+	const nativeSource = await Bun.file(path.join(root, nativePathIdentity)).text();
 	return {
 		contractVersion: manifest.contractVersion,
 		inventory: manifest.inventory as Inventory,
 		digests: Object.fromEntries(Object.entries(await currentTreeDigests()).sort()),
+		nativePathIdentitySha256: crypto.createHash("sha256").update(nativeSource).digest("hex"),
 	};
 }
 
@@ -152,6 +162,8 @@ export async function validateCurrentTreeManifest(): Promise<void> {
 	const expected = JSON.stringify(Object.entries(manifest.digests).sort());
 	if (JSON.stringify(Object.entries(actual.digests).sort()) !== expected)
 		throw new Error("telegram-daemon-generation-guard: semantic manifest declaration digests do not byte-match the current tree");
+	if (actual.nativePathIdentitySha256 !== manifest.nativePathIdentitySha256)
+		throw new Error("telegram-daemon-generation-guard: native path-identity digest does not byte-match the current tree");
 }
 
 function bootstrapGuardContract(): void {

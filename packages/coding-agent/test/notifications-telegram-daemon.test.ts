@@ -1508,20 +1508,14 @@ describe("telegram daemon", () => {
 		});
 	});
 	test.each([
-		["unavailable current provenance", "linux:100", (): string | undefined => undefined, "missing"],
-		[
-			"non-canonical current provenance",
-			"linux:100",
-			(): string | undefined => "linux:not-a-start-time",
-			"aged-malformed",
-		],
-		[
-			"non-canonical persisted provenance",
-			"linux:not-a-start-time",
-			(): string | undefined => "linux:100",
-			"aged-malformed",
-		],
-	] as const)("foreign live owner with %s remains blocked without replacement", async (_name, incarnation, pidIncarnation, lockKind) => {
+		["unavailable current provenance", "linux:100", undefined, "missing"],
+		["non-canonical current provenance", "linux:100", "linux:not-a-start-time", "aged-malformed"],
+		["non-canonical persisted provenance", "linux:not-a-start-time", "linux:100", "aged-malformed"],
+		["missing persisted provenance with no lock", undefined, "linux:100", "missing"],
+		["missing persisted provenance with an aged malformed lock", undefined, "linux:100", "aged-malformed"],
+		["non-string persisted provenance with no lock", 100, "linux:100", "missing"],
+		["non-string persisted provenance with an aged malformed lock", 100, "linux:100", "aged-malformed"],
+	])("foreign live owner with %s remains blocked without replacement", async (_name, incarnation, currentIncarnation, lockKind) => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
@@ -1543,6 +1537,7 @@ describe("telegram daemon", () => {
 			fs.utimesSync(paths.lock, 0, 0);
 		}
 		const beforeState = fs.readFileSync(paths.state, "utf8");
+		const beforeLock = fs.existsSync(paths.lock) ? fs.readFileSync(paths.lock, "utf8") : undefined;
 		let spawns = 0;
 
 		const result = await ensureTelegramDaemonRunning(
@@ -1550,7 +1545,7 @@ describe("telegram daemon", () => {
 			{
 				pid: 4242,
 				pidAlive: pid => pid === 999,
-				pidIncarnation: pid => (pid === 999 ? pidIncarnation() : "linux:200"),
+				pidIncarnation: pid => (pid === 999 ? currentIncarnation : "linux:200"),
 				spawn: () => {
 					spawns++;
 					return { unref() {} };
@@ -1561,6 +1556,8 @@ describe("telegram daemon", () => {
 		expect(result).toBe("blocked");
 		expect(spawns).toBe(0);
 		expect(fs.readFileSync(paths.state, "utf8")).toBe(beforeState);
+		expect(fs.existsSync(paths.lock)).toBe(beforeLock !== undefined);
+		if (beforeLock !== undefined) expect(fs.readFileSync(paths.lock, "utf8")).toBe(beforeLock);
 		expect(fs.existsSync(paths.roots)).toBe(false);
 	});
 

@@ -1,5 +1,5 @@
 {
-  "contractVersion": 12,
+  "contractVersion": 13,
   "inventory": {
     "telegram": {
       "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts": [
@@ -224,7 +224,7 @@
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:runChatDaemonInternal": "74c0a7c475325313453a4295479fd4cb2fcb3af6137426b8262b768d5bc276d0",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:CHAT_DAEMON_GENERATIONS.discord": "570259c98a12622fc637fa668d13931542ac8321e2bc1d738e08da056815b6bb",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonAction": "d8acaf90439e410595b5cd56fd187001393ea943517a5563a4a2ea3c88d155ef",
-    "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonController": "a23519eec01b6549d6f114216c59260a24a7a8a2ca0bb92c3c02f717389c60d8",
+    "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonController": "ed3338e4c80b81d717d936cda7055eb9034c614b94b6a5b3dc3bf3e97f614258",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonKind": "b1c2906c4eb04e120c9ce42f8b549a68cfc834d29d4d745335712a7f61bf09f2",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonState": "cef3a67f3f6652e6bf92166f24ac16713e1c3f3d55c5917bf722364f6ecabdc4",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:acquireChatDaemonOwnership": "28767a80937c72352b62a34d813a7c489231ccea86155d7bad541191d9e4fa98",
@@ -285,7 +285,7 @@
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:runChatDaemonInternal": "74c0a7c475325313453a4295479fd4cb2fcb3af6137426b8262b768d5bc276d0",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:CHAT_DAEMON_GENERATIONS.slack": "251d996568fb74bc999dba7b52b48e70786f475ede8565ada08388d2ec171656",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonAction": "d8acaf90439e410595b5cd56fd187001393ea943517a5563a4a2ea3c88d155ef",
-    "slack:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonController": "a23519eec01b6549d6f114216c59260a24a7a8a2ca0bb92c3c02f717389c60d8",
+    "slack:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonController": "ed3338e4c80b81d717d936cda7055eb9034c614b94b6a5b3dc3bf3e97f614258",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonKind": "b1c2906c4eb04e120c9ce42f8b549a68cfc834d29d4d745335712a7f61bf09f2",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonState": "cef3a67f3f6652e6bf92166f24ac16713e1c3f3d55c5917bf722364f6ecabdc4",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:acquireChatDaemonOwnership": "28767a80937c72352b62a34d813a7c489231ccea86155d7bad541191d9e4fa98",
@@ -366,7 +366,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts:runDaemonSmoke": "6f085a667aa5c83de46d2d8945fb845c355fcbb43c46872342a44489203a5830",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts:DAEMON_GENERATION": "aae44aa3da5ce95baf02f0303079383a9a2c7bb5551337d1cfb138af8c4cd2f4",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts:NOTIFICATION_PROTOCOL_VERSION": "b99289f651fedcf020d28dbaf6f07dd37e7e4a5f6dc1f5118b872112325f1e81",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:TelegramDaemonController": "1eb09d2d3f4612968ccc8d05e48678e02115e5816dd7f2b2a474380df32ead3c",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:TelegramDaemonController": "96da3262531bc6606f9bd25c31e012412169b874b018805e7f583e2a19ba7693",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:clearOwnRequest": "5f02e8a6d69b7400db8aa5f6e33a4efcc29d9b36aa0d71aaeab151b9dbe710c3",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:reload": "22f55a88ce4338529c15495793796f9afd81f8c9da7bbfc8cd10e34cc2442507",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:reloadForGenerationUpgrade": "41cb7e72d4dbccbb53244a4b38d98d08c8d84a23624c8d1dce52e7584dfad8e6",
@@ -385,7 +385,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:acquireDaemonOwnership": "b0a3caef61ee09eb2fa50b105c3885271009dc0dabe1f8e61534dbe57f47a89d",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:acquireTransitionLock": "148715ae25e7c78a3176b80bfd609cfc219052e1690108f17a03b7f10a7656f4",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:bindProvisionalDaemonPid": "3eb3ed518d3071d6d47f323ee17b1749fafa8e96d0c884f6059943c956bf2b0f",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:classifyForeignLiveOwner": "e9069f228d01ad379a4502e37446711a2a1d45efc64ee4c787c4b8623d521915",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:classifyForeignLiveOwner": "2d5fd7a7bdd23eba94619bb766838db51b8a5cbe26958e3bab8dae19ebc72163",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:confirmTelegramDaemonSpawn": "0a1326ba8971e774f8f1a42ac1e10ba682f02460646d73dd340da5739ca777a2",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:defaultPidIncarnation": "377afc123d25710c634df1fcc7f39a0c24d2034e0c31e8ed407435cc4c55a313",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:ensureTelegramDaemonRunning": "0dbc6e3450ee72827d720cf492b69c4659e2f366d4d2ff4c008cc19f793a5a19",
@@ -409,5 +409,6 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:tryCreateOwnershipLock": "774856cf9f50be869cc3d087d78469e6db719a73ca1d8fc57d388dfbad4c0b81",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:unregisterNotificationRoot": "f29a0e6c318d283d56ea54888af48724faa64f21f4d1399e3d5fd2c099239d4a",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:waitForTelegramDaemonReady": "fe21962bdcf6501a7ba4ea7e04bf442394e35cba4f296fd3469c680730b1cdfb"
-  }
+  },
+  "nativePathIdentitySha256": "27c0ecef3655f8ab44395ad964af181688146e2313f4d98aa3df2fe3a7ac3beb"
 }

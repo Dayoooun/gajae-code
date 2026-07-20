@@ -1000,10 +1000,10 @@ describe("TelegramDaemonController captured-owner signal races", () => {
 });
 
 describe.each([
-	["linux:100", "linux:101"],
-	["darwin:100:1", "darwin:101:1"],
-	["windows:100", "windows:101"],
-] as const)("stable %s process signaling", (incarnation, successor) => {
+	["linux", "linux:100", "linux:101"],
+	["darwin", "darwin:100:1", "darwin:101:1"],
+	["win32", "windows:100", "windows:101"],
+] as const)("stable injected %s process signaling", (platform, incarnation, successor) => {
 	test("never signals the numeric PID successor that appears immediately before signaling", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
@@ -1016,6 +1016,7 @@ describe.each([
 		const replacementSignals: NodeJS.Signals[] = [];
 		const result = await new TelegramDaemonController(s, {
 			pidAlive: pid => pid === 999 && oldOwnerAlive,
+			platform,
 			pidIncarnation: () => currentIncarnation,
 			processReference: () => {
 				// The numeric PID is reused after the final ordinary provenance probe.
@@ -1032,6 +1033,25 @@ describe.each([
 		expect(result.ok).toBe(true);
 		expect(stableSignals).toEqual(["SIGTERM"]);
 		expect(replacementSignals).toEqual([]);
+	});
+});
+
+describe("Darwin default daemon signaling", () => {
+	test("Telegram refuses Darwin TERM/KILL without opening the native numeric-PID signal path", async () => {
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		const state = freshState({ incarnation: "darwin:999:1" });
+		writeState(agentDir, state);
+		writeOwnershipLock(agentDir, state);
+
+		const result = await new TelegramDaemonController(s, {
+			platform: "darwin",
+			pidAlive: pid => pid === 999,
+			pidIncarnation: () => "darwin:999:1",
+		}).stop({ force: true, gracefulTimeoutMs: 1, killTimeoutMs: 1 });
+
+		expect(result.ok).toBe(false);
+		expect(result.message).toContain("ownership changed");
 	});
 });
 
@@ -1163,6 +1183,51 @@ describe("ChatDaemonController ownership safety", () => {
 		const result = await controller.stop();
 		expect(result.ok).toBe(true);
 		expect(signals).toEqual([]);
+	});
+
+	test("refuses Darwin default TERM/KILL without opening the native numeric-PID signal path", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(
+			Settings.isolated({
+				"notifications.enabled": true,
+				"notifications.discord.botToken": "discord-token",
+				"notifications.discord.applicationId": "app",
+				"notifications.discord.guildId": "guild",
+				"notifications.discord.parentChannelId": "parent",
+			}) as Settings,
+			agentDir,
+		);
+		const identity = crypto
+			.createHash("sha256")
+			.update(["discord-token", "app", "guild", "parent", "false", "lean"].join("\0"))
+			.digest("hex")
+			.slice(0, 16);
+		const paths = chatDaemonPaths(agentDir, "discord");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				version: 1,
+				kind: "discord",
+				pid: 77,
+				ownerId: "owner-a",
+				identity,
+				incarnation: "darwin:77:1",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+				transportHealthy: true,
+				generation: chatDaemonGeneration("discord"),
+			}),
+		);
+
+		const result = await new ChatDaemonController(s, "discord", {
+			platform: "darwin",
+			pidAlive: pid => pid === 77,
+			pidIncarnation: () => "darwin:77:1",
+		}).stop({ force: true, gracefulTimeoutMs: 1, killTimeoutMs: 1 });
+
+		expect(result.ok).toBe(false);
+		expect(result.message).toContain("ownership changed");
 	});
 
 	test("signals a stable chat reference when a numeric PID is reused immediately before TERM", async () => {

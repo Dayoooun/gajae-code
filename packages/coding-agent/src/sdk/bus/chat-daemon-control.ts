@@ -117,7 +117,11 @@ export interface ChatDaemonProcessReference {
 	signal(signal: NodeJS.Signals): void;
 }
 
-function defaultProcessReference(pid: number): ChatDaemonProcessReference | undefined {
+function defaultProcessReference(pid: number, platform = os.platform()): ChatDaemonProcessReference | undefined {
+	// Process.fromPid on Darwin still resolves identity and then signals a numeric
+	// PID. A process can exit and its PID be reused in that interval, so daemon
+	// control must not use it as privileged signaling authority.
+	if (platform === "darwin") return undefined;
 	try {
 		const processRef = Process.fromPid(pid);
 		if (!processRef || !hasProcessIncarnationAuthority(processRef.incarnation)) return undefined;
@@ -142,6 +146,8 @@ export interface ChatDaemonControlDeps {
 	ownerPid?: number;
 	randomId?: () => string;
 	pidIncarnation?: (pid: number) => string | undefined;
+	/** Test seam for platform-specific default stable-process authority. */
+	platform?: NodeJS.Platform;
 	sleep?: (ms: number) => Promise<void>;
 	spawnReadyTimeoutMs?: number;
 }
@@ -486,7 +492,9 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		return (this.deps.pidIncarnation ?? processIncarnation)(pid);
 	}
 	private processReference(pid: number): ChatDaemonProcessReference | undefined {
-		return (this.deps.processReference ?? defaultProcessReference)(pid);
+		return this.deps.processReference
+			? this.deps.processReference(pid)
+			: defaultProcessReference(pid, this.deps.platform);
 	}
 	private isDefinitelyStoppedState(state: ChatDaemonState | undefined): boolean {
 		if (!state || !hasSafeChatDaemonOwnerShape(state)) return false;
