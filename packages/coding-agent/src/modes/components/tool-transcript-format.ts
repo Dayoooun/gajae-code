@@ -17,7 +17,7 @@ export const INPUT_MAX_JSON_NODES = 20_000;
 export type ToolDisplaySections = {
 	callLines: string[];
 	statusLines: string[];
-	resultLines: string[];
+	resultText: string;
 };
 
 /**
@@ -34,20 +34,20 @@ export function renderToolDisplayLines(
 	const sections = bounded.inputTruncated ? truncatedPlainSections(bounded) : richSections(bounded, theme);
 	const wrap = (lines: string[]) =>
 		balanceWrappedSgr(lines.flatMap(line => wrapTextWithAnsi(validateDisplayLine(line), Math.max(1, contentWidth))));
-	const callLines = wrap(sections.callLines);
-	const statusLines = wrap(sections.statusLines);
-	const resultLines = wrap(sections.resultLines);
+	const result = cappedResultLines(sections.resultText);
+	const resultLines = wrap(result.lines);
 	const shown = resultLines.slice(0, TOOL_RESULT_MAX_EXPANDED_LINES);
-	if (resultLines.length > TOOL_RESULT_MAX_EXPANDED_LINES)
+	if (result.omittedLineCount > 0) shown.push(`... ${result.omittedLineCount} more lines`);
+	else if (resultLines.length > TOOL_RESULT_MAX_EXPANDED_LINES)
 		shown.push(`... ${resultLines.length - TOOL_RESULT_MAX_EXPANDED_LINES} more lines`);
-	return [...callLines, ...statusLines, ...shown];
+	return [...wrap(sections.callLines), ...wrap(sections.statusLines), ...shown];
 }
 
 function truncatedPlainSections(descriptor: ToolTranscriptRenderDescriptor): ToolDisplaySections {
 	return {
 		callLines: [descriptor.name, ...composeToolCall(descriptor).split("\n").filter(Boolean)],
 		statusLines: [!descriptor.hasResult ? "⏳ pending" : descriptor.isError ? "✗ Error" : "✓ done"],
-		resultLines: ["... input truncated for rendering (press r for raw)", ...descriptor.resultContent.split("\n")],
+		resultText: `... input truncated for rendering (press r for raw)\n${boundedPlainResult(descriptor.resultContent)}`,
 	};
 }
 
@@ -87,7 +87,7 @@ function plainSections(descriptor: ToolTranscriptRenderDescriptor, theme: Theme)
 	return {
 		callLines: [theme.fg("accent", descriptor.name), ...composeToolCall(descriptor).split("\n").filter(Boolean)],
 		statusLines: [statusLine(descriptor, theme)],
-		resultLines: boundedPlainResult(descriptor.resultContent).split("\n"),
+		resultText: boundedPlainResult(descriptor.resultContent),
 	};
 }
 
@@ -95,15 +95,15 @@ function richSections(descriptor: ToolTranscriptRenderDescriptor, theme: Theme):
 	const sections = plainSections(descriptor, theme);
 	const diff = extractDiff(descriptor.detailsData) ?? descriptor.details;
 	if ((descriptor.name === "edit" || descriptor.name === "write" || descriptor.name === "apply_patch") && diff) {
-		sections.resultLines = renderDiff(diff, { filePath: extractPath(descriptor.detailsData) }).split("\n");
+		sections.resultText = renderDiff(diff, { filePath: extractPath(descriptor.detailsData) });
 	} else if (descriptor.detailsData && typeof descriptor.detailsData === "object") {
-		sections.resultLines = renderJsonTreeLines(
+		sections.resultText = renderJsonTreeLines(
 			descriptor.detailsData,
 			theme,
 			INPUT_MAX_JSON_DEPTH,
 			TOOL_RESULT_MAX_EXPANDED_LINES * 2,
 			INPUT_MAX_SCALAR_LEN,
-		).lines;
+		).lines.join("\n");
 	}
 	return sections;
 }
@@ -121,12 +121,35 @@ function statusLine(descriptor: ToolTranscriptRenderDescriptor, theme: Theme): s
 }
 
 function boundedPlainResult(text: string): string {
-	return Buffer.from(text)
-		.subarray(0, INPUT_MAX_SOURCE_BYTES)
-		.toString()
-		.split("\n")
-		.slice(0, INPUT_MAX_SOURCE_LINES)
-		.join("\n");
+	const boundedBytes =
+		Buffer.byteLength(text) > INPUT_MAX_SOURCE_BYTES
+			? Buffer.from(text).subarray(0, INPUT_MAX_SOURCE_BYTES).toString()
+			: text;
+	let end = boundedBytes.length;
+	let lineCount = 1;
+	for (let index = 0; index < boundedBytes.length; index++) {
+		if (boundedBytes[index] !== "\n") continue;
+		if (lineCount === INPUT_MAX_SOURCE_LINES) {
+			end = index;
+			break;
+		}
+		lineCount += 1;
+	}
+	return boundedBytes.slice(0, end);
+}
+
+function cappedResultLines(result: string): { lines: string[]; omittedLineCount: number } {
+	let lineCount = 1;
+	let prefixEnd = result.length;
+	for (let index = 0; index < result.length; index++) {
+		if (result[index] !== "\n") continue;
+		if (lineCount === TOOL_RESULT_MAX_EXPANDED_LINES) prefixEnd = index;
+		lineCount += 1;
+	}
+	return {
+		lines: result.slice(0, prefixEnd).split("\n"),
+		omittedLineCount: Math.max(0, lineCount - TOOL_RESULT_MAX_EXPANDED_LINES),
+	};
 }
 
 function extractDiff(value: unknown): string | undefined {

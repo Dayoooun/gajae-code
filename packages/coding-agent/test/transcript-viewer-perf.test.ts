@@ -95,6 +95,18 @@ test("bounds expanded tool rendering independently of raw result size", () => {
 	expect(assistant?.payload.text.split("\n")).toHaveLength(150);
 });
 
+test("caps a valid 50,000-line result before wrapping while preserving source omission accounting", () => {
+	const descriptor = createToolTranscriptRenderDescriptor({
+		name: "bash",
+		args: {},
+		resultContent: Array.from({ length: 50_000 }, () => "x".repeat(19)).join("\n"),
+		hasResult: true,
+	});
+	const lines = renderToolDisplayLines(descriptor, 1, theme);
+	expect(lines).toHaveLength(TOOL_RESULT_MAX_EXPANDED_LINES + 11);
+	expect(lines.at(-1)).toBe("... 49900 more lines");
+});
+
 test("keeps rich expanded-tool recompute below the frame budget without a cache", () => {
 	const descriptor = createToolTranscriptRenderDescriptor({
 		name: "edit",
