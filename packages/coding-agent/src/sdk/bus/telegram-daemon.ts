@@ -17,7 +17,7 @@ import {
 	parseTelegramControlCommand,
 	parseToolActivityToggleCommand,
 } from "./config-commands";
-import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
+import { type DaemonPaths, daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
 import { sanitizeDiagnostic } from "./notification-service";
 import { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION } from "./telegram-daemon-contract";
 import { type TelegramDaemonControlDeps, TelegramDaemonController } from "./telegram-daemon-control";
@@ -6162,14 +6162,12 @@ export class TelegramNotificationDaemon {
 				await this.runtime.sleep(10);
 			}
 		} finally {
-			let toolShutdownError: unknown;
-			try {
-				await this.beginToolActivityShutdown();
-			} catch (error) {
-				toolShutdownError = error;
-			}
 			this.effects.beginShutdown();
 			this.#deliveryAbort.abort();
+			const toolShutdown = this.beginToolActivityShutdown().then(
+				() => undefined,
+				error => error,
+			);
 			let persisted = false;
 			let drained = false;
 			const deadlineAt = Date.now() + BTW_SHUTDOWN_JOIN_MS;
@@ -6183,10 +6181,11 @@ export class TelegramNotificationDaemon {
 				if (this.#ownershipLost) {
 					drained = true;
 				} else {
-					if (toolShutdownError) throw toolShutdownError;
 					const btwDrain = this.#drainBtwTurns();
 					const notificationDrain = this.drainQueuedNotificationsOnShutdown(deadlineAt);
 					await btwDrain;
+					const toolShutdownError = await toolShutdown;
+					if (toolShutdownError) throw toolShutdownError;
 					await this.toolTerminalizationChain;
 					drained = await notificationDrain;
 				}

@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 import manifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
-import { assertGuardAuthority, currentTreeDigests, declaration, evaluate, GUARD_CONTRACT_VERSION, isGenerationFiveBootstrapFingerprint, isLegacyBootstrapBase, manifestForCurrentTree, protectedInventory, validateCiInputs, validateCurrentTreeManifest, validateInventory, validateManifest, validateSha, writeManifest } from "./telegram-daemon-generation-guard";
+import { assertGuardAuthority, currentTreeDigests, declaration, evaluate, GUARD_CONTRACT_VERSION, isGenerationFiveBootstrapFingerprint, isGenerationSixBootstrapFingerprint, isLegacyBootstrapBase, manifestForCurrentTree, protectedInventory, validateCiInputs, validateCurrentTreeManifest, validateInventory, validateManifest, validateSha, writeManifest } from "./telegram-daemon-generation-guard";
 
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
@@ -166,30 +166,37 @@ describe("daemon generation release guard", () => {
 		}
 	});
 
-	test("pins the exact pre-guard generation-5 development topology", () => {
-		expect(
-			isGenerationFiveBootstrapFingerprint({
-				contract: "1644acc9de4ff0f8d4252f82a71d30d6688faf358acf645e328d8e5629572df1",
-				daemon: "42528cb24eaebf8c1ea13e643f76104e1c01b7e4c6ac77dad7d13ca6c5370041",
-				chat: "a81e0b196fee296282e4d10f104bb50242d23b4865136cf767aabc94b7d0102d",
-			}),
-		).toBe(true);
-		expect(
-			isGenerationFiveBootstrapFingerprint({
-				contract: "0644acc9de4ff0f8d4252f82a71d30d6688faf358acf645e328d8e5629572df1",
-				daemon: "42528cb24eaebf8c1ea13e643f76104e1c01b7e4c6ac77dad7d13ca6c5370041",
-				chat: "a81e0b196fee296282e4d10f104bb50242d23b4865136cf767aabc94b7d0102d",
-			}),
-		).toBe(false);
+test("pins exact pre-guard generation development topologies", () => {
+	expect(
+		isGenerationFiveBootstrapFingerprint({
+			contract: "1644acc9de4ff0f8d4252f82a71d30d6688faf358acf645e328d8e5629572df1",
+			daemon: "42528cb24eaebf8c1ea13e643f76104e1c01b7e4c6ac77dad7d13ca6c5370041",
+			chat: "a81e0b196fee296282e4d10f104bb50242d23b4865136cf767aabc94b7d0102d",
+		}),
+	).toBe(true);
+	expect(
+		isGenerationSixBootstrapFingerprint({
+			contract: "4aa4e927c2f4dff59ea40b49b8601a210b3ee0ebc2cfe03b18789309b09b7241",
+			daemon: "828a5ef1d19df5944941d3979608ef8cfe764cac374730b6c40a7583dde9dce3",
+			chat: "a81e0b196fee296282e4d10f104bb50242d23b4865136cf767aabc94b7d0102d",
+		}),
+	).toBe(true);
+	expect(
+		isGenerationSixBootstrapFingerprint({
+			contract: "0aa4e927c2f4dff59ea40b49b8601a210b3ee0ebc2cfe03b18789309b09b7241",
+			daemon: "828a5ef1d19df5944941d3979608ef8cfe764cac374730b6c40a7583dde9dce3",
+			chat: "a81e0b196fee296282e4d10f104bb50242d23b4865136cf767aabc94b7d0102d",
+		}),
+	).toBe(false);
 
-		const broadGenerationFive = files({ telegramOwnership: "return true;" });
-		broadGenerationFive.set(
-			telegramContract,
-			"export const NOTIFICATION_PROTOCOL_VERSION = 3;\nexport const DAEMON_GENERATION = 5;",
-		);
-		broadGenerationFive.set(chatControl, legacyChatDaemonControl);
-		expect(isLegacyBootstrapBase(broadGenerationFive)).toBe(false);
-	});
+	const broadGenerationFive = files({ telegramOwnership: "return true;" });
+	broadGenerationFive.set(
+		telegramContract,
+		"export const NOTIFICATION_PROTOCOL_VERSION = 3;\nexport const DAEMON_GENERATION = 5;",
+	);
+	broadGenerationFive.set(chatControl, legacyChatDaemonControl);
+	expect(isLegacyBootstrapBase(broadGenerationFive)).toBe(false);
+});
 
 	test("semantic manifest rejects duplicate, moved, and narrowed inventories", () => {
 		expect(() => validateManifest()).not.toThrow();

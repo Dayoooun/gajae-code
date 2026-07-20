@@ -19,6 +19,11 @@ const GENERATION_FIVE_BOOTSTRAP_SHA256 = {
 	daemon: "42528cb24eaebf8c1ea13e643f76104e1c01b7e4c6ac77dad7d13ca6c5370041",
 	chat: "a81e0b196fee296282e4d10f104bb50242d23b4865136cf767aabc94b7d0102d",
 } as const;
+const GENERATION_SIX_BOOTSTRAP_SHA256 = {
+	contract: "4aa4e927c2f4dff59ea40b49b8601a210b3ee0ebc2cfe03b18789309b09b7241",
+	daemon: "828a5ef1d19df5944941d3979608ef8cfe764cac374730b6c40a7583dde9dce3",
+	chat: "a81e0b196fee296282e4d10f104bb50242d23b4865136cf767aabc94b7d0102d",
+} as const;
 
 export function isGenerationFiveBootstrapFingerprint(input: {
 	contract: string;
@@ -29,6 +34,18 @@ export function isGenerationFiveBootstrapFingerprint(input: {
 		input.contract === GENERATION_FIVE_BOOTSTRAP_SHA256.contract &&
 		input.daemon === GENERATION_FIVE_BOOTSTRAP_SHA256.daemon &&
 		input.chat === GENERATION_FIVE_BOOTSTRAP_SHA256.chat
+	);
+}
+
+export function isGenerationSixBootstrapFingerprint(input: {
+	contract: string;
+	daemon: string;
+	chat: string;
+}): boolean {
+	return (
+		input.contract === GENERATION_SIX_BOOTSTRAP_SHA256.contract &&
+		input.daemon === GENERATION_SIX_BOOTSTRAP_SHA256.daemon &&
+		input.chat === GENERATION_SIX_BOOTSTRAP_SHA256.chat
 	);
 }
 
@@ -402,10 +419,18 @@ export function isLegacyBootstrapBase(base: ReadonlyMap<string, string | undefin
 				daemon: crypto.createHash("sha256").update(daemon).digest("hex"),
 				chat: crypto.createHash("sha256").update(chat).digest("hex"),
 			});
+		const generationSixDevBaseline =
+			generationDeclaration?.init?.type === "NumericLiteral" &&
+			generationDeclaration.init.value === 6 &&
+			isGenerationSixBootstrapFingerprint({
+				contract: crypto.createHash("sha256").update(contract).digest("hex"),
+				daemon: crypto.createHash("sha256").update(daemon).digest("hex"),
+				chat: crypto.createHash("sha256").update(chat).digest("hex"),
+			});
 		return (
 			protocolDeclaration?.init?.type === "NumericLiteral" &&
 			protocolDeclaration.init.value === 3 &&
-			(legacyProtocolAlias || generationFiveDevBaseline) &&
+			(legacyProtocolAlias || generationFiveDevBaseline || generationSixDevBaseline) &&
 			!declarationNode(chatProgram, "CHAT_DAEMON_GENERATIONS") &&
 			!declarationNode(chatProgram, "chatDaemonGeneration") &&
 			hasOperate

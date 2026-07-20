@@ -1777,7 +1777,6 @@ describe("telegram daemon", () => {
 		expect(registry).toEqual({ version: 1, roots: [manualRoot], managedRoots: [], sessions: {} });
 	});
 
-
 	test("detailed ensure refuses a stale-heartbeat live owner instead of attaching", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);

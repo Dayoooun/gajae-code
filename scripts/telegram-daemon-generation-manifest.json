@@ -396,7 +396,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:requestStop": "90c9a15932f6f6bc68b0aea4c375e9dc0ea181e0951c1fe8006586ef032149f7",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:restoreNotificationRootRegistration": "5e3fb78dc9176da05a4392e59d9c9872293534415fc4dc6f74df35eb9ee95daf",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:retireProvisionalDaemonOwnership": "0cb5f358ff030c909fc562cec2d81c3a3942efe9a25def1fc311a9c573fbda43",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:run": "964bd39115f8ffa04aca50b7f752c4e50b680518bebbb437435be4681b4cb958",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:run": "41f70664b101a80409ad06f1385fef9865a08127a71a90f91b1eec8dc5360893",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:spawnTelegramDaemonOwner": "fdfbd5372cdbce971f3dfc2f3efdbe3029b790d75119aa3d34af2d24e9d85ec9",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:startOwnershipHeartbeatTimer": "6614a13a5108e23dacca2ad879fc172c68ff1751eb5bf301f7e2249cac094c7e",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:submitPool": "9d6f3fbe5f94e7d5270b824a9553d66c5cb78df34eaf00a43e647b2c69fbeea8",

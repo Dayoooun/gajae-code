@@ -20,7 +20,7 @@
       "id": "generation-guard",
       "command": "bun test scripts/telegram-daemon-generation-guard.test.ts",
       "result": "passed",
-      "coverage": "semantic lifecycle inventory and current-tree digest enforcement"
+      "coverage": "semantic lifecycle inventory, current-tree digest enforcement, and the exact pre-guard generation-6 dev bootstrap"
     },
     {
       "id": "compiled-daemon-process-smoke",
@@ -32,8 +32,8 @@
       "id": "package-check",
       "command": "bun --cwd=packages/coding-agent run check",
       "result": "passed",
-      "coverage": "Biome, SDK canonicalization, TypeScript"
+      "coverage": "Biome and TypeScript package validation"
     }
   ],
-  "summary": "355 focused tests passed with 0 failures; package check and current-tree guard validation passed."
+  "summary": "567 focused tests passed with 0 failures after reconciling current dev c7d8f8a7e1cf3452563c0556d763e732211efb4f; package check and current-tree guard validation passed."
 }
