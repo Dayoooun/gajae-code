@@ -885,15 +885,19 @@ describe("telegram daemon", () => {
 			}),
 		).resolves.toMatchObject({ acquired: true });
 	});
-	test("release serializes a successor acquisition behind the transition fence", async () => {
+	test("release removes only the exact old lock before a successor acquires", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const pidAlive = (pid: number) => pid === 111 || pid === 222 || pid === process.pid;
+		const pidIncarnation = (pid: number) => (pid === 111 ? "linux:111" : pid === 222 ? "linux:222" : `linux:${pid}`);
 		await acquireDaemonOwnership({
 			settings: s,
 			tokenFingerprint: "fp",
 			chatId: "42",
 			pid: 111,
 			ownerId: "old",
+			pidAlive,
+			pidIncarnation,
 		});
 		const paths = daemonPaths(agentDir);
 		let stoppedWritten!: () => void;
@@ -901,6 +905,7 @@ describe("telegram daemon", () => {
 		const stoppedWrite = new Promise<void>(resolve => {
 			stoppedWritten = resolve;
 		});
+		let pausedStoppedWrite = false;
 		const releaseGate = new Promise<void>(resolve => {
 			continueRelease = resolve;
 		});
@@ -910,7 +915,8 @@ describe("telegram daemon", () => {
 			readFile: (file, encoding) => fs.promises.readFile(file, encoding),
 			writeFile: async (file, data, opts) => {
 				await fs.promises.writeFile(file, data, opts);
-				if (file.startsWith(`${paths.state}.`) && file.endsWith(".tmp")) {
+				if (!pausedStoppedWrite && file.startsWith(`${paths.state}.`) && file.endsWith(".tmp")) {
+					pausedStoppedWrite = true;
 					stoppedWritten();
 					await releaseGate;
 				}
@@ -928,16 +934,9 @@ describe("telegram daemon", () => {
 			chatId: "42",
 			pid: 111,
 			fs: pausedFs,
+			pidIncarnation,
 		});
 		await stoppedWrite;
-		const successor = acquireDaemonOwnership({
-			settings: s,
-			tokenFingerprint: "fp",
-			chatId: "42",
-			pid: 222,
-			ownerId: "new",
-		});
-		await expect(successor).resolves.toMatchObject({ acquired: false, attached: false, provisional: true });
 		continueRelease();
 		await release;
 		await expect(
@@ -947,6 +946,8 @@ describe("telegram daemon", () => {
 				chatId: "42",
 				pid: 222,
 				ownerId: "new",
+				pidAlive,
+				pidIncarnation,
 			}),
 		).resolves.toMatchObject({ acquired: true, ownerId: "new" });
 		expect((await readDaemonState(s))?.ownerId).toBe("new");

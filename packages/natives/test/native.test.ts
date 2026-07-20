@@ -98,7 +98,7 @@ describe("pi-natives", () => {
 		const childProgram = "setInterval(() => {}, 1_000);";
 		const rootProgram = `
 			const fs = require("node:fs");
-			const child = Bun.spawn([process.execPath, "-e", ${JSON.stringify(childProgram)}], { stdio: ["ignore", "ignore", "ignore"] });
+			const child = Bun.spawn([process.execPath, "-e", ${JSON.stringify(childProgram)}], { detached: true, stdio: ["ignore", "ignore", "ignore"] });
 			fs.writeFileSync(${JSON.stringify(childPidPath)}, String(child.pid));
 			setInterval(() => {}, 1_000);
 		`;
