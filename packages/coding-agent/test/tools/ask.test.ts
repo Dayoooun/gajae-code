@@ -565,6 +565,41 @@ describe("AskTool cancellation", () => {
 				context,
 			),
 		).rejects.toThrow("user_response exceeds max length 10000");
+		const settlements: unknown[] = [];
+		const remote = new AskTool(
+			createSession({
+				getAskAnswerSource: () => ({
+					awaitAnswer: async () => undefined,
+					awaitAnswerRequest: async () => ({
+						source: "remote" as const,
+						interaction: { kind: "value" as const, value: oversized },
+						settle: async settlement => {
+							settlements.push(settlement);
+							return { kind: "resolved_without_commit" as const };
+						},
+					}),
+				}),
+			}),
+		);
+		await expect(
+			remote.execute(
+				"call-remote-oversized-legacy-deep-input",
+				{
+					questions: [
+						{
+							id: "legacy-deep",
+							question:
+								"Round 1 | Component: Scope | Targeting: Constraints | Why now: unresolved boundary | Ambiguity: 42%\n\nWhat is the boundary?",
+							options: [{ label: "Known" }],
+						},
+					],
+				},
+				undefined,
+				undefined,
+				createContext({ select: () => new Promise<string | undefined>(() => {}) }),
+			),
+		).rejects.toThrow("user_response exceeds max length 10000");
+		expect(settlements).toEqual([{ kind: "invalid", reason: "invalid_structured_answer" }]);
 		expect(appendSpy).not.toHaveBeenCalled();
 	});
 

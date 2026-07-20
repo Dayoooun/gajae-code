@@ -1482,7 +1482,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 							return displayIndex >= 0 ? (rawOptionLabels[displayIndex] ?? selected) : selected;
 						})
 					: displaySelectedOptions;
-				if (isDeepInterviewQuestion && customInput !== undefined)
+				if ((isDeepInterviewQuestion || isDeepInterviewAskQuestion(q.question)) && customInput !== undefined)
 					assertDeepInterviewInputWithinLimit(customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
 				if (activeRemoteReceipt) {
 					const settlement: AskSettlement =
