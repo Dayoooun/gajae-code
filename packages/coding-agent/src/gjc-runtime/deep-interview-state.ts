@@ -485,8 +485,12 @@ export function assertDeepInterviewEnvelopeInputLimits(envelope: Record<string, 
 			? (envelope.state as Record<string, unknown>)
 			: {};
 	for (const field of ["initial_idea", "initial_context", "initial_context_summary"] as const) {
-		const value = state[field] ?? envelope[field];
-		if (value !== undefined) assertDeepInterviewInputWithinLimit(value as string, MAX_INITIAL_CONTEXT_LENGTH, field);
+		const nestedValue = state[field];
+		if (nestedValue !== undefined)
+			assertDeepInterviewInputWithinLimit(nestedValue as string, MAX_INITIAL_CONTEXT_LENGTH, `state.${field}`);
+		const topLevelValue = envelope[field];
+		if (topLevelValue !== undefined)
+			assertDeepInterviewInputWithinLimit(topLevelValue as string, MAX_INITIAL_CONTEXT_LENGTH, field);
 	}
 }
 

@@ -468,6 +468,19 @@ describe("native gjc state runtime", () => {
 		);
 		expect(valid.status).toBe(0);
 		const before = await fs.readFile(statePath, "utf-8");
+		const conflictingCopies = await runNativeStateCommand(
+			[
+				"write",
+				"--input",
+				JSON.stringify({ initial_idea: "😀".repeat(50_001), state: { initial_idea: "valid" } }),
+				"--mode",
+				"deep-interview",
+			],
+			root,
+		);
+		expect(conflictingCopies.status).toBe(2);
+		expect(conflictingCopies.stderr).toContain("initial_idea exceeds max length 50000");
+		expect(await fs.readFile(statePath, "utf-8")).toBe(before);
 		const oversizedUpdate = await runNativeStateCommand(
 			[
 				"write",
