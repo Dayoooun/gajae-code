@@ -140,9 +140,10 @@ struct ExactFileIdentity {
 /// Typed result of an identity-bound regular-file deletion or directory detach.
 #[napi(object)]
 pub struct NativeExactUnlinkResult {
-	pub ok:            bool,
-	pub code:          Option<String>,
+	pub ok: bool,
+	pub code: Option<String>,
 	pub detached_path: Option<String>,
+	pub retained_successor_path: Option<String>,
 }
 
 /// A deterministic, no-follow description of a directory tree. `relative_path`
@@ -188,19 +189,38 @@ impl NativeDirectoryTreeResult {
 
 impl NativeExactUnlinkResult {
 	const fn success() -> Self {
-		Self { ok: true, code: None, detached_path: None }
+		Self { ok: true, code: None, detached_path: None, retained_successor_path: None }
 	}
 
 	const fn detached(path: String) -> Self {
-		Self { ok: true, code: None, detached_path: Some(path) }
+		Self { ok: true, code: None, detached_path: Some(path), retained_successor_path: None }
 	}
 
 	fn detached_failure(code: &str, path: String) -> Self {
-		Self { ok: false, code: Some(code.to_owned()), detached_path: Some(path) }
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			detached_path: Some(path),
+			retained_successor_path: None,
+		}
+	}
+
+	fn detached_failure_with_successor(code: &str, path: String, successor_path: String) -> Self {
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			detached_path: Some(path),
+			retained_successor_path: Some(successor_path),
+		}
 	}
 
 	fn failure(code: &str) -> Self {
-		Self { ok: false, code: Some(code.to_owned()), detached_path: None }
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			detached_path: None,
+			retained_successor_path: None,
+		}
 	}
 }
 
@@ -1418,26 +1438,53 @@ mod platform {
 			&& stat_mtime_ns(&detached) == i128::from(identity.mtime_ns);
 		let digest_matches = identity.directory
 			|| digest_openat(parent_fd, &quarantine).ok().as_ref() == identity.sha256.as_ref();
-		if !matches || !digest_matches {
-			let restored = rename_exchange(parent_fd, parent_fd, &quarantine, &name).is_ok();
-			let cleanup =
-				restored.then(|| remove_exchange_placeholder(parent_fd, &quarantine, placeholder));
-			// SAFETY: this branch owns the live descriptor and closes it exactly once.
-			unsafe { libc::close(parent_fd) };
-			return NativeExactUnlinkResult::failure(if !restored {
-				"restore_failed"
-			} else if !matches!(cleanup, Some(ExchangePlaceholderRemoval::Removed)) {
-				"cleanup_failed"
-			} else {
-				"identity_mismatch"
-			});
-		}
 		let detached_path = path
 			.parent()
 			.unwrap_or_else(|| Path::new("."))
 			.join(quarantine.to_string_lossy().as_ref())
 			.to_string_lossy()
 			.into_owned();
+		if !matches || !digest_matches {
+			// Do not exchange an untrusted detached object over the canonical name.
+			// Detach the canonical entry first; this preserves a successor at its
+			// canonical path or reports its retained recovery path while the stale
+			// object remains available at its quarantine path.
+			let result = match remove_exchange_placeholder(parent_fd, &name, placeholder) {
+				ExchangePlaceholderRemoval::Removed | ExchangePlaceholderRemoval::RestoredMismatch => {
+					NativeExactUnlinkResult::detached_failure("identity_mismatch", detached_path.clone())
+				},
+				ExchangePlaceholderRemoval::RetainedMismatch(retained_name) => {
+					NativeExactUnlinkResult::detached_failure_with_successor(
+						"identity_mismatch",
+						detached_path.clone(),
+						path
+							.parent()
+							.unwrap_or_else(|| Path::new("."))
+							.join(retained_name.to_string_lossy().as_ref())
+							.to_string_lossy()
+							.into_owned(),
+					)
+				},
+				ExchangePlaceholderRemoval::RetainedFailure(retained_name, code) => {
+					NativeExactUnlinkResult::detached_failure_with_successor(
+						code,
+						detached_path.clone(),
+						path
+							.parent()
+							.unwrap_or_else(|| Path::new("."))
+							.join(retained_name.to_string_lossy().as_ref())
+							.to_string_lossy()
+							.into_owned(),
+					)
+				},
+				ExchangePlaceholderRemoval::Failed(code) => {
+					NativeExactUnlinkResult::detached_failure(code, detached_path.clone())
+				},
+			};
+			// SAFETY: this branch owns the live descriptor and closes it exactly once.
+			unsafe { libc::close(parent_fd) };
+			return result;
+		}
 		if identity.directory || identity.detach_only {
 			let result = match remove_exchange_placeholder(parent_fd, &name, placeholder) {
 				ExchangePlaceholderRemoval::Removed => NativeExactUnlinkResult::detached(detached_path),
@@ -3944,18 +3991,20 @@ mod platform {
 					Ok(root) => (root, final_path.clone(), true),
 					Err(result) => {
 						return NativeExactUnlinkResult {
-							ok:            false,
-							code:          result.code,
+							ok: false,
+							code: result.code,
 							detached_path: None,
+							retained_successor_path: None,
 						};
 					},
 				}
 			},
 			Err(result) => {
 				return NativeExactUnlinkResult {
-					ok:            false,
-					code:          result.code,
+					ok: false,
+					code: result.code,
 					detached_path: None,
+					retained_successor_path: None,
 				};
 			},
 		};
@@ -4355,6 +4404,71 @@ mod exact_unlink_placeholder_tests {
 	#[test]
 	fn directory_target_preserves_directory_successor_after_exchange() {
 		preserves_directory_successor(true);
+	}
+
+	fn mismatch_preserves_directory_successor_and_stale_recovery(target_is_directory: bool) {
+		let _guard = exchange_hook_test_guard();
+		let root = std::env::temp_dir().join(format!(
+			"gjc-exact-unlink-mismatch-successor-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+		let target = root.join("target");
+		let successor = root.join("successor");
+		if target_is_directory {
+			fs::create_dir(&target).expect("create target directory");
+		} else {
+			fs::write(&target, b"stale").expect("write stale target");
+		}
+		fs::create_dir(&successor).expect("create successor directory");
+		let metadata = fs::metadata(&target).expect("stat target");
+		let identity = ExactFileIdentity {
+			dev:             metadata.dev(),
+			ino:             metadata.ino(),
+			size:            metadata.size(),
+			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:       target_is_directory,
+			detach_only:     false,
+			quarantine_name: Some(".quarantine".to_owned()),
+			sha256:          (!target_is_directory).then(|| sha256(b"stale")),
+		};
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_after_exchange_hook(Some((entered_tx, resume_rx)));
+		let target_for_unlink = target.clone();
+		let unlink = thread::spawn(move || platform::exact_unlink(&target_for_unlink, &identity));
+		entered_rx.recv().expect("wait for exchange");
+		let stale = root.join(".quarantine");
+		if target_is_directory {
+			fs::write(stale.join("mutation"), b"mutated").expect("mutate detached directory");
+		} else {
+			fs::write(&stale, b"mutated").expect("mutate detached file");
+		}
+		fs::rename(&successor, &target).expect("directory successor replaces placeholder");
+		resume_tx.send(()).expect("resume unlink");
+		let result = unlink.join().expect("exact unlink thread");
+		platform::set_after_exchange_hook(None);
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.detached_path.as_deref(), Some(stale.to_string_lossy().as_ref()));
+		assert!(result.retained_successor_path.is_none());
+		assert!(target.is_dir(), "directory successor was displaced from its canonical path");
+		assert!(stale.exists(), "mutated stale object was not recoverable at its detached path");
+		fs::remove_dir_all(root).expect("remove temporary directory");
+	}
+
+	#[test]
+	fn regular_target_mismatch_preserves_directory_successor_and_stale_recovery() {
+		mismatch_preserves_directory_successor_and_stale_recovery(false);
+	}
+
+	#[test]
+	fn directory_target_mismatch_preserves_directory_successor_and_stale_recovery() {
+		mismatch_preserves_directory_successor_and_stale_recovery(true);
 	}
 
 	fn preserves_directory_successor_after_placeholder_identity_verification(

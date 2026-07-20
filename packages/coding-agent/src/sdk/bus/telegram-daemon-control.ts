@@ -9,7 +9,9 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import { Process } from "@gajae-code/natives";
 import type { Settings } from "../../config/settings";
 import type {
 	BuiltInDaemonController,
@@ -22,6 +24,7 @@ import type {
 } from "../../daemon/control-types";
 import { OWNERSHIP_MISMATCH_MESSAGE, ownershipMismatchRecovery } from "../../daemon/operator-contract";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
+import { isProcessIncarnation } from "../broker/process-incarnation";
 import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
 import { exactUnlinkNotificationFile, readNotificationEndpointFile } from "./notification-service";
 import {
@@ -104,11 +107,33 @@ export async function clearTelegramControlRequest(
 	await fsImpl.unlink(file).catch(() => undefined);
 }
 
+export interface DaemonProcessReference {
+	incarnation: string;
+	signal(signal: NodeJS.Signals): void;
+}
+
+function defaultProcessReference(pid: number): DaemonProcessReference | undefined {
+	try {
+		const processRef = Process.fromPid(pid);
+		if (!processRef || !isProcessIncarnation(processRef.incarnation)) return undefined;
+		return {
+			incarnation: processRef.incarnation,
+			signal: signal => {
+				const nativeSignal = os.constants.signals[signal];
+				if (nativeSignal === undefined) throw new Error(`Unsupported signal: ${signal}`);
+				processRef.killTree(nativeSignal);
+			},
+		};
+	} catch {
+		return undefined;
+	}
+}
+
 export interface TelegramDaemonControlDeps {
 	fs?: TelegramDaemonFs;
 	now?: () => number;
 	pidAlive?: (pid: number) => boolean;
-	sendSignal?: (pid: number, signal: NodeJS.Signals) => void;
+	processReference?: (pid: number) => DaemonProcessReference | undefined;
 	pidIncarnation?: (pid: number) => string | undefined;
 	spawn?: TelegramDaemonDeps["spawn"];
 	execPath?: string;
@@ -140,20 +165,12 @@ function defaultPidAlive(pid: number): boolean {
 	}
 }
 
-function defaultSendSignal(pid: number, signal: NodeJS.Signals): void {
-	try {
-		process.kill(pid, signal);
-	} catch {
-		// Best-effort: the process may already be gone.
-	}
-}
-
 export class TelegramDaemonController implements BuiltInDaemonController {
 	readonly kind = "telegram" as const;
 	private readonly fsImpl: TelegramDaemonFs;
-	private readonly now: () => number;
 	private readonly pidAlive: (pid: number) => boolean;
-	private readonly sendSignal: (pid: number, signal: NodeJS.Signals) => void;
+	private readonly now: () => number;
+	private readonly processReference: (pid: number) => DaemonProcessReference | undefined;
 	private readonly waitStepMs: number;
 
 	constructor(
@@ -163,7 +180,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		this.fsImpl = deps.fs ?? nodeFs;
 		this.now = deps.now ?? Date.now;
 		this.pidAlive = deps.pidAlive ?? defaultPidAlive;
-		this.sendSignal = deps.sendSignal ?? defaultSendSignal;
+		this.processReference = deps.processReference ?? defaultProcessReference;
 		this.waitStepMs = deps.waitStepMs ?? DEFAULT_WAIT_STEP_MS;
 	}
 
@@ -312,7 +329,16 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 			})
 		)
 			return "ownership_changed";
-		this.sendSignal(captured.pid, signal);
+		const processRef = this.processReference(captured.pid);
+		// A stable native process reference (pidfd/handle/start-time reference) closes
+		// the exit-and-reuse window between ordinary provenance checks and signaling.
+		// Its identity must still be the exact persisted incarnation before use.
+		if (!processRef || processRef.incarnation !== captured.incarnation) return "ownership_changed";
+		try {
+			processRef.signal(signal);
+		} catch {
+			return "already_gone";
+		}
 		return "signaled";
 	}
 

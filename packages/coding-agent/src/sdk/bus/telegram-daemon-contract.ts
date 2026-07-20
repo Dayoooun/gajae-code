@@ -14,7 +14,8 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * predates capability-gated frame enforcement and trigger a reload. Bump this
  * on every daemon-behavior change independent of the wire version.
  * The current development baseline already includes #2299's generation 4,
- * incarnation fencing in generation 5, and owner-lock authority in generation 6;
- * identity-atomic transition markers advance it to generation 7.
+ * incarnation fencing in generation 5, owner-lock authority in generation 6,
+ * identity-atomic transition markers in generation 7, and stable signaling plus
+ * tri-state foreign-owner provenance in generation 8.
  */
-export const DAEMON_GENERATION = 7;
+export const DAEMON_GENERATION = 8;

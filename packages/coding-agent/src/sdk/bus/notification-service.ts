@@ -106,6 +106,8 @@ export async function readNotificationEndpointFile(file: string): Promise<Notifi
 		await handle.close();
 	}
 }
+/** Bump when the native exact-deletion identity contract changes. */
+export const NATIVE_PATH_IDENTITY_CONTRACT_VERSION = 1;
 
 export function exactUnlinkNotificationFile(
 	file: string,

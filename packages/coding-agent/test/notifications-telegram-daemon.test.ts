@@ -1507,6 +1507,100 @@ describe("telegram daemon", () => {
 			chatId: "old-chat",
 		});
 	});
+	test.each([
+		["unavailable current provenance", "linux:100", (): string | undefined => undefined, "missing"],
+		[
+			"non-canonical current provenance",
+			"linux:100",
+			(): string | undefined => "linux:not-a-start-time",
+			"aged-malformed",
+		],
+		[
+			"non-canonical persisted provenance",
+			"linux:not-a-start-time",
+			(): string | undefined => "linux:100",
+			"aged-malformed",
+		],
+	] as const)("foreign live owner with %s remains blocked without replacement", async (_name, incarnation, pidIncarnation, lockKind) => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		const state = {
+			pid: 999,
+			incarnation,
+			ownerId: "foreign-owner",
+			tokenFingerprint: "foreign-fp",
+			chatId: "foreign-chat",
+			startedAt: 100,
+			heartbeatAt: 100,
+			roots: [],
+			version: DAEMON_VERSION,
+		};
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.state, JSON.stringify(state));
+		if (lockKind === "aged-malformed") {
+			fs.writeFileSync(paths.lock, "{");
+			fs.utimesSync(paths.lock, 0, 0);
+		}
+		const beforeState = fs.readFileSync(paths.state, "utf8");
+		let spawns = 0;
+
+		const result = await ensureTelegramDaemonRunning(
+			{ settings: s, cwd: path.join(agentDir, "new-session"), sessionId: "new-session" },
+			{
+				pid: 4242,
+				pidAlive: pid => pid === 999,
+				pidIncarnation: pid => (pid === 999 ? pidIncarnation() : "linux:200"),
+				spawn: () => {
+					spawns++;
+					return { unref() {} };
+				},
+			},
+		);
+
+		expect(result).toBe("blocked");
+		expect(spawns).toBe(0);
+		expect(fs.readFileSync(paths.state, "utf8")).toBe(beforeState);
+		expect(fs.existsSync(paths.roots)).toBe(false);
+	});
+
+	test("foreign live owner with a canonical mismatched incarnation is reclaimed", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		const state = {
+			pid: 999,
+			incarnation: "linux:100",
+			ownerId: "foreign-owner",
+			tokenFingerprint: "foreign-fp",
+			chatId: "foreign-chat",
+			startedAt: 100,
+			heartbeatAt: 100,
+			roots: [],
+			version: DAEMON_VERSION,
+		};
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.state, JSON.stringify(state));
+
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: "e60b05c186ca",
+				chatId: "42",
+				pid: 222,
+				randomId: () => "replacement",
+				pidAlive: pid => pid === 999,
+				pidIncarnation: pid => (pid === 999 ? "linux:101" : "linux:200"),
+				now: () => 101,
+			}),
+		).resolves.toMatchObject({ acquired: true, ownerId: "replacement" });
+		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({
+			pid: 222,
+			ownerId: "replacement",
+			tokenFingerprint: "e60b05c186ca",
+			chatId: "42",
+		});
+	});
 
 	// -----------------------------------------------------------------------
 	// #2028: a rolling upgrade can leave a still-live PRE-upgrade daemon owning
@@ -1549,9 +1643,9 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps the wire protocol at 3 while identity-atomic transitions use generation 7", () => {
+	test("keeps the wire protocol at 3 while stable signaling uses generation 8", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		expect(DAEMON_GENERATION).toBe(7);
+		expect(DAEMON_GENERATION).toBe(8);
 	});
 
 	test("#2028 acquire flags a reload for a live pre-upgrade owner missing the generation field", async () => {
@@ -2255,10 +2349,16 @@ describe("telegram daemon", () => {
 				pid: 4242,
 				pidAlive: pid => alive.has(pid),
 				pidIncarnation: () => "linux:100",
-				sendSignal: (pid, sig) => {
-					signals.push([pid, sig]);
-					if (sig === "SIGTERM") alive.delete(999);
-				},
+				processReference: pid =>
+					pid === 999
+						? {
+								incarnation: "linux:100",
+								signal: sig => {
+									signals.push([pid, sig]);
+									if (sig === "SIGTERM") alive.delete(pid);
+								},
+							}
+						: undefined,
 				sleep: child.sleep,
 				spawn: child.spawn,
 			},
@@ -2294,10 +2394,16 @@ describe("telegram daemon", () => {
 				pid: 4242,
 				pidAlive: pid => alive.has(pid),
 				pidIncarnation: () => "linux:100",
-				sendSignal: (pid, signal) => {
-					signals.push([pid, signal]);
-					if (signal === "SIGTERM") alive.delete(999);
-				},
+				processReference: pid =>
+					pid === 999
+						? {
+								incarnation: "linux:100",
+								signal: sig => {
+									signals.push([pid, sig]);
+									if (sig === "SIGTERM") alive.delete(pid);
+								},
+							}
+						: undefined,
 				sleep: child.sleep,
 				spawn: child.spawn,
 			},

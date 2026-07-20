@@ -44,6 +44,13 @@ import {
 import { TopicRegistry } from "../src/sdk/bus/topic-registry";
 
 const BOT_TOKEN = "123456:secret-token";
+function testProcessReference(signal: (pid: number, value: NodeJS.Signals) => void) {
+	return (pid: number) => ({ incarnation: "linux:100", signal: (value: NodeJS.Signals) => signal(pid, value) });
+}
+
+function testChatProcessReference(signal: (pid: number, value: NodeJS.Signals) => void) {
+	return (pid: number) => ({ incarnation: "linux:12345", signal: (value: NodeJS.Signals) => signal(pid, value) });
+}
 
 function tempAgentDir(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "gjc-daemon-control-test-"));
@@ -416,7 +423,7 @@ describe("Telegram daemon PID provenance fencing", () => {
 			const result = await new TelegramDaemonController(s, {
 				pidAlive: pid => pid === 999,
 				pidIncarnation: () => incarnation,
-				sendSignal: (_pid, signal) => signals.push(signal),
+				processReference: testProcessReference((_pid, signal) => signals.push(signal)),
 			}).reload({ force: true, spawnIfStopped: false });
 			expect(result.ok).toBe(true);
 			expect(signals).toEqual([]);
@@ -447,10 +454,10 @@ describe("TelegramDaemonController.reload", () => {
 			ownerPid: 4242,
 			pidAlive: pid => alive.has(pid),
 			pidIncarnation: () => "linux:100",
-			sendSignal: (pid, sig) => {
+			processReference: testProcessReference((pid, sig) => {
 				signals.push([pid, sig]);
 				if (sig === "SIGTERM") alive.delete(999);
-			},
+			}),
 			spawn: child.spawn,
 			sleep: child.sleep,
 		});
@@ -484,7 +491,7 @@ describe("TelegramDaemonController.reload", () => {
 		const result = await new TelegramDaemonController(s, {
 			pidAlive: pid => (pid === 999 ? oldAlive : pid === 1001),
 			pidIncarnation: pid => (pid === 1001 ? "linux:101" : "linux:100"),
-			sendSignal: () => undefined,
+			processReference: testProcessReference(() => undefined),
 			sleep: async () => {
 				if (published) return;
 				published = true;
@@ -518,10 +525,10 @@ describe("TelegramDaemonController.reload", () => {
 			ownerPid: 4242,
 			pidAlive: pid => alive.has(pid),
 			pidIncarnation: () => "linux:100",
-			sendSignal: (pid, sig) => {
+			processReference: testProcessReference((pid, sig) => {
 				signals.push([pid, sig]);
 				if (sig === "SIGKILL") alive.delete(999);
-			},
+			}),
 			spawn: child.spawn,
 			sleep: child.sleep,
 			waitStepMs: 1,
@@ -546,7 +553,7 @@ describe("TelegramDaemonController.reload", () => {
 			pidAlive: pid => alive.has(pid),
 			pidIncarnation: () => "linux:100",
 			// SIGTERM never kills 999 here; ownership changes underneath instead.
-			sendSignal: (pid, sig) => signals.push([pid, sig]),
+			processReference: testProcessReference((pid, sig) => signals.push([pid, sig])),
 			spawn: () => ({ unref() {} }),
 			sleep: async () => {
 				if (!mutated) {
@@ -575,7 +582,7 @@ describe("TelegramDaemonController.reload", () => {
 		const ctrl = new TelegramDaemonController(s, {
 			pidAlive: pid => alive.has(pid),
 			pidIncarnation: () => "linux:100",
-			sendSignal: (pid, sig) => signals.push([pid, sig]),
+			processReference: testProcessReference((pid, sig) => signals.push([pid, sig])),
 			spawn: () => {
 				spawnCalls++;
 				return { unref() {} };
@@ -600,7 +607,7 @@ describe("TelegramDaemonController.reload", () => {
 			now: () => now,
 			pidAlive: pid => pid === 999,
 			pidIncarnation: () => "linux:100",
-			sendSignal: () => undefined,
+			processReference: testProcessReference(() => undefined),
 			sleep: async () => {
 				now += 5;
 			},
@@ -627,7 +634,7 @@ describe("TelegramDaemonController.reload", () => {
 		const ctrl = new TelegramDaemonController(s, {
 			pidAlive: pid => alive.has(pid),
 			pidIncarnation: () => "linux:100",
-			sendSignal: () => undefined,
+			processReference: testProcessReference(() => undefined),
 			spawn: () => {
 				spawnCalls++;
 				return { unref() {} };
@@ -666,9 +673,9 @@ describe("TelegramDaemonController.reload", () => {
 			ownerPid: 4242,
 			pidAlive: pid => alive.has(pid),
 			pidIncarnation: () => "linux:100",
-			sendSignal: (_pid, sig) => {
+			processReference: testProcessReference((_pid, sig) => {
 				if (sig === "SIGTERM") alive.delete(999);
-			},
+			}),
 			spawn: child.spawn,
 			sleep: child.sleep,
 		});
@@ -738,10 +745,10 @@ describe("TelegramDaemonController.reload", () => {
 			ownerPid: 4242,
 			pidAlive: pid => alive.has(pid),
 			pidIncarnation: () => "linux:100",
-			sendSignal: (pid, sig) => {
+			processReference: testProcessReference((pid, sig) => {
 				signals.push([pid, sig]);
 				if (sig === "SIGTERM") alive.delete(999);
-			},
+			}),
 			spawn: child.spawn,
 			sleep: child.sleep,
 		});
@@ -763,7 +770,7 @@ describe("TelegramDaemonController.reload", () => {
 		const ctrl = new TelegramDaemonController(s, {
 			pidAlive: pid => pid === 999,
 			pidIncarnation: () => "linux:100",
-			sendSignal: (pid, sig) => signals.push([pid, sig]),
+			processReference: testProcessReference((pid, sig) => signals.push([pid, sig])),
 			spawn: () => {
 				spawnCalls++;
 				return { unref() {} };
@@ -891,7 +898,7 @@ describe("cooperative handoff when the captured owner exits before the recheck",
 				ownerAlive = false;
 				return "req-stop";
 			},
-			sendSignal: (pid, sig) => signals.push([pid, sig]),
+			processReference: testProcessReference((pid, sig) => signals.push([pid, sig])),
 			sleep: async () => undefined,
 			waitStepMs: 1,
 		});
@@ -957,7 +964,7 @@ describe("TelegramDaemonController captured-owner signal races", () => {
 					writeState(agentDir, mutate());
 					return "request-race";
 				},
-				sendSignal: (_pid, signal) => signals.push(signal),
+				processReference: testProcessReference((_pid, signal) => signals.push(signal)),
 			});
 
 			const result = await ctrl.stop();
@@ -977,7 +984,7 @@ describe("TelegramDaemonController captured-owner signal races", () => {
 		const ctrl = new TelegramDaemonController(s, {
 			pidAlive: () => true,
 			pidIncarnation: () => "linux:100",
-			sendSignal: (_pid, signal) => signals.push(signal),
+			processReference: testProcessReference((_pid, signal) => signals.push(signal)),
 			sleep: async () => {
 				if (mutated) return;
 				mutated = true;
@@ -992,6 +999,42 @@ describe("TelegramDaemonController captured-owner signal races", () => {
 	});
 });
 
+describe.each([
+	["linux:100", "linux:101"],
+	["darwin:100:1", "darwin:101:1"],
+	["windows:100", "windows:101"],
+] as const)("stable %s process signaling", (incarnation, successor) => {
+	test("never signals the numeric PID successor that appears immediately before signaling", async () => {
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		const state = freshState({ incarnation });
+		writeState(agentDir, state);
+		writeOwnershipLock(agentDir, state);
+		let currentIncarnation: string = incarnation;
+		let oldOwnerAlive = true;
+		const stableSignals: NodeJS.Signals[] = [];
+		const replacementSignals: NodeJS.Signals[] = [];
+		const result = await new TelegramDaemonController(s, {
+			pidAlive: pid => pid === 999 && oldOwnerAlive,
+			pidIncarnation: () => currentIncarnation,
+			processReference: () => {
+				// The numeric PID is reused after the final ordinary provenance probe.
+				currentIncarnation = successor;
+				return {
+					incarnation,
+					signal: signal => {
+						stableSignals.push(signal);
+						oldOwnerAlive = false;
+					},
+				};
+			},
+		}).stop();
+		expect(result.ok).toBe(true);
+		expect(stableSignals).toEqual(["SIGTERM"]);
+		expect(replacementSignals).toEqual([]);
+	});
+});
+
 describe("TelegramDaemonController provisional launcher signal fencing", () => {
 	for (const action of ["stop", "reload"] as const) {
 		test(`${action} never signals a live generation-4 provisional launcher`, async () => {
@@ -1003,7 +1046,7 @@ describe("TelegramDaemonController provisional launcher signal fencing", () => {
 			const result = await new TelegramDaemonController(s, {
 				pidAlive: pid => pid === 999,
 				pidIncarnation: () => "linux:100",
-				sendSignal: (_pid, signal) => signals.push(signal),
+				processReference: testProcessReference((_pid, signal) => signals.push(signal)),
 				spawn: () => {
 					throw new Error("provisional ownership must block spawning");
 				},
@@ -1027,9 +1070,9 @@ describe("TelegramDaemonController.stop", () => {
 		const ctrl = new TelegramDaemonController(s, {
 			pidAlive: pid => alive.has(pid),
 			pidIncarnation: () => "linux:100",
-			sendSignal: (pid, sig) => {
+			processReference: testProcessReference((pid, sig) => {
 				if (sig === "SIGTERM") alive.delete(pid);
-			},
+			}),
 			spawn: () => {
 				spawnCalls++;
 				return { unref() {} };
@@ -1051,10 +1094,10 @@ describe("TelegramDaemonController.stop", () => {
 		const result = await new TelegramDaemonController(s, {
 			pidAlive: pid => alive.has(pid),
 			pidIncarnation: () => "linux:100",
-			sendSignal: (pid, signal) => {
+			processReference: testProcessReference((pid, signal) => {
 				signals.push(signal);
 				if (signal === "SIGTERM") alive.delete(pid);
-			},
+			}),
 			spawn: () => {
 				spawns++;
 				return { unref() {} };
@@ -1114,12 +1157,69 @@ describe("ChatDaemonController ownership safety", () => {
 		const controller = new ChatDaemonController(s, "discord", {
 			pidAlive: pid => pid === 77,
 			pidIncarnation: () => "linux:12346",
-			sendSignal: (_pid, signal) => signals.push(signal),
+			processReference: testChatProcessReference((_pid, signal) => signals.push(signal)),
 		});
 		expect((await controller.status()).health).toBe("stopped");
 		const result = await controller.stop();
 		expect(result.ok).toBe(true);
 		expect(signals).toEqual([]);
+	});
+
+	test("signals a stable chat reference when a numeric PID is reused immediately before TERM", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(
+			Settings.isolated({
+				"notifications.enabled": true,
+				"notifications.discord.botToken": "discord-token",
+				"notifications.discord.applicationId": "app",
+				"notifications.discord.guildId": "guild",
+				"notifications.discord.parentChannelId": "parent",
+			}) as Settings,
+			agentDir,
+		);
+		const identity = crypto
+			.createHash("sha256")
+			.update(["discord-token", "app", "guild", "parent", "false", "lean"].join("\0"))
+			.digest("hex")
+			.slice(0, 16);
+		const paths = chatDaemonPaths(agentDir, "discord");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				version: 1,
+				kind: "discord",
+				pid: 77,
+				ownerId: "owner-a",
+				identity,
+				incarnation: "linux:12345",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+				transportHealthy: true,
+				generation: chatDaemonGeneration("discord"),
+			}),
+		);
+		let currentIncarnation = "linux:12345";
+		let oldOwnerAlive = true;
+		const stableSignals: NodeJS.Signals[] = [];
+		const replacementSignals: NodeJS.Signals[] = [];
+		const result = await new ChatDaemonController(s, "discord", {
+			pidAlive: pid => pid === 77 && oldOwnerAlive,
+			pidIncarnation: () => currentIncarnation,
+			processReference: () => {
+				currentIncarnation = "linux:12346";
+				return {
+					incarnation: "linux:12345",
+					signal: signal => {
+						stableSignals.push(signal);
+						oldOwnerAlive = false;
+					},
+				};
+			},
+		}).stop();
+		expect(result.ok).toBe(true);
+		expect(stableSignals).toEqual(["SIGTERM"]);
+		expect(replacementSignals).toEqual([]);
 	});
 
 	test("releases chat ownership only with live exact PID and incarnation provenance", async () => {
@@ -1427,7 +1527,7 @@ describe("ChatDaemonController ownership safety", () => {
 			ensureDiscordDaemon(s, {
 				pidAlive: pid => pid === 82,
 				pidIncarnation: () => "linux:12345",
-				sendSignal: (_pid, signal) => signals.push(signal),
+				processReference: testChatProcessReference((_pid, signal) => signals.push(signal)),
 				spawn: () => {
 					spawns++;
 					return { unref() {} };
@@ -1495,9 +1595,9 @@ describe("ChatDaemonController ownership safety", () => {
 			const result = await new ChatDaemonController(s, "slack", {
 				pidAlive: () => true,
 				pidIncarnation: () => "linux:12345",
-				sendSignal: () => {
+				processReference: testChatProcessReference(() => {
 					throw new Error("must not signal");
-				},
+				}),
 			}).stop();
 			expect(result.ok).toBe(false);
 			expect(result.message).toContain("ownership changed");
@@ -1568,10 +1668,10 @@ describe("ChatDaemonController ownership safety", () => {
 				pidAlive: pid => alive.has(pid),
 				pidIncarnation: () => "linux:12345",
 				sleep: async () => undefined,
-				sendSignal: (_pid, signal) => {
+				processReference: testChatProcessReference((_pid, signal) => {
 					signals.push(signal);
 					alive.delete(91);
-				},
+				}),
 				spawn: (_command, args) => {
 					spawns++;
 					const ownerId = args[args.indexOf("--owner-id") + 1];
@@ -1637,7 +1737,7 @@ describe("ChatDaemonController ownership safety", () => {
 			const controller = new ChatDaemonController(configuredSettings(agentDir), kind, {
 				pidAlive: pid => pid === 93,
 				pidIncarnation: () => "linux:12345",
-				sendSignal: (_pid, signal) => signals.push(signal),
+				processReference: testChatProcessReference((_pid, signal) => signals.push(signal)),
 				spawn: () => {
 					spawns++;
 					return { unref() {} };
@@ -1675,7 +1775,7 @@ describe("ChatDaemonController ownership safety", () => {
 				new ChatDaemonController(configuredSettings(agentDir), kind, {
 					pidAlive: () => true,
 					pidIncarnation: () => "linux:12345",
-					sendSignal: (_pid, signal) => signals.push(signal),
+					processReference: testChatProcessReference((_pid, signal) => signals.push(signal)),
 				}).ensure(),
 			).rejects.toThrow("unauthorized");
 			expect(signals).toEqual([]);
@@ -1710,7 +1810,7 @@ describe("ChatDaemonController ownership safety", () => {
 			const controller = new ChatDaemonController(configuredSettings(agentDir), kind, {
 				pidAlive: pid => pid === 94,
 				pidIncarnation: () => "linux:12345",
-				sendSignal: (_pid, signal) => signals.push(signal),
+				processReference: testChatProcessReference((_pid, signal) => signals.push(signal)),
 				spawn: () => {
 					spawns++;
 					return { unref() {} };
@@ -1753,7 +1853,7 @@ describe("ChatDaemonController ownership safety", () => {
 			const controller = new ChatDaemonController(configuredSettings(agentDir), kind, {
 				pidAlive: pid => pid === 97,
 				pidIncarnation: pid => (pid === 97 ? "linux:12352" : undefined),
-				sendSignal: (_pid, signal) => signals.push(signal),
+				processReference: testChatProcessReference((_pid, signal) => signals.push(signal)),
 				spawn: (_command, args) => {
 					spawns++;
 					fs.writeFileSync(
@@ -1809,10 +1909,10 @@ describe("ChatDaemonController ownership safety", () => {
 				pidAlive: pid => alive.has(pid),
 				pidIncarnation: () => "linux:12345",
 				sleep: async () => undefined,
-				sendSignal: (_pid, signal) => {
+				processReference: testChatProcessReference((_pid, signal) => {
 					signals.push(signal);
 					alive.delete(94);
-				},
+				}),
 				spawn: (_command, args) => {
 					spawns++;
 					alive.add(95);
@@ -1869,7 +1969,7 @@ describe("ChatDaemonController ownership safety", () => {
 				const result = await new ChatDaemonController(configuredSettings(agentDir), kind, {
 					pidAlive: pid => pid === 92,
 					pidIncarnation: () => "linux:12345",
-					sendSignal: (_pid, signal) => signals.push(signal),
+					processReference: testChatProcessReference((_pid, signal) => signals.push(signal)),
 				}).stop();
 				expect(result.ok).toBe(false);
 				expect(result.message).toContain("ownership changed");
@@ -2006,6 +2106,60 @@ describe("Chat daemon owner-lock publication", () => {
 		).toBe(true);
 		expect(JSON.parse(fs.readFileSync(paths.state, "utf8")).ownerId).toBe("new");
 		expect(fs.existsSync(`${paths.lock}.reclaim`)).toBe(false);
+	});
+
+	test("a delayed reclaimer cannot delete a successor reclaim lease or owner lock", async () => {
+		const agentDir = tempAgentDir();
+		const paths = chatDaemonPaths(agentDir, "discord");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		const stale = JSON.stringify({ pid: 91, incarnation: "linux:stale", createdAt: 1 });
+		fs.writeFileSync(paths.lock, stale);
+		fs.writeFileSync(`${paths.lock}.reclaim`, stale);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const originalOpen = fs.promises.open;
+		let delayed = false;
+		fs.promises.open = (async (...args: Parameters<typeof fs.promises.open>) => {
+			if (!delayed && String(args[0]) === `${paths.lock}.reclaim` && args[1] === "r") {
+				delayed = true;
+				entered.resolve();
+				await release.promise;
+			}
+			return await originalOpen(...args);
+		}) as typeof fs.promises.open;
+		try {
+			const probe = {
+				pidAlive: (pid: number) => pid !== 91,
+				pidIncarnation: (pid: number) => (pid === 91 ? "linux:replacement" : "linux:12350"),
+			};
+			const delayedClaim = acquireChatDaemonOwnership({
+				agentDir,
+				kind: "discord",
+				ownerId: "delayed",
+				pid: 92,
+				identity: "identity",
+				incarnation: "linux:12350",
+				...probe,
+			});
+			await entered.promise;
+			expect(
+				await acquireChatDaemonOwnership({
+					agentDir,
+					kind: "discord",
+					ownerId: "successor",
+					pid: 93,
+					identity: "identity",
+					incarnation: "linux:12350",
+					...probe,
+				}),
+			).toBe(true);
+			release.resolve();
+			expect(await delayedClaim).toBe(false);
+			expect(JSON.parse(fs.readFileSync(paths.state, "utf8")).ownerId).toBe("successor");
+			expect(JSON.parse(fs.readFileSync(paths.lock, "utf8")).pid).toBe(93);
+		} finally {
+			fs.promises.open = originalOpen;
+		}
 	});
 
 	test("does not steal a fresh reclaim lock owned by a live incarnation", async () => {

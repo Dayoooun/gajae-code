@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 11;
+export const GUARD_CONTRACT_VERSION = 12;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
@@ -27,7 +27,7 @@ type GuardManifest = { contractVersion: number; inventory: Inventory; digests: R
  * endpoint or provider generations: they do not replace daemon owners.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "7762d5d68bcf46c9045541f4e995800290d0cff786ea0d7d42cca990c8bb5ef5";
+const PROTECTED_INVENTORY_SHA256 = "17d5535fc5e4cf88adb244963004712fbacea9ff5928177ccbab791737bb5e59";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -35,6 +35,12 @@ export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
 	"daemonTransitionLockIsHeld",
 	"releaseDaemonTransitionLock",
 	"acquireDaemonTransitionLock",
+	"NATIVE_PATH_IDENTITY_CONTRACT_VERSION",
+	"exactUnlinkNotificationFile",
+	"isDaemonTransitionLock",
+	"readTransitionMarker",
+	"transitionMarkerMatchesLock",
+	"detachTransitionMarker",
 ] as const;
 
 /** Chat owner/reclaim publication is shared authority for both provider families. */
@@ -43,7 +49,10 @@ export const CHAT_OWNER_LOCK_PROTECTED_DECLARATIONS = [
 	"reclaimChatDaemonOwnerLock",
 	"acquireChatDaemonReclaimLock",
 	"canReclaimChatDaemonOwnerLock",
-	"isStaleChatDaemonLock",
+	"captureChatDaemonOwnerLockLease",
+	"unlinkExactChatDaemonOwnerLock",
+	"staleChatDaemonLockLease",
+	"ownsChatDaemonOwnerLock",
 ] as const;
 
 function validateChatOwnerLockInventory(inventory: Inventory): void {
@@ -67,7 +76,7 @@ function inventoryHash(inventory: Inventory): string {
 }
 
 export function validateInventory(inventory: Inventory = protectedInventory): void {
-	if (GUARD_CONTRACT_VERSION !== 11) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
+	if (GUARD_CONTRACT_VERSION !== 12) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
 	for (const [family, files] of Object.entries(inventory)) {
 		for (const [file, symbols] of Object.entries(files)) {
 			if (!file || symbols.length === 0 || new Set(symbols).size !== symbols.length)

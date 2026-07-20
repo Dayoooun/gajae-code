@@ -1,7 +1,10 @@
 import { spawn as childProcessSpawn } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
+import { Process } from "@gajae-code/natives";
 import type { Settings } from "../../config/settings";
 import type {
 	BuiltInDaemonController,
@@ -23,8 +26,8 @@ export type ChatDaemonAction = "stop" | "reload";
  * These are intentionally separate from per-session endpoint generations.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 4,
-	slack: 4,
+	discord: 5,
+	slack: 5,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
@@ -109,9 +112,31 @@ export interface ChatDaemonControlRequest {
 	incarnation: string;
 }
 
+export interface ChatDaemonProcessReference {
+	incarnation: string;
+	signal(signal: NodeJS.Signals): void;
+}
+
+function defaultProcessReference(pid: number): ChatDaemonProcessReference | undefined {
+	try {
+		const processRef = Process.fromPid(pid);
+		if (!processRef || !hasProcessIncarnationAuthority(processRef.incarnation)) return undefined;
+		return {
+			incarnation: processRef.incarnation,
+			signal: signal => {
+				const nativeSignal = os.constants.signals[signal];
+				if (nativeSignal === undefined) throw new Error(`Unsupported signal: ${signal}`);
+				processRef.killTree(nativeSignal);
+			},
+		};
+	} catch {
+		return undefined;
+	}
+}
+
 export interface ChatDaemonControlDeps {
 	pidAlive?: (pid: number) => boolean;
-	sendSignal?: (pid: number, signal: NodeJS.Signals) => void;
+	processReference?: (pid: number) => ChatDaemonProcessReference | undefined;
 	spawn?: (command: string, args: string[], opts: { detached: boolean; stdio: "ignore" }) => { unref?: () => void };
 	execPath?: string;
 	ownerPid?: number;
@@ -135,8 +160,11 @@ interface ChatDaemonOwnerLock {
 
 interface ChatDaemonOwnerLockLease {
 	content: string;
-	dev: number;
-	ino: number;
+	dev: bigint;
+	ino: bigint;
+	size: bigint;
+	mtimeNs: bigint;
+	sha256: string;
 }
 
 interface ChatDaemonOwnershipProbe {
@@ -192,11 +220,6 @@ function defaultPidAlive(pid: number): boolean {
 	} catch {
 		return false;
 	}
-}
-function defaultSignal(pid: number, signal: NodeJS.Signals): void {
-	try {
-		process.kill(pid, signal);
-	} catch {}
 }
 /** Windows process ownership uses immutable StartTime/FileTime provenance through
  * the shared native/platform authority. Without authority, numeric PIDs are never trusted. */
@@ -462,6 +485,9 @@ export class ChatDaemonController implements BuiltInDaemonController {
 	private incarnation(pid: number): string | undefined {
 		return (this.deps.pidIncarnation ?? processIncarnation)(pid);
 	}
+	private processReference(pid: number): ChatDaemonProcessReference | undefined {
+		return (this.deps.processReference ?? defaultProcessReference)(pid);
+	}
 	private isDefinitelyStoppedState(state: ChatDaemonState | undefined): boolean {
 		if (!state || !hasSafeChatDaemonOwnerShape(state)) return false;
 		if (!this.alive(state.pid)) return true;
@@ -570,8 +596,16 @@ export class ChatDaemonController implements BuiltInDaemonController {
 			!this.isSignalableMatchingOwner(current)
 		)
 			return false;
-		(this.deps.sendSignal ?? defaultSignal)(state.pid, signal);
-		return true;
+		const processRef = this.processReference(state.pid);
+		// Numeric PIDs can be reused after the ordinary provenance recheck. Only the
+		// native stable reference may perform this privileged signal operation.
+		if (!processRef || processRef.incarnation !== state.incarnation) return false;
+		try {
+			processRef.signal(signal);
+			return true;
+		} catch {
+			return false;
+		}
 	}
 	private async ownerChanged(
 		action: ChatDaemonAction,
@@ -751,21 +785,69 @@ async function createChatDaemonOwnerLock(
 			if (isAlreadyExists(error)) return undefined;
 			throw error;
 		}
-		const metadata = await fs.promises.stat(lock);
-		return { content, dev: metadata.dev, ino: metadata.ino };
+		return await captureChatDaemonOwnerLockLease(lock);
 	} finally {
 		await fs.promises.unlink(temporary).catch(() => undefined);
 	}
 }
 
-async function ownsChatDaemonOwnerLock(lock: string, lease: ChatDaemonOwnerLockLease): Promise<boolean> {
+async function captureChatDaemonOwnerLockLease(lock: string): Promise<ChatDaemonOwnerLockLease | undefined> {
 	try {
-		const metadata = await fs.promises.stat(lock);
-		return (
-			metadata.dev === lease.dev &&
-			metadata.ino === lease.ino &&
-			(await fs.promises.readFile(lock, "utf8")) === lease.content
-		);
+		const handle = await fs.promises.open(lock, "r");
+		try {
+			const before = await handle.stat({ bigint: true });
+			if (!before.isFile()) return undefined;
+			const content = await handle.readFile({ encoding: "utf8" });
+			const after = await handle.stat({ bigint: true });
+			const pathname = await fs.promises.lstat(lock, { bigint: true });
+			if (
+				!after.isFile() ||
+				!pathname.isFile() ||
+				pathname.isSymbolicLink() ||
+				before.dev !== after.dev ||
+				before.ino !== after.ino ||
+				before.size !== after.size ||
+				before.mtimeNs !== after.mtimeNs ||
+				before.dev !== pathname.dev ||
+				before.ino !== pathname.ino ||
+				before.size !== pathname.size ||
+				before.mtimeNs !== pathname.mtimeNs
+			)
+				return undefined;
+			return {
+				content,
+				dev: before.dev,
+				ino: before.ino,
+				size: before.size,
+				mtimeNs: before.mtimeNs,
+				sha256: crypto.createHash("sha256").update(content).digest("hex"),
+			};
+		} finally {
+			await handle.close();
+		}
+	} catch {
+		return undefined;
+	}
+}
+
+async function ownsChatDaemonOwnerLock(lock: string, lease: ChatDaemonOwnerLockLease): Promise<boolean> {
+	const current = await captureChatDaemonOwnerLockLease(lock);
+	return (
+		current?.dev === lease.dev &&
+		current.ino === lease.ino &&
+		current.size === lease.size &&
+		current.mtimeNs === lease.mtimeNs &&
+		current.content === lease.content
+	);
+}
+
+/** Deletes only the exact lease observed by this contender; a successor is retained. */
+function unlinkExactChatDaemonOwnerLock(lock: string, lease: ChatDaemonOwnerLockLease): boolean {
+	try {
+		return native.exactUnlink(lock, {
+			...lease,
+			quarantineName: `.gjc-delete-chat-daemon-lock-${crypto.randomUUID()}`,
+		}).ok;
 	} catch {
 		return false;
 	}
@@ -777,57 +859,57 @@ async function reclaimChatDaemonOwnerLock(
 	probe: ChatDaemonOwnershipProbe,
 ): Promise<boolean> {
 	if (!(await canReclaimChatDaemonOwnerLock(lock, stateFile, probe))) return false;
-
 	const reclaimFile = `${lock}.reclaim`;
 	const reclaimLock = await acquireChatDaemonReclaimLock(reclaimFile, probe);
-
 	if (!reclaimLock) return false;
 	try {
-		if (!(await canReclaimChatDaemonOwnerLock(lock, stateFile, probe))) return false;
-
-		await fs.promises.unlink(lock).catch(() => undefined);
-		return true;
+		const ownerLock = await canReclaimChatDaemonOwnerLock(lock, stateFile, probe);
+		return !!ownerLock && unlinkExactChatDaemonOwnerLock(lock, ownerLock);
 	} finally {
-		await reclaimLock.close().catch(() => undefined);
-		await fs.promises.unlink(reclaimFile).catch(() => undefined);
+		unlinkExactChatDaemonOwnerLock(reclaimFile, reclaimLock);
 	}
 }
 
 async function acquireChatDaemonReclaimLock(
 	reclaimFile: string,
 	probe: ChatDaemonOwnershipProbe,
-): Promise<{ close(): Promise<void> } | undefined> {
+): Promise<ChatDaemonOwnerLockLease | undefined> {
 	const incarnation = probe.pidIncarnation(process.pid);
 	if (!hasProcessIncarnationAuthority(incarnation)) return undefined;
 	const owner: ChatDaemonOwnerLock = { pid: process.pid, incarnation, createdAt: Date.now() };
-	if (await createChatDaemonOwnerLock(reclaimFile, owner)) return await fs.promises.open(reclaimFile, "r+");
-	if (!(await isStaleChatDaemonLock(reclaimFile, probe))) return undefined;
-	await fs.promises.unlink(reclaimFile).catch(() => undefined);
-	if (!(await createChatDaemonOwnerLock(reclaimFile, owner))) return undefined;
-	return await fs.promises.open(reclaimFile, "r+");
+	const created = await createChatDaemonOwnerLock(reclaimFile, owner);
+	if (created) return created;
+	const stale = await staleChatDaemonLockLease(reclaimFile, probe);
+	if (!stale || !unlinkExactChatDaemonOwnerLock(reclaimFile, stale)) return undefined;
+	return await createChatDaemonOwnerLock(reclaimFile, owner);
 }
 
-async function isStaleChatDaemonLock(lock: string, probe: ChatDaemonOwnershipProbe): Promise<boolean> {
+async function staleChatDaemonLockLease(
+	lock: string,
+	probe: ChatDaemonOwnershipProbe,
+): Promise<ChatDaemonOwnerLockLease | undefined> {
+	const lease = await captureChatDaemonOwnerLockLease(lock);
+	if (!lease) return undefined;
 	let owner: unknown;
 	try {
-		owner = JSON.parse(await fs.promises.readFile(lock, "utf8"));
-	} catch {}
-	if (isChatDaemonOwnerLock(owner)) {
-		if (!probe.pidAlive(owner.pid)) return true;
-		if (!hasProcessIncarnationAuthority(owner.incarnation)) return false;
-		const currentIncarnation = probe.pidIncarnation(owner.pid);
-		return hasProcessIncarnationAuthority(currentIncarnation) && currentIncarnation !== owner.incarnation;
+		owner = JSON.parse(lease.content);
+	} catch {
+		return undefined;
 	}
-	// Complete lock records are published atomically; malformed reservations have
-	// no provenance that can authorize destructive recovery.
-	return false;
+	if (!isChatDaemonOwnerLock(owner)) return undefined;
+	if (!probe.pidAlive(owner.pid)) return lease;
+	if (!hasProcessIncarnationAuthority(owner.incarnation)) return undefined;
+	const currentIncarnation = probe.pidIncarnation(owner.pid);
+	return hasProcessIncarnationAuthority(currentIncarnation) && currentIncarnation !== owner.incarnation
+		? lease
+		: undefined;
 }
 
 async function canReclaimChatDaemonOwnerLock(
 	lock: string,
 	stateFile: string,
 	probe: ChatDaemonOwnershipProbe,
-): Promise<boolean> {
+): Promise<ChatDaemonOwnerLockLease | undefined> {
 	const state = await readJson<unknown>(stateFile);
 	if (hasChatDaemonStatePid(state) && probe.pidAlive(state.pid)) {
 		const current = probe.pidIncarnation(state.pid);
@@ -836,9 +918,9 @@ async function canReclaimChatDaemonOwnerLock(
 			!hasProcessIncarnationAuthority(current) ||
 			current === state.incarnation
 		)
-			return false;
+			return undefined;
 	}
-	return await isStaleChatDaemonLock(lock, probe);
+	return await staleChatDaemonLockLease(lock, probe);
 }
 
 function isChatDaemonOwnerLock(value: unknown): value is ChatDaemonOwnerLock {
@@ -915,8 +997,12 @@ export async function releaseChatDaemonOwnership(input: {
 		)
 			return;
 		await writeJson(paths.state, { ...state, stoppedAt: Date.now(), transportHealthy: false });
-		const lock = await readJson<ChatDaemonOwnerLock>(paths.lock);
-		if (lock?.pid === state.pid && lock.incarnation === state.incarnation)
-			await fs.promises.unlink(paths.lock).catch(() => undefined);
+		const lock = await captureChatDaemonOwnerLockLease(paths.lock);
+		let owner: unknown;
+		try {
+			owner = lock && JSON.parse(lock.content);
+		} catch {}
+		if (lock && isChatDaemonOwnerLock(owner) && owner.pid === state.pid && owner.incarnation === state.incarnation)
+			unlinkExactChatDaemonOwnerLock(paths.lock, lock);
 	});
 }

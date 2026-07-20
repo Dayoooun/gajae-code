@@ -31,7 +31,11 @@ import {
 	sanitizeDiagnostic,
 } from "./notification-service";
 import { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION } from "./telegram-daemon-contract";
-import { type TelegramDaemonControlDeps, TelegramDaemonController } from "./telegram-daemon-control";
+import {
+	type DaemonProcessReference,
+	type TelegramDaemonControlDeps,
+	TelegramDaemonController,
+} from "./telegram-daemon-control";
 import { withTelegramSetupLease } from "./telegram-setup";
 
 export { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION } from "./telegram-daemon-contract";
@@ -152,6 +156,8 @@ export interface TelegramDaemonDeps {
 	now?: () => number;
 	pid?: number;
 	pidAlive?: (pid: number) => boolean;
+	/** Opens an identity-stable process authority for destructive lifecycle operations. */
+	processReference?: (pid: number) => DaemonProcessReference | undefined;
 	/** Returns immutable process-start provenance, or undefined when unsupported. */
 	pidIncarnation?: (pid: number) => string | undefined;
 	spawn?: (
@@ -929,22 +935,32 @@ function isRecognizedLegacyGeneration(generation: number | undefined): boolean {
 	);
 }
 
-function liveOwnerUsesDifferentIdentity(input: {
+/**
+ * Classifies a physically live daemon with a different Telegram identity.
+ *
+ * A differing canonical incarnation is the only authoritative proof that the
+ * persisted PID has been reused. Missing or non-canonical provenance cannot
+ * authorize replacing a foreign live owner's artifacts.
+ */
+function classifyForeignLiveOwner(input: {
 	state: DaemonState | undefined;
 	tokenFingerprint: string;
 	chatId: string;
 	pidAlive: (pid: number) => boolean;
 	pidIncarnation?: (pid: number) => string | undefined;
-}): boolean {
+}): "identity_mismatch" | "ambiguous" | undefined {
 	const { state } = input;
-	return Boolean(
-		state &&
-			hasSafeDaemonStateShape(state) &&
-			state.stoppedAt === undefined &&
-			!ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) &&
-			input.pidAlive(state.pid) &&
-			ownerProvenanceMatches(state, input.pidIncarnation),
-	);
+	if (
+		!state ||
+		!hasSafeDaemonStateShape(state) ||
+		state.stoppedAt !== undefined ||
+		ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) ||
+		!input.pidAlive(state.pid)
+	)
+		return undefined;
+	const currentIncarnation = input.pidIncarnation?.(state.pid) ?? defaultPidIncarnation(state.pid);
+	if (!isProcessIncarnation(state.incarnation) || !isProcessIncarnation(currentIncarnation)) return "ambiguous";
+	return currentIncarnation === state.incarnation ? "identity_mismatch" : undefined;
 }
 
 /** True for a physically live owner with this configuration, including legacy generations. */
@@ -1125,16 +1141,17 @@ export async function acquireDaemonOwnership(input: {
 		return { acquired: false, attached: false, provisional: true };
 	};
 	const existing = await readJson<DaemonState>(fsImpl, paths.state);
-	if (
-		liveOwnerUsesDifferentIdentity({
-			state: existing,
-			tokenFingerprint: input.tokenFingerprint,
-			chatId: input.chatId,
-			pidAlive,
-			pidIncarnation,
-		})
-	) {
-		return { acquired: false, blocked: true, reason: "identity_mismatch" };
+	const foreignOwner = classifyForeignLiveOwner({
+		state: existing,
+		tokenFingerprint: input.tokenFingerprint,
+		chatId: input.chatId,
+		pidAlive,
+		pidIncarnation,
+	});
+	if (foreignOwner) {
+		return foreignOwner === "identity_mismatch"
+			? { acquired: false, blocked: true, reason: "identity_mismatch" }
+			: { acquired: false, blocked: true };
 	}
 
 	const transition = await acquireTransitionLock({ fs: fsImpl, path: paths.steal, pidAlive, pidIncarnation });
@@ -1187,16 +1204,18 @@ export async function acquireDaemonOwnership(input: {
 		} else if (recheckedDecision) {
 			return recheckedDecision;
 		}
-		if (
-			liveOwnerUsesDifferentIdentity({
-				state: rechecked,
-				tokenFingerprint: input.tokenFingerprint,
-				chatId: input.chatId,
-				pidAlive,
-				pidIncarnation,
-			})
-		)
-			return { acquired: false, blocked: true, reason: "identity_mismatch" };
+		const recheckedForeignOwner = classifyForeignLiveOwner({
+			state: rechecked,
+			tokenFingerprint: input.tokenFingerprint,
+			chatId: input.chatId,
+			pidAlive,
+			pidIncarnation,
+		});
+		if (recheckedForeignOwner) {
+			return recheckedForeignOwner === "identity_mismatch"
+				? { acquired: false, blocked: true, reason: "identity_mismatch" }
+				: { acquired: false, blocked: true };
+		}
 		if (
 			hasSafeDaemonStateShape(rechecked) &&
 			rechecked.stoppedAt === undefined &&
@@ -1965,8 +1984,8 @@ function telegramControllerDeps(deps: TelegramDaemonDeps): TelegramDaemonControl
 		fs: deps.fs,
 		now: deps.now,
 		pidAlive: deps.pidAlive,
+		processReference: deps.processReference,
 		pidIncarnation: deps.pidIncarnation,
-		sendSignal: deps.sendSignal,
 		spawn: deps.spawn,
 		execPath: deps.execPath,
 		ownerPid: deps.pid,
