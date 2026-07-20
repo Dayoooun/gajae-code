@@ -9057,34 +9057,34 @@ export class AgentSession {
 	async clearContext(): Promise<boolean> {
 		this.#beginSessionTransition("clear-context");
 		try {
-		const sessionId = this.sessionId;
-		this.#disconnectFromAgent();
-		await this.abort();
-		this.#cancelOwnAsyncJobs();
-		this.#suppressOwnAsyncJobDeliveries();
-		this.yieldQueue.clear();
-		this.#pendingBackgroundExchanges = [];
-		this.#closeAllProviderSessions("context clear");
-		this.agent.reset();
-		await this.sessionManager.flush();
-		this.sessionManager.appendContextClearEntry({ sessionId });
-		this.setTodoPhases([]);
-		this.#syncAgentSessionId(sessionId);
-		this.#steeringMessages = [];
-		this.#followUpMessages = [];
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
+			const sessionId = this.sessionId;
+			this.#disconnectFromAgent();
+			await this.abort();
+			this.#cancelOwnAsyncJobs();
+			this.#suppressOwnAsyncJobDeliveries();
+			this.yieldQueue.clear();
+			this.#pendingBackgroundExchanges = [];
+			this.#closeAllProviderSessions("context clear");
+			this.agent.reset();
+			await this.sessionManager.flush();
+			this.sessionManager.appendContextClearEntry({ sessionId });
+			this.setTodoPhases([]);
+			this.#syncAgentSessionId(sessionId);
+			this.#steeringMessages = [];
+			this.#followUpMessages = [];
+			this.#pendingNextTurnMessages = [];
+			this.#scheduledHiddenNextTurnGeneration = undefined;
 
-		this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
-		if (this.model) {
-			this.sessionManager.appendModelChange(`${this.model.provider}/${this.model.id}`);
-		}
-		this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
-		this.#todoReminderCount = 0;
-		this.#planReferenceSent = false;
-		this.#planReferencePath = "local://PLAN.md";
-		this.#reconnectToAgent();
-		return true;
+			this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
+			if (this.model) {
+				this.sessionManager.appendModelChange(`${this.model.provider}/${this.model.id}`);
+			}
+			this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
+			this.#todoReminderCount = 0;
+			this.#planReferenceSent = false;
+			this.#planReferencePath = "local://PLAN.md";
+			this.#reconnectToAgent();
+			return true;
 		} finally {
 			this.#endSessionTransition();
 		}
@@ -9111,44 +9111,44 @@ export class AgentSession {
 			const previousSessionFile = this.sessionFile;
 			const previousWorkflowGateSessionId = this.sessionId;
 
-		// Emit session_before_switch event with reason "fork" (can be cancelled)
-		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
-			const result = (await this.#extensionRunner.emit({
-				type: "session_before_switch",
-				reason: "fork",
-			})) as SessionBeforeSwitchResult | undefined;
+			// Emit session_before_switch event with reason "fork" (can be cancelled)
+			if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
+				const result = (await this.#extensionRunner.emit({
+					type: "session_before_switch",
+					reason: "fork",
+				})) as SessionBeforeSwitchResult | undefined;
 
-			if (result?.cancel) {
+				if (result?.cancel) {
+					return false;
+				}
+			}
+
+			// Flush current session to ensure all entries are written
+			await this.sessionManager.flush();
+
+			// Fork the session (creates new session file with same entries)
+			const forkResult = await this.sessionManager.fork();
+			if (!forkResult) {
 				return false;
 			}
-		}
 
-		// Flush current session to ensure all entries are written
-		await this.sessionManager.flush();
+			// Update agent session ID
+			this.#syncAgentSessionId();
+			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
+			this.#rekeyHindsightMemoryForCurrentSessionId();
 
-		// Fork the session (creates new session file with same entries)
-		const forkResult = await this.sessionManager.fork();
-		if (!forkResult) {
-			return false;
-		}
+			this.#resetIrcRosterDeliveryState();
 
-		// Update agent session ID
-		this.#syncAgentSessionId();
-		this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
-		this.#rekeyHindsightMemoryForCurrentSessionId();
+			// Emit session_switch event with reason "fork" to hooks
+			if (this.#extensionRunner) {
+				await this.#extensionRunner.emit({
+					type: "session_switch",
+					reason: "fork",
+					previousSessionFile,
+				});
+			}
 
-		this.#resetIrcRosterDeliveryState();
-
-		// Emit session_switch event with reason "fork" to hooks
-		if (this.#extensionRunner) {
-			await this.#extensionRunner.emit({
-				type: "session_switch",
-				reason: "fork",
-				previousSessionFile,
-			});
-		}
-
-		return true;
+			return true;
 		} finally {
 			this.#endSessionTransition();
 		}
@@ -10156,149 +10156,149 @@ export class AgentSession {
 		// navigateTree). Released in the outer finally below.
 		this.#beginSessionTransition("compact");
 		try {
-		if (this.#compactionAbortController) {
-			throw new Error("Compaction already in progress");
-		}
-		this.#disconnectFromAgent();
-		await this.abort();
-		const compactionAbortController = new AbortController();
-		this.#compactionAbortController = compactionAbortController;
-
-		try {
-			if (!this.model) {
-				throw new Error("No model selected");
+			if (this.#compactionAbortController) {
+				throw new Error("Compaction already in progress");
 			}
+			this.#disconnectFromAgent();
+			await this.abort();
+			const compactionAbortController = new AbortController();
+			this.#compactionAbortController = compactionAbortController;
 
-			const compactionSettings = this.settings.getGroup("compaction");
-			const pathEntries = this.#withoutEphemeralCustomMessageEntries(this.sessionManager.getBranch());
-
-			const preparation = prepareCompaction(pathEntries, compactionSettings, {
-				contextWindow: this.model.contextWindow,
-				tokenCorrectionRatio: this.#computeCompactionTokenCorrectionRatio(),
-			});
-			if (!preparation) {
-				// Check why we can't compact
-				const lastEntry = pathEntries[pathEntries.length - 1];
-				if (lastEntry?.type === "compaction") {
-					throw new Error("Already compacted");
+			try {
+				if (!this.model) {
+					throw new Error("No model selected");
 				}
-				throw new Error("Nothing to compact (session too small)");
-			}
 
-			let hookCompaction: CompactionResult | undefined;
-			let fromExtension = false;
-			let preserveData: Record<string, unknown> | undefined;
+				const compactionSettings = this.settings.getGroup("compaction");
+				const pathEntries = this.#withoutEphemeralCustomMessageEntries(this.sessionManager.getBranch());
 
-			if (this.#extensionRunner?.hasHandlers("session_before_compact")) {
-				const result = (await this.#extensionRunner.emit({
-					type: "session_before_compact",
-					preparation,
-					branchEntries: pathEntries,
-					customInstructions,
-					signal: compactionAbortController.signal,
-				})) as SessionBeforeCompactResult | undefined;
+				const preparation = prepareCompaction(pathEntries, compactionSettings, {
+					contextWindow: this.model.contextWindow,
+					tokenCorrectionRatio: this.#computeCompactionTokenCorrectionRatio(),
+				});
+				if (!preparation) {
+					// Check why we can't compact
+					const lastEntry = pathEntries[pathEntries.length - 1];
+					if (lastEntry?.type === "compaction") {
+						throw new Error("Already compacted");
+					}
+					throw new Error("Nothing to compact (session too small)");
+				}
 
-				if (result?.cancel) {
+				let hookCompaction: CompactionResult | undefined;
+				let fromExtension = false;
+				let preserveData: Record<string, unknown> | undefined;
+
+				if (this.#extensionRunner?.hasHandlers("session_before_compact")) {
+					const result = (await this.#extensionRunner.emit({
+						type: "session_before_compact",
+						preparation,
+						branchEntries: pathEntries,
+						customInstructions,
+						signal: compactionAbortController.signal,
+					})) as SessionBeforeCompactResult | undefined;
+
+					if (result?.cancel) {
+						throw new CompactionCancelledError();
+					}
+
+					if (result?.compaction) {
+						hookCompaction = result.compaction;
+						fromExtension = true;
+					}
+				}
+
+				const compactionPrep = await this.#prepareCompactionFromHooks(preparation, hookCompaction);
+
+				let summary: string;
+				let shortSummary: string | undefined;
+				let firstKeptEntryId: string;
+				let tokensBefore: number;
+				let details: unknown;
+
+				if (compactionPrep.kind === "fromHook") {
+					summary = compactionPrep.summary;
+					shortSummary = compactionPrep.shortSummary;
+					firstKeptEntryId = compactionPrep.firstKeptEntryId;
+					tokensBefore = compactionPrep.tokensBefore;
+					details = compactionPrep.details;
+					preserveData = compactionPrep.preserveData;
+				} else {
+					// Generate compaction result. Only convert known abort-shaped
+					// rejections (AbortError raised while the abort signal is set,
+					// or an already-typed sentinel) into `CompactionCancelledError`
+					// so downstream callers can discriminate cancel from generic
+					// failure via `instanceof` without inspecting message strings.
+					// Real compaction bugs (network, server, parsing, etc.) keep
+					// their original shape — they must not be silently relabeled
+					// as cancellations even if the signal happens to be aborted
+					// for an unrelated reason. Assignments live inside the try
+					// block because every catch path throws — the post-try reads
+					// of the result-derived locals are reachable only on success.
+					try {
+						const result = await this.#compactWithFallbackModel(
+							preparation,
+							customInstructions,
+							compactionAbortController.signal,
+							{
+								promptOverride: compactionPrep.hookPrompt,
+								extraContext: compactionPrep.hookContext,
+								remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
+								convertToLlm,
+							},
+						);
+						summary = result.summary;
+						shortSummary = result.shortSummary;
+						firstKeptEntryId = result.firstKeptEntryId;
+						tokensBefore = result.tokensBefore;
+						details = result.details;
+						preserveData = { ...(compactionPrep.preserveData ?? {}), ...(result.preserveData ?? {}) };
+					} catch (err) {
+						if (err instanceof CompactionCancelledError) {
+							throw err;
+						}
+						if (compactionAbortController.signal.aborted && err instanceof Error && err.name === "AbortError") {
+							throw new CompactionCancelledError();
+						}
+						throw err;
+					}
+				}
+
+				if (compactionAbortController.signal.aborted) {
 					throw new CompactionCancelledError();
 				}
 
-				if (result?.compaction) {
-					hookCompaction = result.compaction;
-					fromExtension = true;
+				const compactionEntryId = this.sessionManager.appendCompaction(
+					summary,
+					shortSummary,
+					firstKeptEntryId,
+					tokensBefore,
+					details,
+					fromExtension,
+					preserveData,
+				);
+				await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
+
+				const compactionResult: CompactionResult = {
+					summary,
+					shortSummary,
+					firstKeptEntryId,
+					tokensBefore,
+					details,
+					preserveData,
+				};
+				options?.onComplete?.(compactionResult);
+				return compactionResult;
+			} catch (error) {
+				const err = error instanceof Error ? error : new Error(String(error));
+				options?.onError?.(err);
+				throw error;
+			} finally {
+				if (this.#compactionAbortController === compactionAbortController) {
+					this.#compactionAbortController = undefined;
 				}
+				this.#reconnectToAgent();
 			}
-
-			const compactionPrep = await this.#prepareCompactionFromHooks(preparation, hookCompaction);
-
-			let summary: string;
-			let shortSummary: string | undefined;
-			let firstKeptEntryId: string;
-			let tokensBefore: number;
-			let details: unknown;
-
-			if (compactionPrep.kind === "fromHook") {
-				summary = compactionPrep.summary;
-				shortSummary = compactionPrep.shortSummary;
-				firstKeptEntryId = compactionPrep.firstKeptEntryId;
-				tokensBefore = compactionPrep.tokensBefore;
-				details = compactionPrep.details;
-				preserveData = compactionPrep.preserveData;
-			} else {
-				// Generate compaction result. Only convert known abort-shaped
-				// rejections (AbortError raised while the abort signal is set,
-				// or an already-typed sentinel) into `CompactionCancelledError`
-				// so downstream callers can discriminate cancel from generic
-				// failure via `instanceof` without inspecting message strings.
-				// Real compaction bugs (network, server, parsing, etc.) keep
-				// their original shape — they must not be silently relabeled
-				// as cancellations even if the signal happens to be aborted
-				// for an unrelated reason. Assignments live inside the try
-				// block because every catch path throws — the post-try reads
-				// of the result-derived locals are reachable only on success.
-				try {
-					const result = await this.#compactWithFallbackModel(
-						preparation,
-						customInstructions,
-						compactionAbortController.signal,
-						{
-							promptOverride: compactionPrep.hookPrompt,
-							extraContext: compactionPrep.hookContext,
-							remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
-							convertToLlm,
-						},
-					);
-					summary = result.summary;
-					shortSummary = result.shortSummary;
-					firstKeptEntryId = result.firstKeptEntryId;
-					tokensBefore = result.tokensBefore;
-					details = result.details;
-					preserveData = { ...(compactionPrep.preserveData ?? {}), ...(result.preserveData ?? {}) };
-				} catch (err) {
-					if (err instanceof CompactionCancelledError) {
-						throw err;
-					}
-					if (compactionAbortController.signal.aborted && err instanceof Error && err.name === "AbortError") {
-						throw new CompactionCancelledError();
-					}
-					throw err;
-				}
-			}
-
-			if (compactionAbortController.signal.aborted) {
-				throw new CompactionCancelledError();
-			}
-
-			const compactionEntryId = this.sessionManager.appendCompaction(
-				summary,
-				shortSummary,
-				firstKeptEntryId,
-				tokensBefore,
-				details,
-				fromExtension,
-				preserveData,
-			);
-			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
-
-			const compactionResult: CompactionResult = {
-				summary,
-				shortSummary,
-				firstKeptEntryId,
-				tokensBefore,
-				details,
-				preserveData,
-			};
-			options?.onComplete?.(compactionResult);
-			return compactionResult;
-		} catch (error) {
-			const err = error instanceof Error ? error : new Error(String(error));
-			options?.onError?.(err);
-			throw error;
-		} finally {
-			if (this.#compactionAbortController === compactionAbortController) {
-				this.#compactionAbortController = undefined;
-			}
-			this.#reconnectToAgent();
-		}
 		} finally {
 			this.#endSessionTransition();
 		}
@@ -14287,202 +14287,208 @@ export class AgentSession {
 	async switchSession(sessionPath: string): Promise<boolean> {
 		this.#beginSessionTransition("switch-session");
 		try {
-		const previousSessionFile = this.sessionManager.getSessionFile();
-		const switchingToDifferentSession = previousSessionFile
-			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
-			: true;
-		// Emit session_before_switch event (can be cancelled)
-		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
-			const result = (await this.#extensionRunner.emit({
-				type: "session_before_switch",
-				reason: "resume",
-				targetSessionFile: sessionPath,
-			})) as SessionBeforeSwitchResult | undefined;
-
-			if (result?.cancel) {
-				return false;
-			}
-		}
-
-		this.#disconnectFromAgent();
-		await this.abort();
-
-		// Flush pending writes before switching so restore snapshots reflect committed state.
-		await this.sessionManager.flush();
-		const previousSessionState = this.sessionManager.captureState();
-		const previousSessionContext = this.buildDisplaySessionContext();
-		// switchSession replaces these arrays wholesale during load/rollback, so retaining
-		// the existing message objects is sufficient and avoids structured-clone failures for
-		// extension/custom metadata that is valid to persist but not cloneable.
-		const previousAgentMessages = [...this.agent.state.messages];
-		const previousSteeringMessages = [...this.#steeringMessages];
-		const previousFollowUpMessages = [...this.#followUpMessages];
-		const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
-		const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
-		const previousModel = this.model;
-		const previousThinkingLevel = this.#thinkingLevel;
-		const previousServiceTier = this.agent.serviceTier;
-		const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
-		const previousTools = [...this.agent.state.tools];
-		const previousBaseSystemPrompt = this.#baseSystemPrompt;
-		const previousSystemPrompt = this.agent.state.systemPrompt;
-		const previousAgentSteeringQueue = this.agent.snapshotSteering();
-		const previousAgentFollowUpQueue = this.agent.snapshotFollowUp();
-
-		this.#steeringMessages = [];
-		this.#followUpMessages = [];
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
-		const suspendedWorkflowGateEmitter = switchingToDifferentSession
-			? this.#suspendWorkflowGateEmitter(previousSessionState.sessionId)
-			: undefined;
-		let unavailableDefaultChainMessage: string | undefined;
-
-		try {
-			await this.sessionManager.setSessionFile(sessionPath);
-			this.#syncAgentSessionId();
-			this.#rekeyHindsightMemoryForCurrentSessionId();
-
-			const sessionContext = this.buildDisplaySessionContext();
-			const didReloadConversationChange =
-				!switchingToDifferentSession &&
-				this.#didSessionMessagesChange(previousSessionContext.messages, sessionContext.messages);
-			await this.#restoreMCPSelectionsForSessionContext(sessionContext);
-
-			// The target session is loaded and MCP selections are restored: discard
-			// pre-switch delivery queues before completing the restored agent state.
-			this.agent.clearAllQueues();
-
-			this.agent.replaceMessages(sessionContext.messages);
-			this.#resetInjectedContextSignatures();
-			this.#syncTodoPhasesFromBranch();
-			if (switchingToDifferentSession || didReloadConversationChange) {
-				this.#closeAllProviderSessions(switchingToDifferentSession ? "session switch" : "session reload");
-				this.#rebindProviderSessionState(new Map());
-			}
-
-			const configuredDefaultChain = sessionContext.configuredModelChains.default?.entries;
-			const defaultEntries =
-				configuredDefaultChain ?? (sessionContext.models.default ? [sessionContext.models.default] : []);
-			this.#defaultFallbackController = undefined;
-			if (defaultEntries.length > 0) {
-				const resolution = await resolveModelChainWithAuth(
-					defaultEntries,
-					this.#modelRegistry,
-					this.settings,
-					this.sessionId,
-					{ managedFallback: true },
-				);
-				const controller = this.#defaultFallbackChain();
-				this.seedDefaultFallbackResolution(resolution.activeIndex, resolution.skips);
-				if (!resolution.model) {
-					unavailableDefaultChainMessage = this.#fallbackExhaustionError(controller);
-					throw new Error(unavailableDefaultChainMessage);
-				}
-				if (!this.model || !modelsAreEqual(this.model, resolution.model)) {
-					this.#setModelAuthoritatively(resolution.model, "restore");
-				}
-				if (resolution.explicitThinkingLevel && resolution.thinkingLevel !== undefined) {
-					this.setThinkingLevel(resolution.thinkingLevel);
-				}
-			}
-
-			const hasThinkingEntry = this.sessionManager.getBranch().some(entry => entry.type === "thinking_level_change");
-			const hasServiceTierEntry = this.sessionManager
-				.getBranch()
-				.some(entry => entry.type === "service_tier_change");
-			const defaultThinkingLevel = this.settings.get("defaultThinkingLevel");
-			const configuredServiceTier = this.settings.get("serviceTier");
-			const persistedThinkingLevel = hasThinkingEntry
-				? (sessionContext.thinkingLevel as ThinkingLevel | undefined)
-				: defaultThinkingLevel;
-			const nextThinkingLevel = resolveThinkingLevelForModel(
-				this.model,
-				persistedThinkingLevel === ThinkingLevel.Inherit
-					? this.#getInheritedThinkingLevel()
-					: persistedThinkingLevel,
-			);
-			this.#thinkingLevel = nextThinkingLevel;
-			this.agent.setThinkingLevel(toReasoningEffort(nextThinkingLevel));
-			this.agent.serviceTier = hasServiceTierEntry
-				? sessionContext.serviceTier
-				: configuredServiceTier === "none"
-					? undefined
-					: configuredServiceTier;
-			// Establish the successor's durable session identity only after every
-			// restored state facet is live. Identity-bound extension hooks run below.
-			await this.sessionManager.ensureOnDisk();
-
-			if (switchingToDifferentSession) {
-				this.#resetHindsightConversationTrackingIfHindsight();
-				this.#resetIrcRosterDeliveryState();
-			}
-
-			this.#reconnectToAgent();
-			// Fence predecessor continuations before session_switch starts SDK runtime
-			// teardown. The previous runtime waits for those continuations to settle;
-			// waiting to transfer authority until after hooks creates a circular wait.
-			if (suspendedWorkflowGateEmitter)
-				this.#bindWorkflowGateEmitter(previousSessionState.sessionId, suspendedWorkflowGateEmitter);
-			// session_switch is the post-commit identity signal. SDK authority and
-			// other identity-bound integrations must not observe the successor until
-			// messages, model state, MCP selections, and the agent subscription are live.
-			if (this.#extensionRunner) {
-				await this.#extensionRunner.emit({
-					type: "session_switch",
+			const previousSessionFile = this.sessionManager.getSessionFile();
+			const switchingToDifferentSession = previousSessionFile
+				? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
+				: true;
+			// Emit session_before_switch event (can be cancelled)
+			if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
+				const result = (await this.#extensionRunner.emit({
+					type: "session_before_switch",
 					reason: "resume",
-					previousSessionFile,
-				});
-			}
-			return true;
-		} catch (error) {
-			this.sessionManager.restoreState(previousSessionState);
-			this.#defaultFallbackController = undefined;
-			this.#syncAgentSessionId(previousSessionState.sessionId);
-			this.#restoreWorkflowGateEmitter(suspendedWorkflowGateEmitter);
-			this.#rekeyHindsightMemoryForCurrentSessionId();
-			let restoreMcpError: unknown;
-			try {
-				await this.#restoreMCPSelectionsForSessionContext(previousSessionContext);
-			} catch (mcpError) {
-				restoreMcpError = mcpError;
-				logger.warn("Failed to restore MCP selections after switch error", {
-					previousSessionFile,
 					targetSessionFile: sessionPath,
-					error: String(mcpError),
-				});
-				this.#selectedMCPToolNames = new Set(previousSelectedMCPToolNames);
-				this.#setGuardedAgentTools(previousTools);
+				})) as SessionBeforeSwitchResult | undefined;
+
+				if (result?.cancel) {
+					return false;
+				}
+			}
+
+			this.#disconnectFromAgent();
+			await this.abort();
+
+			// Flush pending writes before switching so restore snapshots reflect committed state.
+			await this.sessionManager.flush();
+			const previousSessionState = this.sessionManager.captureState();
+			const previousSessionContext = this.buildDisplaySessionContext();
+			// switchSession replaces these arrays wholesale during load/rollback, so retaining
+			// the existing message objects is sufficient and avoids structured-clone failures for
+			// extension/custom metadata that is valid to persist but not cloneable.
+			const previousAgentMessages = [...this.agent.state.messages];
+			const previousSteeringMessages = [...this.#steeringMessages];
+			const previousFollowUpMessages = [...this.#followUpMessages];
+			const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
+			const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
+			const previousModel = this.model;
+			const previousThinkingLevel = this.#thinkingLevel;
+			const previousServiceTier = this.agent.serviceTier;
+			const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
+			const previousTools = [...this.agent.state.tools];
+			const previousBaseSystemPrompt = this.#baseSystemPrompt;
+			const previousSystemPrompt = this.agent.state.systemPrompt;
+			const previousAgentSteeringQueue = this.agent.snapshotSteering();
+			const previousAgentFollowUpQueue = this.agent.snapshotFollowUp();
+
+			this.#steeringMessages = [];
+			this.#followUpMessages = [];
+			this.#pendingNextTurnMessages = [];
+			this.#scheduledHiddenNextTurnGeneration = undefined;
+			const suspendedWorkflowGateEmitter = switchingToDifferentSession
+				? this.#suspendWorkflowGateEmitter(previousSessionState.sessionId)
+				: undefined;
+			let unavailableDefaultChainMessage: string | undefined;
+
+			try {
+				await this.sessionManager.setSessionFile(sessionPath);
+				this.#syncAgentSessionId();
+				this.#rekeyHindsightMemoryForCurrentSessionId();
+
+				const sessionContext = this.buildDisplaySessionContext();
+				const didReloadConversationChange =
+					!switchingToDifferentSession &&
+					this.#didSessionMessagesChange(previousSessionContext.messages, sessionContext.messages);
+				await this.#restoreMCPSelectionsForSessionContext(sessionContext);
+
+				// The target session is loaded and MCP selections are restored: discard
+				// pre-switch delivery queues before completing the restored agent state.
+				this.agent.clearAllQueues();
+
+				this.agent.replaceMessages(sessionContext.messages);
+				this.#resetInjectedContextSignatures();
+				this.#syncTodoPhasesFromBranch();
+				if (switchingToDifferentSession || didReloadConversationChange) {
+					this.#closeAllProviderSessions(switchingToDifferentSession ? "session switch" : "session reload");
+					this.#rebindProviderSessionState(new Map());
+				}
+
+				const configuredDefaultChain = sessionContext.configuredModelChains.default?.entries;
+				const defaultEntries =
+					configuredDefaultChain ?? (sessionContext.models.default ? [sessionContext.models.default] : []);
+				this.#defaultFallbackController = undefined;
+				if (defaultEntries.length > 0) {
+					const resolution = await resolveModelChainWithAuth(
+						defaultEntries,
+						this.#modelRegistry,
+						this.settings,
+						this.sessionId,
+						{ managedFallback: true },
+					);
+					const controller = this.#defaultFallbackChain();
+					this.seedDefaultFallbackResolution(resolution.activeIndex, resolution.skips);
+					if (!resolution.model) {
+						unavailableDefaultChainMessage = this.#fallbackExhaustionError(controller);
+						throw new Error(unavailableDefaultChainMessage);
+					}
+					if (!this.model || !modelsAreEqual(this.model, resolution.model)) {
+						this.#setModelAuthoritatively(resolution.model, "restore");
+					}
+					if (resolution.explicitThinkingLevel && resolution.thinkingLevel !== undefined) {
+						this.setThinkingLevel(resolution.thinkingLevel);
+					}
+				}
+
+				const hasThinkingEntry = this.sessionManager
+					.getBranch()
+					.some(entry => entry.type === "thinking_level_change");
+				const hasServiceTierEntry = this.sessionManager
+					.getBranch()
+					.some(entry => entry.type === "service_tier_change");
+				const defaultThinkingLevel = this.settings.get("defaultThinkingLevel");
+				const configuredServiceTier = this.settings.get("serviceTier");
+				const persistedThinkingLevel = hasThinkingEntry
+					? (sessionContext.thinkingLevel as ThinkingLevel | undefined)
+					: defaultThinkingLevel;
+				const nextThinkingLevel = resolveThinkingLevelForModel(
+					this.model,
+					persistedThinkingLevel === ThinkingLevel.Inherit
+						? this.#getInheritedThinkingLevel()
+						: persistedThinkingLevel,
+				);
+				this.#thinkingLevel = nextThinkingLevel;
+				this.agent.setThinkingLevel(toReasoningEffort(nextThinkingLevel));
+				this.agent.serviceTier = hasServiceTierEntry
+					? sessionContext.serviceTier
+					: configuredServiceTier === "none"
+						? undefined
+						: configuredServiceTier;
+				// Establish the successor's durable session identity only after every
+				// restored state facet is live. Identity-bound extension hooks run below.
+				await this.sessionManager.ensureOnDisk();
+
+				if (switchingToDifferentSession) {
+					this.#resetHindsightConversationTrackingIfHindsight();
+					this.#resetIrcRosterDeliveryState();
+				}
+
+				this.#reconnectToAgent();
+				// Fence predecessor continuations before session_switch starts SDK runtime
+				// teardown. The previous runtime waits for those continuations to settle;
+				// waiting to transfer authority until after hooks creates a circular wait.
+				if (suspendedWorkflowGateEmitter)
+					this.#bindWorkflowGateEmitter(previousSessionState.sessionId, suspendedWorkflowGateEmitter);
+				// session_switch is the post-commit identity signal. SDK authority and
+				// other identity-bound integrations must not observe the successor until
+				// messages, model state, MCP selections, and the agent subscription are live.
+				if (this.#extensionRunner) {
+					await this.#extensionRunner.emit({
+						type: "session_switch",
+						reason: "resume",
+						previousSessionFile,
+					});
+				}
+				return true;
+			} catch (error) {
+				this.sessionManager.restoreState(previousSessionState);
+				this.#defaultFallbackController = undefined;
+				this.#syncAgentSessionId(previousSessionState.sessionId);
+				this.#restoreWorkflowGateEmitter(suspendedWorkflowGateEmitter);
+				this.#rekeyHindsightMemoryForCurrentSessionId();
+				let restoreMcpError: unknown;
+				try {
+					await this.#restoreMCPSelectionsForSessionContext(previousSessionContext);
+				} catch (mcpError) {
+					restoreMcpError = mcpError;
+					logger.warn("Failed to restore MCP selections after switch error", {
+						previousSessionFile,
+						targetSessionFile: sessionPath,
+						error: String(mcpError),
+					});
+					this.#selectedMCPToolNames = new Set(previousSelectedMCPToolNames);
+					this.#setGuardedAgentTools(previousTools);
+					this.#baseSystemPrompt = previousBaseSystemPrompt;
+					this.agent.setSystemPrompt(previousSystemPrompt);
+				}
 				this.#baseSystemPrompt = previousBaseSystemPrompt;
 				this.agent.setSystemPrompt(previousSystemPrompt);
+				this.agent.replaceMessages(previousAgentMessages);
+				this.#steeringMessages = previousSteeringMessages;
+				this.#followUpMessages = previousFollowUpMessages;
+				this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
+				this.#scheduledHiddenNextTurnGeneration = previousScheduledHiddenNextTurnGeneration;
+				this.agent.clearAllQueues();
+				this.agent.restoreSteering(previousAgentSteeringQueue);
+				this.agent.restoreFollowUp(previousAgentFollowUpQueue);
+				if (previousModel) {
+					this.agent.setModel(previousModel);
+				}
+				this.#thinkingLevel = previousThinkingLevel;
+				this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
+				this.agent.serviceTier = previousServiceTier;
+				this.#syncTodoPhasesFromBranch();
+				this.#reconnectToAgent();
+				if (restoreMcpError) {
+					throw restoreMcpError;
+				}
+				if (unavailableDefaultChainMessage) {
+					this.emitNotice(
+						"error",
+						`Could not restore session model: ${unavailableDefaultChainMessage}`,
+						"fallback",
+					);
+					return false;
+				}
+				throw error;
 			}
-			this.#baseSystemPrompt = previousBaseSystemPrompt;
-			this.agent.setSystemPrompt(previousSystemPrompt);
-			this.agent.replaceMessages(previousAgentMessages);
-			this.#steeringMessages = previousSteeringMessages;
-			this.#followUpMessages = previousFollowUpMessages;
-			this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
-			this.#scheduledHiddenNextTurnGeneration = previousScheduledHiddenNextTurnGeneration;
-			this.agent.clearAllQueues();
-			this.agent.restoreSteering(previousAgentSteeringQueue);
-			this.agent.restoreFollowUp(previousAgentFollowUpQueue);
-			if (previousModel) {
-				this.agent.setModel(previousModel);
-			}
-			this.#thinkingLevel = previousThinkingLevel;
-			this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
-			this.agent.serviceTier = previousServiceTier;
-			this.#syncTodoPhasesFromBranch();
-			this.#reconnectToAgent();
-			if (restoreMcpError) {
-				throw restoreMcpError;
-			}
-			if (unavailableDefaultChainMessage) {
-				this.emitNotice("error", `Could not restore session model: ${unavailableDefaultChainMessage}`, "fallback");
-				return false;
-			}
-			throw error;
-		}
 		} finally {
 			this.#endSessionTransition();
 		}
@@ -14503,74 +14509,74 @@ export class AgentSession {
 	}> {
 		this.#beginSessionTransition("branch");
 		try {
-		const previousSessionFile = this.sessionFile;
-		const previousWorkflowGateSessionId = this.sessionId;
-		const selectedEntry = this.sessionManager.getEntryForFidelity(entryId);
+			const previousSessionFile = this.sessionFile;
+			const previousWorkflowGateSessionId = this.sessionId;
+			const selectedEntry = this.sessionManager.getEntryForFidelity(entryId);
 
-		if (selectedEntry?.type !== "message" || selectedEntry.message.role !== "user") {
-			throw new Error("Invalid entry ID for branching");
-		}
-
-		const selectedText = this.#extractUserMessageText(selectedEntry.message.content);
-
-		let skipConversationRestore = false;
-
-		// Emit session_before_branch event (can be cancelled)
-		if (this.#extensionRunner?.hasHandlers("session_before_branch")) {
-			const result = (await this.#extensionRunner.emit({
-				type: "session_before_branch",
-				entryId,
-			})) as SessionBeforeBranchResult | undefined;
-
-			if (result?.cancel) {
-				return { selectedText, cancelled: true };
+			if (selectedEntry?.type !== "message" || selectedEntry.message.role !== "user") {
+				throw new Error("Invalid entry ID for branching");
 			}
-			skipConversationRestore = result?.skipConversationRestore ?? false;
-		}
 
-		// Clear pending messages (bound to old session state)
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
+			const selectedText = this.#extractUserMessageText(selectedEntry.message.content);
 
-		// Flush pending writes before branching
-		await this.sessionManager.flush();
-		this.#cancelOwnAsyncJobs();
+			let skipConversationRestore = false;
 
-		if (!selectedEntry.parentId) {
-			await this.sessionManager.newSession({ parentSession: previousSessionFile });
-		} else {
-			this.sessionManager.createBranchedSession(selectedEntry.parentId);
-		}
-		this.#syncTodoPhasesFromBranch();
-		this.#syncAgentSessionId();
-		this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
-		this.#rekeyHindsightMemoryForCurrentSessionId();
-		this.#resetHindsightConversationTrackingIfHindsight();
-		this.#closeAllProviderSessions("session branch");
-		this.#rebindProviderSessionState(new Map());
+			// Emit session_before_branch event (can be cancelled)
+			if (this.#extensionRunner?.hasHandlers("session_before_branch")) {
+				const result = (await this.#extensionRunner.emit({
+					type: "session_before_branch",
+					entryId,
+				})) as SessionBeforeBranchResult | undefined;
 
-		// Reload messages from entries (works for both file and in-memory mode)
-		const sessionContext = this.buildDisplaySessionContext();
+				if (result?.cancel) {
+					return { selectedText, cancelled: true };
+				}
+				skipConversationRestore = result?.skipConversationRestore ?? false;
+			}
 
-		await this.#restoreMCPSelectionsForSessionContext(sessionContext);
+			// Clear pending messages (bound to old session state)
+			this.#pendingNextTurnMessages = [];
+			this.#scheduledHiddenNextTurnGeneration = undefined;
 
-		if (!skipConversationRestore) {
-			this.agent.replaceMessages(sessionContext.messages);
-			this.#resetInjectedContextSignatures();
-			this.#closeCodexProviderSessionsForHistoryRewrite();
-		}
+			// Flush pending writes before branching
+			await this.sessionManager.flush();
+			this.#cancelOwnAsyncJobs();
 
-		this.#resetIrcRosterDeliveryState();
-		// session_branch is the post-commit identity signal. Publish it only after
-		// the successor's messages and MCP selections are restored.
-		if (this.#extensionRunner) {
-			await this.#extensionRunner.emit({
-				type: "session_branch",
-				previousSessionFile,
-			});
-		}
+			if (!selectedEntry.parentId) {
+				await this.sessionManager.newSession({ parentSession: previousSessionFile });
+			} else {
+				this.sessionManager.createBranchedSession(selectedEntry.parentId);
+			}
+			this.#syncTodoPhasesFromBranch();
+			this.#syncAgentSessionId();
+			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
+			this.#rekeyHindsightMemoryForCurrentSessionId();
+			this.#resetHindsightConversationTrackingIfHindsight();
+			this.#closeAllProviderSessions("session branch");
+			this.#rebindProviderSessionState(new Map());
 
-		return { selectedText, cancelled: false };
+			// Reload messages from entries (works for both file and in-memory mode)
+			const sessionContext = this.buildDisplaySessionContext();
+
+			await this.#restoreMCPSelectionsForSessionContext(sessionContext);
+
+			if (!skipConversationRestore) {
+				this.agent.replaceMessages(sessionContext.messages);
+				this.#resetInjectedContextSignatures();
+				this.#closeCodexProviderSessionsForHistoryRewrite();
+			}
+
+			this.#resetIrcRosterDeliveryState();
+			// session_branch is the post-commit identity signal. Publish it only after
+			// the successor's messages and MCP selections are restored.
+			if (this.#extensionRunner) {
+				await this.#extensionRunner.emit({
+					type: "session_branch",
+					previousSessionFile,
+				});
+			}
+
+			return { selectedText, cancelled: false };
 		} finally {
 			this.#endSessionTransition();
 		}
@@ -14605,165 +14611,170 @@ export class AgentSession {
 		// live history in place, so a concurrent transition would race the same state.
 		this.#beginSessionTransition("navigate-tree");
 		try {
-		const oldLeafId = this.sessionManager.getLeafId();
+			const oldLeafId = this.sessionManager.getLeafId();
 
-		// No-op if already at target
-		if (targetId === oldLeafId) {
-			return { cancelled: false };
-		}
-
-		// Model required for summarization
-		if (options.summarize && !this.model) {
-			throw new Error("No model available for summarization");
-		}
-
-		const targetEntry = this.sessionManager.getEntryForFidelity(targetId);
-		if (!targetEntry) {
-			throw new Error(`Entry ${targetId} not found`);
-		}
-
-		// Collect entries to summarize (from old leaf to common ancestor).
-		const { entries: collectedEntriesToSummarize, commonAncestorId } = collectEntriesForBranchSummary(
-			this.sessionManager,
-			oldLeafId,
-			targetId,
-		);
-		const entriesToSummarize = this.#withoutEphemeralCustomMessageEntries(collectedEntriesToSummarize);
-
-		// Prepare event data
-		const preparation: TreePreparation = {
-			targetId,
-			oldLeafId,
-			commonAncestorId,
-			entriesToSummarize,
-			userWantsSummary: options.summarize ?? false,
-		};
-
-		// Set up abort controller for summarization
-		this.#branchSummaryAbortController = new AbortController();
-		let hookSummary: { summary: string; details?: unknown } | undefined;
-		let fromExtension = false;
-
-		// Emit session_before_tree event
-		if (this.#extensionRunner?.hasHandlers("session_before_tree")) {
-			const result = (await this.#extensionRunner.emit({
-				type: "session_before_tree",
-				preparation,
-				signal: this.#branchSummaryAbortController.signal,
-			})) as SessionBeforeTreeResult | undefined;
-
-			if (result?.cancel) {
-				return { cancelled: true };
+			// No-op if already at target
+			if (targetId === oldLeafId) {
+				return { cancelled: false };
 			}
 
-			if (result?.summary && options.summarize) {
-				hookSummary = result.summary;
-				fromExtension = true;
+			// Model required for summarization
+			if (options.summarize && !this.model) {
+				throw new Error("No model available for summarization");
 			}
-		}
 
-		// Run default summarizer if needed
-		let summaryText: string | undefined;
-		let summaryDetails: unknown;
-		if (options.summarize && entriesToSummarize.length > 0 && !hookSummary) {
-			const model = this.model!;
-			const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
-			if (!apiKey) {
-				throw new Error(`No API key for ${model.provider}`);
+			const targetEntry = this.sessionManager.getEntryForFidelity(targetId);
+			if (!targetEntry) {
+				throw new Error(`Entry ${targetId} not found`);
 			}
-			const branchSummarySettings = this.settings.getGroup("branchSummary");
-			const result = await generateBranchSummary(entriesToSummarize, {
-				...this.#maintenanceProviderTransport(),
-				model,
-				apiKey,
-				signal: this.#branchSummaryAbortController.signal,
-				customInstructions: options.customInstructions,
-				reserveTokens: branchSummarySettings.reserveTokens,
-				metadata: this.agent.metadataForProvider(model.provider),
-				convertToLlm,
-				telemetry: resolveTelemetry(this.agent.telemetry, this.sessionId),
-			});
-			this.#branchSummaryAbortController = undefined;
-			if (result.aborted) {
-				return { cancelled: true, aborted: true };
-			}
-			if (result.error) {
-				throw new Error(result.error);
-			}
-			summaryText = result.summary;
-			summaryDetails = {
-				readFiles: result.readFiles || [],
-				modifiedFiles: result.modifiedFiles || [],
-			};
-		} else if (hookSummary) {
-			summaryText = hookSummary.summary;
-			summaryDetails = hookSummary.details;
-		}
 
-		// Determine the new leaf position based on target type
-		let newLeafId: string | null;
-		let editorText: string | undefined;
-
-		if (targetEntry.type === "message" && targetEntry.message.role === "user") {
-			// User message: leaf = parent (null if root), text goes to editor
-			newLeafId = targetEntry.parentId;
-			editorText = this.#extractUserMessageText(targetEntry.message.content);
-		} else if (targetEntry.type === "custom_message") {
-			// Custom message: leaf = parent (null if root), text goes to editor
-			newLeafId = targetEntry.parentId;
-			editorText =
-				typeof targetEntry.content === "string"
-					? targetEntry.content
-					: targetEntry.content
-							.filter((c): c is { type: "text"; text: string } => c.type === "text")
-							.map(c => c.text)
-							.join("");
-		} else {
-			// Non-user message: leaf = selected node
-			newLeafId = targetId;
-		}
-
-		// Switch leaf (with or without summary)
-		// Summary is attached at the navigation target position (newLeafId), not the old branch
-		let summaryEntry: BranchSummaryEntry | undefined;
-		if (summaryText) {
-			// Create summary at target position (can be null for root)
-			const summaryId = this.sessionManager.branchWithSummary(newLeafId, summaryText, summaryDetails, fromExtension);
-			summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
-		} else if (newLeafId === null) {
-			// No summary, navigating to root - reset leaf
-			this.sessionManager.resetLeaf();
-		} else {
-			// No summary, navigating to non-root
-			this.sessionManager.branch(newLeafId);
-		}
-
-		// Update agent state through the canonical filtered display context so legacy
-		// request-scoped entries cannot re-enter live history after tree navigation.
-		const displayContext = this.buildDisplaySessionContext();
-		await this.#restoreMCPSelectionsForSessionContext(displayContext);
-		this.agent.replaceMessages(displayContext.messages);
-		this.#resetInjectedContextSignatures();
-		this.#syncTodoPhasesFromBranch();
-		this.#closeCodexProviderSessionsForHistoryRewrite();
-
-		this.#branchSummaryAbortController = undefined;
-
-		// Emit session_tree event; only handlers can mutate session entries, so skip
-		// the emit and the context rebuild when no handlers are registered (mirrors
-		// the session_before_tree guard above).
-		if (this.#extensionRunner?.hasHandlers("session_tree")) {
-			await this.#extensionRunner.emit({
-				type: "session_tree",
-				newLeafId: this.sessionManager.getLeafId(),
+			// Collect entries to summarize (from old leaf to common ancestor).
+			const { entries: collectedEntriesToSummarize, commonAncestorId } = collectEntriesForBranchSummary(
+				this.sessionManager,
 				oldLeafId,
-				summaryEntry,
-				fromExtension: summaryText ? fromExtension : undefined,
-			});
-			const refreshedContext = this.buildDisplaySessionContext();
-			return { editorText, cancelled: false, summaryEntry, sessionContext: refreshedContext };
-		}
-		return { editorText, cancelled: false, summaryEntry, sessionContext: displayContext };
+				targetId,
+			);
+			const entriesToSummarize = this.#withoutEphemeralCustomMessageEntries(collectedEntriesToSummarize);
+
+			// Prepare event data
+			const preparation: TreePreparation = {
+				targetId,
+				oldLeafId,
+				commonAncestorId,
+				entriesToSummarize,
+				userWantsSummary: options.summarize ?? false,
+			};
+
+			// Set up abort controller for summarization
+			this.#branchSummaryAbortController = new AbortController();
+			let hookSummary: { summary: string; details?: unknown } | undefined;
+			let fromExtension = false;
+
+			// Emit session_before_tree event
+			if (this.#extensionRunner?.hasHandlers("session_before_tree")) {
+				const result = (await this.#extensionRunner.emit({
+					type: "session_before_tree",
+					preparation,
+					signal: this.#branchSummaryAbortController.signal,
+				})) as SessionBeforeTreeResult | undefined;
+
+				if (result?.cancel) {
+					return { cancelled: true };
+				}
+
+				if (result?.summary && options.summarize) {
+					hookSummary = result.summary;
+					fromExtension = true;
+				}
+			}
+
+			// Run default summarizer if needed
+			let summaryText: string | undefined;
+			let summaryDetails: unknown;
+			if (options.summarize && entriesToSummarize.length > 0 && !hookSummary) {
+				const model = this.model!;
+				const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
+				if (!apiKey) {
+					throw new Error(`No API key for ${model.provider}`);
+				}
+				const branchSummarySettings = this.settings.getGroup("branchSummary");
+				const result = await generateBranchSummary(entriesToSummarize, {
+					...this.#maintenanceProviderTransport(),
+					model,
+					apiKey,
+					signal: this.#branchSummaryAbortController.signal,
+					customInstructions: options.customInstructions,
+					reserveTokens: branchSummarySettings.reserveTokens,
+					metadata: this.agent.metadataForProvider(model.provider),
+					convertToLlm,
+					telemetry: resolveTelemetry(this.agent.telemetry, this.sessionId),
+				});
+				this.#branchSummaryAbortController = undefined;
+				if (result.aborted) {
+					return { cancelled: true, aborted: true };
+				}
+				if (result.error) {
+					throw new Error(result.error);
+				}
+				summaryText = result.summary;
+				summaryDetails = {
+					readFiles: result.readFiles || [],
+					modifiedFiles: result.modifiedFiles || [],
+				};
+			} else if (hookSummary) {
+				summaryText = hookSummary.summary;
+				summaryDetails = hookSummary.details;
+			}
+
+			// Determine the new leaf position based on target type
+			let newLeafId: string | null;
+			let editorText: string | undefined;
+
+			if (targetEntry.type === "message" && targetEntry.message.role === "user") {
+				// User message: leaf = parent (null if root), text goes to editor
+				newLeafId = targetEntry.parentId;
+				editorText = this.#extractUserMessageText(targetEntry.message.content);
+			} else if (targetEntry.type === "custom_message") {
+				// Custom message: leaf = parent (null if root), text goes to editor
+				newLeafId = targetEntry.parentId;
+				editorText =
+					typeof targetEntry.content === "string"
+						? targetEntry.content
+						: targetEntry.content
+								.filter((c): c is { type: "text"; text: string } => c.type === "text")
+								.map(c => c.text)
+								.join("");
+			} else {
+				// Non-user message: leaf = selected node
+				newLeafId = targetId;
+			}
+
+			// Switch leaf (with or without summary)
+			// Summary is attached at the navigation target position (newLeafId), not the old branch
+			let summaryEntry: BranchSummaryEntry | undefined;
+			if (summaryText) {
+				// Create summary at target position (can be null for root)
+				const summaryId = this.sessionManager.branchWithSummary(
+					newLeafId,
+					summaryText,
+					summaryDetails,
+					fromExtension,
+				);
+				summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
+			} else if (newLeafId === null) {
+				// No summary, navigating to root - reset leaf
+				this.sessionManager.resetLeaf();
+			} else {
+				// No summary, navigating to non-root
+				this.sessionManager.branch(newLeafId);
+			}
+
+			// Update agent state through the canonical filtered display context so legacy
+			// request-scoped entries cannot re-enter live history after tree navigation.
+			const displayContext = this.buildDisplaySessionContext();
+			await this.#restoreMCPSelectionsForSessionContext(displayContext);
+			this.agent.replaceMessages(displayContext.messages);
+			this.#resetInjectedContextSignatures();
+			this.#syncTodoPhasesFromBranch();
+			this.#closeCodexProviderSessionsForHistoryRewrite();
+
+			this.#branchSummaryAbortController = undefined;
+
+			// Emit session_tree event; only handlers can mutate session entries, so skip
+			// the emit and the context rebuild when no handlers are registered (mirrors
+			// the session_before_tree guard above).
+			if (this.#extensionRunner?.hasHandlers("session_tree")) {
+				await this.#extensionRunner.emit({
+					type: "session_tree",
+					newLeafId: this.sessionManager.getLeafId(),
+					oldLeafId,
+					summaryEntry,
+					fromExtension: summaryText ? fromExtension : undefined,
+				});
+				const refreshedContext = this.buildDisplaySessionContext();
+				return { editorText, cancelled: false, summaryEntry, sessionContext: refreshedContext };
+			}
+			return { editorText, cancelled: false, summaryEntry, sessionContext: displayContext };
 		} finally {
 			this.#endSessionTransition();
 		}
