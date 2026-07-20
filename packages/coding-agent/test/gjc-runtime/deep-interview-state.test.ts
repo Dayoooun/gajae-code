@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { deriveDeepInterviewHud } from "@gajae-code/coding-agent/skill-state/workflow-hud";
 import {
+	assertDeepInterviewEnvelopeInputLimits,
 	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewIntentReview,
 	assertDeepInterviewStructuredResponseWithinLimit,
@@ -15,8 +17,7 @@ import {
 	mergeDeepInterviewRounds,
 	normalizeDeepInterviewEnvelope,
 	reviewDeepInterviewIntent,
-} from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
-import { deriveDeepInterviewHud } from "@gajae-code/coding-agent/skill-state/workflow-hud";
+} from "../../src/gjc-runtime/deep-interview-state";
 
 function inner(envelope: { state?: Record<string, unknown> }): Record<string, unknown> {
 	return (envelope.state ?? {}) as Record<string, unknown>;
@@ -433,6 +434,21 @@ describe("deep-interview-state: free-text field allowlist + input size limits", 
 		expect(() => assertDeepInterviewStructuredResponseWithinLimit(cyclic)).toThrow(
 			"invalid structured deep-interview response",
 		);
+	});
+
+	it("bounds legacy round answer aliases before persistence without constraining generated answer objects", () => {
+		const exact = "😀".repeat(MAX_USER_RESPONSE_LENGTH);
+		for (const field of ["custom_input", "customInput", "user_response", "answer"] as const) {
+			expect(() =>
+				assertDeepInterviewEnvelopeInputLimits({ state: { rounds: [{ [field]: exact }] } }),
+			).not.toThrow();
+			expect(() =>
+				assertDeepInterviewEnvelopeInputLimits({ state: { rounds: [{ [field]: `${exact}😀` }] } }),
+			).toThrow(`state.rounds[0].${field} exceeds max length 10000`);
+		}
+		expect(() =>
+			assertDeepInterviewEnvelopeInputLimits({ state: { rounds: [{ lifecycle: "scored", answer: { score: 1 } }] } }),
+		).not.toThrow();
 	});
 
 	it("pins the documented cap values", () => {

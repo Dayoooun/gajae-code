@@ -251,7 +251,11 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isOnlyPlainData(value: unknown): boolean {
-	if (Array.isArray(value)) return value.every(isOnlyPlainData);
+	if (Array.isArray(value))
+		return (
+			Reflect.ownKeys(value).length === value.length + 1 &&
+			value.every((item, index) => Object.hasOwn(value, index) && isOnlyPlainData(item))
+		);
 	if (typeof value !== "object" || value === null) return true;
 	return isPlainRecord(value) && Object.values(value).every(isOnlyPlainData);
 }
@@ -310,11 +314,27 @@ function normalizeRoundZeroOptionalNulls(arguments_: Record<string, unknown>): R
 		}
 	}
 	const normalizedDeepInterview = { ...question.deepInterview };
-	if (Object.hasOwn(normalizedDeepInterview, "round_id") && normalizedDeepInterview.round_id === null) {
-		delete normalizedDeepInterview.round_id;
-		normalizedQuestion.deepInterview = normalizedDeepInterview;
-		changed = true;
+	for (const key of ["round_id", "confused_terms", "references"] as const) {
+		if (Object.hasOwn(normalizedDeepInterview, key) && normalizedDeepInterview[key] === null) {
+			delete normalizedDeepInterview[key];
+			changed = true;
+		}
 	}
+	if (Array.isArray(normalizedDeepInterview.references)) {
+		const references = normalizedDeepInterview.references.map(reference => {
+			if (!isPlainRecord(reference)) return reference;
+			const normalizedReference = { ...reference };
+			for (const key of ["url", "excerpt"] as const) {
+				if (Object.hasOwn(normalizedReference, key) && normalizedReference[key] === null) {
+					delete normalizedReference[key];
+					changed = true;
+				}
+			}
+			return normalizedReference;
+		});
+		normalizedDeepInterview.references = references;
+	}
+	if (changed) normalizedQuestion.deepInterview = normalizedDeepInterview;
 	return changed ? { ...arguments_, questions: [normalizedQuestion] } : arguments_;
 }
 function recoverRoundZeroIntentContract(arguments_: Record<string, unknown>): RawArgumentValidationResult {
@@ -372,6 +392,8 @@ function recoverRoundZeroIntentContract(arguments_: Record<string, unknown>): Ra
 		"component",
 		"dimension",
 		"ambiguity",
+		"confused_terms",
+		"references",
 		"intent_contract",
 		"intent_review",
 	];
@@ -1091,9 +1113,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			activeSkillState: this.session.getActiveSkillState?.(),
 			sessionId: this.session.getSessionId?.() ?? null,
 		});
-		for (const question of params.questions) {
-			if (question.deepInterview !== undefined) assertDeepInterviewStructuredResponseWithinLimit(question);
-		}
+		assertDeepInterviewStructuredResponseWithinLimit(params);
 		let activeRemoteReceipt: AskRemoteReceipt | undefined;
 		let activeRemoteRequest: AskAnswerRequest | undefined;
 		let remoteGeneration = 0;
@@ -1357,7 +1377,6 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					timedOut: false,
 				};
 			}
-			let leaveRemotePending = false;
 			try {
 				const deepInterviewPrompt = formatDeepInterviewSelectorPrompt(q.question);
 				const isDeepInterviewQuestion = deepInterviewPrompt !== null || q.deepInterview !== undefined;
@@ -1439,10 +1458,8 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 							return displayIndex >= 0 ? (rawOptionLabels[displayIndex] ?? selected) : selected;
 						})
 					: displaySelectedOptions;
-				if (isDeepInterviewQuestion && customInput !== undefined) {
-					leaveRemotePending = true;
+				if (isDeepInterviewQuestion && customInput !== undefined)
 					assertDeepInterviewInputWithinLimit(customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
-				}
 				if (activeRemoteReceipt) {
 					const settlement: AskSettlement =
 						clarificationQuestion !== undefined
@@ -1477,12 +1494,14 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					timedOut,
 				};
 			} catch (error) {
-				if (!leaveRemotePending) {
-					await settleActiveRemote({
-						kind: "resolve_without_commit",
-						reason: error instanceof Error && error.name === "AbortError" ? "aborted" : "exception",
-					});
-				}
+				await settleActiveRemote(
+					error instanceof Error && error.message.includes("exceeds max length")
+						? { kind: "invalid", reason: "invalid_structured_answer" }
+						: {
+								kind: "resolve_without_commit",
+								reason: error instanceof Error && error.name === "AbortError" ? "aborted" : "exception",
+							},
+				);
 				activeRemoteRequest = undefined;
 				if (error instanceof Error && error.name === "AbortError") {
 					throw new ToolAbortError("Ask input was cancelled");

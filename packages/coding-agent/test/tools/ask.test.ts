@@ -483,7 +483,7 @@ describe("AskTool cancellation", () => {
 		expect(appendSpy).not.toHaveBeenCalled();
 	});
 
-	it("accepts exactly 10000 emoji custom-input characters and keeps a 10001-character remote reply pending", async () => {
+	it("accepts exactly 10000 emoji custom-input characters and invalidates a 10001-character remote reply", async () => {
 		const appendSpy = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as AppendOrMergeResult["record"],
@@ -532,7 +532,7 @@ describe("AskTool cancellation", () => {
 				createContext({ select: () => new Promise<string | undefined>(() => {}) }),
 			),
 		).rejects.toThrow("user_response exceeds max length 10000");
-		expect(settlements).toEqual([]);
+		expect(settlements).toEqual([{ kind: "invalid", reason: "invalid_structured_answer" }]);
 		expect(appendSpy).not.toHaveBeenCalled();
 	});
 
@@ -2707,13 +2707,13 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(result.details?.selectedOptions).toEqual(["yes"]);
 	});
 
-	function deepInterviewQuestionAtSerializedLength(length: number) {
+	function deepInterviewQuestionAtPayloadLength(length: number) {
 		const question = singleDeepInterviewQuestion();
 		question.question = "";
-		const paddingLength = length - deepInterviewCharacterCount(JSON.stringify(question));
+		const paddingLength = length - deepInterviewCharacterCount(JSON.stringify({ questions: [question] }));
 		if (paddingLength < 0) throw new Error("deep-interview question base exceeds structured-response limit");
 		question.question = "😀".repeat(paddingLength);
-		if (deepInterviewCharacterCount(JSON.stringify(question)) !== length)
+		if (deepInterviewCharacterCount(JSON.stringify({ questions: [question] })) !== length)
 			throw new Error("unable to construct structured question boundary");
 		return question;
 	}
@@ -2731,20 +2731,46 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const tool = new AskTool(
 			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
 		);
-		const exact = deepInterviewQuestionAtSerializedLength(100_000);
-		const oversized = deepInterviewQuestionAtSerializedLength(100_001);
+		const exact = deepInterviewQuestionAtPayloadLength(100_000);
+		const oversized = deepInterviewQuestionAtPayloadLength(100_001);
 
-		expect(deepInterviewCharacterCount(JSON.stringify(exact))).toBe(100_000);
+		expect(deepInterviewCharacterCount(JSON.stringify({ questions: [exact] }))).toBe(100_000);
 		await tool.execute("call-structured-limit-exact", { questions: [exact] }, undefined, undefined, undefined);
 		expect(gateEmitter.emitGate).toHaveBeenCalledTimes(1);
 		expect(appendSpy).toHaveBeenCalledTimes(1);
 
-		expect(deepInterviewCharacterCount(JSON.stringify(oversized))).toBe(100_001);
+		expect(deepInterviewCharacterCount(JSON.stringify({ questions: [oversized] }))).toBe(100_001);
 		await expect(
 			tool.execute("call-structured-limit-oversized", { questions: [oversized] }, undefined, undefined, undefined),
 		).rejects.toThrow("structured deep-interview response exceeds max length 100000");
 		expect(gateEmitter.emitGate).toHaveBeenCalledTimes(1);
 		expect(appendSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("bounds the complete legacy and multi-question ask payload before any gate emission", async () => {
+		const gateEmitter = { isUnattended: () => true, emitGate: vi.fn(async () => ({ selected: ["A"] })) };
+		const tool = new AskTool(
+			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		);
+		const payloadAtLength = (length: number) => {
+			const questions = [
+				{ id: "legacy", question: "", options: [{ label: "A" }] },
+				{ id: "second", question: "Continue?", options: [{ label: "A" }] },
+			];
+			const overhead = deepInterviewCharacterCount(JSON.stringify({ questions }));
+			questions[0]!.question = "한".repeat(length - overhead);
+			return { questions };
+		};
+		const exact = payloadAtLength(100_000);
+		const oversized = payloadAtLength(100_001);
+		expect(deepInterviewCharacterCount(JSON.stringify(exact))).toBe(100_000);
+		await tool.execute("call-legacy-aggregate-exact", exact, undefined, undefined, undefined);
+		expect(gateEmitter.emitGate).toHaveBeenCalledTimes(2);
+		expect(deepInterviewCharacterCount(JSON.stringify(oversized))).toBe(100_001);
+		await expect(
+			tool.execute("call-legacy-aggregate-oversized", oversized, undefined, undefined, undefined),
+		).rejects.toThrow("structured deep-interview response exceeds max length 100000");
+		expect(gateEmitter.emitGate).toHaveBeenCalledTimes(2);
 	});
 
 	it("forwards bounded inert adapter context through the canonical gate", async () => {
@@ -2898,12 +2924,24 @@ describe("AskTool Round-0 intent recovery", () => {
 		});
 	});
 
-	it("normalizes strict-provider null placeholders before exact Round-0 recovery", () => {
+	it("normalizes strict-provider null placeholders and preserves bounded adapter context before exact Round-0 recovery", () => {
 		const pair = roundZeroPair();
 		Object.assign(pair.questions[0], { multi: null, recommended: null, workflowGate: null });
-		Object.assign(pair.questions[0].deepInterview, { round_id: null });
+		Object.assign(pair.questions[0].deepInterview, {
+			round_id: null,
+			confused_terms: ["eventual consistency"],
+			references: [{ reference_id: "note", label: "Note", origin: "user", url: null, excerpt: null }],
+		});
 		const question = validateAsk(pair).questions[0];
-		expect(question).toMatchObject({ deepInterview: { intent_contract: expect.any(Object) } });
+		expect(question).toMatchObject({
+			deepInterview: {
+				intent_contract: expect.any(Object),
+				confused_terms: ["eventual consistency"],
+				references: [{ reference_id: "note" }],
+			},
+		});
+		expect(question.deepInterview.references?.[0]).not.toHaveProperty("url");
+		expect(question.deepInterview.references?.[0]).not.toHaveProperty("excerpt");
 		expect(question.deepInterview).not.toHaveProperty("intent_review");
 		expect(question.deepInterview).not.toHaveProperty("round_id");
 		expect(question).not.toHaveProperty("multi");
@@ -2972,6 +3010,8 @@ describe("AskTool Round-0 intent recovery", () => {
 		malformedReviewOnly.questions[0].deepInterview.component = "locked-intent";
 		malformedReviewOnly.questions[0].deepInterview.dimension = "constraints";
 		malformedReviewOnly.questions[0].deepInterview.intent_review.approval_options = ["Not displayed"];
+		const sparseAdapterContext = roundZeroPair();
+		Object.assign(sparseAdapterContext.questions[0].deepInterview, { confused_terms: new Array(1) });
 
 		const invalidGates: unknown[] = [
 			"deep-interview/question",
@@ -3008,6 +3048,7 @@ describe("AskTool Round-0 intent recovery", () => {
 			nullDeepInterview,
 			malformedContractOnly,
 			malformedReviewOnly,
+			sparseAdapterContext,
 		]) {
 			expect(() => validateCandidate(arguments_)).toThrow("raw arguments rejected before coercion");
 		}

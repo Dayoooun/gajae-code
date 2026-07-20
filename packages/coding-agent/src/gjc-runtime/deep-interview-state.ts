@@ -477,7 +477,7 @@ export function assertDeepInterviewInputWithinLimit(value: string, max: number, 
 	if (deepInterviewCharacterCount(value) > max) throw new Error(`${fieldName} exceeds max length ${max}`);
 }
 
-/** Validate user-supplied initial context fields before a deep-interview envelope is persisted. */
+/** Validate user-supplied deep-interview prose before an envelope is persisted. */
 export function assertDeepInterviewEnvelopeInputLimits(envelope: Record<string, unknown>): void {
 	const state =
 		typeof envelope.state === "object" && envelope.state !== null && !Array.isArray(envelope.state)
@@ -490,6 +490,30 @@ export function assertDeepInterviewEnvelopeInputLimits(envelope: Record<string, 
 		const topLevelValue = envelope[field];
 		if (topLevelValue !== undefined)
 			assertDeepInterviewInputWithinLimit(topLevelValue as string, MAX_INITIAL_CONTEXT_LENGTH, field);
+	}
+	for (const field of ["user_response", "answer"] as const) {
+		const nestedValue = state[field];
+		if (nestedValue !== undefined)
+			assertDeepInterviewInputWithinLimit(nestedValue as string, MAX_USER_RESPONSE_LENGTH, `state.${field}`);
+		const topLevelValue = envelope[field];
+		if (topLevelValue !== undefined)
+			assertDeepInterviewInputWithinLimit(topLevelValue as string, MAX_USER_RESPONSE_LENGTH, field);
+	}
+	if (!Array.isArray(state.rounds)) return;
+	for (const [index, round] of state.rounds.entries()) {
+		if (typeof round !== "object" || round === null || Array.isArray(round)) continue;
+		const record = round as Record<string, unknown>;
+		for (const field of ["custom_input", "customInput", "user_response", "answer"] as const) {
+			const value = record[field];
+			// A structured scorer may use an unrelated object-valued `answer`; only prose
+			// values in a legacy answer slot are user input subject to this cap.
+			if (value === undefined || (field === "answer" && typeof value !== "string")) continue;
+			assertDeepInterviewInputWithinLimit(
+				value as string,
+				MAX_USER_RESPONSE_LENGTH,
+				`state.rounds[${index}].${field}`,
+			);
+		}
 	}
 }
 
