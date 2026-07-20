@@ -2239,11 +2239,28 @@ export class AgentSession {
 		// SDK ToolSession callbacks capture the just-constructed session. Defer the
 		// initial ask-tool registration until that capture has been assigned by the
 		// session factory, while retaining the durable emitter created above.
-		queueMicrotask(() => {
-			if (this.#isDisposed) return;
-			this.#registerWorkflowGateAskTool();
-			void this.#attachAskToolIfWorkflowActive();
+		this.#workflowGateToolRestoration = new Promise<void>(resolve => {
+			queueMicrotask(() => {
+				if (this.#isDisposed) {
+					resolve();
+					return;
+				}
+				this.#registerWorkflowGateAskTool();
+				this.#attachAskToolIfWorkflowActive().finally(resolve);
+			});
 		});
+	}
+
+	#workflowGateToolRestoration: Promise<void> = Promise.resolve();
+
+	/**
+	 * Resolves when constructor-time workflow-gate tool restoration (ask
+	 * registration plus durable active-workflow attachment) has settled. The
+	 * SDK factory awaits this so a resumed canonical workflow session is
+	 * returned with `ask` already resident.
+	 */
+	get workflowGateToolRestoration(): Promise<void> {
+		return this.#workflowGateToolRestoration;
 	}
 
 	/** Model registry for API key resolution and model discovery */
@@ -6527,6 +6544,10 @@ export class AgentSession {
 				});
 				return;
 			}
+			// Identity fence: the durable read is async — the session may have been
+			// disposed or switched to a different identity meanwhile. Never attach
+			// a predecessor session's workflow state to the current identity.
+			if (this.#isDisposed || this.sessionManager.getSessionId() !== sessionId) return;
 		}
 		if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill.trim())) this.#attachAskTool();
 	}

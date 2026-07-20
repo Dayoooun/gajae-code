@@ -327,8 +327,8 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			slashCommands: [],
 		});
 		try {
-			for (let attempt = 0; attempt < 20 && !resumedSession.getActiveToolNames().includes("ask"); attempt += 1)
-				await Bun.sleep(1);
+			// Deterministic readiness contract: createAgentSession awaits
+			// workflowGateToolRestoration, so ask must be resident immediately.
 			expect(resumedSession.getActiveToolNames()).toContain("ask");
 		} finally {
 			await resumedSession.dispose();
