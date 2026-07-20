@@ -266,6 +266,74 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			await session.dispose();
 		}
 	});
+	it("restores ask for durable workflow state without carrying it into a fresh session", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-workflow-resume-"));
+		tempDirs.push(tempDir);
+		const settings = Settings.isolated({ "mcp.discoveryMode": "mcp-only" });
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		await sessionManager.ensureOnDisk();
+		const originalSessionFile = sessionManager.getSessionFile();
+		if (!originalSessionFile) throw new Error("Expected persisted workflow session");
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager,
+			settings,
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			session.agent.emitExternalEvent({
+				type: "message_start",
+				message: {
+					role: "custom",
+					customType: SKILL_PROMPT_MESSAGE_TYPE,
+					content: "# Ultragoal",
+					display: true,
+					details: { name: "ultragoal" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				},
+			});
+			for (let attempt = 0; attempt < 20 && !session.getActiveSkillState(); attempt += 1) await Bun.sleep(1);
+			expect(session.getActiveToolNames()).toContain("ask");
+			expect(session.getActiveSkillState()).toMatchObject({ skill: "ultragoal" });
+
+			await expect(session.newSession()).resolves.toBe(true);
+			expect(session.getActiveToolNames()).not.toContain("ask");
+			await expect(session.switchSession(originalSessionFile)).resolves.toBe(true);
+			expect(session.getActiveToolNames()).toContain("ask");
+		} finally {
+			await session.dispose();
+		}
+
+		const resumedManager = await SessionManager.open(originalSessionFile, tempDir);
+		const { session: resumedSession } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: resumedManager,
+			settings: Settings.isolated({ "mcp.discoveryMode": "mcp-only" }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			for (let attempt = 0; attempt < 20 && !resumedSession.getActiveToolNames().includes("ask"); attempt += 1)
+				await Bun.sleep(1);
+			expect(resumedSession.getActiveToolNames()).toContain("ask");
+		} finally {
+			await resumedSession.dispose();
+		}
+	}, 15_000);
 	it("attaches ask for a canonical workflow skill even when state sync fails", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-workflow-skill-statefail-"));
 		tempDirs.push(tempDir);

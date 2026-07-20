@@ -2240,7 +2240,9 @@ export class AgentSession {
 		// initial ask-tool registration until that capture has been assigned by the
 		// session factory, while retaining the durable emitter created above.
 		queueMicrotask(() => {
-			if (!this.#isDisposed) this.#registerWorkflowGateAskTool();
+			if (this.#isDisposed) return;
+			this.#registerWorkflowGateAskTool();
+			void this.#attachAskToolIfWorkflowActive();
 		});
 	}
 
@@ -5777,14 +5779,17 @@ export class AgentSession {
 	}
 
 	async #restoreMCPSelectionsForSessionContext(sessionContext: SessionContext): Promise<void> {
-		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") return;
+		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") {
+			await this.#attachAskToolIfWorkflowActive();
+			return;
+		}
 		const selectionOnlyDiscoveredBuiltinToolNames = new Set(
 			this.#getSelectedDiscoveredBuiltinToolNames().filter(
 				name => !this.#baselineDiscoveredBuiltinToolNames.has(name),
 			),
 		);
 		const nextActiveNonMCPToolNames = this.#getActiveNonMCPToolNames().filter(
-			name => !selectionOnlyDiscoveredBuiltinToolNames.has(name),
+			name => name !== "ask" && !selectionOnlyDiscoveredBuiltinToolNames.has(name),
 		);
 		const constructorMCPToolNames = this.#resolveConstructorMCPToolSelection();
 		const restoredMCPToolNames = sessionContext.hasPersistedMCPToolSelection
@@ -5799,6 +5804,7 @@ export class AgentSession {
 			[...nextActiveNonMCPToolNames, ...restoredMCPToolNames, ...restoredDiscoveredBuiltinToolNames],
 			{ persistMCPSelection: false },
 		);
+		await this.#attachAskToolIfWorkflowActive();
 	}
 	/** Rebuild the base system prompt using the current active tool set. */
 	async refreshBaseSystemPrompt(): Promise<void> {
@@ -6501,6 +6507,28 @@ export class AgentSession {
 			});
 			this.#attachAskTool();
 		}
+	}
+
+	async #attachAskToolIfWorkflowActive(): Promise<void> {
+		const sessionId = this.sessionManager.getSessionId();
+		const inMemoryActiveSkill =
+			this.#activeSkillState && (!this.#activeSkillState.sessionId || this.#activeSkillState.sessionId === sessionId)
+				? this.#activeSkillState.skill
+				: undefined;
+		let activeSkill = inMemoryActiveSkill;
+		if (!activeSkill) {
+			try {
+				const activeState = await readVisibleSkillActiveState(this.sessionManager.getCwd(), sessionId);
+				activeSkill =
+					activeState?.skill ?? activeState?.active_skills?.find(entry => entry.active !== false)?.skill;
+			} catch (error) {
+				logger.warn("Failed to read durable workflow skill state while restoring ask tool", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return;
+			}
+		}
+		if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill.trim())) this.#attachAskTool();
 	}
 
 	#attachAskTool(): void {
@@ -8587,7 +8615,9 @@ export class AgentSession {
 		);
 		const nextDiscoverySessionToolNames = this.#mcpDiscoveryEnabled
 			? [
-					...this.#getActiveNonMCPToolNames().filter(name => !selectionOnlyDiscoveredBuiltinToolNames.has(name)),
+					...this.#getActiveNonMCPToolNames().filter(
+						name => name !== "ask" && !selectionOnlyDiscoveredBuiltinToolNames.has(name),
+					),
 					...this.#getConfiguredDefaultSelectedMCPToolNames(),
 				]
 			: undefined;

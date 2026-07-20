@@ -120,11 +120,19 @@ const DeepInterviewMetadata = z.object({
 	ambiguity: z.number().min(0).max(1),
 });
 
-/** Provider-visible metadata keeps one compact object shape; refinements below enforce branch invariants. */
-const DeepInterviewMeta = DeepInterviewMetadata.extend({
-	intent_contract: DeepInterviewIntentContract.optional(),
-	intent_review: DeepInterviewIntentReview.optional(),
-}).strict();
+const DeepInterviewMeta = z.union([
+	DeepInterviewMetadata.strict(),
+	DeepInterviewMetadata.extend({
+		round: z.literal(0),
+		component: z.literal("review-topology"),
+		dimension: z.literal("topology"),
+		intent_contract: DeepInterviewIntentContract,
+	}).strict(),
+	DeepInterviewMetadata.extend({
+		round: z.number().int().positive(),
+		intent_review: DeepInterviewIntentReview,
+	}).strict(),
+]);
 
 type DeepInterviewMeta = z.infer<typeof DeepInterviewMeta>;
 
