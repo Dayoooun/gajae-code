@@ -3547,16 +3547,12 @@ export function createNotificationsExtension(
 		};
 		const cleanupAbandonedStartup = async (): Promise<void> => {
 			try {
-				await server.stopAndWait();
-			} catch {}
-			try {
-				await host.stop();
-				host.reverse.dispose();
-			} catch {}
-			try {
-				cursors.close();
-				await revisions.close();
-			} catch {}
+				await stopSession(id, "session", initializedRuntime);
+			} catch (error) {
+				// stopSession fences the exact runtime before releasing its owners and records
+				// the lifecycle rollback proof even when one release needs a later retry.
+				logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
+			}
 		};
 
 		const ephemeralTurns = new EphemeralTurnHost(sendSdkFrame, async (question, signal) => {

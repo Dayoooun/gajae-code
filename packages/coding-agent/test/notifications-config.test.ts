@@ -41,6 +41,11 @@ import {
 	loadLightweightDaemonSettings,
 	runDaemonInternal,
 } from "../src/sdk/bus/telegram-daemon-cli";
+import {
+	attachLifecycleStartupCapability,
+	SdkStartupCapability,
+	SdkStartupRollbackTracker,
+} from "../src/sdk/startup-capability";
 import { SessionManager } from "../src/session/session-manager";
 import { cleanupFixtureRoot } from "./helpers/fixture-broker-cleanup";
 import {
@@ -1514,6 +1519,70 @@ describe("notifications config", () => {
 			} finally {
 				await session?.extensionRunner?.emit({ type: "session_shutdown" });
 				session?.dispose();
+				await cleanupFixtureRoot(cleanup);
+				resetSettingsForTest();
+			}
+		}, 30000);
+
+		test("removes a readiness-failed runtime with rollback proof so /notify on retries a real startup", async () => {
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-provider-readiness-retry-"));
+			const agentDir = path.join(cwd, ".gjc", "agent");
+			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
+			const settings = providerSettings(agentDir);
+			const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+			let notify: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> | void } | undefined;
+			let providerReady = false;
+			const rollback = new SdkStartupRollbackTracker();
+			const capability = new SdkStartupCapability(rollback);
+			const api = {
+				on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+					handlers.set(event, handler);
+				},
+				registerCommand(
+					name: string,
+					command: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> | void },
+				) {
+					if (name === "notify") notify = command;
+				},
+			} as unknown as ExtensionAPI;
+			attachLifecycleStartupCapability(api, capability);
+			const context = {
+				cwd,
+				sessionManager: {
+					getSessionId: () => "provider-readiness-retry",
+					getSessionName: () => "provider readiness retry",
+				},
+				ui: { notify: () => {} },
+			} as unknown as ExtensionCommandContext;
+			const endpoint = path.join(cwd, ".gjc", "state", "sdk", "provider-readiness-retry.json");
+			createNotificationsExtension(api, {
+				settings,
+				ensureProviderDaemon: async () => {
+					if (!providerReady) throw new Error("provider readiness denied");
+				},
+			});
+			const sessionStart = handlers.get("session_start");
+			const sessionShutdown = handlers.get("session_shutdown");
+			if (!sessionStart || !sessionShutdown || !notify)
+				throw new Error("notifications extension did not register its command handlers");
+			try {
+				await sessionStart({}, context);
+				expect(await capability.promise).toMatchObject({
+					status: "failed",
+					failure: { message: "provider readiness denied" },
+				});
+				expect(fs.existsSync(endpoint)).toBe(false);
+				expect(rollback.result).toMatchObject({
+					runtimeRemoved: true,
+					hostStopped: true,
+					brokerRegistrationReleased: true,
+				});
+
+				providerReady = true;
+				await notify.handler("on", context);
+				expect(fs.existsSync(endpoint)).toBe(true);
+			} finally {
+				await sessionShutdown({}, context);
 				await cleanupFixtureRoot(cleanup);
 				resetSettingsForTest();
 			}
