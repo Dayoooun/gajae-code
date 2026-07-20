@@ -350,6 +350,52 @@ describe("native gjc deep-interview runtime", () => {
 		expect(await fs.readFile(payload.path, "utf-8")).toBe(`${inlineSpec}\n`);
 	});
 
+	it("accepts a 100k-code-point resolved spec and rejects +1 before persisting artifacts or handoff state", async () => {
+		const acceptedRoot = await tempDir();
+		const exactSpec = "😀".repeat(100_000);
+		const sourceSpecPath = path.join(acceptedRoot, "exact-spec.md");
+		await fs.writeFile(sourceSpecPath, exactSpec, "utf-8");
+
+		const accepted = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "exact-limit", "--spec", sourceSpecPath, "--json"],
+			acceptedRoot,
+		);
+		expect(accepted.status).toBe(0);
+		expect(
+			await fs.readFile(
+				path.join(sessionSpecsDir(acceptedRoot, TEST_SESSION_ID), "deep-interview-exact-limit.md"),
+				"utf-8",
+			),
+		).toBe(`${exactSpec}\n`);
+
+		const rejectedRoot = await tempDir();
+		const rejected = await runNativeDeepInterviewCommand(
+			[
+				"--write",
+				"--stage",
+				"final",
+				"--slug",
+				"over-limit",
+				"--spec",
+				"😀".repeat(100_001),
+				"--deliberate",
+				"--json",
+			],
+			rejectedRoot,
+		);
+		expect(rejected.status).toBe(1);
+		expect(rejected.stderr).toContain("structured deep-interview response exceeds max length 100000");
+		await expect(
+			fs.access(path.join(sessionSpecsDir(rejectedRoot, TEST_SESSION_ID), "deep-interview-over-limit.md")),
+		).rejects.toThrow();
+		await expect(
+			fs.access(path.join(sessionSpecsDir(rejectedRoot, TEST_SESSION_ID), "deep-interview-index.jsonl")),
+		).rejects.toThrow();
+		await expect(fs.access(modeStatePath(rejectedRoot, TEST_SESSION_ID, "deep-interview"))).rejects.toThrow();
+		await expect(fs.access(modeStatePath(rejectedRoot, TEST_SESSION_ID, "ralplan"))).rejects.toThrow();
+		await expect(fs.access(activeSnapshotPath(rejectedRoot, TEST_SESSION_ID))).rejects.toThrow();
+	});
+
 	it("uses --deliberate to persist the final spec and hand off to ralplan", async () => {
 		const root = await tempDir();
 		const result = await runNativeDeepInterviewCommand(

@@ -13,6 +13,7 @@ import {
 	type DeepInterviewIntentItem,
 	type DeepInterviewIntentManifest,
 	type DeepInterviewIntentReview,
+	MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH,
 	MAX_INITIAL_CONTEXT_LENGTH,
 	normalizeDeepInterviewEnvelope,
 	reviewDeepInterviewIntent,
@@ -635,6 +636,11 @@ export async function persistDeepInterviewSpec(
 	cwd: string,
 	resolved: ResolvedDeepInterviewSpecWriteArgs,
 ): Promise<PersistedDeepInterviewSpec> {
+	assertDeepInterviewInputWithinLimit(
+		resolved.spec,
+		MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH,
+		"structured deep-interview response",
+	);
 	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
 	const existingRead = await readExistingStateForMutation(statePath);
 	if (existingRead.kind === "corrupt" && !resolved.force) {
