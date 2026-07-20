@@ -167,7 +167,7 @@ After session reset, handoff is persisted as `custom_message` with `customType: 
 
 `buildSessionContext()` converts this entry into a runtime custom/user-context message via `createCustomMessage(...)`, so it is included in future prompts from the new session.
 
-Auto-triggered handoffs can additionally write a timestamped `handoff-*.md` artifact under the session artifacts directory when `compaction.handoffSaveToDisk` is enabled. Manual `/handoff` does not write that artifact.
+Auto-triggered handoffs can additionally save the handoff document as a session artifact when `compaction.handoffSaveToDisk` is enabled; `handoff()` returns its resolvable `artifact://<id>` URI as `savedPath`. Manual `/handoff` does not save an artifact.
 
 ## Controller/UI behavior
 
@@ -251,4 +251,4 @@ High-level state flow:
 - No structural validation checks that generated markdown follows the requested section format.
 - Missing generated text is reported as cancellation in controller UX.
 - Manual handoff has no streaming visibility; a cancellable loader is shown until the UI updates after generation completes.
-- Auto-triggered handoffs can write a timestamped `handoff-*.md` artifact when `compaction.handoffSaveToDisk` is enabled; write failure is logged and does not fail the handoff.
+- Auto-triggered handoffs can save the handoff document as a session artifact (`artifact://<id>`) when `compaction.handoffSaveToDisk` is enabled; save failure is logged and does not fail the handoff.

@@ -1420,6 +1420,11 @@ export class AgentSession {
 	readonly notificationSessionController: NotificationSessionController | undefined;
 	readonly taskDepth: number;
 	readonly yieldQueue: YieldQueue;
+	// True from the start of a handoff transition through commit/rollback. While
+	// set, the yield queue treats the session as busy so background async-job
+	// completions cannot start a new idle turn against the session being handed
+	// off (or, on rollback, the restored predecessor mid-transition).
+	#handoffTransitionActive = false;
 
 	#powerAssertion: MacOSPowerAssertion | undefined;
 
@@ -1839,6 +1844,21 @@ export class AgentSession {
 		});
 	}
 
+	/**
+	 * Reject a turn start while a handoff transition owns the session. Handoff never
+	 * routes its own generation/injection through these turn-start chokepoints, and
+	 * auto-maintenance runs before the fence, so this fences only external entrants
+	 * (steer/follow-up/sendUserMessage/custom/hidden-next-turn/continuation) that
+	 * bypass prompt admission.
+	 */
+	#assertNoHandoffTransition(): void {
+		if (this.#handoffTransitionActive) {
+			throw Object.assign(new AgentBusyError("Cannot start a turn while a handoff is in progress."), {
+				code: "busy",
+			});
+		}
+	}
+
 	#activateNextSessionAdmission(): void {
 		if (this.#activeSessionAdmission || this.#sessionAdmissionClosed) return;
 		const next = this.#sessionAdmissionQueue.shift();
@@ -1854,6 +1874,16 @@ export class AgentSession {
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
+		// Reject new external turns for the whole handoff transition. The handoff
+		// itself never acquires prompt admission (it generates via generateHandoff and
+		// injects via appendCustomMessageEntry), so this fences external entrants —
+		// prompt/sendUserMessage/steer/follow-up/triggerTurn all funnel here — without
+		// blocking the handoff's own work or the exempt auto-maintenance owner.
+		if (kind === "prompt" && this.#handoffTransitionActive) {
+			throw Object.assign(new AgentBusyError("Cannot start a turn while a handoff is in progress."), {
+				code: "busy",
+			});
+		}
 
 		const entry: SessionAdmissionEntry = {
 			kind,
@@ -1870,6 +1900,17 @@ export class AgentSession {
 			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
 			this.#activateNextSessionAdmission();
 			throw this.#sessionAdmissionBusyError();
+		}
+		// Re-check the handoff fence after activation: a prompt queued before the
+		// transition began must not start once the fence is up.
+		if (kind === "prompt" && this.#handoffTransitionActive) {
+			entry.released = true;
+			entry.settled.resolve();
+			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
+			this.#activateNextSessionAdmission();
+			throw Object.assign(new AgentBusyError("Cannot start a turn while a handoff is in progress."), {
+				code: "busy",
+			});
 		}
 
 		const release = () => {
@@ -2136,7 +2177,7 @@ export class AgentSession {
 		this.#setGuardedAgentTools(this.agent.state.tools);
 		this.#bindWorkflowGateEmitter();
 		this.yieldQueue = new YieldQueue({
-			isStreaming: () => this.isStreaming,
+			isStreaming: () => this.isStreaming || this.#handoffTransitionActive,
 			injectStreaming: message => this.agent.followUp(message),
 			injectIdle: async messages => {
 				const first = messages[0];
@@ -3772,7 +3813,7 @@ export class AgentSession {
 		skipCompactionCheck?: boolean;
 		suppressPredecessorAgentEnd?: boolean;
 		shouldContinue?: () => boolean;
-		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained") => void;
+		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress") => void;
 		allowDuringCancelAndSubmit?: boolean;
 		onError?: (error: unknown) => void;
 	}): Promise<void> {
@@ -3780,7 +3821,7 @@ export class AgentSession {
 			? this.#reserveDeferredAgentEndForContinuation()
 			: undefined;
 		let terminalized = false;
-		const skip = (reason: "generation_changed" | "aborted_signal" | "queue_drained") => {
+		const skip = (reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress") => {
 			if (terminalized) return;
 			terminalized = true;
 			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
@@ -3834,6 +3875,13 @@ export class AgentSession {
 					}
 					if (options?.shouldContinue && !options.shouldContinue()) {
 						skip("queue_drained");
+						return;
+					}
+					// A continuation scheduled before a handoff engaged must not start a
+					// turn against the session being handed off (or the restored
+					// predecessor). rearmIdle / normal delivery resumes after the fence.
+					if (this.#handoffTransitionActive) {
+						skip("handoff_in_progress");
 						return;
 					}
 					const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
@@ -6239,6 +6287,7 @@ export class AgentSession {
 
 	/** Main startup calls this exactly once, after a strict open returned `kind: "opened"`. */
 	async continuePersistedHistory(): Promise<void> {
+		this.#assertNoHandoffTransition();
 		this.#assertRecoveryHydrationPromoted();
 		this.#removeEphemeralCustomMessages();
 
@@ -6275,6 +6324,10 @@ export class AgentSession {
 					hindsightRecall = undefined;
 				}
 			}
+			// Re-check after the awaited preparation: a handoff can engage during the
+			// volatile-context/hindsight awaits above and this would otherwise start a
+			// turn against the session being handed off.
+			this.#assertNoHandoffTransition();
 			await this.agent.continue({
 				...this.#managedFallbackPromptOptions(),
 				onRunAccepted: () => {
@@ -6561,27 +6614,61 @@ export class AgentSession {
 		return getAskAnswerSourceFromRegistry(this.sessionId);
 	}
 
-	#bindWorkflowGateEmitter(previousSessionId?: string, previousEmitter = this.#workflowGateEmitter): void {
+	#constructWorkflowGateEmitter(): WorkflowGateEmitter {
 		const sessionId = this.sessionManager.getSessionId();
 		assertNonEmptyGjcSessionId(sessionId, "AgentSession workflow-gate session");
 		const gateStore = this.sessionManager.isPersisted()
 			? new FileGateStore(path.join(sessionStateDir(this.sessionManager.getCwd(), sessionId), "workflow-gates.json"))
 			: new MemoryGateStore();
-		const successorEmitter = new BrokerWorkflowGateEmitter(sessionId, gateStore);
-		previousEmitter?.fence?.();
-		if (previousEmitter && !previousEmitter.fence) {
-			for (const gate of previousEmitter.listPendingGates?.() ?? []) previousEmitter.quarantineGate?.(gate.gate_id);
+		return new BrokerWorkflowGateEmitter(sessionId, gateStore);
+	}
+
+	/**
+	 * Publish an already-constructed successor emitter. This is no-throw from the
+	 * caller's perspective: predecessor fencing/quarantine is best-effort (a failure
+	 * must never leave the session with no emitter after a committed switch), and
+	 * listener notification is isolated in the registry.
+	 */
+	#publishWorkflowGateEmitter(
+		successorEmitter: WorkflowGateEmitter,
+		previousSessionId?: string,
+		previousEmitter = this.#workflowGateEmitter,
+	): void {
+		try {
+			previousEmitter?.fence?.();
+			if (previousEmitter && !previousEmitter.fence) {
+				for (const gate of previousEmitter.listPendingGates?.() ?? [])
+					previousEmitter.quarantineGate?.(gate.gate_id);
+			}
+		} catch (error) {
+			logger.warn("Workflow-gate predecessor fence failed during publish", {
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 		if (previousSessionId) notifyWorkflowGateEmitterChanged(previousSessionId, undefined);
 		this.setWorkflowGateEmitter(successorEmitter);
 	}
 
+	#bindWorkflowGateEmitter(previousSessionId?: string, previousEmitter = this.#workflowGateEmitter): void {
+		this.#publishWorkflowGateEmitter(this.#constructWorkflowGateEmitter(), previousSessionId, previousEmitter);
+	}
+
 	#suspendWorkflowGateEmitter(sessionId: string): WorkflowGateEmitter | undefined {
 		const emitter = this.#workflowGateEmitter;
 		if (!emitter) return undefined;
-		emitter.suspend?.();
+		// Clear the field first, then run the (throwable) suspend + listener
+		// notification inside a guard. This guarantees the caller always receives the
+		// emitter token so a rollback can restore it, even if a registry listener
+		// throws during notification.
 		this.#workflowGateEmitter = undefined;
-		notifyWorkflowGateEmitterChanged(sessionId, undefined);
+		try {
+			emitter.suspend?.();
+			notifyWorkflowGateEmitterChanged(sessionId, undefined);
+		} catch (error) {
+			logger.warn("Workflow-gate emitter suspension notification failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 		return emitter;
 	}
 
@@ -7290,7 +7377,12 @@ export class AgentSession {
 			resetRetryReplaySafety?: boolean;
 		},
 	): Promise<void> {
+		this.#assertNoHandoffTransition();
 		await this.#agentEndPublicationPromise;
+		// Re-check after the publication await: a handoff can engage during that
+		// window, and #beginInFlight below would otherwise start a turn against the
+		// session being handed off.
+		this.#assertNoHandoffTransition();
 		this.#beginInFlight();
 		const predecessorAgentEndHold =
 			options?.predecessorAgentEndHold ?? this.#reserveDeferredAgentEndForContinuation();
@@ -7776,6 +7868,7 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: { claimsGenuineUserIntent?: boolean },
 	): Promise<void> {
+		this.#assertNoHandoffTransition();
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
 		this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText));
@@ -7810,6 +7903,7 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: { forceOneAtATime?: boolean; claimsGenuineUserIntent?: boolean },
 	): Promise<void> {
+		this.#assertNoHandoffTransition();
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
 		this.#followUpMessages.push(this.#createQueuedDisplayEntry(displayText));
@@ -7881,6 +7975,10 @@ export class AgentSession {
 	}
 
 	#queueHiddenNextTurnMessage(message: CustomMessage, triggerTurn: boolean): void {
+		// A hidden next-turn message queued during a handoff transition would be
+		// dropped when the successor clears predecessor queues; reject it as busy so
+		// the caller can retry against the settled session.
+		this.#assertNoHandoffTransition();
 		this.#pendingNextTurnMessages.push(message);
 		if (!triggerTurn) return;
 		const generation = this.#promptGeneration;
@@ -8000,6 +8098,10 @@ export class AgentSession {
 			this.#deepInterviewGenuineUserMessageEpochs.set(appMessage, epoch);
 		}
 		if (this.isStreaming) {
+			// A handoff transition owns the session; a background/custom trigger (cron,
+			// monitor, skill) must not steer/follow-up/queue against the outgoing turn
+			// while an (auto-)handoff is unwinding it.
+			this.#assertNoHandoffTransition();
 			if (options?.deliverAs === "nextTurn") {
 				this.#queueHiddenNextTurnMessage(appMessage, options?.triggerTurn ?? false);
 				return;
@@ -8724,6 +8826,7 @@ export class AgentSession {
 	 * @returns true if completed, false if cancelled by hook
 	 */
 	newSession(options?: NewSessionOptions): Promise<boolean> {
+		this.#assertNoHandoffTransition();
 		if (this.#newSessionTransition) return this.#newSessionTransition;
 
 		const transition = this.#runNewSessionTransition(options);
@@ -8925,6 +9028,7 @@ export class AgentSession {
 	 * session identity and durable history trail.
 	 */
 	async clearContext(): Promise<boolean> {
+		this.#assertNoHandoffTransition();
 		const sessionId = this.sessionId;
 		this.#disconnectFromAgent();
 		await this.abort();
@@ -10009,6 +10113,9 @@ export class AgentSession {
 	 * @param options Optional callbacks for completion/error handling
 	 */
 	async compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
+		// A handoff transition owns the session manager/agent; a concurrent compaction
+		// would mutate the same state during handoff's reversible window.
+		this.#assertNoHandoffTransition();
 		if (this.#compactionAbortController) {
 			throw new Error("Compaction already in progress");
 		}
@@ -10214,6 +10321,8 @@ export class AgentSession {
 	/** Trigger idle compaction through the auto-compaction flow (with UI events). */
 	async runIdleCompaction(): Promise<void> {
 		if (this.isStreaming || this.isCompacting) return;
+		// Do not start idle compaction while a handoff transition owns the session.
+		if (this.isGeneratingHandoff || this.#handoffTransitionActive) return;
 		await this.#runAutoCompaction("idle", false, true);
 	}
 
@@ -10252,8 +10361,39 @@ export class AgentSession {
 		if (messageCount < 2) {
 			throw new Error("Nothing to hand off (no messages yet)");
 		}
+		// Single-flight: a concurrent handoff would overwrite the abort controller
+		// and the transition fence, letting one invocation's finally clear the
+		// other's ownership and allowing overlapping newSession/restore transactions.
+		if (this.isGeneratingHandoff || this.#handoffTransitionActive) {
+			throw Object.assign(new Error("A handoff is already in progress."), { code: "busy" });
+		}
+		// A manual/external handoff must not race an active turn: replacing the
+		// session and resetting the agent mid-stream can strand old-turn events
+		// onto the successor session. Auto-triggered handoffs run during
+		// post-turn maintenance (never mid-stream) and are exempt.
+		if (this.isStreaming && !options?.autoTriggered) {
+			throw Object.assign(
+				new Error("Cannot hand off while a response is streaming; wait for it to finish or abort it first."),
+				{ code: "busy" },
+			);
+		}
+		// Do not begin a MANUAL/external handoff while another session transition owns
+		// the manager/agent (compaction or a new/switch/branch/clear transition); they
+		// mutate the same state that handoff's reversible prepare window depends on.
+		// Auto-triggered handoff IS the maintenance action and runs within that flow,
+		// so it is exempt.
+		if (!options?.autoTriggered && (this.isCompacting || this.#newSessionTransition)) {
+			throw Object.assign(new Error("Cannot hand off while another session transition is in progress."), {
+				code: "busy",
+			});
+		}
 
 		this.#skipPostTurnMaintenanceAssistantTimestamp = undefined;
+		// Fence background async-job delivery for the whole transition (generation
+		// through commit/rollback): a completion that lands mid-handoff must not
+		// start an idle turn against the session being replaced or the restored
+		// predecessor. Cleared in the finally below.
+		this.#handoffTransitionActive = true;
 
 		this.#handoffAbortController = new AbortController();
 		const handoffAbortController = this.#handoffAbortController;
@@ -10294,6 +10434,7 @@ export class AgentSession {
 					systemPrompt: this.#baseSystemPrompt,
 					tools: this.agent.state.tools,
 					customInstructions,
+					promptExtension: this.settings.get("compaction.handoffPromptExtension") || undefined,
 					convertToLlm,
 					initiatorOverride: "agent",
 					metadata: this.agent.metadataForProvider(model.provider),
@@ -10309,68 +10450,206 @@ export class AgentSession {
 				return undefined;
 			}
 
-			// Start a new session
+			// Revalidate immediately before mutating: generation can take seconds,
+			// during which a turn (e.g. a background completion that started before
+			// the delivery fence) may have begun. A manual/external handoff must not
+			// mutate under an active turn; auto-triggered handoff runs at post-turn
+			// maintenance and stays exempt. Nothing has been mutated yet, so throwing
+			// here is fully non-destructive.
+			if (this.isStreaming && !options?.autoTriggered) {
+				throw Object.assign(
+					new Error("Cannot hand off while a response is streaming; wait for it to finish or abort it first."),
+					// The document was already generated; retain it so public callers can
+					// copy/retry even though this late race declines to mutate.
+					{ code: "busy", handoffDocument: handoffText },
+				);
+			}
+
+			// Start a new session transactionally. Capture restore state before the
+			// switch so a persistence, injection, display, or extension failure
+			// after the switch is non-destructive: the current session stays active
+			// and the generated handoff document is preserved for copy/retry.
 			const previousSessionFile = this.sessionFile;
 			await this.sessionManager.flush();
-			this.#cancelOwnAsyncJobs();
-			await this.sessionManager.newSession(previousSessionFile ? { parentSession: previousSessionFile } : undefined);
-			this.agent.reset();
-			this.#syncAgentSessionId();
-			this.#rekeyHindsightMemoryForCurrentSessionId();
-			this.#resetHindsightConversationTrackingIfHindsight();
-			this.#steeringMessages = [];
-			this.#followUpMessages = [];
-			this.#pendingNextTurnMessages = [];
-			this.#scheduledHiddenNextTurnGeneration = undefined;
-			this.#todoReminderCount = 0;
-			if (model) {
-				this.sessionManager.appendModelChange(`${model.provider}/${model.id}`);
-			}
-			this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
-			this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
-
-			// Inject the handoff document as a custom message
-			const handoffContent = createHandoffContext(handoffText);
-			this.sessionManager.appendCustomMessageEntry("handoff", handoffContent, true, undefined, "agent");
-			await this.sessionManager.ensureOnDisk();
+			const rollbackSessionState = this.sessionManager.captureState();
+			const rollbackAgentMessages = [...this.agent.state.messages];
+			const rollbackSteeringMessages = [...this.#steeringMessages];
+			const rollbackFollowUpMessages = [...this.#followUpMessages];
+			const rollbackPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
+			const rollbackScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
+			const rollbackTodoReminderCount = this.#todoReminderCount;
+			// Snapshot the agent's executable queues so a rollback restores queued
+			// user work that agent.reset() would otherwise clear.
+			const rollbackAgentSteeringQueue = this.agent.snapshotSteering();
+			const rollbackAgentFollowUpQueue = this.agent.snapshotFollowUp();
+			let successorSessionFile: string | undefined;
 			let savedPath: string | undefined;
-			if (options?.autoTriggered && this.settings.get("compaction.handoffSaveToDisk")) {
-				try {
-					const artifactId = await this.sessionManager.saveArtifact(`${handoffText}\n`, "handoff");
-					savedPath = `artifact://${artifactId}`;
-				} catch (error) {
-					logger.warn("Failed to save handoff document", {
-						error: error instanceof Error ? error.message : String(error),
+			let committed = false;
+			// Suspend (do not destroy) the workflow-gate emitter so it can be fenced on
+			// commit or resumed on rollback. Suspension runs inside the transaction so a
+			// listener fault during suspension is rolled back like any other prepare step.
+			let suspendedWorkflowGateEmitter: WorkflowGateEmitter | undefined;
+			try {
+				suspendedWorkflowGateEmitter = this.#suspendWorkflowGateEmitter(rollbackSessionState.sessionId);
+				// --- Prepare (reversible): build and persist the successor session
+				// without touching predecessor authority. No irreversible predecessor
+				// teardown or identity publication happens until the commit boundary.
+				await this.sessionManager.newSession(
+					previousSessionFile ? { parentSession: previousSessionFile } : undefined,
+				);
+				successorSessionFile = this.sessionFile;
+				this.agent.reset();
+				this.#syncAgentSessionId();
+				this.#rekeyHindsightMemoryForCurrentSessionId();
+				this.#steeringMessages = [];
+				this.#followUpMessages = [];
+				this.#pendingNextTurnMessages = [];
+				this.#scheduledHiddenNextTurnGeneration = undefined;
+				this.#todoReminderCount = 0;
+				if (model) {
+					this.sessionManager.appendModelChange(`${model.provider}/${model.id}`);
+				}
+				this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
+				this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
+
+				// Inject the handoff document as a custom message
+				const handoffContent = createHandoffContext(handoffText);
+				this.sessionManager.appendCustomMessageEntry("handoff", handoffContent, true, undefined, "agent");
+				await this.sessionManager.ensureOnDisk();
+				if (options?.autoTriggered && this.settings.get("compaction.handoffSaveToDisk")) {
+					try {
+						const artifactId = await this.sessionManager.saveArtifact(`${handoffText}\n`, "handoff");
+						savedPath = `artifact://${artifactId}`;
+					} catch (error) {
+						logger.warn("Failed to save handoff document", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				}
+
+				// Rebuild agent messages from session
+				const sessionContext = this.buildDisplaySessionContext();
+				this.agent.replaceMessages(sessionContext.messages);
+				this.#syncTodoPhasesFromBranch();
+
+				// Construct the successor workflow-gate emitter in the reversible window:
+				// FileGateStore load / broker init can throw, and a failure here must roll
+				// back rather than corrupt an already-committed switch. Publication is
+				// deferred to the (no-throw) commit step below.
+				const successorGateEmitter = this.#constructWorkflowGateEmitter();
+
+				// --- Commit boundary: the successor is durably persisted and every
+				// reversible, fallible step above has succeeded. Cross the irreversible
+				// commit BEFORE any identity rotation. Fencing the predecessor gate
+				// emitter and rotating provider sessions cannot be undone, so once we
+				// begin them a failure must RETAIN the committed successor rather than
+				// attempt a (now-impossible) rollback that would resume a fenced emitter.
+				committed = true;
+				this.#resetInjectedContextSignatures();
+				this.#publishWorkflowGateEmitter(
+					successorGateEmitter,
+					rollbackSessionState.sessionId,
+					suspendedWorkflowGateEmitter,
+				);
+				this.#closeAllProviderSessions("session handoff");
+				this.#rebindProviderSessionState(new Map());
+				this.#resetHindsightConversationTrackingIfHindsight();
+				this.#resetIrcRosterDeliveryState();
+				this.#planReferenceSent = false;
+				this.#planReferencePath = "local://PLAN.md";
+				this.#cancelOwnAsyncJobs();
+				// The predecessor's fenced async-job results (queued while the
+				// transition held the delivery fence) belong to the handed-off session,
+				// not the successor. Suppress and drop ONLY the async-result kind so they
+				// never flush into the new session; MCP resource notifications are
+				// server-scoped and are preserved for the successor.
+				this.#suppressOwnAsyncJobDeliveries();
+				this.yieldQueue.clearKind("async-result");
+
+				// The successor identity/emitter/provider state is now fully live and
+				// predecessor deliveries are suppressed, so release the turn-admission
+				// fence BEFORE publishing session_switch. Successor turns (e.g. a
+				// session_switch hook queuing steering) are legitimate and must not be
+				// rejected; the finally below is only a backstop for early-exit paths.
+				this.#handoffTransitionActive = false;
+				// session_switch is a post-commit identity signal. Extension handler
+				// errors are isolated by ExtensionRunner and must not roll back the
+				// already-committed switch.
+				if (this.#extensionRunner) {
+					await this.#extensionRunner.emit({
+						type: "session_switch",
+						reason: "new",
+						previousSessionFile,
 					});
 				}
-			}
 
-			// Rebuild agent messages from session
-			const sessionContext = this.buildDisplaySessionContext();
-			this.agent.replaceMessages(sessionContext.messages);
-			// Handoff rebuilds live context and can evict a previously injected
-			// goal/plan-mode-context copy; clear the static-once signatures.
-			this.#resetInjectedContextSignatures();
-			this.#syncTodoPhasesFromBranch();
-
-			this.#resetIrcRosterDeliveryState();
-			if (this.#extensionRunner) {
-				await this.#extensionRunner.emit({
-					type: "session_switch",
-					reason: "new",
-					previousSessionFile,
+				return { document: handoffText, savedPath };
+			} catch (switchError) {
+				if (committed) {
+					// The switch already committed; a post-commit step failed. Do not
+					// tear down the new session — surface success (the handoff exists).
+					logger.warn("Handoff post-commit step failed after the session switch committed", {
+						error: switchError instanceof Error ? switchError.message : String(switchError),
+					});
+					return { document: handoffText, savedPath };
+				}
+				// Reversible window: roll back to the pre-handoff session so the
+				// failure is non-destructive. Predecessor gate emitter, provider
+				// sessions, async jobs, IRC/plan bookkeeping, and injection signatures
+				// were never mutated before commit, so they survive intact.
+				this.sessionManager.restoreState(rollbackSessionState);
+				this.#syncAgentSessionId(rollbackSessionState.sessionId);
+				this.#restoreWorkflowGateEmitter(suspendedWorkflowGateEmitter);
+				this.#rekeyHindsightMemoryForCurrentSessionId();
+				this.agent.replaceMessages(rollbackAgentMessages);
+				this.agent.clearAllQueues();
+				this.agent.restoreSteering(rollbackAgentSteeringQueue);
+				this.agent.restoreFollowUp(rollbackAgentFollowUpQueue);
+				this.#steeringMessages = rollbackSteeringMessages;
+				this.#followUpMessages = rollbackFollowUpMessages;
+				this.#pendingNextTurnMessages = rollbackPendingNextTurnMessages;
+				this.#scheduledHiddenNextTurnGeneration = rollbackScheduledHiddenNextTurnGeneration;
+				this.#todoReminderCount = rollbackTodoReminderCount;
+				this.#syncTodoPhasesFromBranch();
+				// Remove the orphaned successor transcript/artifacts written before the
+				// failure so a rolled-back handoff leaves nothing behind.
+				if (successorSessionFile && successorSessionFile !== previousSessionFile) {
+					try {
+						await this.sessionManager.discardUncommittedSession(successorSessionFile);
+					} catch (cleanupError) {
+						logger.warn("Failed to remove orphaned handoff session after rollback", {
+							path: successorSessionFile,
+							error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+						});
+					}
+				}
+				// Map to cancellation only for a genuine handoff-signal abort; a
+				// downstream error keeps its cause and the generated document.
+				if (handoffSignal.aborted) {
+					throw new Error("Handoff cancelled");
+				}
+				// Preserve the generated handoff document for copy/retry.
+				throw Object.assign(switchError instanceof Error ? switchError : new Error(String(switchError)), {
+					handoffDocument: handoffText,
 				});
 			}
-
-			return { document: handoffText, savedPath };
 		} catch (error) {
-			if (handoffSignal.aborted || (error instanceof Error && error.name === "AbortError")) {
+			// Genuine handoff-signal cancellation maps to a cancellation error.
+			// Errors surfaced by the inner transaction (which already rolled back
+			// and, for non-aborts, attached the generated document) pass through.
+			if (handoffSignal.aborted) {
 				throw new Error("Handoff cancelled");
 			}
 			throw error;
 		} finally {
 			sourceSignal?.removeEventListener("abort", onSourceAbort);
 			this.#handoffAbortController = undefined;
+			this.#handoffTransitionActive = false;
+			// Releasing the fence: re-arm any idle delivery queued while the transition
+			// held it (e.g. a predecessor async result retained through a rollback, or a
+			// preserved MCP notification) so it is not stranded until an unrelated
+			// enqueue or the next agent yield.
+			this.yieldQueue.rearmIdle();
 		}
 	}
 
@@ -13046,6 +13325,9 @@ export class AgentSession {
 	 */
 	async retry(): Promise<boolean> {
 		if (this.isStreaming || this.isCompacting || this.isRetrying) return false;
+		// A handoff transition owns the session; retrying would mutate the tail and
+		// schedule a continuation against the session being handed off.
+		if (this.isGeneratingHandoff || this.#handoffTransitionActive) return false;
 
 		const messages = this.agent.state.messages;
 		const lastMsg = messages[messages.length - 1];
@@ -13961,6 +14243,7 @@ export class AgentSession {
 	 * @returns true if switch completed, false if cancelled by hook
 	 */
 	async switchSession(sessionPath: string): Promise<boolean> {
+		this.#assertNoHandoffTransition();
 		const previousSessionFile = this.sessionManager.getSessionFile();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
@@ -14172,6 +14455,7 @@ export class AgentSession {
 		selectedText: string;
 		cancelled: boolean;
 	}> {
+		this.#assertNoHandoffTransition();
 		const previousSessionFile = this.sessionFile;
 		const previousWorkflowGateSessionId = this.sessionId;
 		const selectedEntry = this.sessionManager.getEntryForFidelity(entryId);
