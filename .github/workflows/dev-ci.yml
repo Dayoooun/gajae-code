@@ -685,6 +685,8 @@ jobs:
           CI_DEV_EVIDENCE_ROOT: ${{ runner.temp }}/ci-dev-affected-evidence
         run: bun scripts/ci-dev-affected.ts --validate-affected-evidence
       - name: Validate live affected aggregate
+        env:
+          CI_DEV_AFFECTED_PLAN: ${{ runner.temp }}/ci-dev-affected-evidence/.ci-dev-affected-plan.json
         run: bun scripts/ci-dev-affected.ts --validate-aggregate
 
   gjc-state-gates-matrix:

@@ -83,6 +83,9 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_GUARD_RESULT")).toBe("${{ needs.telegram-daemon-generation.result }}");
 		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_GUARD_REQUIRED")).toBe("${{ needs.affected-plan.outputs.relevant }}");
 		expect(aggregateStep.run).toContain("--validate-aggregate");
+		expect(requiredEnvValue(aggregateStep, "CI_DEV_AFFECTED_PLAN")).toBe(
+			"${{ runner.temp }}/ci-dev-affected-evidence/.ci-dev-affected-plan.json",
+		);
 	});
 
 	test("requires Windows daemon safety for chat control and Telegram daemon paths, and never accepts a required skip", async () => {
