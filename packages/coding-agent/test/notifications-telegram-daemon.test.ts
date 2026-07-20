@@ -937,19 +937,34 @@ describe("telegram daemon", () => {
 			pidIncarnation,
 		});
 		await stoppedWrite;
+		const successorUnlinks: string[] = [];
+		const successorFsBase = pausedFs;
+		const successorFs: TelegramDaemonFs = {
+			...successorFsBase,
+			unlink: async file => {
+				successorUnlinks.push(file);
+				await successorFsBase.unlink(file);
+			},
+		};
+		let successorSettled = false;
+		const successor = acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: 222,
+			ownerId: "new",
+			pidAlive,
+			pidIncarnation,
+			fs: successorFs,
+		}).finally(() => {
+			successorSettled = true;
+		});
+		await Bun.sleep(0);
+		expect(successorSettled).toBe(false);
 		continueRelease();
 		await release;
-		await expect(
-			acquireDaemonOwnership({
-				settings: s,
-				tokenFingerprint: "fp",
-				chatId: "42",
-				pid: 222,
-				ownerId: "new",
-				pidAlive,
-				pidIncarnation,
-			}),
-		).resolves.toMatchObject({ acquired: true, ownerId: "new" });
+		await expect(successor).resolves.toMatchObject({ acquired: true, ownerId: "new" });
+		expect(successorUnlinks).not.toContain(paths.lock);
 		expect((await readDaemonState(s))?.ownerId).toBe("new");
 		expect(fs.existsSync(paths.lock)).toBe(true);
 	});
