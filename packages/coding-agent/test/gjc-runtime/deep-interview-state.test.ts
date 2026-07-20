@@ -418,6 +418,15 @@ describe("deep-interview-state: free-text field allowlist + input size limits", 
 		);
 	});
 
+	it("allows optional undefined object fields that JSON serialization omits", () => {
+		expect(() =>
+			assertDeepInterviewStructuredResponseWithinLimit({
+				question: "What is the boundary?",
+				round_id: undefined,
+				customInput: undefined,
+			}),
+		).not.toThrow();
+	});
 	it("rejects non-serializable structured responses", () => {
 		const cyclic: { self?: unknown } = {};
 		cyclic.self = cyclic;

@@ -1449,8 +1449,9 @@ async function assertDeepInterviewHandoffReady(state: Record<string, unknown>): 
 				`deep-interview handoff cannot read persisted spec: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
+		const boundedContent = content.endsWith("\n") ? content.slice(0, -1) : content;
 		assertDeepInterviewInputWithinLimit(
-			content,
+			boundedContent,
 			MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH,
 			"persisted deep-interview spec",
 		);

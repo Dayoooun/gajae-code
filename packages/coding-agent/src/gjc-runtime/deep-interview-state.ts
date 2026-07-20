@@ -453,7 +453,6 @@ export function assertDeepInterviewStructuredResponseWithinLimit(value: unknown)
 				typeof nestedValue === "bigint" ||
 				typeof nestedValue === "function" ||
 				typeof nestedValue === "symbol" ||
-				typeof nestedValue === "undefined" ||
 				(typeof nestedValue === "number" && !Number.isFinite(nestedValue))
 			)
 				throw new Error("invalid structured deep-interview response");
