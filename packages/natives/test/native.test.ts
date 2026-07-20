@@ -16,6 +16,7 @@ import {
 	listWorkspace,
 	MacOSPowerAssertion,
 	Process,
+	ProcessStatus,
 	PtySession,
 	summarizeCode,
 	truncateToWidth,
@@ -127,7 +128,7 @@ describe("pi-natives", () => {
 			expect(childReference).not.toBeNull();
 			expect(childReference?.signalRoot(os.constants.signals.SIGKILL)).toBe(true);
 			expect(await childReference?.waitForExit({ timeoutMs: 2_000 })).toBe(true);
-			expect(childReference?.status()).toBe("exited");
+			expect(childReference?.status()).toBe(ProcessStatus.Exited);
 		} finally {
 			if (childPid) Process.fromPid(childPid)?.signalRoot(os.constants.signals.SIGKILL);
 			Process.fromPid(root.pid)?.signalRoot(os.constants.signals.SIGKILL);
