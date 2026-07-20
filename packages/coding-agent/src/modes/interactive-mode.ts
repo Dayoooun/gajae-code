@@ -1839,6 +1839,7 @@ export class InteractiveMode implements InteractiveModeContext {
 								isError: result?.isError ?? false,
 								resultText,
 								hasResult: toolResults.has(content.id),
+								detailsData: result?.details,
 							},
 							source: { content, result },
 						}),
