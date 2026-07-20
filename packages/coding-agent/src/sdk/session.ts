@@ -445,6 +445,8 @@ export interface CreateAgentSessionOptions {
 	notificationHostModeSupported?: boolean;
 	/** Whether this host mode can own the root SDK endpoint. Default: true. */
 	sdkHostModeSupported?: boolean;
+	/** Override configured Discord/Slack daemon readiness, primarily for embedded hosts and deterministic tests. */
+	ensureNotificationProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 
 	/**
 	 * Opt-in OpenTelemetry instrumentation forwarded to the underlying Agent.
@@ -1831,6 +1833,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						controller: notificationSessionController,
 						spawnedByGjc,
 						sdkHostModeSupported: options.sdkHostModeSupported,
+						ensureProviderDaemon: options.ensureNotificationProviderDaemon,
 						runEphemeralTurn: async (promptText, signal) => {
 							if (!session) throw new Error("Ephemeral turns are unavailable.");
 							const { replyText } = await session.runEphemeralTurn({ promptText, signal });

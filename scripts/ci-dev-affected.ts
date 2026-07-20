@@ -747,7 +747,7 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 	}
 	if (paths.some(isWorkflowOrScriptPath)) {
 		add(tasks, "affected-dry-run", "Affected CI selector self-check", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
-		add(tasks, "affected-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts"]);
+		add(tasks, "affected-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/dev-ci-guard-topology.test.ts"]);
 		if (paths.some(isWorkflowPath)) {
 			add(tasks, "workflow-yaml-parse", "Workflow YAML parse check", ["bun", "scripts/check-workflow-yaml.ts"]);
 		}
@@ -866,7 +866,7 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		add(tasks, "install-methods", "Install method smoke tests", ["bun", "run", "ci:test:install-methods"]);
 	}
 	if (needCiSelftest) {
-		add(tasks, "ci-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts"]);
+		add(tasks, "ci-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/dev-ci-guard-topology.test.ts"]);
 		add(tasks, "ci-dry-run", "Affected CI selector dry-run", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
 	}
 	if (needYamlParse) {
@@ -973,7 +973,7 @@ function isTestFilePath(changedPath: string): boolean {
 }
 
 function isCiHarnessScriptPath(changedPath: string): boolean {
-	return changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/ci-dev-affected.test.ts" || changedPath === "scripts/check-workflow-yaml.ts";
+	return changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/ci-dev-affected.test.ts" || changedPath === "scripts/dev-ci-guard-topology.test.ts" || changedPath === "scripts/check-workflow-yaml.ts";
 }
 
 
@@ -1357,7 +1357,13 @@ async function expandCargoDependents(
 	return Array.from(selected.values());
 }
 function isWorkflowHarnessPath(changedPath: string): boolean {
-	return isWorkflowPath(changedPath) || changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/check-workflow-yaml.ts";
+	return (
+		isWorkflowPath(changedPath) ||
+		changedPath === "scripts/ci-dev-affected.ts" ||
+		changedPath === "scripts/ci-dev-affected.test.ts" ||
+		changedPath === "scripts/dev-ci-guard-topology.test.ts" ||
+		changedPath === "scripts/check-workflow-yaml.ts"
+	);
 }
 
 function isToolingScriptPath(changedPath: string): boolean {
@@ -1434,6 +1440,10 @@ export interface AffectedAggregateResults {
 	shards: string;
 	windowsDoctor: string;
 	windowsDoctorRequired: string;
+	telegramGuard: string;
+	telegramGuardRequired: string;
+	telegramWindows: string;
+	telegramWindowsRequired: string;
 	hasNative: string;
 	hasTasks: string;
 	darwinArm64TabWorkerSmoke: string;
@@ -1450,6 +1460,10 @@ export function validateAffectedAggregate(results: AffectedAggregateResults): vo
 	if (results.windowsDoctor !== (results.windowsDoctorRequired === "true" ? "success" : "skipped")) throw new Error(results.windowsDoctorRequired === "true" ? "required Windows dev:doctor did not succeed" : "unplanned Windows dev:doctor was not skipped");
 	if (results.darwinArm64TabWorkerSmokeRequired !== "true" && results.darwinArm64TabWorkerSmokeRequired !== "false") throw new Error(`planner emitted invalid darwin_arm64_tab_worker_smoke_required=${results.darwinArm64TabWorkerSmokeRequired}`);
 	if (results.darwinArm64TabWorkerSmoke !== (results.darwinArm64TabWorkerSmokeRequired === "true" ? "success" : "skipped")) throw new Error(results.darwinArm64TabWorkerSmokeRequired === "true" ? "required Darwin arm64 tab-worker smoke did not succeed" : "unplanned Darwin arm64 tab-worker smoke was not skipped");
+	if (results.telegramGuardRequired !== "true" && results.telegramGuardRequired !== "false") throw new Error(`planner emitted invalid telegram_guard_required=${results.telegramGuardRequired}`);
+	if (results.telegramGuard !== (results.telegramGuardRequired === "true" ? "success" : "skipped")) throw new Error(results.telegramGuardRequired === "true" ? "required Telegram daemon generation guard did not succeed" : "unplanned Telegram daemon generation guard was not skipped");
+	if (results.telegramWindowsRequired !== "true" && results.telegramWindowsRequired !== "false") throw new Error(`planner emitted invalid telegram_windows_required=${results.telegramWindowsRequired}`);
+	if (results.telegramWindows !== (results.telegramWindowsRequired === "true" ? "success" : "skipped")) throw new Error(results.telegramWindowsRequired === "true" ? "required Windows Telegram daemon safety did not succeed" : "unplanned Windows Telegram daemon safety was not skipped");
 }
 
 async function validateAggregate(): Promise<void> {
@@ -1459,6 +1473,10 @@ async function validateAggregate(): Promise<void> {
 		shards: Bun.env.CI_DEV_SHARDS_RESULT?.trim() || "",
 		windowsDoctor: Bun.env.CI_DEV_WINDOWS_DOCTOR_RESULT?.trim() || "",
 		windowsDoctorRequired: Bun.env.CI_DEV_WINDOWS_DOCTOR_REQUIRED?.trim() || "",
+		telegramGuard: Bun.env.CI_DEV_TELEGRAM_GUARD_RESULT?.trim() || "",
+		telegramGuardRequired: Bun.env.CI_DEV_TELEGRAM_GUARD_REQUIRED?.trim() || "",
+		telegramWindows: Bun.env.CI_DEV_TELEGRAM_WINDOWS_RESULT?.trim() || "",
+		telegramWindowsRequired: Bun.env.CI_DEV_TELEGRAM_WINDOWS_REQUIRED?.trim() || "",
 		hasNative: Bun.env.CI_DEV_HAS_NATIVE?.trim() || "",
 		hasTasks: Bun.env.CI_DEV_HAS_TASKS?.trim() || "",
 		darwinArm64TabWorkerSmoke: Bun.env.CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT?.trim() || "",
@@ -1475,6 +1493,10 @@ async function validateAggregate(): Promise<void> {
 	console.log(`planned Windows dev:doctor: ${results.windowsDoctorRequired}`);
 	console.log(`darwin-arm64 tab-worker smoke: ${results.darwinArm64TabWorkerSmoke}`);
 	console.log(`planned Darwin arm64 tab-worker smoke: ${results.darwinArm64TabWorkerSmokeRequired}`);
+	console.log(`telegram-daemon-generation: ${results.telegramGuard}`);
+	console.log(`planned Telegram daemon generation: ${results.telegramGuardRequired}`);
+	console.log(`windows-telegram-daemon-safety: ${results.telegramWindows}`);
+	console.log(`planned Windows Telegram daemon safety: ${results.telegramWindowsRequired}`);
 	validateAffectedAggregate(results);
 	const tasks = await loadCanonicalPlan();
 	if (!tasks) throw new Error("affected-plan-invalid: aggregate requires a canonical plan");
@@ -1559,6 +1581,10 @@ function aggregateFromEnv(): AffectedAggregateResults {
 		shards: requiredEnv("CI_DEV_SHARDS_RESULT"),
 		windowsDoctor: requiredEnv("CI_DEV_WINDOWS_DOCTOR_RESULT"),
 		windowsDoctorRequired: requiredEnv("CI_DEV_WINDOWS_DOCTOR_REQUIRED"),
+		telegramGuard: requiredEnv("CI_DEV_TELEGRAM_GUARD_RESULT"),
+		telegramGuardRequired: requiredEnv("CI_DEV_TELEGRAM_GUARD_REQUIRED"),
+		telegramWindows: requiredEnv("CI_DEV_TELEGRAM_WINDOWS_RESULT"),
+		telegramWindowsRequired: requiredEnv("CI_DEV_TELEGRAM_WINDOWS_REQUIRED"),
 		hasNative: requiredEnv("CI_DEV_HAS_NATIVE"),
 		hasTasks: requiredEnv("CI_DEV_HAS_TASKS"),
 		darwinArm64TabWorkerSmoke: requiredEnv("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT"),
@@ -1575,6 +1601,10 @@ function parseAggregate(value: unknown): AffectedAggregateResults {
 			"shards",
 			"windowsDoctor",
 			"windowsDoctorRequired",
+			"telegramGuard",
+			"telegramGuardRequired",
+			"telegramWindows",
+			"telegramWindowsRequired",
 			"hasNative",
 			"hasTasks",
 			"darwinArm64TabWorkerSmoke",
@@ -1589,6 +1619,10 @@ function parseAggregate(value: unknown): AffectedAggregateResults {
 		shards: value.shards as string,
 		windowsDoctor: value.windowsDoctor as string,
 		windowsDoctorRequired: value.windowsDoctorRequired as string,
+		telegramGuard: value.telegramGuard as string,
+		telegramGuardRequired: value.telegramGuardRequired as string,
+		telegramWindows: value.telegramWindows as string,
+		telegramWindowsRequired: value.telegramWindowsRequired as string,
 		hasNative: value.hasNative as string,
 		hasTasks: value.hasTasks as string,
 		darwinArm64TabWorkerSmoke: value.darwinArm64TabWorkerSmoke as string,

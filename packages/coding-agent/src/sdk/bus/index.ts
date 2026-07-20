@@ -2737,6 +2737,22 @@ function sdkInboundFrame(commandJson: string | undefined): Record<string, unknow
 		return undefined;
 	}
 }
+/**
+ * Ensures every configured chat-provider daemon is ready before the SDK
+ * publishes session identity. A rejected ensure is startup-fatal: presenting
+ * an identity for a transport that never became available is false success.
+ */
+export async function ensureConfiguredProviderDaemons(
+	settings: Settings,
+	cfg: NotificationConfig,
+	ensureProviderDaemon: (provider: "discord" | "slack", settings: Settings) => Promise<unknown> = (
+		provider,
+		configuredSettings,
+	) => (provider === "discord" ? ensureDiscordDaemon(configuredSettings) : ensureSlackDaemon(configuredSettings)),
+): Promise<void> {
+	if (isDiscordConfigured(cfg)) await ensureProviderDaemon("discord", settings);
+	if (isSlackConfigured(cfg)) await ensureProviderDaemon("slack", settings);
+}
 
 export function createNotificationsExtension(
 	api: ExtensionAPI,
@@ -2747,6 +2763,7 @@ export function createNotificationsExtension(
 			cwd: string;
 			sessionId: string;
 		}) => Promise<EnsureDaemonResult>;
+		ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
 		spawnedByGjc?: boolean;
 		controller?: NotificationSessionController;
@@ -2796,7 +2813,7 @@ export function createNotificationsExtension(
 			? "blocked_identity"
 			: "ready";
 	}
-	async function ensureConfiguredDaemons(
+	async function ensureConfiguredDaemonOwners(
 		settings: Settings,
 		cfg: NotificationConfig,
 		cwd: string,
@@ -2805,8 +2822,7 @@ export function createNotificationsExtension(
 		if (isTelegramConfigured(cfg)) {
 			if ((await ensureTelegramOwner(settings, cwd, id)) === "blocked_identity") return false;
 		}
-		if (isDiscordConfigured(cfg)) await ensureDiscordDaemon(settings);
-		if (isSlackConfigured(cfg)) await ensureSlackDaemon(settings);
+		await ensureConfiguredProviderDaemons(settings, cfg, options.ensureProviderDaemon);
 		return true;
 	}
 	const identityControlOperations = new Set([
@@ -3531,16 +3547,12 @@ export function createNotificationsExtension(
 		};
 		const cleanupAbandonedStartup = async (): Promise<void> => {
 			try {
-				await server.stopAndWait();
-			} catch {}
-			try {
-				await host.stop();
-				host.reverse.dispose();
-			} catch {}
-			try {
-				cursors.close();
-				await revisions.close();
-			} catch {}
+				await stopSession(id, "session", initializedRuntime);
+			} catch (error) {
+				// stopSession fences the exact runtime before releasing its owners and records
+				// the lifecycle rollback proof even when one release needs a later retry.
+				logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
+			}
 		};
 
 		const ephemeralTurns = new EphemeralTurnHost(sendSdkFrame, async (question, signal) => {
@@ -3993,7 +4005,7 @@ export function createNotificationsExtension(
 			}
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				try {
-					if (!(await ensureConfiguredDaemons(settings, cfg, ctx.cwd, id))) {
+					if (!(await ensureConfiguredDaemonOwners(settings, cfg, ctx.cwd, id))) {
 						const result = failLifecycleStartup("failed", "Telegram daemon ownership is blocked.");
 						finishStartup(result);
 						await cleanupAbandonedStartup();
@@ -4007,10 +4019,9 @@ export function createNotificationsExtension(
 				}
 			}
 
-			// Startup contract: identity is committed to the replayable SDK event log
-			// immediately after the host starts, before awaiting notification transport
-			// startup. Native frames are ephemeral, so ensure configured daemon owners
-			// before broadcasting identity; late SDK consumers still recover it from
+			// Startup contract: configured notification daemon ownership must be ready
+			// before identity or endpoint publication. Native frames are ephemeral, so
+			// publish identity only after readiness; late SDK consumers recover it from
 			// event_replay.
 			const identityHeader = {
 				type: "identity_header",
@@ -4375,9 +4386,18 @@ export function createNotificationsExtension(
 		},
 	});
 
+	const startAndReconcileSession = async (ctx: ExtensionContext): Promise<void> => {
+		const result = await startSession(ctx);
+		if (result.status === "started" || result.status === "already") {
+			await controller.reconcileCurrentSession(ctx);
+			return;
+		}
+		if (!lifecycleStartupCapability && result.status === "failed")
+			throw new Error(`notifications: SDK startup failed: ${result.failure?.message ?? "Unknown startup failure."}`);
+	};
+
 	api.on("session_start", async (_event, ctx) => {
-		await startSession(ctx);
-		await controller.reconcileCurrentSession(ctx);
+		await startAndReconcileSession(ctx);
 	});
 
 	// A session endpoint's token and generation are authority for exactly one
@@ -4463,7 +4483,11 @@ export function createNotificationsExtension(
 		if (extensionShuttingDown) return;
 		const startup = startSession(ctx);
 		if (awaitStartup) {
-			await startup;
+			const result = await startup;
+			if (!lifecycleStartupCapability && result.status === "failed")
+				throw new Error(
+					`notifications: SDK startup failed: ${result.failure?.message ?? "Unknown startup failure."}`,
+				);
 			if (extensionShuttingDown) {
 				await stopSession(newId);
 				return;
