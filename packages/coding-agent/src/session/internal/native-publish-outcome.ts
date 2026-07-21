@@ -95,7 +95,11 @@ const malformed: NativePublishOutcome = Object.freeze({
 function validDiagnostic(value: unknown): value is PublishDiagnostic {
 	if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) return false;
 	const diagnostic = value as Record<string, unknown>;
-	if (!Object.keys(diagnostic).every(key => ["schemaVersion", "collectionState", "osCode", "syncFailures"].includes(key)))
+	if (
+		!Object.keys(diagnostic).every(key =>
+			["schemaVersion", "collectionState", "osCode", "syncFailures"].includes(key),
+		)
+	)
 		return false;
 	if (
 		diagnostic.schemaVersion !== 1 ||
