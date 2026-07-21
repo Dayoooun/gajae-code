@@ -1454,6 +1454,7 @@ fn rename_managed_file_no_replace(
 	}
 }
 
+#[cfg(target_os = "linux")]
 fn rename_managed_file_no_replace_inner(
 	root: &File,
 	source: &str,
@@ -1869,6 +1870,7 @@ fn install(root: &File, source: &str, destination: &str) -> RecoveryFsPublishRes
 	}
 }
 
+#[cfg(target_os = "linux")]
 fn install_inner(
 	root: &File,
 	source: &str,
@@ -2306,6 +2308,7 @@ fn rename_managed_tree_no_replace(
 	}
 }
 
+#[cfg(target_os = "linux")]
 fn rename_managed_tree_no_replace_inner(
 	root: &File,
 	source: &str,
