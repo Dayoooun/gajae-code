@@ -13,7 +13,7 @@ import {
 } from "../../src/session/internal/managed-session-scope";
 import { publishManagedFileNoReplace } from "../../src/session/internal/managed-session-storage";
 import { FileSessionStorage } from "../../src/session/session-storage";
-
+import { SessionManager } from "../../src/session/session-manager";
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -67,6 +67,65 @@ async function fixture() {
 	if (resolved.kind !== "resolved") throw new Error(resolved.message);
 	return { cwd, sessionsRoot, scope: resolved.scope };
 }
+
+describe.skipIf(process.platform !== "linux")("managed session scope shared sticky ancestry", () => {
+	async function sharedStickyFixture() {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-shared-sticky-"));
+		temporaryDirectories.push(root);
+		const agentDir = path.join(root, "agent");
+		const cwd = path.join(root, "workspace");
+		await fs.mkdir(cwd);
+		return { agentDir, cwd, sessionsRoot: path.join(agentDir, "sessions") };
+	}
+
+	it("prepares the managed chain directly below the shared sticky temp directory", async () => {
+		expect((await fs.stat(os.tmpdir())).mode & 0o1000).toBe(0o1000);
+		const stickyRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-shared-sticky-root-"));
+		await fs.rm(stickyRoot, { recursive: true, force: true });
+		temporaryDirectories.push(stickyRoot);
+		const cwdRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-shared-sticky-workspace-"));
+		temporaryDirectories.push(cwdRoot);
+		const cwd = path.join(cwdRoot, "workspace");
+		await fs.mkdir(cwd);
+		const agentDir = stickyRoot;
+		const sessionsRoot = path.join(agentDir, "sessions");
+		const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot });
+		expect(resolved.kind).toBe("resolved");
+		if (resolved.kind !== "resolved") throw new Error(resolved.message);
+
+		expect(SessionManager.getDefaultSessionDir(cwd, agentDir)).toBe(resolved.scope.directoryPath);
+		expect((await prepareManagedSessionScopeForWrite(resolved.scope)).kind).toBe("resolved");
+		expect((await fs.stat(agentDir)).mode & 0o777).toBe(0o700);
+	});
+
+	it("rejects symlinked managed intermediates and leaves their targets untouched", async () => {
+		const { agentDir, cwd, sessionsRoot } = await sharedStickyFixture();
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+		const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot });
+		if (resolved.kind !== "resolved") throw new Error(resolved.message);
+		const external = path.join(path.dirname(agentDir), "external");
+		await fs.mkdir(external);
+		await fs.symlink(external, sessionsRoot);
+
+		await expect(prepareManagedSessionScopeForWrite(resolved.scope)).resolves.toMatchObject({ kind: "error" });
+		expect((await fs.lstat(sessionsRoot)).isSymbolicLink()).toBe(true);
+		expect(await fs.readdir(external)).toEqual([]);
+	});
+
+	it("rejects a symlinked managed scope leaf without following it", async () => {
+		const { agentDir, cwd, sessionsRoot } = await sharedStickyFixture();
+		await fs.mkdir(sessionsRoot, { recursive: true, mode: 0o700 });
+		const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot });
+		if (resolved.kind !== "resolved") throw new Error(resolved.message);
+		const external = path.join(path.dirname(agentDir), "external-leaf");
+		await fs.mkdir(external);
+		await fs.symlink(external, resolved.scope.directoryPath);
+
+		await expect(prepareManagedSessionScopeForWrite(resolved.scope)).resolves.toMatchObject({ kind: "error" });
+		expect((await fs.lstat(resolved.scope.directoryPath)).isSymbolicLink()).toBe(true);
+		expect(await fs.readdir(external)).toEqual([]);
+	});
+});
 
 describe("managed session write protocol", () => {
 	it("copy-retains a legacy candidate and coalesces it to its committed v2 transcript", async () => {

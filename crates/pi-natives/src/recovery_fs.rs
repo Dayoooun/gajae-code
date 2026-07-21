@@ -71,10 +71,34 @@ impl RecoveryFsResult {
 
 /// Bounded, path-free diagnostic evidence for one retained publication.
 #[napi(object)]
+#[derive(Clone)]
+pub struct RecoveryFsPublishSyncFailure {
+	pub phase:       String,
+	pub parent_role: String,
+	pub os_code:     Option<i32>,
+	pub kind:        String,
+}
+
+#[cfg(target_os = "linux")]
+enum RetainedPublishError {
+	Code(&'static str),
+	SyncFailures(Vec<RecoveryFsPublishSyncFailure>),
+}
+
+#[cfg(target_os = "linux")]
+impl From<&'static str> for RetainedPublishError {
+	fn from(code: &'static str) -> Self {
+		Self::Code(code)
+	}
+}
+
+/// Bounded, path-free diagnostic evidence for one retained publication.
+#[napi(object)]
 pub struct RecoveryFsPublishDiagnostic {
 	pub schema_version:   u32,
 	pub collection_state: String,
 	pub os_code:          Option<i32>,
+	pub sync_failures:    Option<Vec<RecoveryFsPublishSyncFailure>>,
 }
 
 /// Explicit mutation and durability outcome for retained no-replace
@@ -145,6 +169,7 @@ impl RecoveryFsPublishResult {
 				}
 				.to_owned(),
 				os_code,
+				sync_failures: None,
 			},
 		}
 	}
@@ -174,6 +199,81 @@ fn publish_post_mutation_failure(code: &'static str, phase: &str) -> RecoveryFsP
 		"io_failure"
 	};
 	RecoveryFsPublishResult::failure("committed", "not_provable", reason, phase, code, None)
+}
+
+#[cfg(target_os = "linux")]
+fn publish_post_mutation_sync_failures(
+	failures: Vec<RecoveryFsPublishSyncFailure>,
+) -> RecoveryFsPublishResult {
+	let phase = failures
+		.first()
+		.map_or("source_parent_sync", |failure| failure.phase.as_str());
+	let os_code = failures.first().and_then(|failure| failure.os_code);
+	let mut result = RecoveryFsPublishResult::failure(
+		"committed",
+		"not_provable",
+		"durability_not_provable",
+		phase,
+		"fsync_failed",
+		os_code,
+	);
+	result.diagnostic.collection_state = "partial".to_owned();
+	result.diagnostic.sync_failures = Some(failures);
+	result
+}
+
+#[cfg(target_os = "linux")]
+fn sync_failure(
+	phase: &str,
+	parent_role: &str,
+	error: &std::io::Error,
+) -> RecoveryFsPublishSyncFailure {
+	let os_code = error.raw_os_error();
+	let kind = match os_code {
+		Some(code) if code == libc::ENOTSUP || code == libc::EOPNOTSUPP => "unsupported",
+		Some(libc::EACCES | libc::EPERM) => "permission",
+		Some(libc::EIO) => "io",
+		_ => "other",
+	};
+	RecoveryFsPublishSyncFailure {
+		phase: phase.to_owned(),
+		parent_role: parent_role.to_owned(),
+		os_code,
+		kind: kind.to_owned(),
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn collect_parent_sync_failures(
+	source_parent: &File,
+	destination_parent: &File,
+	shared: bool,
+	mut sync: impl FnMut(&File) -> std::io::Result<()>,
+) -> Result<(), RetainedPublishError> {
+	let source_role = if shared { "shared" } else { "source" };
+	let mut failures = Vec::with_capacity(2);
+	if let Err(error) = sync(source_parent) {
+		failures.push(sync_failure("source_parent_sync", source_role, &error));
+	}
+	if !shared {
+		if let Err(error) = sync(destination_parent) {
+			failures.push(sync_failure("destination_parent_sync", "destination", &error));
+		}
+	}
+	if failures.is_empty() {
+		Ok(())
+	} else {
+		Err(RetainedPublishError::SyncFailures(failures))
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn sync_distinct_parents(
+	source_parent: &File,
+	destination_parent: &File,
+	shared: bool,
+) -> Result<(), RetainedPublishError> {
+	collect_parent_sync_failures(source_parent, destination_parent, shared, File::sync_all)
 }
 
 #[cfg(target_os = "linux")]
@@ -1444,17 +1544,20 @@ fn rename_managed_file_no_replace(
 			|| publish_post_mutation_failure("identity_mismatch", "terminal_identity"),
 			RecoveryFsPublishResult::success,
 		),
-		Err("fsync_failed") => publish_post_mutation_failure("fsync_failed", "source_parent_sync"),
-		Err("rollback_unavailable") => {
+		Err(RetainedPublishError::SyncFailures(failures)) => {
+			publish_post_mutation_sync_failures(failures)
+		},
+		Err(RetainedPublishError::Code("rollback_unavailable")) => {
 			publish_post_mutation_failure("rollback_unavailable", "terminal_identity")
 		},
-		Err("interrupted") => publish_unknown_failure("interrupted", "rename"),
-		Err(
+		Err(RetainedPublishError::Code("interrupted")) => {
+			publish_unknown_failure("interrupted", "rename")
+		},
+		Err(RetainedPublishError::Code(
 			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"
 			| "invalid_request"),
-		) => publish_preflight_failure(code),
-
-		Err(code) => publish_unknown_failure(code, "terminal_identity"),
+		)) => publish_preflight_failure(code),
+		Err(RetainedPublishError::Code(code)) => publish_unknown_failure(code, "terminal_identity"),
 	}
 }
 
@@ -1469,12 +1572,12 @@ fn rename_managed_file_no_replace_inner(
 	mtime_ns: &str,
 	ctime_ns: &str,
 	sha256: &str,
-) -> Result<RecoveryFsResult, &'static str> {
+) -> Result<RecoveryFsResult, RetainedPublishError> {
 	use std::os::fd::AsRawFd;
 	let source_file = open_existing(root, source, false)?;
 	crate::path_identity::platform::verify_created_owner_only_file(&source_file)?;
 	if !same_expected(&source_file, dev, ino, size, mtime_ns, ctime_ns, sha256)? {
-		return Err("identity_mismatch");
+		return Err("identity_mismatch".into());
 	}
 
 	let (source_parent, source_name) = open_parent(root, source)?;
@@ -1492,18 +1595,21 @@ fn rename_managed_file_no_replace_inner(
 		)
 	};
 	if result != 0 {
-		return Err(match std::io::Error::last_os_error().raw_os_error() {
-			Some(libc::EEXIST) => "already_exists",
-			Some(libc::ENOSYS) => "atomic_unavailable",
-			// The retained syscall uses fixed, validated descriptors, names, and flags.
-			// EINVAL still cannot prove that this filesystem lacks RENAME_NOREPLACE;
-			// retain it as an invalid request rather than weakening no-overwrite authority.
-			Some(libc::EINVAL) => "invalid_request",
-			Some(libc::EXDEV) => "cross_device",
-			Some(libc::EACCES | libc::EPERM) => "permission_denied",
-			Some(libc::EINTR) => "interrupted",
-			_ => "io_error",
-		});
+		return Err(
+			match std::io::Error::last_os_error().raw_os_error() {
+				Some(libc::EEXIST) => "already_exists",
+				Some(libc::ENOSYS) => "atomic_unavailable",
+				// The retained syscall uses fixed, validated descriptors, names, and flags.
+				// EINVAL still cannot prove that this filesystem lacks RENAME_NOREPLACE;
+				// retain it as an invalid request rather than weakening no-overwrite authority.
+				Some(libc::EINVAL) => "invalid_request",
+				Some(libc::EXDEV) => "cross_device",
+				Some(libc::EACCES | libc::EPERM) => "permission_denied",
+				Some(libc::EINTR) => "interrupted",
+				_ => "io_error",
+			}
+			.into(),
+		);
 	}
 	// The namespace mutation is authoritative immediately after renameat2 returns
 	// success. Every following failure is therefore committed-but-unproven.
@@ -1514,27 +1620,22 @@ fn rename_managed_file_no_replace_inner(
 	if !same_expected_after_rename(&moved_file, dev, ino, size, mtime_ns, sha256)
 		.map_err(|_| "rollback_unavailable")?
 	{
-		return Err("rollback_unavailable");
+		return Err("rollback_unavailable".into());
 	}
 	let terminal =
 		statat(&destination_parent, &destination_name).map_err(|_| "rollback_unavailable")?;
 	if terminal.st_dev.to_string() != moved.dev || terminal.st_ino.to_string() != moved.ino {
-		return Err("rollback_unavailable");
+		return Err("rollback_unavailable".into());
 	}
 	let source_parent_identity = identity(&source_parent).map_err(|_| "rollback_unavailable")?;
 	let destination_parent_identity =
 		identity(&destination_parent).map_err(|_| "rollback_unavailable")?;
-	let source_sync = source_parent.sync_all();
-	let destination_sync = if source_parent_identity.dev == destination_parent_identity.dev
-		&& source_parent_identity.ino == destination_parent_identity.ino
-	{
-		Ok(())
-	} else {
-		destination_parent.sync_all()
-	};
-	if source_sync.is_err() || destination_sync.is_err() {
-		return Err("fsync_failed");
-	}
+	sync_distinct_parents(
+		&source_parent,
+		&destination_parent,
+		source_parent_identity.dev == destination_parent_identity.dev
+			&& source_parent_identity.ino == destination_parent_identity.ino,
+	)?;
 	let after = regular_identity(&moved_file).map_err(|_| "rollback_unavailable")?;
 	let named_after =
 		statat(&destination_parent, &destination_name).map_err(|_| "rollback_unavailable")?;
@@ -1554,7 +1655,7 @@ fn rename_managed_file_no_replace_inner(
 		|| stat_mtime_ns(&named_after).to_string() != moved.mtime_ns
 		|| stat_ctime_ns(&named_after).to_string() != moved.ctime_ns
 	{
-		return Err("rollback_unavailable");
+		return Err("rollback_unavailable".into());
 	}
 	Ok(RecoveryFsResult::success(moved))
 }
@@ -1869,17 +1970,20 @@ fn install(root: &File, source: &str, destination: &str) -> RecoveryFsPublishRes
 			|| publish_post_mutation_failure("identity_mismatch", "terminal_identity"),
 			RecoveryFsPublishResult::success,
 		),
-		Err("fsync_failed") => publish_post_mutation_failure("fsync_failed", "source_parent_sync"),
-		Err("post_mutation_identity_mismatch") => {
+		Err(RetainedPublishError::SyncFailures(failures)) => {
+			publish_post_mutation_sync_failures(failures)
+		},
+		Err(RetainedPublishError::Code("post_mutation_identity_mismatch")) => {
 			publish_post_mutation_failure("identity_mismatch", "terminal_identity")
 		},
-		Err("interrupted") => publish_unknown_failure("interrupted", "rename"),
-		Err(
+		Err(RetainedPublishError::Code("interrupted")) => {
+			publish_unknown_failure("interrupted", "rename")
+		},
+		Err(RetainedPublishError::Code(
 			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"
 			| "invalid_request"),
-		) => publish_preflight_failure(code),
-
-		Err(code) => publish_unknown_failure(code, "terminal_identity"),
+		)) => publish_preflight_failure(code),
+		Err(RetainedPublishError::Code(code)) => publish_unknown_failure(code, "terminal_identity"),
 	}
 }
 
@@ -1888,7 +1992,7 @@ fn install_inner(
 	root: &File,
 	source: &str,
 	destination: &str,
-) -> Result<RecoveryFsResult, &'static str> {
+) -> Result<RecoveryFsResult, RetainedPublishError> {
 	use std::os::fd::AsRawFd;
 	let source_file = open_existing(root, source, false)?;
 	let source_identity = regular_identity(&source_file)?;
@@ -1907,15 +2011,18 @@ fn install_inner(
 		)
 	};
 	if result != 0 {
-		return Err(match std::io::Error::last_os_error().raw_os_error() {
-			Some(libc::EEXIST) => "already_exists",
-			Some(libc::ENOSYS) => "atomic_unavailable",
-			Some(libc::EINVAL) => "invalid_request",
-			Some(libc::EXDEV) => "cross_device",
-			Some(libc::EACCES | libc::EPERM) => "permission_denied",
-			Some(libc::EINTR) => "interrupted",
-			_ => "io_error",
-		});
+		return Err(
+			match std::io::Error::last_os_error().raw_os_error() {
+				Some(libc::EEXIST) => "already_exists",
+				Some(libc::ENOSYS) => "atomic_unavailable",
+				Some(libc::EINVAL) => "invalid_request",
+				Some(libc::EXDEV) => "cross_device",
+				Some(libc::EACCES | libc::EPERM) => "permission_denied",
+				Some(libc::EINTR) => "interrupted",
+				_ => "io_error",
+			}
+			.into(),
+		);
 	}
 	// The rename has committed; all following verification failures are durability
 	// proof failures, never a new pre-mutation classification.
@@ -1925,23 +2032,18 @@ fn install_inner(
 		regular_identity(&installed).map_err(|_| "post_mutation_identity_mismatch")?;
 	if installed_identity.dev != source_identity.dev || installed_identity.ino != source_identity.ino
 	{
-		return Err("post_mutation_identity_mismatch");
+		return Err("post_mutation_identity_mismatch".into());
 	}
 	let source_parent_identity =
 		identity(&source_parent).map_err(|_| "post_mutation_identity_mismatch")?;
 	let destination_parent_identity =
 		identity(&destination_parent).map_err(|_| "post_mutation_identity_mismatch")?;
-	let source_sync = source_parent.sync_all();
-	let destination_sync = if source_parent_identity.dev == destination_parent_identity.dev
-		&& source_parent_identity.ino == destination_parent_identity.ino
-	{
-		Ok(())
-	} else {
-		destination_parent.sync_all()
-	};
-	if source_sync.is_err() || destination_sync.is_err() {
-		return Err("fsync_failed");
-	}
+	sync_distinct_parents(
+		&source_parent,
+		&destination_parent,
+		source_parent_identity.dev == destination_parent_identity.dev
+			&& source_parent_identity.ino == destination_parent_identity.ino,
+	)?;
 	Ok(RecoveryFsResult::success(installed_identity))
 }
 
@@ -2312,16 +2414,20 @@ fn rename_managed_tree_no_replace(
 			|| publish_post_mutation_failure("identity_mismatch", "terminal_identity"),
 			RecoveryFsPublishResult::success,
 		),
-		Err("fsync_failed") => publish_post_mutation_failure("fsync_failed", "source_parent_sync"),
-		Err("rollback_unavailable") => {
+		Err(RetainedPublishError::SyncFailures(failures)) => {
+			publish_post_mutation_sync_failures(failures)
+		},
+		Err(RetainedPublishError::Code("rollback_unavailable")) => {
 			publish_post_mutation_failure("rollback_unavailable", "terminal_identity")
 		},
-		Err("interrupted") => publish_unknown_failure("interrupted", "rename"),
-		Err(
+		Err(RetainedPublishError::Code("interrupted")) => {
+			publish_unknown_failure("interrupted", "rename")
+		},
+		Err(RetainedPublishError::Code(
 			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"
 			| "invalid_request"),
-		) => publish_preflight_failure(code),
-		Err(code) => publish_unknown_failure(code, "terminal_identity"),
+		)) => publish_preflight_failure(code),
+		Err(RetainedPublishError::Code(code)) => publish_unknown_failure(code, "terminal_identity"),
 	}
 }
 
@@ -2331,12 +2437,12 @@ fn rename_managed_tree_no_replace_inner(
 	source: &str,
 	destination: &str,
 	expected: &crate::path_identity::NativeDirectoryTreeSnapshot,
-) -> Result<RecoveryFsResult, &'static str> {
+) -> Result<RecoveryFsResult, RetainedPublishError> {
 	let before = snapshot_managed_tree(root, source)?
 		.snapshot
 		.ok_or("io_error")?;
 	if &before != expected {
-		return Err("identity_mismatch");
+		return Err("identity_mismatch".into());
 	}
 	let (source_parent, source_name) = open_parent(root, source)?;
 	let (destination_parent, destination_name) = open_parent(root, destination)?;
@@ -2353,55 +2459,52 @@ fn rename_managed_tree_no_replace_inner(
 		)
 	} != 0
 	{
-		return Err(match std::io::Error::last_os_error().raw_os_error() {
-			Some(libc::EEXIST) => "already_exists",
-			Some(libc::ENOSYS) => "atomic_unavailable",
-			Some(libc::EINVAL) => "invalid_request",
-			Some(libc::EXDEV) => "cross_device",
-			Some(libc::EACCES | libc::EPERM) => "permission_denied",
-			Some(libc::EINTR) => "interrupted",
-			_ => "io_error",
-		});
+		return Err(
+			match std::io::Error::last_os_error().raw_os_error() {
+				Some(libc::EEXIST) => "already_exists",
+				Some(libc::ENOSYS) => "atomic_unavailable",
+				Some(libc::EINVAL) => "invalid_request",
+				Some(libc::EXDEV) => "cross_device",
+				Some(libc::EACCES | libc::EPERM) => "permission_denied",
+				Some(libc::EINTR) => "interrupted",
+				_ => "io_error",
+			}
+			.into(),
+		);
 	}
-	let post_mutation = (|| -> Result<RecoveryFsIdentity, &'static str> {
+	let post_mutation = (|| -> Result<RecoveryFsIdentity, RetainedPublishError> {
 		let after = snapshot_managed_tree(root, destination)?
 			.snapshot
 			.ok_or("io_error")?;
 		if !tree_matches_after_rename(&after, expected) {
-			return Err("identity_mismatch");
+			return Err("identity_mismatch".into());
 		}
 		let source_parent_identity = identity(&source_parent)?;
 		let destination_parent_identity = identity(&destination_parent)?;
-		let source_sync = source_parent.sync_all();
-		let destination_sync = if source_parent_identity.dev == destination_parent_identity.dev
-			&& source_parent_identity.ino == destination_parent_identity.ino
-		{
-			Ok(())
-		} else {
-			destination_parent.sync_all()
-		};
-		if source_sync.is_err() || destination_sync.is_err() {
-			return Err("fsync_failed");
-		}
+		sync_distinct_parents(
+			&source_parent,
+			&destination_parent,
+			source_parent_identity.dev == destination_parent_identity.dev
+				&& source_parent_identity.ino == destination_parent_identity.ino,
+		)?;
 		let terminal = snapshot_managed_tree(root, destination)?
 			.snapshot
 			.ok_or("io_error")?;
 		if terminal != after {
-			return Err("identity_mismatch");
+			return Err("identity_mismatch".into());
 		}
 		let destination_root = open_existing_directory(root, destination)?;
 		let destination_identity = identity(&destination_root)?;
 		if destination_identity.dev != expected.root_dev
 			|| destination_identity.ino != expected.root_ino
 		{
-			return Err("identity_mismatch");
+			return Err("identity_mismatch".into());
 		}
 		Ok(destination_identity)
 	})();
 	match post_mutation {
 		Ok(identity) => Ok(RecoveryFsResult::success(identity)),
-		Err("fsync_failed") => Err("fsync_failed"),
-		Err(_) => Err("rollback_unavailable"),
+		Err(error) => Err(error),
 	}
 }
 
@@ -2463,4 +2566,72 @@ fn remove_managed_tree(
 	// cleanup evidence; deleting descendants here would reopen a destructive race
 	// with a concurrent same-UID actor.
 	Ok(RecoveryFsResult::success(root_identity))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+	use super::*;
+
+	fn failures(result: Result<(), RetainedPublishError>) -> Vec<RecoveryFsPublishSyncFailure> {
+		match result {
+			Err(RetainedPublishError::SyncFailures(failures)) => failures,
+			_ => panic!("expected retained parent sync failure evidence"),
+		}
+	}
+
+	#[test]
+	fn retained_parent_sync_evidence_records_source_destination_and_error_kinds() {
+		let parent = File::open("/").expect("root directory must be openable");
+		let mut calls = 0;
+		let source_only = failures(collect_parent_sync_failures(&parent, &parent, false, |_| {
+			calls += 1;
+			if calls == 1 {
+				Err(std::io::Error::from_raw_os_error(libc::EIO))
+			} else {
+				Ok(())
+			}
+		}));
+		assert_eq!(source_only.len(), 1);
+		assert_eq!(source_only[0].parent_role, "source");
+		assert_eq!(source_only[0].phase, "source_parent_sync");
+		assert_eq!(source_only[0].kind, "io");
+		assert_eq!(source_only[0].os_code, Some(libc::EIO));
+
+		let mut calls = 0;
+		let destination_only =
+			failures(collect_parent_sync_failures(&parent, &parent, false, |_| {
+				calls += 1;
+				if calls == 1 {
+					Ok(())
+				} else {
+					Err(std::io::Error::from_raw_os_error(libc::EACCES))
+				}
+			}));
+		assert_eq!(destination_only.len(), 1);
+		assert_eq!(destination_only[0].parent_role, "destination");
+		assert_eq!(destination_only[0].phase, "destination_parent_sync");
+		assert_eq!(destination_only[0].kind, "permission");
+
+		let mut calls = 0;
+		let both = failures(collect_parent_sync_failures(&parent, &parent, false, |_| {
+			calls += 1;
+			Err(std::io::Error::from_raw_os_error(if calls == 1 { libc::EIO } else { libc::ENOTSUP }))
+		}));
+		assert_eq!(both.len(), 2);
+		assert_eq!(both[1].kind, "unsupported");
+	}
+
+	#[test]
+	fn shared_parent_sync_is_attempted_once_and_reports_a_shared_role() {
+		let parent = File::open("/").expect("root directory must be openable");
+		let mut calls = 0;
+		let shared = failures(collect_parent_sync_failures(&parent, &parent, true, |_| {
+			calls += 1;
+			Err(std::io::Error::from_raw_os_error(libc::EIO))
+		}));
+		assert_eq!(calls, 1);
+		assert_eq!(shared.len(), 1);
+		assert_eq!(shared[0].parent_role, "shared");
+		assert_eq!(shared[0].phase, "source_parent_sync");
+	}
 }

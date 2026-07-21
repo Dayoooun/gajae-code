@@ -33,7 +33,7 @@ export type NativePublishPhase =
 type SyncFailure = {
 	phase: Exclude<NativePublishPhase, "preflight" | "file_sync" | "rename" | "complete" | "unknown">;
 	parentRole: "source" | "destination" | "shared" | "staged_file";
-	osCode: number;
+	osCode?: number;
 	kind: "unsupported" | "io" | "permission" | "other";
 };
 
@@ -153,12 +153,12 @@ function validDiagnostic(value: unknown): value is PublishDiagnostic {
 		const role = failure.parentRole;
 		const compatibleRole =
 			(phase === "source_parent_sync" && ["source", "shared"].includes(role as string)) ||
-			(phase === "destination_parent_sync" && ["destination", "shared"].includes(role as string)) ||
+			(phase === "destination_parent_sync" && role === "destination") ||
 			(phase === "terminal_identity" && ["source", "destination", "shared", "staged_file"].includes(role as string));
 		return (
 			["source_parent_sync", "destination_parent_sync", "terminal_identity"].includes(phase as string) &&
 			compatibleRole &&
-			int32(failure.osCode) &&
+			(failure.osCode === undefined || int32(failure.osCode)) &&
 			["unsupported", "io", "permission", "other"].includes(failure.kind as string)
 		);
 	});
@@ -257,7 +257,10 @@ export function mayCleanCurrentStaging(outcome: NativePublishOutcome): boolean {
 export function formatNativePublishDiagnostic(outcome: NativePublishOutcome): string {
 	const osCode = outcome.diagnostic.osCode === undefined ? "" : ` os=${outcome.diagnostic.osCode}`;
 	const failures = outcome.diagnostic.syncFailures
-		?.map(failure => `${failure.parentRole}:${failure.phase}:${failure.kind}:${failure.osCode}`)
+		?.map(
+			failure =>
+				`${failure.parentRole}:${failure.phase}:${failure.kind}${failure.osCode === undefined ? "" : `:${failure.osCode}`}`,
+		)
 		.join(",");
 	return `${outcome.reason} primitive=${outcome.primitive} phase=${outcome.phase}${osCode}${failures ? ` sync=${failures}` : ""}`;
 }

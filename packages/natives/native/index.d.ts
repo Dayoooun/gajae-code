@@ -465,9 +465,11 @@ export declare class Shell {
 }
 
 /**
- * Publish-result wire-contract sentinel. The loader requires this in addition
- * to the release sentinel, so a same-version modern artifact built before the
- * retained-publish contract cannot be selected over a compatible baseline.
+ * Publish-result wire-contract sentinel.
+ *
+ * The loader requires this in addition to the release sentinel, so a
+ * same-version modern artifact built before the retained-publish contract
+ * cannot be selected over a compatible baseline.
  */
 export declare function __piNativesPublishOutcomeV1(): void
 
@@ -1986,6 +1988,7 @@ export interface RecoveryFsPublishDiagnostic {
   schemaVersion: number
   collectionState: string
   osCode?: number
+  syncFailures?: Array<RecoveryFsPublishSyncFailure>
 }
 
 /**
@@ -2002,6 +2005,14 @@ export interface RecoveryFsPublishResult {
   primitive: string
   phase: string
   diagnostic: RecoveryFsPublishDiagnostic
+}
+
+/** Bounded, path-free diagnostic evidence for one retained publication. */
+export interface RecoveryFsPublishSyncFailure {
+  phase: string
+  parentRole: string
+  osCode?: number
+  kind: string
 }
 
 export interface RecoveryFsResult {
@@ -2286,3 +2297,19 @@ export interface WorkProfile {
  * Returns UTF-16 lines with active SGR codes carried across line boundaries.
  */
 export declare function wrapTextWithAnsi(text: string, width: number, tabWidth: number): Array<string>
+
+/** Bounded, path-free evidence for a parent-directory durability failure. */
+export interface NativePublishSyncFailure {
+  phase: string
+  parentRole: string
+  osCode: number
+  kind: string
+}
+
+/** Bounded, path-free evidence for one atomic publication. */
+export interface NativePublishDiagnostic {
+  schemaVersion: number
+  collectionState: string
+  osCode?: number
+  syncFailures?: Array<NativePublishSyncFailure>
+}

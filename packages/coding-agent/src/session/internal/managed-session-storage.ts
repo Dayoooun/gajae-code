@@ -267,6 +267,40 @@ export interface ManagedDirectoryRoot {
 	readonly ino: bigint;
 }
 
+/**
+ * Establish the first managed directory beneath a potentially shared ancestor.
+ * The ancestor is used only to create the managed chain; every component from
+ * `configuredRoot` downward is independently type, symlink, owner, mode, and
+ * ACL checked. This deliberately does not impose owner-only policy on `/tmp`.
+ */
+export function prepareManagedDirectoryRoot(
+	configuredRoot: string,
+	policy: ManagedSessionSecurityPolicy = "default",
+): ManagedDirectoryRoot {
+	const target = path.resolve(configuredRoot);
+	const missing: string[] = [];
+	let existing = target;
+	for (;;) {
+		try {
+			assertSafeDirectory(existing);
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			const parent = path.dirname(existing);
+			if (parent === existing) throw new Error(`Managed root is unavailable: ${configuredRoot}`);
+			missing.unshift(path.basename(existing));
+			existing = parent;
+		}
+	}
+	let current = fs.realpathSync.native(existing);
+	for (const component of missing) {
+		current = path.join(current, component);
+		const created = ensureDirectoryComponent(current);
+		secureManagedDirectory(current, created, policy);
+	}
+	if (missing.length === 0) secureManagedDirectory(current, false, policy);
+	return managedDirectoryRoot(current);
+}
 export function managedDirectoryRoot(configuredRoot: string): ManagedDirectoryRoot {
 	const canonicalPath = fs.realpathSync.native(configuredRoot);
 	const stat = fs.lstatSync(canonicalPath, { bigint: true });

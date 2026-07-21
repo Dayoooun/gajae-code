@@ -28,7 +28,7 @@ import {
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
 	type ManagedStorageLock,
-	managedDirectoryRoot,
+	prepareManagedDirectoryRoot,
 	publishManagedFileNoReplace,
 	publishManagedTombstone,
 	retainManagedDirectoryAuthority,
@@ -64,7 +64,7 @@ export interface ManagedCandidateWriteAuthority {
 	readonly retainedDirectory?: string;
 }
 
-const managedRoots = new WeakMap<ManagedScope, ReturnType<typeof managedDirectoryRoot>>();
+const managedRoots = new WeakMap<ManagedScope, ReturnType<typeof prepareManagedDirectoryRoot>>();
 const managedDirectoryIdentities = new WeakMap<ManagedScope, { dev: bigint; ino: bigint }>();
 const managedDirectoryAuthorities = new WeakMap<ManagedScope, native.RecoveryFsRoot | undefined>();
 const boundManagedWriteAuthorities = new WeakMap<ManagedScope, ManagedCandidateWriteAuthority>();
@@ -98,21 +98,24 @@ export function managedDirectoryIdentityForScope(scope: ManagedScope): { dev: bi
 
 function configuredRootPath(scope: ManagedScope): string {
 	let candidate = pathIsWithin(scope.agentDir, scope.sessionsRoot) ? scope.agentDir : path.dirname(scope.sessionsRoot);
+	const suffix: string[] = [];
 	for (;;) {
 		try {
 			const stat = fs.lstatSync(candidate);
 			if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Unsafe configured root: ${candidate}`);
-			return fs.realpathSync.native(candidate);
+			const canonical = fs.realpathSync.native(candidate);
+			return suffix.length === 0 ? canonical : path.join(canonical, ...suffix);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			const parent = path.dirname(candidate);
 			if (parent === candidate) throw new Error("Configured managed root is unavailable.");
+			suffix.unshift(path.basename(candidate));
 			candidate = parent;
 		}
 	}
 }
 
-function scopeRoot(scope: ManagedScope) {
+function scopeRoot(scope: ManagedScope, policy: ManagedSessionSecurityPolicy = "default") {
 	const bound = boundManagedWriteAuthorities.get(scope);
 	if (bound) {
 		bindManagedWriteAuthority(scope, bound);
@@ -120,7 +123,7 @@ function scopeRoot(scope: ManagedScope) {
 	}
 	const retained = managedRoots.get(scope);
 	if (retained) return retained;
-	const root = managedDirectoryRoot(configuredRootPath(scope));
+	const root = prepareManagedDirectoryRoot(configuredRootPath(scope), policy);
 	managedRoots.set(scope, root);
 	return root;
 }
@@ -685,7 +688,7 @@ export async function ensureManagedScope(
 	policy: ManagedSessionSecurityPolicy = "default",
 ): Promise<ManagedScopeResolution> {
 	try {
-		const root = scopeRoot(scope);
+		const root = scopeRoot(scope, policy);
 		ensureManagedDirectory(scope.sessionsRoot, root, policy);
 		ensureManagedDirectory(scope.directoryPath, root, policy);
 		const bindingPath = path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
@@ -771,7 +774,7 @@ export function prepareManagedSessionScopeForWriteSync(
 	authority?: ManagedCandidateWriteAuthority,
 ): ManagedScopeResolution {
 	try {
-		const root = authority?.rootAuthority ?? scopeRoot(scope);
+		const root = authority?.rootAuthority ?? scopeRoot(scope, policy);
 		if (authority) bindManagedWriteAuthority(scope, authority);
 		ensureManagedDirectory(scope.sessionsRoot, root, policy);
 		ensureManagedDirectory(scope.directoryPath, root, policy);

@@ -157,13 +157,26 @@ describe("native publish outcome classification", () => {
 	});
 
 	it("preserves bounded per-parent fsync evidence without accepting fabricated roles", () => {
-		const outcome = classifyNativePublishOutcome({
+		const base = {
 			ok: false,
 			code: "fsync_failed",
 			mutationState: "committed",
 			durabilityState: "not_provable",
 			reason: "durability_not_provable",
 			primitive: "renameat2_noreplace",
+		};
+		const sourceOnly = classifyNativePublishOutcome({
+			...base,
+			phase: "source_parent_sync",
+			diagnostic: {
+				schemaVersion: 1,
+				collectionState: "partial",
+				syncFailures: [{ phase: "source_parent_sync", parentRole: "source", osCode: 5, kind: "io" }],
+			},
+		});
+		expect(formatNativePublishDiagnostic(sourceOnly)).toContain("source:source_parent_sync:io:5");
+		const destinationOnly = classifyNativePublishOutcome({
+			...base,
 			phase: "destination_parent_sync",
 			diagnostic: {
 				schemaVersion: 1,
@@ -171,12 +184,35 @@ describe("native publish outcome classification", () => {
 				syncFailures: [{ phase: "destination_parent_sync", parentRole: "destination", osCode: 5, kind: "io" }],
 			},
 		});
-		expect(formatNativePublishDiagnostic(outcome)).toContain("destination:destination_parent_sync:io:5");
+		expect(formatNativePublishDiagnostic(destinationOnly)).toContain("destination:destination_parent_sync:io:5");
+		const both = classifyNativePublishOutcome({
+			...base,
+			phase: "source_parent_sync",
+			diagnostic: {
+				schemaVersion: 1,
+				collectionState: "partial",
+				syncFailures: [
+					{ phase: "source_parent_sync", parentRole: "source", osCode: 5, kind: "io" },
+					{ phase: "destination_parent_sync", parentRole: "destination", osCode: 95, kind: "unsupported" },
+				],
+			},
+		});
+		expect(formatNativePublishDiagnostic(both)).toContain("destination:destination_parent_sync:unsupported:95");
+		const sharedOnce = classifyNativePublishOutcome({
+			...base,
+			phase: "source_parent_sync",
+			diagnostic: {
+				schemaVersion: 1,
+				collectionState: "partial",
+				syncFailures: [{ phase: "source_parent_sync", parentRole: "shared", kind: "permission" }],
+			},
+		});
+		expect(formatNativePublishDiagnostic(sharedOnce)).toContain("shared:source_parent_sync:permission");
 		expect(
 			classifyNativePublishOutcome({
-				...outcome,
+				...destinationOnly,
 				diagnostic: {
-					...outcome.diagnostic,
+					...destinationOnly.diagnostic,
 					syncFailures: [{ phase: "destination_parent_sync", parentRole: "source", osCode: 5, kind: "io" }],
 				},
 			}).reason,

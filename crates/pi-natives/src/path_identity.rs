@@ -175,10 +175,20 @@ pub struct NativeExactUnlinkResult {
 
 /// Bounded, path-free evidence for one publish operation.
 #[napi(object)]
+pub struct NativePublishSyncFailure {
+	pub phase:       String,
+	pub parent_role: String,
+	pub os_code:     i32,
+	pub kind:        String,
+}
+
+/// Bounded, path-free evidence for one publish operation.
+#[napi(object)]
 pub struct NativePublishDiagnostic {
 	pub schema_version:   u32,
 	pub collection_state: String,
 	pub os_code:          Option<i32>,
+	pub sync_failures:    Option<Vec<NativePublishSyncFailure>>,
 }
 
 /// Dedicated result for an atomic no-replace namespace publication.
@@ -245,6 +255,7 @@ impl NativeNoReplaceResult {
 				schema_version:   1,
 				collection_state: "unavailable".to_owned(),
 				os_code:          None,
+				sync_failures:    None,
 			},
 		}
 	}
