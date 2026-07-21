@@ -501,7 +501,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:writeJsonAtomic": "a768c87646d56cf28b0adbd596884c964aed54ea40775517fa385c111af05a5b"
   },
   "nativeAuthoritySha256": {
-    "crates/pi-natives/src/path_identity.rs": "bc7b676e7808cb9df2368e004d96e929ef42311ba90dc4c3392d4da1c51af394",
+    "crates/pi-natives/src/path_identity.rs": "2991011d8baf46e337b6d0648ab3ee4a493cd6917b010463bba9fbce8d8ec6f6",
     "crates/pi-natives/src/ps.rs": "3c8a28d1daf84e91c3db0d29fa05a6231b871903800428ca1acbb2ddecea5f6b",
     "crates/pi-shell/src/process.rs": "3f74458492c16fff24ecc234c74efd29d2a7f5f5c5a7c879c68b00a2e4f08274",
     "packages/natives/native/index.d.ts": "1362c2bab4a92c609c352d0cecb858a4298d4449494488aa7941d09cbad54756",
