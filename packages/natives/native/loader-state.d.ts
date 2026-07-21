@@ -109,7 +109,13 @@ export interface PrivateLoadDirectoryInput {
 	platform?: NodeJS.Platform | string;
 }
 
+export interface PrunePrivateLoadDirectoriesInput {
+	cacheDir: string;
+	/** Test hook; production uses a cross-platform process liveness probe. */
+	isProcessAlive?: (pid: number) => boolean;
+}
+
 export function cleanupPrivateLoadDirectory(input: PrivateLoadDirectoryInput): void;
-export function prunePrivateLoadDirectories(input: { cacheDir: string }): number;
+export function prunePrivateLoadDirectories(input: PrunePrivateLoadDirectoriesInput): number;
 
 export function loadNative(): Record<string, unknown>;

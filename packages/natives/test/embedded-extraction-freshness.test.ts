@@ -211,22 +211,45 @@ describe("load-time cache attestation", () => {
 		expect(cleanedPaths).toEqual([privateLoadPath]);
 	});
 
-	it("defers Windows cleanup and prunes only loader-owned directories at startup", () => {
+	it("keeps a concurrently loading process's private directory and reaps only a proven-dead owner", () => {
 		const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-natives-private-load-"));
-		const deferredDir = path.join(cacheDir, ".pi-natives-load-locked");
+		const activeDir = path.join(cacheDir, ".pi-natives-load-active");
 		const staleDir = path.join(cacheDir, ".pi-natives-load-stale");
+		const unownedDir = path.join(cacheDir, ".pi-natives-load-unowned");
 		const unrelatedDir = path.join(cacheDir, "keep-me");
 		try {
-			fs.mkdirSync(deferredDir);
+			fs.mkdirSync(activeDir);
 			fs.mkdirSync(staleDir);
+			fs.mkdirSync(unownedDir);
 			fs.mkdirSync(unrelatedDir);
+			fs.writeFileSync(path.join(activeDir, ".owner.json"), JSON.stringify({ pid: 101 }));
+			fs.writeFileSync(path.join(staleDir, ".owner.json"), JSON.stringify({ pid: 202 }));
 
-			cleanupPrivateLoadDirectory({ loadDir: deferredDir, platform: "win32" });
-			expect(fs.existsSync(deferredDir)).toBe(true);
-			expect(prunePrivateLoadDirectories({ cacheDir })).toBe(2);
-			expect(fs.existsSync(deferredDir)).toBe(false);
+			// Model a second loader starting while the first has already bound its
+			// private copy. The probe is injected so this cross-process race is
+			// deterministic on every platform, including Windows.
+			expect(
+				prunePrivateLoadDirectories({
+					cacheDir,
+					isProcessAlive: pid => pid === 101,
+				}),
+			).toBe(1);
+			expect(fs.existsSync(activeDir)).toBe(true);
 			expect(fs.existsSync(staleDir)).toBe(false);
+			expect(fs.existsSync(unownedDir)).toBe(true);
 			expect(fs.existsSync(unrelatedDir)).toBe(true);
+		} finally {
+			fs.rmSync(cacheDir, { recursive: true, force: true });
+		}
+	});
+
+	it("defers every private copy's cleanup until its owner exits", () => {
+		const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-natives-private-load-"));
+		const deferredDir = path.join(cacheDir, ".pi-natives-load-deferred");
+		try {
+			fs.mkdirSync(deferredDir);
+			cleanupPrivateLoadDirectory({ loadDir: deferredDir });
+			expect(fs.existsSync(deferredDir)).toBe(true);
 		} finally {
 			fs.rmSync(cacheDir, { recursive: true, force: true });
 		}

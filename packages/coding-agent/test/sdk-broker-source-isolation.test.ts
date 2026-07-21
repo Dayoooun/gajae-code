@@ -25,7 +25,7 @@ afterEach(async () => {
 	brokerLeases.clear();
 });
 
-it("starts a fresh detached source broker with a content-attested native addon without loading hostile cwd bunfig or dotenv", async () => {
+it("keeps a detached broker's active native load private while a concurrent source client starts without loading hostile cwd bunfig or dotenv", async () => {
 	const root = await tempRoot();
 	const hostileCwd = path.join(root, "hostile project ü");
 	const agentDir = path.join(root, "agent");
@@ -64,6 +64,10 @@ it("starts a fresh detached source broker with a content-attested native addon w
 			})
 		).lease,
 	);
+	const activePrivateLoadDirs = (await fs.readdir(nativeCacheDir)).filter(filename =>
+		filename.startsWith(".pi-natives-load-"),
+	);
+	expect(activePrivateLoadDirs).not.toEqual([]);
 	await Bun.write(path.join(hostileCwd, "bunfig.toml"), `preload = [${JSON.stringify(preload)}]\n`);
 	await Bun.write(path.join(hostileCwd, ".env"), "GJC_2178_DOTENV=dotenv-loaded\n");
 	await Bun.write(
@@ -112,6 +116,9 @@ it("starts a fresh detached source broker with a content-attested native addon w
 	expect(response.result?.sessions).toEqual([]);
 	expect(await readBrokerDiscovery(agentDir)).not.toBeNull();
 	expect(brokerLeases.get(root)).toBeDefined();
+	for (const loadDir of activePrivateLoadDirs) {
+		expect(await Bun.file(path.join(nativeCacheDir, loadDir)).exists()).toBe(true);
+	}
 	const cachedAddons = await fs.readdir(nativeCacheDir);
 	const cachedAddon = cachedAddons.find(filename => /^pi_natives\..+\.[a-f0-9]{64}\.node$/.test(filename));
 	expect(cachedAddon).toBeDefined();

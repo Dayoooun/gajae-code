@@ -285,16 +285,43 @@ export function resolveRuntimeCandidates({
 }
 
 const PRIVATE_LOAD_DIR_PREFIX = ".pi-natives-load-";
+const PRIVATE_LOAD_OWNER_FILENAME = ".owner.json";
 const deferredPrivateLoadDirs = new Set();
 let privateLoadExitCleanupRegistered = false;
 
+function privateLoadDirectoryOwnerPath(loadDir) {
+	return path.join(loadDir, PRIVATE_LOAD_OWNER_FILENAME);
+}
+
+function writePrivateLoadDirectoryOwner(loadDir) {
+	fs.writeFileSync(privateLoadDirectoryOwnerPath(loadDir), JSON.stringify({ pid: process.pid }), {
+		encoding: "utf8",
+		flag: "wx",
+		mode: 0o600,
+	});
+}
+
+function isProcessAlive(pid) {
+	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		// ESRCH is the only proof that an owner is gone. Access-denied and other
+		// platform-specific failures must retain the directory rather than delete
+		// a process's loaded addon.
+		return !(err && typeof err === "object" && "code" in err && err.code === "ESRCH");
+	}
+}
+
 /**
- * Remove abandoned private load directories left by a previous process. Only
- * directories bearing the loader-owned prefix are eligible for removal.
- * @param {{ cacheDir: string }} input
+ * Remove private load directories only after their owning process is proven
+ * dead. Directories without a valid owner record are retained fail-closed: a
+ * concurrently starting process creates that record before writing its addon.
+ * @param {{ cacheDir: string; isProcessAlive?: (pid: number) => boolean }} input
  * @returns {number}
  */
-export function prunePrivateLoadDirectories({ cacheDir }) {
+export function prunePrivateLoadDirectories({ cacheDir, isProcessAlive: processIsAlive = isProcessAlive }) {
 	let entries;
 	try {
 		entries = fs.readdirSync(cacheDir, { withFileTypes: true });
@@ -305,8 +332,16 @@ export function prunePrivateLoadDirectories({ cacheDir }) {
 	let removed = 0;
 	for (const entry of entries) {
 		if (!entry.isDirectory() || !entry.name.startsWith(PRIVATE_LOAD_DIR_PREFIX)) continue;
+		const loadDir = path.join(cacheDir, entry.name);
+		let owner;
 		try {
-			fs.rmSync(path.join(cacheDir, entry.name), { recursive: true, force: true });
+			owner = JSON.parse(fs.readFileSync(privateLoadDirectoryOwnerPath(loadDir), "utf8"));
+		} catch {
+			continue;
+		}
+		if (!owner || !Number.isSafeInteger(owner.pid) || processIsAlive(owner.pid)) continue;
+		try {
+			fs.rmSync(loadDir, { recursive: true, force: true });
 			removed++;
 		} catch {
 			// A Windows process can retain the loaded .node until it exits. Keep it
@@ -317,28 +352,24 @@ export function prunePrivateLoadDirectories({ cacheDir }) {
 }
 
 /**
- * Clean a one-use, attested addon copy. Windows keeps loaded native modules
- * locked, so its deletion is deferred to process exit and retried at startup.
+ * Keep every private copy until process exit. Unlinking immediately after
+ * require is usually safe on POSIX, but retaining it gives Windows and other
+ * loaders the same module-lifetime guarantee; a later process reaps it only
+ * after proving this owner is no longer alive.
  * @param {{ loadDir: string; platform?: NodeJS.Platform | string }} input
  */
-export function cleanupPrivateLoadDirectory({ loadDir, platform = process.platform }) {
-	if (platform === "win32") {
-		deferredPrivateLoadDirs.add(loadDir);
-		if (!privateLoadExitCleanupRegistered) {
-			privateLoadExitCleanupRegistered = true;
-			process.once("exit", () => {
-				for (const deferredLoadDir of deferredPrivateLoadDirs) {
-					try {
-						fs.rmSync(deferredLoadDir, { recursive: true, force: true });
-					} catch {}
-				}
-			});
-		}
-		return;
+export function cleanupPrivateLoadDirectory({ loadDir }) {
+	deferredPrivateLoadDirs.add(loadDir);
+	if (!privateLoadExitCleanupRegistered) {
+		privateLoadExitCleanupRegistered = true;
+		process.once("exit", () => {
+			for (const deferredLoadDir of deferredPrivateLoadDirs) {
+				try {
+					fs.rmSync(deferredLoadDir, { recursive: true, force: true });
+				} catch {}
+			}
+		});
 	}
-	try {
-		fs.rmSync(loadDir, { recursive: true, force: true });
-	} catch {}
 }
 
 function createPrivateLoadBinding(ctx, expectedCandidate, filename, contentHash, label) {
@@ -352,6 +383,7 @@ function createPrivateLoadBinding(ctx, expectedCandidate, filename, contentHash,
 				throw new Error(`${label} (${filename}): immutable cache entry changed before load`);
 			}
 			loadDir = fs.mkdtempSync(path.join(ctx.versionedDir, PRIVATE_LOAD_DIR_PREFIX));
+			writePrivateLoadDirectoryOwner(loadDir);
 			const loadPath = path.join(loadDir, filename);
 			fs.writeFileSync(loadPath, candidateBytes, { flag: "wx", mode: 0o500 });
 			loadDirs.set(loadPath, loadDir);
