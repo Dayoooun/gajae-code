@@ -34,6 +34,7 @@ function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFa
 			'if [ "${3:-}" = "config" ] || [ "${3:-}" = "remote" ]; then printf "%s\\n" "${TEST_ORIGIN:-https://github.com/Yeachan-Heo/gajae-code.git}"; exit 0; fi',
 			'if [ "${3:-}" = "status" ]; then [ "${TEST_DIRTY:-}" = "1" ] && printf " M changed\\n"; exit 0; fi',
 			'if [ "${3:-}" = "symbolic-ref" ]; then [ -z "${TEST_HEAD_REF+x}" ] || printf "%s\\n" "$TEST_HEAD_REF"; exit 0; fi',
+			'if [ "${3:-}" = "rev-parse" ] && [ "${4:-}" = "--is-inside-work-tree" ] && [ "${TEST_NOT_GIT:-}" = "1" ]; then exit 1; fi',
 			'if [ "${3:-}" = "rev-parse" ]; then printf "%040d\\n" 0; exit 0; fi',
 			"exit 0",
 		].join("\n"),
@@ -110,7 +111,7 @@ describe("install_local_build.sh", () => {
 		const nonempty = path.join(sandbox.root, "nonempty");
 		fs.mkdirSync(nonempty);
 		fs.writeFileSync(path.join(nonempty, "keep"), "user data");
-		let result = await run(["--dir", nonempty]);
+		let result = await run(["--dir", nonempty], { TEST_NOT_GIT: "1" });
 		expect(result.exitCode).not.toBe(0);
 		expect(fs.readFileSync(path.join(nonempty, "keep"), "utf8")).toBe("user data");
 		const checkout = path.join(sandbox.root, "checkout");
