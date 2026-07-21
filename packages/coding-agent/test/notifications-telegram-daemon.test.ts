@@ -15,6 +15,7 @@ import {
 } from "../src/sdk/bus/html-format";
 import {
 	acquireDaemonTransitionLock,
+	classifyNotificationEndpoint,
 	type NotificationEndpointFileIdentity,
 	releaseDaemonTransitionLock,
 } from "../src/sdk/bus/notification-service";
@@ -64,6 +65,34 @@ test("endpoint authority digest canonicalizes endpoint presentation and binds au
 	expect(endpointAuthorityDigest("ws://localhost/sdk", "token", "native-connection-a")).toBe(
 		endpointAuthorityDigest("ws://localhost/sdk", "token", "native-connection-a"),
 	);
+});
+
+test("endpoint classification excludes lifecycle records and fails closed for PID-less and unreadable records", async () => {
+	const agentDir = tempAgentDir();
+	const identity: NotificationEndpointFileIdentity = { dev: 1n, ino: 1n, size: 1n, mtimeNs: 1n, sha256: "test" };
+	const classify = async (name: string, value: string) =>
+		await classifyNotificationEndpoint(
+			{ readEndpointFile: async () => ({ bytes: Buffer.from(value), identity }) },
+			path.join(agentDir, name),
+			pid => pid === 7,
+		);
+	const dead = await classify("dead.json", JSON.stringify({ url: "ws://dead", token: "x", pid: 8 }));
+	const pidless = await classify("pidless.json", JSON.stringify({ url: "ws://unknown", token: "x" }));
+	expect(dead.kind === "endpoint" && dead.liveness).toBe("dead");
+	expect(pidless.kind === "endpoint" && pidless.liveness).toBe("unknown");
+	expect((await classify("broker.json", JSON.stringify({ url: "ws://broker", token: "x", pid: 8 }))).kind).toBe(
+		"non-endpoint",
+	);
+	expect(
+		(await classify("owner.lifecycle.json", JSON.stringify({ pid: 8, incarnation: "linux:8", effectMarker: "x" })))
+			.kind,
+	).toBe("non-endpoint");
+	const unreadable = await classifyNotificationEndpoint(
+		{ readEndpointFile: async () => Promise.reject(new Error("mid-write")) },
+		path.join(agentDir, "broken.json"),
+		() => false,
+	);
+	expect(unreadable.kind).toBe("unreadable");
 });
 
 function tempAgentDir(): string {
@@ -3032,6 +3061,10 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "stale-token",
 			generation: DAEMON_GENERATION,
 		});
+		const endpoint = path.join(agentDir, ".gjc", "state", "sdk", "reconciled.json");
+		fs.mkdirSync(path.dirname(endpoint), { recursive: true });
+		fs.writeFileSync(endpoint, JSON.stringify({ url: "ws://dead", token: "dead", pid: 111 }));
+
 		let now = 1_000;
 		let staleProbes = 0;
 		const child = readyTelegramSpawnFixture({ settings: s, firstChildPid: 4243, now: () => now });
@@ -3059,6 +3092,58 @@ describe("telegram daemon", () => {
 			ownershipPhase: "ready",
 		});
 		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toMatchObject({ pid: 4243 });
+		expect(fs.existsSync(endpoint)).toBe(false);
+	});
+	test("startup recovery retains an endpoint successor installed during exact stale cleanup", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		const endpoint = path.join(agentDir, ".gjc", "state", "sdk", "raced.json");
+		const successor = JSON.stringify({ url: "ws://live", token: "live", pid: 4243 });
+		fs.mkdirSync(path.dirname(endpoint), { recursive: true });
+		fs.writeFileSync(endpoint, JSON.stringify({ url: "ws://dead", token: "dead", pid: 111 }));
+		writeLiveOwner(agentDir, {
+			pid: 111,
+			ownerId: "crashed",
+			acquisitionId: "crashed",
+			tokenFingerprint: "stale-token",
+			generation: DAEMON_GENERATION,
+		});
+		let now = 1_000;
+		let staleProbes = 0;
+
+		const child = readyTelegramSpawnFixture({ settings: s, firstChildPid: 4243, now: () => now });
+		const recoveryFs: TelegramDaemonFs = {
+			...(fs.promises as unknown as TelegramDaemonFs),
+			...exactTransitionFs(file => {
+				if (file === endpoint) {
+					fs.unlinkSync(file);
+					fs.writeFileSync(file, successor);
+				}
+			}),
+		};
+
+		await expect(
+			ensureTelegramDaemonRunningDetailed(
+				{ settings: s, cwd: agentDir, sessionId: "raced" },
+				{
+					fs: recoveryFs,
+					pid: 4242,
+					now: () => now,
+					pidAlive: pid => (pid === 111 ? staleProbes++ === 0 : pid === 4243),
+					pidIncarnation: () => "linux:100",
+					spawn: child.spawn,
+					readinessTimeoutMs: 1,
+					waitStepMs: 1,
+					sleep: async () => {
+						now++;
+						await child.sleep();
+					},
+				},
+			),
+		).resolves.toBe("blocked_identity");
+		expect(fs.readFileSync(endpoint, "utf8")).toBe(successor);
+		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toMatchObject({ pid: 111, ownerId: "crashed" });
 	});
 	test("#2028 retires an unbound launcher reservation after bounded bind contention so ensure can recover", async () => {
 		const agentDir = tempAgentDir();
