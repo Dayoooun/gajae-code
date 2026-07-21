@@ -12,8 +12,9 @@ import {
 	resolveManagedScope,
 } from "../../src/session/internal/managed-session-scope";
 import { publishManagedFileNoReplace } from "../../src/session/internal/managed-session-storage";
-import { FileSessionStorage } from "../../src/session/session-storage";
 import { SessionManager } from "../../src/session/session-manager";
+import { FileSessionStorage } from "../../src/session/session-storage";
+
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {

@@ -217,7 +217,7 @@ fn publish_post_mutation_sync_failures(
 		"fsync_failed",
 		os_code,
 	);
-	result.diagnostic.collection_state = "partial".to_owned();
+	"partial".clone_into(&mut result.diagnostic.collection_state);
 	result.diagnostic.sync_failures = Some(failures);
 	result
 }
@@ -255,10 +255,8 @@ fn collect_parent_sync_failures(
 	if let Err(error) = sync(source_parent) {
 		failures.push(sync_failure("source_parent_sync", source_role, &error));
 	}
-	if !shared {
-		if let Err(error) = sync(destination_parent) {
-			failures.push(sync_failure("destination_parent_sync", "destination", &error));
-		}
+	if !shared && let Err(error) = sync(destination_parent) {
+		failures.push(sync_failure("destination_parent_sync", "destination", &error));
 	}
 	if failures.is_empty() {
 		Ok(())
