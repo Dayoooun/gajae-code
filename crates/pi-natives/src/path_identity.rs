@@ -173,6 +173,74 @@ pub struct NativeExactUnlinkResult {
 	pub retained_unknown_path: Option<String>,
 }
 
+/// Bounded, path-free evidence for one publish operation.
+#[napi(object)]
+pub struct NativePublishDiagnostic {
+	pub schema_version:   u32,
+	pub collection_state: String,
+	pub os_code:          Option<i32>,
+}
+
+/// Dedicated result for an atomic no-replace namespace publication.
+#[napi(object)]
+pub struct NativeNoReplaceResult {
+	pub ok:               bool,
+	pub code:             Option<String>,
+	pub mutation_state:   String,
+	pub durability_state: String,
+	pub reason:           String,
+	pub primitive:        String,
+	pub phase:            String,
+	pub diagnostic:       NativePublishDiagnostic,
+}
+
+impl NativeNoReplaceResult {
+	fn from_exact(result: NativeExactUnlinkResult) -> Self {
+		let (mutation_state, reason) = if result.ok {
+			("committed", "none")
+		} else {
+			match result.code.as_deref() {
+				Some("quarantine_collision" | "already_exists") => {
+					("not_committed", "destination_exists")
+				},
+				Some("atomic_unavailable") => ("not_committed", "atomic_unavailable"),
+				Some("cross_device") => ("not_committed", "cross_device"),
+				Some("permission_denied") => ("not_committed", "permission_denied"),
+				Some("io_error") => ("not_committed", "io_failure"),
+				_ => ("unknown", "unknown"),
+			}
+		};
+		Self {
+			ok:               result.ok,
+			code:             result.code,
+			mutation_state:   mutation_state.to_owned(),
+			durability_state: "not_attempted".to_owned(),
+			reason:           reason.to_owned(),
+			primitive:        if cfg!(target_os = "linux") {
+				"renameat2_noreplace"
+			} else if cfg!(target_os = "macos") {
+				"renameatx_np_excl"
+			} else if cfg!(windows) {
+				"windows_rename_noreplace"
+			} else {
+				"unsupported"
+			}
+			.to_owned(),
+			phase:            if mutation_state == "committed" {
+				"complete"
+			} else {
+				"rename"
+			}
+			.to_owned(),
+			diagnostic:       NativePublishDiagnostic {
+				schema_version:   1,
+				collection_state: "unavailable".to_owned(),
+				os_code:          None,
+			},
+		}
+	}
+}
+
 /// A deterministic, no-follow description of a directory tree. `relative_path`
 /// is UTF-8, uses `/` separators, and is empty only for the root entry.
 #[napi(object)]
@@ -678,11 +746,14 @@ pub fn exact_restore(
 pub fn rename_no_replace_path(
 	source_path: String,
 	destination_path: String,
-) -> NativeExactUnlinkResult {
+) -> NativeNoReplaceResult {
 	if source_path.contains('\0') || destination_path.contains('\0') {
-		return NativeExactUnlinkResult::failure("io_error");
+		return NativeNoReplaceResult::from_exact(NativeExactUnlinkResult::failure("io_error"));
 	}
-	platform::rename_path_no_replace(Path::new(&source_path), Path::new(&destination_path))
+	NativeNoReplaceResult::from_exact(platform::rename_path_no_replace(
+		Path::new(&source_path),
+		Path::new(&destination_path),
+	))
 }
 
 /// Capture a deterministic, descriptor-relative snapshot of a regular-file and
@@ -5627,6 +5698,11 @@ mod owner_only_security_tests {
 			destination.to_string_lossy().into_owned(),
 		);
 		assert!(renamed.ok, "{:?}", renamed.code);
+		assert_eq!(renamed.mutation_state, "committed");
+		assert_eq!(renamed.durability_state, "not_attempted");
+		assert_eq!(renamed.reason, "none");
+		assert_eq!(renamed.diagnostic.schema_version, 1);
+
 		assert_eq!(std::fs::read(&destination).expect("read renamed destination"), b"source");
 
 		let collision_source = dir.0.join("collision-source.tmp");
@@ -5637,6 +5713,9 @@ mod owner_only_security_tests {
 		);
 		assert!(!collision.ok);
 		assert_eq!(collision.code.as_deref(), Some("quarantine_collision"));
+		assert_eq!(collision.mutation_state, "not_committed");
+		assert_eq!(collision.reason, "destination_exists");
+		assert_eq!(collision.durability_state, "not_attempted");
 		assert_eq!(
 			std::fs::read(&collision_source).expect("read retained collision source"),
 			b"collision"

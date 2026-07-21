@@ -137,11 +137,13 @@ export type ManagedScopeErrorCode =
 	| "network_unsupported"
 	| "sessions_root_unavailable"
 	| "binding_conflict"
-	| "binding_invalid";
+	| "binding_invalid"
+	| "atomic_unavailable"
+	| "durability_not_provable";
 
 export type ManagedScopeResolution =
 	| { kind: "resolved"; scope: ManagedScope }
-	| { kind: "error"; code: ManagedScopeErrorCode; message: string };
+	| { kind: "error"; code: ManagedScopeErrorCode; message: string; cause?: { readonly classification: string } };
 
 export interface ManagedCandidate {
 	sessionId: string;
@@ -170,6 +172,8 @@ export type ManagedOpenFailure =
 	| "source_changed"
 	| "unsafe_artifacts"
 	| "durability_failed"
+	| "atomic_unavailable"
+	| "durability_not_provable"
 	| "migration_retired"
 	| "legacy_migration_disabled"
 	| "managed_storage_unsupported";
@@ -821,10 +825,14 @@ export function prepareManagedSessionScopeForWriteSync(
 		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY), root, policy);
 		return { kind: "resolved", scope };
 	} catch (error) {
+		const message = error instanceof Error ? error.message : "Managed write protocol setup failed.";
+		const code =
+			message === "atomic_unavailable" || message === "durability_not_provable" ? message : "binding_invalid";
 		return {
 			kind: "error",
-			code: "binding_invalid",
-			message: error instanceof Error ? error.message : "Managed write protocol setup failed.",
+			code,
+			message,
+			...(code === "binding_invalid" ? {} : { cause: { classification: code } }),
 		};
 	}
 }
@@ -948,6 +956,8 @@ function expectedFailure(error: unknown): ManagedOpenFailure {
 		message === "source_changed" ||
 		message === "unsafe_artifacts" ||
 		message === "durability_failed" ||
+		message === "atomic_unavailable" ||
+		message === "durability_not_provable" ||
 		message === "migration_retired"
 		? message
 		: "managed_storage_unsupported";

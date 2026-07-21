@@ -2158,23 +2158,6 @@ function formatTimeAgo(date: Date): string {
 	return date.toLocaleDateString();
 }
 
-async function syncPathAndParent(filePath: string): Promise<void> {
-	const file = await fs.promises.open(filePath, "r");
-	try {
-		await file.sync();
-	} finally {
-		await file.close();
-	}
-	if (process.platform !== "win32") {
-		const parent = await fs.promises.open(path.dirname(filePath), "r");
-		try {
-			await parent.sync();
-		} finally {
-			await parent.close();
-		}
-	}
-}
-
 interface SessionMoveDirectoryHandle {
 	sync(): Promise<void>;
 	close(): Promise<void>;
@@ -2191,40 +2174,6 @@ export async function syncSessionMoveDirectory(
 		await handle.sync();
 	} finally {
 		await handle.close();
-	}
-}
-
-/** Durably flush every copied file and directory before an EXDEV source removal. */
-async function syncCopiedTree(treePath: string): Promise<void> {
-	const stat = await fs.promises.lstat(treePath);
-	if (stat.isSymbolicLink()) throw new Error("Refusing to fsync a copied symbolic link during a cross-device move");
-	if (stat.isFile()) {
-		const file = await fs.promises.open(treePath, "r");
-		try {
-			await file.sync();
-		} finally {
-			await file.close();
-		}
-		return;
-	}
-	if (!stat.isDirectory()) throw new Error("Copied cross-device move contains an unsupported filesystem entry");
-	const directory = await fs.promises.opendir(treePath);
-	try {
-		for (;;) {
-			const entry = await directory.read();
-			if (entry === null) break;
-			await syncCopiedTree(path.join(treePath, entry.name));
-		}
-	} finally {
-		await directory.close();
-	}
-	if (process.platform !== "win32") {
-		const handle = await fs.promises.open(treePath, "r");
-		try {
-			await handle.sync();
-		} finally {
-			await handle.close();
-		}
 	}
 }
 
@@ -2275,14 +2224,6 @@ async function captureCrossDeviceTreeIdentity(treePath: string): Promise<CrossDe
 	return `directory:${before.dev}:${before.ino}:${before.size}:${before.mtimeNs}:[${children.join(",")}]`;
 }
 
-async function removeCrossDeviceSourceIfUnchanged(source: string, expected: CrossDeviceTreeIdentity): Promise<void> {
-	if ((await captureCrossDeviceTreeIdentity(source)) !== expected)
-		throw new Error("Cross-device move source changed before removal");
-	const stat = await fs.promises.lstat(source);
-	if (stat.isDirectory()) await fs.promises.rm(source, { recursive: true, force: false });
-	else await fs.promises.unlink(source);
-}
-
 /**
  * An EXDEV retirement must be driven by a native descriptor/handle-bound
  * snapshot-copy-verify transaction.  Do not fall back to pathname copy/remove:
@@ -2298,24 +2239,14 @@ class CrossDeviceMoveUnsupportedError extends Error {
 	}
 }
 
-class PathMoveCompletedWithSyncFailure extends Error {
-	constructor(readonly cause: unknown) {
-		super("Path move completed but final source-directory sync failed.", { cause });
-	}
-}
-
 async function movePathAcrossDevicesSafe(source: string, destination: string): Promise<void> {
 	const sourceIdentity = await captureCrossDeviceTreeIdentity(source);
 	const renamed = native.renameNoReplacePath(source, destination);
 	if (renamed.ok) {
-		try {
-			if ((await captureCrossDeviceTreeIdentity(destination)) !== sourceIdentity)
-				throw new Error("Atomic session rename did not preserve the captured source identity");
-			await syncSessionMoveDirectory(path.dirname(destination));
-			if (path.dirname(source) !== path.dirname(destination)) await syncSessionMoveDirectory(path.dirname(source));
-		} catch (error) {
-			throw new PathMoveCompletedWithSyncFailure(error);
-		}
+		if ((await captureCrossDeviceTreeIdentity(destination)) !== sourceIdentity)
+			throw new Error("Atomic session rename did not preserve the captured source identity");
+		await syncSessionMoveDirectory(path.dirname(destination));
+		if (path.dirname(source) !== path.dirname(destination)) await syncSessionMoveDirectory(path.dirname(source));
 		return;
 	}
 	if (renamed.code === "quarantine_collision") {
@@ -2325,56 +2256,7 @@ async function movePathAcrossDevicesSafe(source: string, destination: string): P
 	}
 	if (renamed.code !== "atomic_unavailable")
 		throw new Error(`Atomic session rename failed: ${renamed.code ?? "unknown"}`);
-	const sourceStat = await fs.promises.lstat(source);
-	if (!sourceStat.isDirectory()) {
-		let destinationCreated = false;
-		let sourceRemoved = false;
-		try {
-			try {
-				await fs.promises.link(source, destination);
-				destinationCreated = true;
-			} catch (error) {
-				if (hasFsCode(error, "EXDEV")) throw new CrossDeviceMoveUnsupportedError(source, destination, error);
-				if (
-					!hasFsCode(error, "EPERM") &&
-					!hasFsCode(error, "EACCES") &&
-					!hasFsCode(error, "ENOTSUP") &&
-					!hasFsCode(error, "EOPNOTSUPP")
-				)
-					throw error;
-				await fs.promises.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
-				destinationCreated = true;
-			}
-			await syncPathAndParent(destination);
-			await removeCrossDeviceSourceIfUnchanged(source, sourceIdentity);
-			sourceRemoved = true;
-			await syncSessionMoveDirectory(path.dirname(source));
-			return;
-		} catch (error) {
-			if (!sourceRemoved && destinationCreated) await fs.promises.unlink(destination).catch(() => undefined);
-			if (sourceRemoved && !(error instanceof PathMoveCompletedWithSyncFailure))
-				throw new PathMoveCompletedWithSyncFailure(error);
-			throw error;
-		}
-	}
-
-	const destinationParent = await fs.promises.lstat(path.dirname(destination));
-	if (sourceStat.dev !== destinationParent.dev) throw new CrossDeviceMoveUnsupportedError(source, destination);
-
-	try {
-		await fs.promises.cp(source, destination, { recursive: true, force: false, errorOnExist: true });
-		await syncCopiedTree(destination);
-		await removeCrossDeviceSourceIfUnchanged(source, sourceIdentity);
-		try {
-			await syncSessionMoveDirectory(path.dirname(source));
-		} catch (error) {
-			throw new PathMoveCompletedWithSyncFailure(error);
-		}
-	} catch (error) {
-		if (!(error instanceof PathMoveCompletedWithSyncFailure))
-			await fs.promises.rm(destination, { recursive: true, force: true }).catch(() => undefined);
-		throw error;
-	}
+	throw new CrossDeviceMoveUnsupportedError(source, destination, new Error(renamed.code));
 }
 
 const MAX_PERSIST_CHARS = 500_000;

@@ -69,6 +69,112 @@ impl RecoveryFsResult {
 	}
 }
 
+/// Bounded, path-free diagnostic evidence for one retained publication.
+#[napi(object)]
+pub struct RecoveryFsPublishDiagnostic {
+	pub schema_version:   u32,
+	pub collection_state: String,
+	pub os_code:          Option<i32>,
+}
+
+/// Explicit mutation and durability outcome for retained no-replace
+/// publication.
+#[napi(object)]
+pub struct RecoveryFsPublishResult {
+	pub ok:               bool,
+	pub code:             Option<String>,
+	pub identity:         Option<RecoveryFsIdentity>,
+	pub mutation_state:   String,
+	pub durability_state: String,
+	pub reason:           String,
+	pub primitive:        String,
+	pub phase:            String,
+	pub diagnostic:       RecoveryFsPublishDiagnostic,
+}
+
+impl RecoveryFsPublishResult {
+	fn success(identity: RecoveryFsIdentity) -> Self {
+		Self::result(true, None, Some(identity), "committed", "proven", "none", "complete", None)
+	}
+
+	fn failure(
+		mutation_state: &str,
+		durability_state: &str,
+		reason: &str,
+		phase: &str,
+		code: &str,
+		os_code: Option<i32>,
+	) -> Self {
+		Self::result(
+			false,
+			Some(code.to_owned()),
+			None,
+			mutation_state,
+			durability_state,
+			reason,
+			phase,
+			os_code,
+		)
+	}
+
+	fn result(
+		ok: bool,
+		code: Option<String>,
+		identity: Option<RecoveryFsIdentity>,
+		mutation_state: &str,
+		durability_state: &str,
+		reason: &str,
+		phase: &str,
+		os_code: Option<i32>,
+	) -> Self {
+		Self {
+			ok,
+			code,
+			identity,
+			mutation_state: mutation_state.to_owned(),
+			durability_state: durability_state.to_owned(),
+			reason: reason.to_owned(),
+			primitive: "renameat2_noreplace".to_owned(),
+			phase: phase.to_owned(),
+			diagnostic: RecoveryFsPublishDiagnostic {
+				schema_version: 1,
+				collection_state: if os_code.is_some() {
+					"partial"
+				} else {
+					"complete"
+				}
+				.to_owned(),
+				os_code,
+			},
+		}
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn publish_preflight_failure(code: &'static str) -> RecoveryFsPublishResult {
+	let (reason, phase) = match code {
+		"already_exists" => ("destination_exists", "preflight"),
+		"atomic_unavailable" => ("atomic_unavailable", "rename"),
+		"cross_device" => ("cross_device", "rename"),
+		"permission_denied" => ("permission_denied", "preflight"),
+		"identity_mismatch" => ("identity_violation", "preflight"),
+		_ => ("io_failure", "preflight"),
+	};
+	RecoveryFsPublishResult::failure("not_committed", "not_attempted", reason, phase, code, None)
+}
+
+#[cfg(target_os = "linux")]
+fn publish_post_mutation_failure(code: &'static str, phase: &str) -> RecoveryFsPublishResult {
+	let reason = if code == "fsync_failed" {
+		"durability_not_provable"
+	} else if code == "identity_mismatch" {
+		"identity_violation"
+	} else {
+		"io_failure"
+	};
+	RecoveryFsPublishResult::failure("committed", "not_provable", reason, phase, code, None)
+}
+
 /// Retained trusted-root authority for Linux recovery artifacts.
 #[napi]
 pub struct RecoveryFsRoot {
@@ -390,10 +496,10 @@ impl RecoveryFsRoot {
 		expected_mtime_ns: String,
 		expected_ctime_ns: String,
 		expected_sha256: String,
-	) -> RecoveryFsResult {
+	) -> RecoveryFsPublishResult {
 		#[cfg(target_os = "linux")]
 		{
-			with_root(&self.root, |root| {
+			with_root_publish(&self.root, |root| {
 				rename_managed_file_no_replace(
 					root,
 					&source_relative_path,
@@ -419,7 +525,14 @@ impl RecoveryFsRoot {
 				expected_ctime_ns,
 				expected_sha256,
 			);
-			RecoveryFsResult::failure("unsupported_platform")
+			RecoveryFsPublishResult::failure(
+				"not_committed",
+				"not_attempted",
+				"atomic_unavailable",
+				"preflight",
+				"unsupported_platform",
+				None,
+			)
 		}
 	}
 
@@ -466,10 +579,10 @@ impl RecoveryFsRoot {
 		source_relative_path: String,
 		destination_relative_path: String,
 		expected: crate::path_identity::NativeDirectoryTreeSnapshot,
-	) -> RecoveryFsResult {
+	) -> RecoveryFsPublishResult {
 		#[cfg(target_os = "linux")]
 		{
-			with_root(&self.root, |root| {
+			with_root_publish(&self.root, |root| {
 				rename_managed_tree_no_replace(
 					root,
 					&source_relative_path,
@@ -481,7 +594,14 @@ impl RecoveryFsRoot {
 		#[cfg(not(target_os = "linux"))]
 		{
 			let _ = (source_relative_path, destination_relative_path, expected);
-			RecoveryFsResult::failure("unsupported_platform")
+			RecoveryFsPublishResult::failure(
+				"not_committed",
+				"not_attempted",
+				"atomic_unavailable",
+				"preflight",
+				"unsupported_platform",
+				None,
+			)
 		}
 	}
 
@@ -513,17 +633,24 @@ impl RecoveryFsRoot {
 		&self,
 		source_relative_path: String,
 		destination_relative_path: String,
-	) -> RecoveryFsResult {
+	) -> RecoveryFsPublishResult {
 		#[cfg(target_os = "linux")]
 		{
-			with_root(&self.root, |root| {
+			with_root_publish(&self.root, |root| {
 				install(root, &source_relative_path, &destination_relative_path)
 			})
 		}
 		#[cfg(not(target_os = "linux"))]
 		{
 			let _ = (source_relative_path, destination_relative_path);
-			RecoveryFsResult::failure("unsupported_platform")
+			RecoveryFsPublishResult::failure(
+				"not_committed",
+				"not_attempted",
+				"atomic_unavailable",
+				"preflight",
+				"unsupported_platform",
+				None,
+			)
 		}
 	}
 
@@ -753,6 +880,27 @@ fn with_root(
 	guard.as_ref().map_or_else(
 		|| RecoveryFsResult::failure("closed"),
 		|root| operation(root).unwrap_or_else(RecoveryFsResult::failure),
+	)
+}
+
+#[cfg(target_os = "linux")]
+fn with_root_publish(
+	root: &Mutex<Option<File>>,
+	operation: impl FnOnce(&File) -> RecoveryFsPublishResult,
+) -> RecoveryFsPublishResult {
+	let guard = root.lock();
+	guard.as_ref().map_or_else(
+		|| {
+			RecoveryFsPublishResult::failure(
+				"not_committed",
+				"not_attempted",
+				"io_failure",
+				"preflight",
+				"closed",
+				None,
+			)
+		},
+		operation,
 	)
 }
 
@@ -1274,6 +1422,48 @@ fn rename_managed_file_no_replace(
 	mtime_ns: &str,
 	ctime_ns: &str,
 	sha256: &str,
+) -> RecoveryFsPublishResult {
+	match rename_managed_file_no_replace_inner(
+		root,
+		source,
+		destination,
+		dev,
+		ino,
+		size,
+		mtime_ns,
+		ctime_ns,
+		sha256,
+	) {
+		Ok(result) => result.identity.map_or_else(
+			|| publish_post_mutation_failure("identity_mismatch", "terminal_identity"),
+			RecoveryFsPublishResult::success,
+		),
+		Err("fsync_failed") => publish_post_mutation_failure("fsync_failed", "source_parent_sync"),
+		Err("rollback_unavailable") => {
+			publish_post_mutation_failure("rollback_unavailable", "terminal_identity")
+		},
+		Err("interrupted") => RecoveryFsPublishResult::failure(
+			"unknown",
+			"not_provable",
+			"unknown",
+			"rename",
+			"io_error",
+			Some(libc::EINTR),
+		),
+		Err(code) => publish_preflight_failure(code),
+	}
+}
+
+fn rename_managed_file_no_replace_inner(
+	root: &File,
+	source: &str,
+	destination: &str,
+	dev: &str,
+	ino: &str,
+	size: &str,
+	mtime_ns: &str,
+	ctime_ns: &str,
+	sha256: &str,
 ) -> Result<RecoveryFsResult, &'static str> {
 	use std::os::fd::AsRawFd;
 	let source_file = open_existing(root, source, false)?;
@@ -1300,6 +1490,9 @@ fn rename_managed_file_no_replace(
 		return Err(match std::io::Error::last_os_error().raw_os_error() {
 			Some(libc::EEXIST) => "already_exists",
 			Some(libc::ENOSYS | libc::EINVAL) => "atomic_unavailable",
+			Some(libc::EXDEV) => "cross_device",
+			Some(libc::EACCES | libc::EPERM) => "permission_denied",
+			Some(libc::EINTR) => "interrupted",
 			_ => "io_error",
 		});
 	}
@@ -1314,8 +1507,18 @@ fn rename_managed_file_no_replace(
 	if terminal.st_dev.to_string() != moved.dev || terminal.st_ino.to_string() != moved.ino {
 		return Err("rollback_unavailable");
 	}
-	if source_parent.sync_all().is_err() || destination_parent.sync_all().is_err() {
-		return Err("rollback_unavailable");
+	let source_parent_identity = identity(&source_parent)?;
+	let destination_parent_identity = identity(&destination_parent)?;
+	let source_sync = source_parent.sync_all();
+	let destination_sync = if source_parent_identity.dev == destination_parent_identity.dev
+		&& source_parent_identity.ino == destination_parent_identity.ino
+	{
+		Ok(())
+	} else {
+		destination_parent.sync_all()
+	};
+	if source_sync.is_err() || destination_sync.is_err() {
+		return Err("fsync_failed");
 	}
 	let after = regular_identity(&moved_file)?;
 	let named_after =
@@ -1644,7 +1847,33 @@ fn replace_managed(
 }
 
 #[cfg(target_os = "linux")]
-fn install(root: &File, source: &str, destination: &str) -> Result<RecoveryFsResult, &'static str> {
+fn install(root: &File, source: &str, destination: &str) -> RecoveryFsPublishResult {
+	match install_inner(root, source, destination) {
+		Ok(result) => result.identity.map_or_else(
+			|| publish_post_mutation_failure("identity_mismatch", "terminal_identity"),
+			RecoveryFsPublishResult::success,
+		),
+		Err("fsync_failed") => publish_post_mutation_failure("fsync_failed", "source_parent_sync"),
+		Err("post_mutation_identity_mismatch") => {
+			publish_post_mutation_failure("identity_mismatch", "terminal_identity")
+		},
+		Err("interrupted") => RecoveryFsPublishResult::failure(
+			"unknown",
+			"not_provable",
+			"unknown",
+			"rename",
+			"io_error",
+			Some(libc::EINTR),
+		),
+		Err(code) => publish_preflight_failure(code),
+	}
+}
+
+fn install_inner(
+	root: &File,
+	source: &str,
+	destination: &str,
+) -> Result<RecoveryFsResult, &'static str> {
 	use std::os::fd::AsRawFd;
 	let source_file = open_existing(root, source, false)?;
 	let source_identity = regular_identity(&source_file)?;
@@ -1666,6 +1895,9 @@ fn install(root: &File, source: &str, destination: &str) -> Result<RecoveryFsRes
 		return Err(match std::io::Error::last_os_error().raw_os_error() {
 			Some(libc::EEXIST) => "already_exists",
 			Some(libc::ENOSYS | libc::EINVAL) => "atomic_unavailable",
+			Some(libc::EXDEV) => "cross_device",
+			Some(libc::EACCES | libc::EPERM) => "permission_denied",
+			Some(libc::EINTR) => "interrupted",
 			_ => "io_error",
 		});
 	}
@@ -1673,9 +1905,21 @@ fn install(root: &File, source: &str, destination: &str) -> Result<RecoveryFsRes
 	let installed_identity = regular_identity(&installed)?;
 	if installed_identity.dev != source_identity.dev || installed_identity.ino != source_identity.ino
 	{
-		return Err("identity_mismatch");
+		return Err("post_mutation_identity_mismatch");
 	}
-	destination_parent.sync_all().map_err(|_| "fsync_failed")?;
+	let source_parent_identity = identity(&source_parent)?;
+	let destination_parent_identity = identity(&destination_parent)?;
+	let source_sync = source_parent.sync_all();
+	let destination_sync = if source_parent_identity.dev == destination_parent_identity.dev
+		&& source_parent_identity.ino == destination_parent_identity.ino
+	{
+		Ok(())
+	} else {
+		destination_parent.sync_all()
+	};
+	if source_sync.is_err() || destination_sync.is_err() {
+		return Err("fsync_failed");
+	}
 	Ok(RecoveryFsResult::success(installed_identity))
 }
 
@@ -2040,6 +2284,33 @@ fn rename_managed_tree_no_replace(
 	source: &str,
 	destination: &str,
 	expected: &crate::path_identity::NativeDirectoryTreeSnapshot,
+) -> RecoveryFsPublishResult {
+	match rename_managed_tree_no_replace_inner(root, source, destination, expected) {
+		Ok(result) => result.identity.map_or_else(
+			|| publish_post_mutation_failure("identity_mismatch", "terminal_identity"),
+			RecoveryFsPublishResult::success,
+		),
+		Err("fsync_failed") => publish_post_mutation_failure("fsync_failed", "source_parent_sync"),
+		Err("rollback_unavailable") => {
+			publish_post_mutation_failure("rollback_unavailable", "terminal_identity")
+		},
+		Err("interrupted") => RecoveryFsPublishResult::failure(
+			"unknown",
+			"not_provable",
+			"unknown",
+			"rename",
+			"io_error",
+			Some(libc::EINTR),
+		),
+		Err(code) => publish_preflight_failure(code),
+	}
+}
+
+fn rename_managed_tree_no_replace_inner(
+	root: &File,
+	source: &str,
+	destination: &str,
+	expected: &crate::path_identity::NativeDirectoryTreeSnapshot,
 ) -> Result<RecoveryFsResult, &'static str> {
 	let before = snapshot_managed_tree(root, source)?
 		.snapshot
@@ -2065,6 +2336,9 @@ fn rename_managed_tree_no_replace(
 		return Err(match std::io::Error::last_os_error().raw_os_error() {
 			Some(libc::EEXIST) => "already_exists",
 			Some(libc::ENOSYS | libc::EINVAL) => "atomic_unavailable",
+			Some(libc::EXDEV) => "cross_device",
+			Some(libc::EACCES | libc::EPERM) => "permission_denied",
+			Some(libc::EINTR) => "interrupted",
 			_ => "io_error",
 		});
 	}
@@ -2075,8 +2349,19 @@ fn rename_managed_tree_no_replace(
 		if !tree_matches_after_rename(&after, expected) {
 			return Err("identity_mismatch");
 		}
-		source_parent.sync_all().map_err(|_| "fsync_failed")?;
-		destination_parent.sync_all().map_err(|_| "fsync_failed")?;
+		let source_parent_identity = identity(&source_parent)?;
+		let destination_parent_identity = identity(&destination_parent)?;
+		let source_sync = source_parent.sync_all();
+		let destination_sync = if source_parent_identity.dev == destination_parent_identity.dev
+			&& source_parent_identity.ino == destination_parent_identity.ino
+		{
+			Ok(())
+		} else {
+			destination_parent.sync_all()
+		};
+		if source_sync.is_err() || destination_sync.is_err() {
+			return Err("fsync_failed");
+		}
 		let terminal = snapshot_managed_tree(root, destination)?
 			.snapshot
 			.ok_or("io_error")?;
@@ -2094,6 +2379,7 @@ fn rename_managed_tree_no_replace(
 	})();
 	match post_mutation {
 		Ok(identity) => Ok(RecoveryFsResult::success(identity)),
+		Err("fsync_failed") => Err("fsync_failed"),
 		Err(_) => Err("rollback_unavailable"),
 	}
 }

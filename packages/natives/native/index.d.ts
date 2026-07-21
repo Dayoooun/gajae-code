@@ -409,14 +409,14 @@ export declare class RecoveryFsRoot {
    * retained root. The source identity is rechecked after the no-replace
    * rename, and the move is rolled back on a mismatch.
    */
-  renameManagedFileNoReplace(sourceRelativePath: string, destinationRelativePath: string, expectedDev: string, expectedIno: string, expectedSize: string, expectedMtimeNs: string, expectedCtimeNs: string, expectedSha256: string): RecoveryFsResult
+  renameManagedFileNoReplace(sourceRelativePath: string, destinationRelativePath: string, expectedDev: string, expectedIno: string, expectedSize: string, expectedMtimeNs: string, expectedCtimeNs: string, expectedSha256: string): RecoveryFsPublishResult
   /** Snapshot a managed directory tree entirely through the retained root. */
   snapshotManagedTree(relativePath: string): NativeDirectoryTreeResult
   /**
    * Move an exact managed directory tree to an absent name through retained
    * authority.
    */
-  renameManagedTreeNoReplace(sourceRelativePath: string, destinationRelativePath: string, expected: NativeDirectoryTreeSnapshot): RecoveryFsResult
+  renameManagedTreeNoReplace(sourceRelativePath: string, destinationRelativePath: string, expected: NativeDirectoryTreeSnapshot): RecoveryFsPublishResult
   /** Remove an exact managed directory tree through retained authority. */
   removeManagedTree(relativePath: string, expected: NativeDirectoryTreeSnapshot): RecoveryFsResult
   /**
@@ -424,7 +424,7 @@ export declare class RecoveryFsRoot {
    * Both names remain relative to this retained root and are never resolved
    * through a pathname after their parent descriptors are acquired.
    */
-  install(sourceRelativePath: string, destinationRelativePath: string): RecoveryFsResult
+  install(sourceRelativePath: string, destinationRelativePath: string): RecoveryFsPublishResult
   /**
    * Synchronize the retained root directory, making a preceding create or
    * install durable when the filesystem supports directory fsync.
@@ -1732,6 +1732,18 @@ export interface NativeExactUnlinkResult {
   retainedUnknownPath?: string
 }
 
+/** Dedicated result for an atomic no-replace namespace publication. */
+export interface NativeNoReplaceResult {
+  ok: boolean
+  code?: string
+  mutationState: string
+  durabilityState: string
+  reason: string
+  primitive: string
+  phase: string
+  diagnostic: NativePublishDiagnostic
+}
+
 /** Result of applying or checking owner-only path security. */
 export type NativeOwnerOnlySecurityResult =
 	| {
@@ -1962,6 +1974,26 @@ export interface RecoveryFsIdentity {
   sha256?: string
 }
 
+/** Bounded, path-free diagnostic evidence for one retained publication. */
+export interface RecoveryFsPublishDiagnostic {
+  schemaVersion: number
+  collectionState: string
+  osCode?: number
+}
+
+/** Explicit mutation and durability outcome for retained no-replace publication. */
+export interface RecoveryFsPublishResult {
+  ok: boolean
+  code?: string
+  identity?: RecoveryFsIdentity
+  mutationState: string
+  durabilityState: string
+  reason: string
+  primitive: string
+  phase: string
+  diagnostic: RecoveryFsPublishDiagnostic
+}
+
 export interface RecoveryFsResult {
   ok: boolean
   code?: string
@@ -1969,7 +2001,7 @@ export interface RecoveryFsResult {
   data?: Uint8Array
 }
 
-export declare function renameNoReplacePath(sourcePath: string, destinationPath: string): NativeExactUnlinkResult
+export declare function renameNoReplacePath(sourcePath: string, destinationPath: string): NativeNoReplaceResult
 
 /**
  * Repair an owner-only ACL on a retained expected path.

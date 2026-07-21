@@ -12,6 +12,12 @@ import {
 	retainManagedDirectoryAuthority,
 	validateNativeSecurityResult,
 } from "../src/session/internal/managed-session-storage";
+import {
+	classifyNativePublishOutcome,
+	formatNativePublishDiagnostic,
+	mayCleanCurrentStaging,
+} from "../src/session/internal/native-publish-outcome";
+
 import { SessionManager } from "../src/session/session-manager";
 import {
 	createManagedSessionSecurityContext,
@@ -24,6 +30,42 @@ import {
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../src/session/session-storage";
+
+describe("native publish outcome classification", () => {
+	const preMutation = {
+		ok: false,
+		code: "atomic_unavailable",
+		mutationState: "not_committed",
+		durabilityState: "not_attempted",
+		reason: "atomic_unavailable",
+		primitive: "renameat2_noreplace",
+		phase: "rename",
+		diagnostic: { schemaVersion: 1, collectionState: "complete", osCode: 38 },
+	};
+
+	it("allows staging-only cleanup only for a complete known pre-mutation envelope", () => {
+		expect(mayCleanCurrentStaging(classifyNativePublishOutcome(preMutation))).toBe(true);
+		expect(
+			mayCleanCurrentStaging(
+				classifyNativePublishOutcome({
+					...preMutation,
+					mutationState: "committed",
+					durabilityState: "not_provable",
+				}),
+			),
+		).toBe(false);
+	});
+
+	it("fails malformed and path-bearing envelopes closed without formatting unsafe values", () => {
+		const outcome = classifyNativePublishOutcome({
+			...preMutation,
+			diagnostic: { schemaVersion: 1, collectionState: "complete", path: "/secret" },
+		});
+		expect(outcome.mutationState).toBe("unknown");
+		expect(mayCleanCurrentStaging(outcome)).toBe(false);
+		expect(formatNativePublishDiagnostic(outcome)).not.toContain("secret");
+	});
+});
 
 describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 	let tempDir: string;
