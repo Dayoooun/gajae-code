@@ -312,8 +312,8 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 			candidates: [modern, baseline],
 			requireCandidate: candidate =>
 				candidate === baseline
-					? { __piNativesVCurrent: () => undefined, __piNativesPublishOutcomeV1: () => undefined }
-					: { __piNativesVCurrent: () => undefined },
+					? { __piNativesVCurrent: (): void => undefined, __piNativesPublishOutcomeV1: (): void => undefined }
+					: { __piNativesVCurrent: (): void => undefined },
 			validateCandidate: bindings => {
 				validateCurrentSentinel(bindings);
 				if (typeof bindings.__piNativesPublishOutcomeV1 !== "function")

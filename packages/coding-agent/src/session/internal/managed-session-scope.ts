@@ -832,7 +832,9 @@ export function prepareManagedSessionScopeForWriteSync(
 		return { kind: "resolved", scope };
 	} catch (error) {
 		const publication = error instanceof ManagedPublishError ? error : undefined;
-		const message = publication?.classification ?? (error instanceof Error ? error.message : "Managed write protocol setup failed.");
+		const message =
+			publication?.classification ??
+			(error instanceof Error ? error.message : "Managed write protocol setup failed.");
 		const code =
 			message === "atomic_unavailable" || message === "durability_not_provable" ? message : "binding_invalid";
 		return {
