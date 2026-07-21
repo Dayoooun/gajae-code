@@ -196,24 +196,32 @@ pub struct NativeNoReplaceResult {
 
 impl NativeNoReplaceResult {
 	fn from_exact(result: NativeExactUnlinkResult) -> Self {
-		let (mutation_state, reason) = if result.ok {
-			("committed", "none")
+		let (mutation_state, durability_state, reason) = if result.ok {
+			// A direct no-replace rename commits the namespace mutation, but does not
+			// fsync either parent directory.
+			("committed", "not_attempted", "none")
 		} else {
 			match result.code.as_deref() {
 				Some("quarantine_collision" | "already_exists") => {
-					("not_committed", "destination_exists")
+					("not_committed", "not_attempted", "destination_exists")
 				},
-				Some("atomic_unavailable") => ("not_committed", "atomic_unavailable"),
-				Some("cross_device") => ("not_committed", "cross_device"),
-				Some("permission_denied") => ("not_committed", "permission_denied"),
-				_ => ("unknown", "unknown"),
+				Some("atomic_unavailable") => ("not_committed", "not_attempted", "atomic_unavailable"),
+				Some("cross_device") => ("not_committed", "not_attempted", "cross_device"),
+				Some("permission_denied") => ("not_committed", "not_attempted", "permission_denied"),
+				Some("not_found") => ("not_committed", "not_attempted", "invalid_request"),
+				Some("reparse_point" | "identity_mismatch") => {
+					("not_committed", "not_attempted", "identity_violation")
+				},
+				// EINTR and unclassified failures leave the syscall's namespace effect
+				// ambiguous. Never authorize staging cleanup from them.
+				_ => ("unknown", "not_provable", "unknown"),
 			}
 		};
 		Self {
 			ok:               result.ok,
 			code:             result.code,
 			mutation_state:   mutation_state.to_owned(),
-			durability_state: "not_attempted".to_owned(),
+			durability_state: durability_state.to_owned(),
 			reason:           reason.to_owned(),
 			primitive:        if cfg!(target_os = "linux") {
 				"renameat2_noreplace"
@@ -227,6 +235,8 @@ impl NativeNoReplaceResult {
 			.to_owned(),
 			phase:            if mutation_state == "committed" {
 				"complete"
+			} else if matches!(reason, "invalid_request" | "identity_violation") {
+				"preflight"
 			} else {
 				"rename"
 			}
@@ -2238,6 +2248,9 @@ pub(crate) mod platform {
 			match std::io::Error::last_os_error().raw_os_error() {
 				Some(libc::EEXIST) => Err("quarantine_collision"),
 				Some(libc::ENOSYS | libc::EINVAL) => Err("atomic_unavailable"),
+				Some(libc::EXDEV) => Err("cross_device"),
+				Some(libc::EACCES | libc::EPERM) => Err("permission_denied"),
+				Some(libc::EINTR) => Err("interrupted"),
 				_ => Err("io_error"),
 			}
 		}
@@ -2307,6 +2320,9 @@ pub(crate) mod platform {
 			match std::io::Error::last_os_error().raw_os_error() {
 				Some(libc::EEXIST) => Err("quarantine_collision"),
 				Some(libc::ENOSYS | libc::EINVAL) => Err("atomic_unavailable"),
+				Some(libc::EXDEV) => Err("cross_device"),
+				Some(libc::EACCES | libc::EPERM) => Err("permission_denied"),
+				Some(libc::EINTR) => Err("interrupted"),
 				_ => Err("io_error"),
 			}
 		}
