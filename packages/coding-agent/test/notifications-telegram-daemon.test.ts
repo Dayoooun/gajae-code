@@ -2087,9 +2087,9 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps the wire protocol at 3 while stale endpoint startup recovery uses generation 15", () => {
+	test("keeps wire protocol 3 while Windows ACL and stale startup recovery use generation 16", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		expect(DAEMON_GENERATION).toBe(15);
+		expect(DAEMON_GENERATION).toBe(16);
 	});
 
 	test("#2028 acquire flags a reload for a live pre-upgrade owner missing the generation field", async () => {
