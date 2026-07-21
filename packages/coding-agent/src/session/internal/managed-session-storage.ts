@@ -18,7 +18,12 @@ import {
 	verifyOwnerOnlyPathSecurity,
 	verifyOwnerOnlyPathSecurityExpected,
 } from "@gajae-code/natives";
-import { classifyNativePublishOutcome, mayCleanCurrentStaging } from "./native-publish-outcome";
+import {
+	classifyNativePublishOutcome,
+	formatNativePublishDiagnostic,
+	mayCleanCurrentStaging,
+	type NativePublishOutcome,
+} from "./native-publish-outcome";
 
 export const MANAGED_ARTIFACT_MAX_DEPTH = 32;
 export const MANAGED_ARTIFACT_MAX_FILES = 10_000;
@@ -29,6 +34,54 @@ const LOCK_HEARTBEAT_MS = 10_000;
 const LOCK_WAIT_MS = 5_000;
 
 const LOCK_STALE_RECHECK_MS = 100;
+function publishFailure(outcome: NativePublishOutcome): Error {
+	if (outcome.reason === "destination_exists") return new Error("destination_conflict");
+	if (outcome.reason === "atomic_unavailable") return new Error("atomic_unavailable");
+	if (outcome.reason === "durability_not_provable") return new Error("durability_not_provable");
+	return new Error(
+		`${outcome.code ?? (outcome.reason === "unknown" ? "durability_failed" : outcome.reason)}: ${formatNativePublishDiagnostic(outcome)}`,
+	);
+}
+
+/** A same-filesystem rename updates the moved root's ctime but no other tree identity. */
+function sameDirectoryTreeSnapshotAfterRename(
+	left: NativeDirectoryTreeSnapshot,
+	right: NativeDirectoryTreeSnapshot,
+): boolean {
+	return (
+		left.rootDev === right.rootDev &&
+		left.rootIno === right.rootIno &&
+		left.entries.length === right.entries.length &&
+		left.entries.every((entry, index) => {
+			const other = right.entries[index];
+			return (
+				other !== undefined &&
+				entry.relativePath === other.relativePath &&
+				entry.kind === other.kind &&
+				entry.dev === other.dev &&
+				entry.ino === other.ino &&
+				entry.size === other.size &&
+				entry.mtimeNs === other.mtimeNs &&
+				(entry.relativePath === "" || entry.ctimeNs === other.ctimeNs) &&
+				entry.sha256 === other.sha256
+			);
+		})
+	);
+}
+
+class ManagedTreeMoveOutcomeError extends Error {
+	constructor(
+		message: string,
+		readonly stagingCleanupSafe: boolean,
+	) {
+		super(message);
+	}
+}
+
+/** Cleanup is safe only when the native move reports that it did not commit. */
+export function mayCleanManagedTreeStaging(error: unknown): boolean {
+	return !(error instanceof ManagedTreeMoveOutcomeError) || error.stagingCleanupSafe;
+}
 
 export type ManagedSessionSecurityPolicy = "default" | "windows-existing-verify-first";
 
@@ -648,12 +701,7 @@ export class ManagedSessionDescendantStore {
 				digest,
 			);
 			const outcome = classifyNativePublishOutcome(published);
-			if (!outcome.ok) {
-				if (outcome.reason === "destination_exists") throw new Error("destination_conflict");
-				if (outcome.reason === "atomic_unavailable") throw new Error("atomic_unavailable");
-				if (outcome.reason === "durability_not_provable") throw new Error("durability_not_provable");
-				throw new Error(outcome.code ?? (outcome.reason === "unknown" ? "durability_failed" : outcome.reason));
-			}
+			if (!outcome.ok) throw publishFailure(outcome);
 		} catch (error) {
 			// A committed or unknown native outcome is evidence, not authorization to
 			// probe or remove the destination. Only a validated pre-mutation result
@@ -873,22 +921,30 @@ export class ManagedSessionDescendantStore {
 		sourceRelativePath: string,
 		destinationRelativePath: string,
 		expected: NativeDirectoryTreeSnapshot,
-	): void {
+	): NativeDirectoryTreeSnapshot {
 		this.#assertBound();
-		if (!this.#authority) throw new Error("managed_storage_unsupported");
-		const moved = this.#authority.renameManagedTreeNoReplace(
-			this.#relative(this.#resolve(sourceRelativePath)),
-			this.#relative(this.#resolve(destinationRelativePath)),
-			expected,
-		);
+		const moved = this.#authority
+			? this.#authority.renameManagedTreeNoReplace(
+					this.#relative(this.#resolve(sourceRelativePath)),
+					this.#relative(this.#resolve(destinationRelativePath)),
+					expected,
+				)
+			: renameNoReplacePath(this.#resolve(sourceRelativePath), this.#resolve(destinationRelativePath));
 		const outcome = classifyNativePublishOutcome(moved);
-		if (!outcome.ok) {
-			if (outcome.reason === "destination_exists") throw new Error("destination_conflict");
-			if (outcome.reason === "atomic_unavailable") throw new Error("atomic_unavailable");
-			if (outcome.reason === "durability_not_provable") throw new Error("durability_not_provable");
-			throw new Error(outcome.code ?? (outcome.reason === "unknown" ? "durability_failed" : outcome.reason));
-		}
+		if (!outcome.ok)
+			throw new ManagedTreeMoveOutcomeError(publishFailure(outcome).message, mayCleanCurrentStaging(outcome));
+		const movedSnapshot = this.#authority
+			? this.#authority.snapshotManagedTree(this.#relative(this.#resolve(destinationRelativePath)))
+			: snapshotDirectoryTree(this.#resolve(destinationRelativePath));
+		if (
+			!movedSnapshot.ok ||
+			!movedSnapshot.snapshot ||
+			!sameDirectoryTreeSnapshotAfterRename(movedSnapshot.snapshot, expected)
+		)
+			throw new ManagedTreeMoveOutcomeError("artifact_destination_mismatch", false);
+
 		this.#assertBound();
+		return movedSnapshot.snapshot;
 	}
 
 	removeTreeExpected(relativePath: string, expected: NativeDirectoryTreeSnapshot): void {
@@ -1147,6 +1203,8 @@ export async function publishManagedFileNoReplace(
 	let fd: number | undefined;
 	let stagingIdentity: { dev: bigint; ino: bigint } | undefined;
 	let failure: unknown;
+	let outcome: NativePublishOutcome | undefined;
+
 	try {
 		assertOwned?.();
 		fd = fs.openSync(
@@ -1163,11 +1221,10 @@ export async function publishManagedFileNoReplace(
 		stagingIdentity = { dev: staged.dev, ino: staged.ino };
 		assertOwned?.();
 
-		const published = renameNoReplacePath(staging, destination);
-		if (!published.ok) {
-			if (published.code === "quarantine_collision") throw new Error("destination_conflict");
-			throw new Error("durability_failed");
-		}
+		outcome = classifyNativePublishOutcome(renameNoReplacePath(staging, destination));
+
+		if (!outcome.ok) throw publishFailure(outcome);
+
 		const named = fs.lstatSync(destination, { bigint: true });
 		if (
 			!named.isFile() ||
@@ -1186,7 +1243,8 @@ export async function publishManagedFileNoReplace(
 		failure = error;
 	} finally {
 		if (fd !== undefined) fs.closeSync(fd);
-		if (stagingIdentity) {
+
+		if (stagingIdentity && outcome && mayCleanCurrentStaging(outcome)) {
 			await fsp
 				.lstat(staging, { bigint: true })
 				.then(stat => {
@@ -1213,6 +1271,8 @@ export function publishManagedFileNoReplaceSync(
 	let fd: number | undefined;
 	let stagingIdentity: { dev: bigint; ino: bigint } | undefined;
 	let failure: unknown;
+	let outcome: NativePublishOutcome | undefined;
+
 	try {
 		fd = fs.openSync(
 			staging,
@@ -1227,11 +1287,9 @@ export function publishManagedFileNoReplaceSync(
 		const staged = fs.fstatSync(fd, { bigint: true });
 		stagingIdentity = { dev: staged.dev, ino: staged.ino };
 
-		const published = renameNoReplacePath(staging, destination);
-		if (!published.ok) {
-			if (published.code === "quarantine_collision") throw new Error("destination_conflict");
-			throw new Error("durability_failed");
-		}
+		outcome = classifyNativePublishOutcome(renameNoReplacePath(staging, destination));
+		if (!outcome.ok) throw publishFailure(outcome);
+
 		const named = fs.lstatSync(destination, { bigint: true });
 		if (!named.isFile() || named.isSymbolicLink() || named.dev !== staged.dev || named.ino !== staged.ino) {
 			throw new Error("destination_identity_changed");
@@ -1245,7 +1303,7 @@ export function publishManagedFileNoReplaceSync(
 	} finally {
 		if (fd !== undefined) fs.closeSync(fd);
 	}
-	if (stagingIdentity) {
+	if (stagingIdentity && outcome && mayCleanCurrentStaging(outcome)) {
 		try {
 			const named = fs.lstatSync(staging, { bigint: true });
 			if (named.dev !== stagingIdentity.dev || named.ino !== stagingIdentity.ino) {

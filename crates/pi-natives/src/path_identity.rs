@@ -206,7 +206,6 @@ impl NativeNoReplaceResult {
 				Some("atomic_unavailable") => ("not_committed", "atomic_unavailable"),
 				Some("cross_device") => ("not_committed", "cross_device"),
 				Some("permission_denied") => ("not_committed", "permission_denied"),
-				Some("io_error") => ("not_committed", "io_failure"),
 				_ => ("unknown", "unknown"),
 			}
 		};

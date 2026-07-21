@@ -175,6 +175,11 @@ fn publish_post_mutation_failure(code: &'static str, phase: &str) -> RecoveryFsP
 	RecoveryFsPublishResult::failure("committed", "not_provable", reason, phase, code, None)
 }
 
+#[cfg(target_os = "linux")]
+fn publish_unknown_failure(code: &'static str, phase: &str) -> RecoveryFsPublishResult {
+	RecoveryFsPublishResult::failure("unknown", "not_provable", "unknown", phase, code, None)
+}
+
 /// Retained trusted-root authority for Linux recovery artifacts.
 #[napi]
 pub struct RecoveryFsRoot {
@@ -1442,15 +1447,12 @@ fn rename_managed_file_no_replace(
 		Err("rollback_unavailable") => {
 			publish_post_mutation_failure("rollback_unavailable", "terminal_identity")
 		},
-		Err("interrupted") => RecoveryFsPublishResult::failure(
-			"unknown",
-			"not_provable",
-			"unknown",
-			"rename",
-			"io_error",
-			Some(libc::EINTR),
-		),
-		Err(code) => publish_preflight_failure(code),
+		Err("interrupted") => publish_unknown_failure("io_error", "rename"),
+		Err(
+			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"),
+		) => publish_preflight_failure(code),
+
+		Err(code) => publish_unknown_failure(code, "terminal_identity"),
 	}
 }
 
@@ -1858,15 +1860,12 @@ fn install(root: &File, source: &str, destination: &str) -> RecoveryFsPublishRes
 		Err("post_mutation_identity_mismatch") => {
 			publish_post_mutation_failure("identity_mismatch", "terminal_identity")
 		},
-		Err("interrupted") => RecoveryFsPublishResult::failure(
-			"unknown",
-			"not_provable",
-			"unknown",
-			"rename",
-			"io_error",
-			Some(libc::EINTR),
-		),
-		Err(code) => publish_preflight_failure(code),
+		Err("interrupted") => publish_unknown_failure("io_error", "rename"),
+		Err(
+			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"),
+		) => publish_preflight_failure(code),
+
+		Err(code) => publish_unknown_failure(code, "terminal_identity"),
 	}
 }
 
@@ -2296,15 +2295,11 @@ fn rename_managed_tree_no_replace(
 		Err("rollback_unavailable") => {
 			publish_post_mutation_failure("rollback_unavailable", "terminal_identity")
 		},
-		Err("interrupted") => RecoveryFsPublishResult::failure(
-			"unknown",
-			"not_provable",
-			"unknown",
-			"rename",
-			"io_error",
-			Some(libc::EINTR),
-		),
-		Err(code) => publish_preflight_failure(code),
+		Err("interrupted") => publish_unknown_failure("io_error", "rename"),
+		Err(
+			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"),
+		) => publish_preflight_failure(code),
+		Err(code) => publish_unknown_failure(code, "terminal_identity"),
 	}
 }
 

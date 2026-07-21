@@ -410,12 +410,16 @@ function maybeStageNodeModulesAddon(ctx, errors) {
 }
 
 function validateLoadedBindings(ctx, bindings, candidate) {
-	if (typeof bindings[ctx.versionSentinelExport] === "function") return;
-	throw new Error(
-		`Loaded ${candidate} but it does not expose the @gajae-code/natives@${ctx.packageVersion} ` +
-			`version sentinel \`${ctx.versionSentinelExport}\`. The .node file on disk is from a different ` +
-			"release than this loader — reinstall to re-sync.",
-	);
+	if (typeof bindings[ctx.versionSentinelExport] !== "function") {
+		throw new Error(
+			`Loaded ${candidate} but it does not expose the @gajae-code/natives@${ctx.packageVersion} ` +
+				`version sentinel \`${ctx.versionSentinelExport}\`. The .node file on disk is from a different ` +
+				"release than this loader — reinstall to re-sync.",
+		);
+	}
+	if (typeof bindings.renameNoReplacePath !== "function") {
+		throw new Error(`Loaded ${candidate} but it lacks required atomic publish capability \`renameNoReplacePath\`.`);
+	}
 }
 
 function buildHelpMessage(ctx) {

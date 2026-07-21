@@ -95,15 +95,11 @@ const malformed: NativePublishOutcome = Object.freeze({
 function validDiagnostic(value: unknown): value is PublishDiagnostic {
 	if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) return false;
 	const diagnostic = value as Record<string, unknown>;
-	if (
-		!Object.keys(diagnostic).every(key =>
-			["schemaVersion", "collectionState", "osCode", "syncFailures"].includes(key),
-		)
-	)
+	if (!Object.keys(diagnostic).every(key => ["schemaVersion", "collectionState", "osCode", "syncFailures"].includes(key)))
 		return false;
 	if (
 		diagnostic.schemaVersion !== 1 ||
-		!["complete", "partial", "unavailable"].includes(diagnostic.collectionState as string)
+		!(["complete", "partial", "unavailable"] as const).includes(diagnostic.collectionState as "complete")
 	)
 		return false;
 	const osCode = diagnostic.osCode;
@@ -112,12 +108,23 @@ function validDiagnostic(value: unknown): value is PublishDiagnostic {
 		(typeof osCode !== "number" || !Number.isInteger(osCode) || osCode < -2147483648 || osCode > 2147483647)
 	)
 		return false;
-	if (
-		diagnostic.syncFailures !== undefined &&
-		(!Array.isArray(diagnostic.syncFailures) || diagnostic.syncFailures.length > 4)
-	)
-		return false;
-	return true;
+	const failures = diagnostic.syncFailures;
+	if (failures === undefined) return true;
+	if (!Array.isArray(failures) || failures.length > 4) return false;
+	return failures.every(failure => {
+		if (!failure || typeof failure !== "object" || Object.getPrototypeOf(failure) !== Object.prototype) return false;
+		const entry = failure as Record<string, unknown>;
+		return (
+			Object.keys(entry).every(key => ["phase", "parentRole", "osCode", "kind"].includes(key)) &&
+			phases.has(entry.phase as NativePublishPhase) &&
+			["source", "destination", "shared", "staged_file"].includes(entry.parentRole as string) &&
+			["unsupported", "io", "permission", "other"].includes(entry.kind as string) &&
+			typeof entry.osCode === "number" &&
+			Number.isInteger(entry.osCode) &&
+			entry.osCode >= -2147483648 &&
+			entry.osCode <= 2147483647
+		);
+	});
 }
 
 /** Treat incompatible native results as an unknown mutation; never infer safety from legacy fields. */
@@ -140,14 +147,16 @@ export function classifyNativePublishOutcome(value: unknown): NativePublishOutco
 		(outcome.mutationState !== "committed" && outcome.durabilityState === "proven") ||
 		(outcome.ok && (outcome.mutationState !== "committed" || outcome.reason !== "none")) ||
 		(outcome.ok && outcome.durabilityState !== "proven" && outcome.durabilityState !== "not_attempted") ||
-		(outcome.reason === "atomic_unavailable" && outcome.mutationState === "committed")
+		(outcome.reason === "atomic_unavailable" && outcome.mutationState === "committed") ||
+		(outcome.mutationState === "not_committed" && outcome.ok)
 	)
 		return malformed;
+
 	return outcome;
 }
 
 export function mayCleanCurrentStaging(outcome: NativePublishOutcome): boolean {
-	return outcome.mutationState === "not_committed";
+	return !outcome.ok && outcome.mutationState === "not_committed";
 }
 
 /** Stable, bounded text for startup errors. Native paths and messages are intentionally excluded. */

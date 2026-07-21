@@ -73,8 +73,10 @@ import {
 	type ManagedFileSnapshot,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
+	mayCleanManagedTreeStaging,
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
+import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./internal/native-publish-outcome";
 
 import {
 	type BashExecutionMessage,
@@ -2241,22 +2243,23 @@ class CrossDeviceMoveUnsupportedError extends Error {
 
 async function movePathAcrossDevicesSafe(source: string, destination: string): Promise<void> {
 	const sourceIdentity = await captureCrossDeviceTreeIdentity(source);
-	const renamed = native.renameNoReplacePath(source, destination);
-	if (renamed.ok) {
+	const outcome = classifyNativePublishOutcome(native.renameNoReplacePath(source, destination));
+	if (outcome.ok) {
 		if ((await captureCrossDeviceTreeIdentity(destination)) !== sourceIdentity)
 			throw new Error("Atomic session rename did not preserve the captured source identity");
 		await syncSessionMoveDirectory(path.dirname(destination));
 		if (path.dirname(source) !== path.dirname(destination)) await syncSessionMoveDirectory(path.dirname(source));
 		return;
 	}
-	if (renamed.code === "quarantine_collision") {
+	if (outcome.reason === "destination_exists") {
 		const error = new Error(`Session move destination already exists: ${destination}`) as NodeJS.ErrnoException;
 		error.code = "EEXIST";
 		throw error;
 	}
-	if (renamed.code !== "atomic_unavailable")
-		throw new Error(`Atomic session rename failed: ${renamed.code ?? "unknown"}`);
-	throw new CrossDeviceMoveUnsupportedError(source, destination, new Error(renamed.code));
+	if (outcome.reason === "atomic_unavailable")
+		throw new CrossDeviceMoveUnsupportedError(source, destination, new Error(formatNativePublishDiagnostic(outcome)));
+	const message = `Atomic session rename failed: ${outcome.code ?? outcome.reason}`;
+	throw new Error(message, { cause: new Error(formatNativePublishDiagnostic(outcome)) });
 }
 
 const MAX_PERSIST_CHARS = 500_000;
@@ -4441,8 +4444,7 @@ export class SessionManager {
 			}
 			if (JSON.stringify(parentStore.captureTree(sourceName)) !== JSON.stringify(sourceSnapshot))
 				throw new Error("artifact_source_changed");
-			parentStore.moveTreeNoReplace(stagingName, destinationName, stagingSnapshot);
-			publishedSnapshot = parentStore.captureTree(destinationName);
+			publishedSnapshot = parentStore.moveTreeNoReplace(stagingName, destinationName, stagingSnapshot);
 			const comparable = (tree: native.NativeDirectoryTreeSnapshot) =>
 				tree.entries.map(entry => ({
 					relativePath: entry.relativePath,
@@ -4467,7 +4469,8 @@ export class SessionManager {
 		} catch (error) {
 			try {
 				if (publishedSnapshot) parentStore.removeTreeExpected(destinationName, publishedSnapshot);
-				else if (stagingSnapshot) parentStore.removeTreeExpected(stagingName, stagingSnapshot);
+				else if (stagingSnapshot && mayCleanManagedTreeStaging(error))
+					parentStore.removeTreeExpected(stagingName, stagingSnapshot);
 			} catch (cleanupError) {
 				throw new Error(`Failed to clean up managed fork artifacts: ${toError(cleanupError).message}`, {
 					cause: toError(error),
