@@ -38,6 +38,7 @@
 
 ### Fixed
 - MCP OAuth discovery now treats transport error hints as classification-only and uses one public-network-validated, redirect-aware, issuer/resource-bound traversal budget across metadata aliases and cycles.
+- Restored the documented interactive `/fork` slash command to autocomplete and dispatch so persisted sessions can be duplicated from the TUI again.
 - Telegram `/btw` rich-delivery E2E coverage now awaits native and daemon teardown ownership, records exact per-iteration lifecycle phases, and uses an internal exact-tuple terminal-delivery receipt to keep fallback stress deterministic under shard load without extending the original test timeout.
 - Malformed spurious Round-0 review metadata no longer blocks an otherwise valid locked-intent question/gate, while durable intent safety remains fail-closed (#2643).
 - Restricted role-agent `gjc state` command authorization now fails closed on argv-classification disagreement: one shared manifest-aware native state argv grammar (action names, flag arity, positionals, effective modifiers, selector candidates) is consumed by both runtime dispatch and the policy boundary, which rejects ambiguous selectors, malformed flags, destructive actions, and file-backed input (#2665).

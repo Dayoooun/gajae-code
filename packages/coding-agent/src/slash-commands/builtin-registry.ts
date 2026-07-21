@@ -1179,6 +1179,14 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			runtime.ctx.editor.setText("");
 		},
 	},
+	{
+		name: "fork",
+		description: "Fork the current session",
+		handleTui: async (_command, runtime) => {
+			await runtime.ctx.handleForkCommand();
+			runtime.ctx.editor.setText("");
+		},
+	},
 
 	{
 		name: "provider",

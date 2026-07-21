@@ -153,6 +153,26 @@ describe("builtin /copy slash command", () => {
 		expect(sessionCommand?.subcommands?.map(command => command.name)).toEqual(["info", "delete"]);
 	});
 
+	it("discovers and dispatches /fork to the session controller", async () => {
+		const forkCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "fork");
+		const handleForkCommand = vi.fn(async () => {});
+		const setText = vi.fn();
+		const ctx = {
+			handleForkCommand,
+			editor: { setText },
+		} as unknown as InteractiveModeContext;
+
+		const result = await executeBuiltinSlashCommand("/fork", {
+			ctx,
+			handleBackgroundCommand: () => undefined,
+		});
+
+		expect(forkCommand?.description).toBe("Fork the current session");
+		expect(result).toBe(true);
+		expect(handleForkCommand).toHaveBeenCalledTimes(1);
+		expect(setText).toHaveBeenCalledWith("");
+	});
+
 	it("dispatches zero-argument /copy to the existing copy controller path", async () => {
 		const { runtime, handleCopyCommand, showError, setText } = createTuiRuntime();
 
