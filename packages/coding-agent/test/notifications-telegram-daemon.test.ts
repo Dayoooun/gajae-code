@@ -3098,6 +3098,100 @@ describe("telegram daemon", () => {
 		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toMatchObject({ pid: 4243 });
 		expect(fs.existsSync(endpoint)).toBe(false);
 	});
+	test("Windows production preflight clears a lockless dead owner and dead endpoints before one ready replacement", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		writeLiveOwner(agentDir, {
+			pid: 111,
+			ownerId: "crashed",
+			acquisitionId: "crashed",
+			tokenFingerprint: "stale-token",
+			generation: DAEMON_GENERATION,
+		});
+		fs.unlinkSync(paths.lock);
+		const endpointDir = path.join(agentDir, ".gjc", "state", "sdk");
+		const endpoints = [path.join(endpointDir, "dead-a.json"), path.join(endpointDir, "dead-b.json")];
+		fs.mkdirSync(endpointDir, { recursive: true });
+		for (const endpoint of endpoints)
+			fs.writeFileSync(endpoint, JSON.stringify({ url: "ws://dead", token: "dead", pid: 111 }));
+
+		let now = 1_000;
+		let spawns = 0;
+		const child = readyTelegramSpawnFixture({
+			settings: s,
+			firstChildPid: 4243,
+			now: () => now,
+			onSpawn: () => spawns++,
+		});
+		await expect(
+			ensureTelegramDaemonRunningDetailed(
+				{ settings: s, cwd: agentDir, sessionId: "windows-lockless-recovery" },
+				{
+					platform: "win32",
+					pid: 4242,
+					now: () => now,
+					pidAlive: pid => pid === 4243,
+					pidIncarnation: () => "linux:100",
+					spawn: child.spawn,
+					readinessTimeoutMs: 1,
+					waitStepMs: 1,
+					sleep: async () => {
+						now++;
+						await child.sleep();
+					},
+				},
+			),
+		).resolves.toBe("spawned");
+		expect(spawns).toBe(1);
+		expect(endpoints.every(endpoint => !fs.existsSync(endpoint))).toBe(true);
+		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({
+			pid: 4243,
+			ownershipPhase: "ready",
+		});
+	});
+
+	test("Windows production preflight fails closed on unsafe lockless-owner endpoint evidence", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		writeLiveOwner(agentDir, {
+			pid: 111,
+			ownerId: "crashed",
+			acquisitionId: "crashed",
+			generation: DAEMON_GENERATION,
+		});
+		fs.unlinkSync(paths.lock);
+		const endpoint = path.join(agentDir, ".gjc", "state", "sdk", "unproven.json");
+		fs.mkdirSync(path.dirname(endpoint), { recursive: true });
+		fs.writeFileSync(endpoint, JSON.stringify({ url: "ws://unproven", token: "unproven" }));
+		let spawns = 0;
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await expect(
+				ensureTelegramDaemonRunningDetailed(
+					{ settings: s, cwd: agentDir, sessionId: "windows-unsafe-recovery" },
+					{
+						platform: "win32",
+						pid: 4242,
+						pidAlive: () => false,
+						pidIncarnation: () => "linux:100",
+						spawn: () => {
+							spawns++;
+							return { pid: 4243, unref() {} };
+						},
+					},
+				),
+			).resolves.toBe("blocked_identity");
+			expect(spawns).toBe(0);
+			expect(fs.existsSync(endpoint)).toBe(true);
+			expect(warnSpy).toHaveBeenCalledWith(
+				expect.stringContaining("startup recovery unsafe (unsafe-endpoint); run `gjc notify recovery`"),
+			);
+		} finally {
+			warnSpy.mockRestore();
+		}
+	});
 	test("startup recovery retains an endpoint successor installed during exact stale cleanup", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
