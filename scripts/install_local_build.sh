@@ -29,6 +29,8 @@ PROMOTION_STATUS_DIR=""
 REUSED_CHECKOUT=""
 ORIGINAL_HEAD=""
 ORIGINAL_REF=""
+PROMOTION_MARKER=""
+PROMOTION_TOKEN=""
 cleanup() {
 	status=$?
 	trap - 0 HUP INT TERM
@@ -39,12 +41,16 @@ cleanup() {
 			git -C "$SRC_DIR" checkout --quiet --detach "$ORIGINAL_HEAD" || echo "cleanup: could not restore the reused checkout." >&2
 		fi
 	fi
+	if [ "$status" -ne 0 ]; then remove_owned_destination; fi
 	[ -z "$TEMP_CLONE" ] || rm -rf "$TEMP_CLONE"
 	[ -z "$TEMP_BUN_INSTALLER" ] || rm -f "$TEMP_BUN_INSTALLER"
 	if [ -n "$PROMOTION_STATUS_DIR" ] && ! rm -rf "$PROMOTION_STATUS_DIR"; then echo "cleanup: could not remove temporary copy-status files." >&2; fi
 	exit "$status"
 }
-trap cleanup 0 HUP INT TERM
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 fail() {
 	echo "$1: $2" >&2

@@ -21,7 +21,7 @@ function writeExecutable(name: string, body: string): void {
 	fs.chmodSync(target, 0o755);
 }
 
-function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFails?: boolean; bun?: "path" | "failing-link"; tar?: "failing-producer" | "failing-extractor"; markerWriteFails?: boolean; statusWriteFails?: boolean } = {}): void {
+function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFails?: boolean; bun?: "path" | "failing-link"; tar?: "failing-producer" | "failing-extractor" | "blocking-extractor"; markerWriteFails?: boolean; statusWriteFails?: boolean } = {}): void {
 	writeExecutable(
 		"git",
 		[
@@ -78,21 +78,34 @@ function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFa
 			[
 				options.tar === "failing-producer" ? '[ "${1:-}" = "cf" ] && exit 43' : "",
 				options.tar === "failing-extractor" ? '[ "${1:-}" = "xpf" ] && { printf partial > partial-copy; exit 44; }' : "",
+				options.tar === "blocking-extractor" ? '[ "${1:-}" = "xpf" ] && { printf partial > partial-copy; : > "$TEST_INTERRUPT_READY"; while [ ! -f "$TEST_INTERRUPT_RELEASE" ]; do sleep 0.01; done; }' : "",
 				"exit 0",
 			].join("\n"),
 		);
 	}
 }
 
-async function run(args: string[], extra: Record<string, string> = {}) {
-	const proc = Bun.spawn(["sh", installer, ...args], {
+function start(args: string[], extra: Record<string, string> = {}) {
+	return Bun.spawn(["sh", installer, ...args], {
 		cwd: repoRoot,
 		env: { PATH: `${sandbox.bin}:/usr/bin:/bin`, HOME: sandbox.home, TMPDIR: sandbox.root, TEST_LOG: sandbox.log, BUN_INSTALL: path.join(sandbox.root, "bun home"), ...extra },
 		stdout: "pipe",
 		stderr: "pipe",
 	});
+}
+
+async function run(args: string[], extra: Record<string, string> = {}) {
+	const proc = start(args, extra);
 	const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
 	return { exitCode, stdout, stderr };
+}
+
+async function waitForPath(target: string): Promise<void> {
+	for (let attempt = 0; attempt < 200; attempt += 1) {
+		if (fs.existsSync(target)) return;
+		await Bun.sleep(10);
+	}
+	throw new Error(`Timed out waiting for ${target}`);
 }
 
 function temporaryClones(): string[] {
@@ -211,6 +224,36 @@ describe("install_local_build.sh", () => {
 		expect(result.stderr).toContain("Could not populate");
 		expect(fs.existsSync(destination)).toBe(false);
 		expect(temporaryClones()).toEqual([]);
+	});
+	test("signal cleanup removes owned partial promotions and preserves foreign destinations", async () => {
+		writeTools({ bun: "path", tar: "blocking-extractor" });
+		for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"] as const) {
+			for (const foreign of [false, true]) {
+				const destination = path.join(sandbox.root, `${signal}-${foreign ? "foreign" : "owned"}`);
+				const ready = path.join(sandbox.root, `${signal}-${foreign ? "foreign" : "owned"}.ready`);
+				const release = path.join(sandbox.root, `${signal}-${foreign ? "foreign" : "owned"}.release`);
+				const proc = start(["--dir", destination], { TEST_INTERRUPT_READY: ready, TEST_INTERRUPT_RELEASE: release });
+				const stdout = new Response(proc.stdout).text();
+				const stderr = new Response(proc.stderr).text();
+				await waitForPath(ready);
+				expect(fs.existsSync(path.join(destination, "partial-copy"))).toBe(true);
+				if (foreign) {
+					fs.rmSync(destination, { recursive: true, force: true });
+					fs.mkdirSync(destination);
+					fs.writeFileSync(path.join(destination, "keep"), "foreign");
+					fs.writeFileSync(path.join(destination, ".gajae-code-install-owner"), "foreign-token\n");
+				}
+				proc.kill(signal);
+				fs.writeFileSync(release, "");
+				const [resultStdout, resultStderr, exitCode] = await Promise.all([stdout, stderr, proc.exited]);
+				expect(exitCode, `${resultStdout}\n${resultStderr}`).not.toBe(0);
+				if (foreign) {
+					expect(fs.readFileSync(path.join(destination, "keep"), "utf8")).toBe("foreign");
+				} else {
+					expect(fs.existsSync(destination)).toBe(false);
+				}
+			}
+		}
 	});
 	test("cleans an invocation-owned partial clone after clone failure", async () => {
 		writeTools({ cloneFails: true, bun: "path" });

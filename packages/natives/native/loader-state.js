@@ -203,18 +203,21 @@ export function resolveLoaderCandidates({
  * @param {{
  *   candidates: string[];
  *   attestCandidate?: (candidate: string) => void;
+ *   bindCandidate?: (candidate: string) => string;
+ *   bindCandidate?: (candidate: string) => string;
  *   requireCandidate: (candidate: string) => T;
  *   validateCandidate: (bindings: T, candidate: string) => void;
  *   describeCandidate: (candidate: string) => string;
  * }} input
  * @returns {{ bindings: T | null; errors: string[] }}
  */
-export function loadFromCandidates({ candidates, attestCandidate, requireCandidate, validateCandidate, describeCandidate }) {
+export function loadFromCandidates({ candidates, attestCandidate, bindCandidate, requireCandidate, validateCandidate, describeCandidate }) {
 	const errors = [];
 	for (const candidate of candidates) {
 		try {
 			attestCandidate?.(candidate);
-			const bindings = requireCandidate(candidate);
+			const loadCandidate = bindCandidate ? bindCandidate(candidate) : candidate;
+			const bindings = requireCandidate(loadCandidate);
 			validateCandidate(bindings, candidate);
 			return { bindings, errors };
 		} catch (err) {
@@ -354,8 +357,81 @@ function selectEmbeddedAddonFile(selectedVariant) {
 	return embeddedAddon.files.find(file => file.variant === "baseline") || null;
 }
 
+/**
+ * Cache a locally built addon under a content-addressed path when a source
+ * child inherits compiled-mode evidence but has no embedded addon payload. This
+ * gives detached source children the same attested artifact contract as the
+ * standalone parent without admitting mutable versioned cache filenames.
+ */
+function maybeCacheLocalCompiledAddon(ctx, errors) {
+	const noExtraction = { candidate: null, validatedCandidates: [], bindCandidate: null };
+	if (!ctx.isCompiledBinary || embeddedAddon) return noExtraction;
+
+	for (const filename of ctx.addonFilenames) {
+		const sourcePath = path.join(ctx.nativeDir, filename);
+		let buffer;
+		try {
+			buffer = fs.readFileSync(sourcePath);
+		} catch {
+			continue;
+		}
+		const contentHash = createHash("sha256").update(buffer).digest("hex");
+		const targetPath = getImmutableEmbeddedCachePath({ cacheDir: ctx.versionedDir, filename, contentHash });
+		if (!targetPath) continue;
+		const isFresh = () => {
+			try {
+				return createHash("sha256").update(fs.readFileSync(targetPath)).digest("hex") === contentHash;
+			} catch {
+				return false;
+			}
+		};
+		const bindCandidate = candidate => {
+			if (candidate !== targetPath) throw new Error(`local addon validation (${filename}): unexpected cache entry`);
+			let loadDir;
+			try {
+				// Do not pass a shared cache pathname to the loader: it can be replaced
+				// after its hash was checked. Bind freshly-read, attested bytes instead.
+				const candidateBytes = fs.readFileSync(candidate);
+				if (createHash("sha256").update(candidateBytes).digest("hex") !== contentHash)
+					throw new Error(`local addon validation (${filename}): immutable cache entry changed before load`);
+				loadDir = fs.mkdtempSync(path.join(ctx.versionedDir, ".pi-natives-load-"));
+				const loadPath = path.join(loadDir, filename);
+				fs.writeFileSync(loadPath, candidateBytes, { flag: "wx", mode: 0o500 });
+				return loadPath;
+			} catch (err) {
+				if (loadDir) {
+					try {
+						fs.rmSync(loadDir, { recursive: true, force: true });
+					} catch {}
+				}
+				throw err;
+			}
+		};
+		if (!fs.existsSync(targetPath)) {
+			try {
+				fs.mkdirSync(ctx.versionedDir, { recursive: true });
+				const tempPath = `${targetPath}.tmp.${process.pid}`;
+				try {
+					fs.writeFileSync(tempPath, buffer, { flag: "wx" });
+					fs.linkSync(tempPath, targetPath);
+				} finally {
+					try {
+						fs.unlinkSync(tempPath);
+					} catch {}
+				}
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				errors.push(`local addon write (${filename}): ${message}`);
+			}
+		}
+		if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath], bindCandidate };
+		errors.push(`local addon validation (${filename}): immutable cache entry did not match built artifact`);
+	}
+	return noExtraction;
+}
+
 function maybeExtractEmbeddedAddon(ctx, errors) {
-	const noExtraction = { candidate: null, validatedCandidates: [], attestCandidate: null };
+	const noExtraction = { candidate: null, validatedCandidates: [], bindCandidate: null };
 	if (!ctx.isCompiledBinary || !embeddedAddon) return noExtraction;
 	if (embeddedAddon.platformTag !== ctx.platformTag || embeddedAddon.version !== ctx.packageVersion) return noExtraction;
 
@@ -388,13 +464,34 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 		}
 	};
 	const isFresh = () => contentHash(targetPath) === embeddedHash;
-	const attestCandidate = candidate => {
-		if (candidate !== targetPath || !isFresh()) {
-			throw new Error(`embedded addon validation (${selectedEmbeddedFile.filename}): immutable cache entry changed before load`);
+	const bindCandidate = candidate => {
+		if (candidate !== targetPath) {
+			throw new Error(`embedded addon validation (${selectedEmbeddedFile.filename}): unexpected cache entry`);
+		}
+
+		let loadDir;
+		try {
+			// The content-addressed cache path can be replaced after validation. Copy
+			// validated bytes into a fresh 0700 directory, then load only that path.
+			loadDir = fs.mkdtempSync(path.join(ctx.versionedDir, ".pi-natives-load-"));
+			const loadPath = path.join(loadDir, selectedEmbeddedFile.filename);
+			const candidateBytes = fs.readFileSync(candidate);
+			if (createHash("sha256").update(candidateBytes).digest("hex") !== embeddedHash) {
+				throw new Error(`embedded addon validation (${selectedEmbeddedFile.filename}): immutable cache entry changed before load`);
+			}
+			fs.writeFileSync(loadPath, candidateBytes, { flag: "wx", mode: 0o500 });
+			return loadPath;
+		} catch (err) {
+			if (loadDir) {
+				try {
+					fs.rmSync(loadDir, { recursive: true, force: true });
+				} catch {}
+			}
+			throw err;
 		}
 	};
 	if (fs.existsSync(targetPath)) {
-		if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath], attestCandidate };
+		if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath], bindCandidate };
 		errors.push(`embedded addon validation (${selectedEmbeddedFile.filename}): immutable cache entry did not match embedded payload`);
 		return noExtraction;
 	}
@@ -422,7 +519,7 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 		} catch {}
 	}
 
-	if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath], attestCandidate };
+	if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath], bindCandidate };
 	errors.push(`embedded addon validation (${selectedEmbeddedFile.filename}): extracted file did not match embedded payload`);
 	return noExtraction;
 }
@@ -575,17 +672,18 @@ export function loadNative() {
 
 	const errors = [];
 	const embeddedExtraction = maybeExtractEmbeddedAddon(ctx, errors);
-	const stagedCandidate = embeddedExtraction.candidate ? null : maybeStageNodeModulesAddon(ctx, errors);
+	const attestedAddon = embeddedExtraction.candidate ? embeddedExtraction : maybeCacheLocalCompiledAddon(ctx, errors);
+	const stagedCandidate = attestedAddon.candidate ? null : maybeStageNodeModulesAddon(ctx, errors);
 	const runtimeCandidates = resolveRuntimeCandidates({
 		candidates: ctx.candidates,
-		embeddedCandidate: embeddedExtraction.candidate,
+		embeddedCandidate: attestedAddon.candidate,
 		stagedCandidate,
-		validatedCandidates: ctx.isCompiledBinary ? embeddedExtraction.validatedCandidates : undefined,
+		validatedCandidates: ctx.isCompiledBinary ? attestedAddon.validatedCandidates : undefined,
 	});
 
 	const loaded = loadFromCandidates({
 		candidates: runtimeCandidates,
-		attestCandidate: embeddedExtraction.attestCandidate || undefined,
+		bindCandidate: attestedAddon.bindCandidate || undefined,
 		requireCandidate: candidate => require_(candidate),
 		validateCandidate: (bindings, candidate) => validateLoadedBindings(ctx, bindings, candidate),
 		describeCandidate: candidate => candidate,

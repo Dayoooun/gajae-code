@@ -61,6 +61,8 @@ export interface LoadFromCandidatesInput<T> {
 	candidates: string[];
 	/** Runs immediately before loading a candidate and must throw when it is no longer eligible. */
 	attestCandidate?: (candidate: string) => void;
+	/** Binds a validated candidate to the stable path passed to the module loader. */
+	bindCandidate?: (candidate: string) => string;
 	requireCandidate: (candidate: string) => T;
 	validateCandidate: (bindings: T, candidate: string) => void;
 	describeCandidate: (candidate: string) => string;
@@ -94,7 +96,7 @@ export interface ResolveRuntimeCandidatesInput {
 	candidates: string[];
 	embeddedCandidate?: string | null;
 	stagedCandidate?: string | null;
-	/** When present, excludes every candidate not validated against embedded content. */
+	/** When present, excludes every candidate not content-attested by the embedded or locally built addon. */
 	validatedCandidates?: string[];
 }
 

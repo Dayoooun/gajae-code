@@ -1,4 +1,5 @@
 import { afterEach, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
@@ -24,7 +25,7 @@ afterEach(async () => {
 	brokerLeases.clear();
 });
 
-it("starts a fresh detached source broker without loading hostile cwd bunfig or dotenv", async () => {
+it("starts a fresh detached source broker with a content-attested native addon without loading hostile cwd bunfig or dotenv", async () => {
 	const root = await tempRoot();
 	const hostileCwd = path.join(root, "hostile project ü");
 	const agentDir = path.join(root, "agent");
@@ -33,9 +34,12 @@ it("starts a fresh detached source broker without loading hostile cwd bunfig or 
 	const preload = path.join(root, "preload.ts");
 	const pathSentinel = path.join(root, "path-sentinel");
 	const hostileBin = path.join(root, "hostile-bin");
+	const xdgDataHome = path.join(root, "data");
+	const nativeCacheDir = path.join(xdgDataHome, "gjc", "natives", "0.11.6");
 	await fs.mkdir(hostileCwd, { recursive: true });
 	await fs.mkdir(hostileBin, { recursive: true });
 	const fakeBun = path.join(hostileBin, process.platform === "win32" ? "bun.cmd" : "bun");
+	await fs.mkdir(path.join(xdgDataHome, "gjc"), { recursive: true });
 	await Bun.write(
 		fakeBun,
 		process.platform === "win32"
@@ -55,6 +59,7 @@ it("starts a fresh detached source broker without loading hostile cwd bunfig or 
 					PI_COMPILED: "1",
 					GJC_COMPILED: "1",
 					PATH: `${hostileBin}${path.delimiter}${process.env.PATH ?? ""}`,
+					XDG_DATA_HOME: xdgDataHome,
 				},
 			})
 		).lease,
@@ -90,6 +95,7 @@ it("starts a fresh detached source broker without loading hostile cwd bunfig or 
 				PI_COMPILED: "1",
 				GJC_COMPILED: "1",
 				PATH: `${hostileBin}${path.delimiter}${process.env.PATH ?? ""}`,
+				XDG_DATA_HOME: xdgDataHome,
 			},
 			stdout: "pipe",
 			stderr: "pipe",
@@ -106,6 +112,14 @@ it("starts a fresh detached source broker without loading hostile cwd bunfig or 
 	expect(response.result?.sessions).toEqual([]);
 	expect(await readBrokerDiscovery(agentDir)).not.toBeNull();
 	expect(brokerLeases.get(root)).toBeDefined();
+	const cachedAddons = await fs.readdir(nativeCacheDir);
+	const cachedAddon = cachedAddons.find(filename => /^pi_natives\..+\.[a-f0-9]{64}\.node$/.test(filename));
+	expect(cachedAddon).toBeDefined();
+	if (!cachedAddon) throw new Error("detached broker did not receive a content-attested native addon");
+	const sourceAddon = path.join(path.resolve(import.meta.dir, "../../natives/native"), cachedAddon.replace(/\.[a-f0-9]{64}(?=\.node$)/, ""));
+	expect(createHash("sha256").update(await fs.readFile(path.join(nativeCacheDir, cachedAddon))).digest("hex")).toBe(
+		createHash("sha256").update(await fs.readFile(sourceAddon)).digest("hex"),
+	);
 	expect(await Bun.file(preloadSentinel).exists()).toBe(false);
 	expect(await Bun.file(dotenvSentinel).exists()).toBe(false);
 	expect(await Bun.file(pathSentinel).exists()).toBe(false);

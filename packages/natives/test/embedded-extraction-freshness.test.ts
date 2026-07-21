@@ -75,7 +75,11 @@ describe("getImmutableEmbeddedCachePath", () => {
 			}),
 		).toBeNull();
 		expect(
-			getImmutableEmbeddedCachePath({ cacheDir: "/cache", filename: "pi_natives.node", contentHash: "not-a-sha256" }),
+			getImmutableEmbeddedCachePath({
+				cacheDir: "/cache",
+				filename: "pi_natives.node",
+				contentHash: "not-a-sha256",
+			}),
 		).toBeNull();
 	});
 });
@@ -139,7 +143,7 @@ describe("resolveRuntimeCandidates", () => {
 });
 
 describe("load-time cache attestation", () => {
-	it("rejects a target replaced after extraction validation and before require", () => {
+	it("loads a validated private copy when the cache target is substituted at the load boundary", () => {
 		const immutablePath = getImmutableEmbeddedCachePath({
 			cacheDir: "/cache",
 			filename: "pi_natives.linux-x64-modern.node",
@@ -155,32 +159,28 @@ describe("load-time cache attestation", () => {
 				contentHash: hashes({ [embeddedPath]: currentHash, [immutablePath!]: targetHash }),
 			}),
 		).toBe(true);
-		targetHash = staleHash;
 
-		let required = false;
+		const privateLoadPath = "/private/pi-natives-load-123/pi_natives.linux-x64-modern.node";
+		let requiredPath: string | null = null;
 		const loaded = loadFromCandidates({
 			candidates: [immutablePath!],
-			attestCandidate: candidate => {
-				if (
-					!cachedEmbeddedExtractionIsFresh({
-						targetPath: candidate,
-						embeddedPath,
-						contentHash: hashes({ [embeddedPath]: currentHash, [immutablePath!]: targetHash }),
-					})
-				) {
-					throw new Error("immutable cache entry changed before load");
-				}
+			bindCandidate: candidate => {
+				expect(candidate).toBe(immutablePath);
+				return privateLoadPath;
 			},
-			requireCandidate: () => {
-				required = true;
+			requireCandidate: candidate => {
+				// Simulate a concurrent replacement precisely as loading begins.
+				targetHash = staleHash;
+				requiredPath = candidate;
 				return { __piNativesVCurrent: () => undefined };
 			},
 			validateCandidate: () => undefined,
 			describeCandidate: candidate => candidate,
 		});
 
-		expect(required).toBe(false);
-		expect(loaded.bindings).toBeNull();
-		expect(loaded.errors).toEqual([`${immutablePath}: immutable cache entry changed before load`]);
+		expect(targetHash).toBe(staleHash);
+		expect(requiredPath).toBe(privateLoadPath);
+		expect(loaded.errors).toEqual([]);
+		expect(loaded.bindings).not.toBeNull();
 	});
 });
