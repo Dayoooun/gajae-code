@@ -38,6 +38,7 @@ export class ManagedPublishError extends Error {
 	readonly classification:
 		| "destination_conflict"
 		| "atomic_unavailable"
+		| "invalid_request"
 		| "durability_not_provable"
 		| "identity_mismatch"
 		| "io_error"
@@ -58,13 +59,15 @@ function publishFailure(outcome: NativePublishOutcome): ManagedPublishError {
 			? "destination_conflict"
 			: outcome.reason === "atomic_unavailable"
 				? "atomic_unavailable"
-				: outcome.reason === "durability_not_provable"
-					? "durability_not_provable"
-					: outcome.reason === "identity_violation"
-						? "identity_mismatch"
-						: outcome.reason === "io_failure"
-							? "io_error"
-							: "durability_failed";
+				: outcome.reason === "invalid_request"
+					? "invalid_request"
+					: outcome.reason === "durability_not_provable"
+						? "durability_not_provable"
+						: outcome.reason === "identity_violation"
+							? "identity_mismatch"
+							: outcome.reason === "io_failure"
+								? "io_error"
+								: "durability_failed";
 	return new ManagedPublishError(classification, outcome);
 }
 

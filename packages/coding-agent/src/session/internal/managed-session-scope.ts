@@ -140,6 +140,7 @@ export type ManagedScopeErrorCode =
 	| "binding_conflict"
 	| "binding_invalid"
 	| "atomic_unavailable"
+	| "invalid_request"
 	| "durability_not_provable";
 
 export type ManagedScopeResolution =
@@ -179,6 +180,7 @@ export type ManagedOpenFailure =
 	| "unsafe_artifacts"
 	| "durability_failed"
 	| "atomic_unavailable"
+	| "invalid_request"
 	| "durability_not_provable"
 	| "migration_retired"
 	| "legacy_migration_disabled"
@@ -836,7 +838,9 @@ export function prepareManagedSessionScopeForWriteSync(
 			publication?.classification ??
 			(error instanceof Error ? error.message : "Managed write protocol setup failed.");
 		const code =
-			message === "atomic_unavailable" || message === "durability_not_provable" ? message : "binding_invalid";
+			message === "atomic_unavailable" || message === "invalid_request" || message === "durability_not_provable"
+				? message
+				: "binding_invalid";
 		return {
 			kind: "error",
 			code,
@@ -970,6 +974,7 @@ function expectedFailure(error: unknown): ManagedOpenFailure {
 		message === "unsafe_artifacts" ||
 		message === "durability_failed" ||
 		message === "atomic_unavailable" ||
+		message === "invalid_request" ||
 		message === "durability_not_provable" ||
 		message === "migration_retired"
 		? message

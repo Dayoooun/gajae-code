@@ -40,7 +40,8 @@ export type ResolveManagedSessionScopeResult =
 				| "binding_conflict"
 				| "binding_invalid"
 				| "atomic_unavailable"
-				| "durability_not_provable";
+				| "durability_not_provable"
+				| "invalid_request";
 			message: string;
 	  };
 
