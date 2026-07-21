@@ -2079,6 +2079,7 @@ export type DeadOwnerRecoveryResult =
 				| "owner-superseded"
 				| "unsafe-endpoint"
 				| "endpoint-changed"
+				| "endpoint-directory-unreadable"
 				| "lock-changed";
 	  };
 
@@ -2149,8 +2150,9 @@ export async function reclaimDeadDaemonOwner(input: {
 			let names: string[];
 			try {
 				names = await fsImpl.readdir(input.endpointDir);
-			} catch {
-				names = [];
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") names = [];
+				else return { recovered: false, reason: "endpoint-directory-unreadable" };
 			}
 			for (const name of names) {
 				if (!name.endsWith(".json")) continue;
