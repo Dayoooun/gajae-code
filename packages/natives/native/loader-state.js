@@ -33,7 +33,6 @@ import { embeddedAddon } from "./embedded-addon.js";
 const SUPPORTED_PLATFORMS = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64"];
 const OPTIONAL_PACKAGE_BY_PLATFORM_TAG = {
 	"darwin-arm64": "@gajae-code/natives-darwin-arm64",
-	"darwin-x64": "@gajae-code/natives-darwin-x64",
 	"linux-arm64": "@gajae-code/natives-linux-arm64",
 	"linux-x64": "@gajae-code/natives-linux-x64",
 	"win32-x64": "@gajae-code/natives-win32-x64",

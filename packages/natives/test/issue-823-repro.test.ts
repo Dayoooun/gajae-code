@@ -164,7 +164,11 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 		expect(candidates.indexOf(optionalBaseline)).toBeLessThan(candidates.indexOf(legacyModern));
 	});
 
-	it("resolves only the current host optional package directory when installed", () => {
+	it("does not resolve a published optional package for darwin-x64", () => {
+		expect(getOptionalPackageNames("darwin-x64")).toEqual([]);
+	});
+
+	it("resolves the darwin-arm64 optional package directory when installed", () => {
 		const packageNames = getOptionalPackageNames("darwin-arm64");
 		expect(packageNames).toEqual(["@gajae-code/natives-darwin-arm64"]);
 
@@ -180,6 +184,24 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 
 		expect(dirs).toEqual(["/repo/node_modules/@gajae-code/natives-darwin-arm64/native"]);
 		expect(getOptionalPackageNames("freebsd-x64")).toEqual([]);
+	});
+
+	it("keeps local darwin-x64 source-build candidates without an optional package", () => {
+		const nativeDir = "/repo/packages/natives/native";
+		const filename = "pi_natives.darwin-x64-modern.node";
+		const candidates = resolveLoaderCandidates({
+			addonFilenames: [filename],
+			isCompiledBinary: false,
+			isWorkspaceLoad: true,
+			optionalPackageNativeDirs: getOptionalPackageNames("darwin-x64"),
+			nativeDir,
+			execDir: "/usr/local/bin",
+			versionedDir: "/Users/u/.gjc/natives/14.5.2",
+			userDataDir: "/Users/u/.local/bin",
+		});
+
+		expect(candidates).toContain(path.join(nativeDir, filename));
+		expect(candidates).not.toContain("/repo/node_modules/@gajae-code/natives-darwin-x64/native/pi_natives.darwin-x64-modern.node");
 	});
 	it("prefers the current workspace addon over a stale optional package addon", () => {
 		const localDir = "/repo/packages/natives/native";

@@ -120,5 +120,7 @@ mkdir -p "$TARBALL_APP_DIR"
 	smoke_cli ./node_modules/.bin/gjc
 )
 
+section "Local build installer safety"
+bun test scripts/install-tests/local-build-installer.test.ts
 echo ""
 echo "All install method smoke tests passed"
