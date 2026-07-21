@@ -42,7 +42,7 @@ type GuardManifest = {
  * endpoint or provider generations: they do not replace daemon owners.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "7151a6704e238e172db18b8ca10b8e48ca7662c7c7d620f0abc8473ac64c6daf";
+const PROTECTED_INVENTORY_SHA256 = "c4afe2731edb029ea970dd57d2ba57bd1393bc296e0c223da372d7f457c68ee2";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [

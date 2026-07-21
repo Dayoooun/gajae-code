@@ -22,10 +22,7 @@
         "isDaemonTransitionLock",
         "readTransitionMarker",
         "transitionMarkerMatchesLock",
-        "detachTransitionMarker",
-        "readNotificationEndpointFile",
-        "notificationEndpointLiveness",
-        "classifyNotificationEndpoint"
+        "detachTransitionMarker"
       ],
       "packages/coding-agent/src/sdk/bus/telegram-daemon.ts": [
         "TelegramDaemonOwnershipPhase",
@@ -436,14 +433,11 @@
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:DaemonTransitionLock": "0fb018a6384bff312aab0345012936f7e0609e4691c841919426ad3d75841dcb",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:NATIVE_PATH_IDENTITY_CONTRACT_VERSION": "ec669ef396909ce429e08ce4fa9a78b5f0106d8cedf967e634c6ae6974830b8a",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:acquireDaemonTransitionLock": "0115500fcb5c5797008d607bd69694579c5b372420310f265d33a4759364decc",
-    "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:classifyNotificationEndpoint": "500d18397ec647454e2d8b99f502645755e0f6af82086ff409feb5b88ff4aef3",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:daemonGenerationRelation": "508f3f02dc8fb94199a27604c8caa1864ec308a19824be3b92456d807b8d761d",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:daemonTransitionLockIsHeld": "6c71abc9a4ee7079db817d0acbc94b9fe398d2bd63bf9a3fe0edb399325b1f47",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:detachTransitionMarker": "c2bc3beb65542bb532830fab2e26bd14d1f4074fad25277bdcc8cca44c9d90b6",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:exactUnlinkNotificationFile": "723c9b0dd995d0f46aeebacade80967adedc8a781aa696a2f5f80898619aefe0",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:isDaemonTransitionLock": "dfcef896a49029a1b5c3ab21fd4b2e9a66eca314e93bbdfe122e666510f9f81a",
-    "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:notificationEndpointLiveness": "913a2d3003eb096f8b63ece3a6ff7b05b0c6bebff76a1c1403670577d3192236",
-    "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:readNotificationEndpointFile": "1d26908e14bf1c0e9be4ca4c6ef6fd162d2edbd4a664c7b6857f7a1803208221",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:readTransitionMarker": "d6d33240a8e45e54d72c78ee7857fd4c7eb78b32854ed32c6bb3cc51cb24a22e",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:releaseDaemonTransitionLock": "d60f7568bee003dac6d31b936c98a3366d96d483f3a79afe5a28bb65475b65fa",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:transitionMarkerMatchesLock": "63268b301aaa8d6c55488f2d839a2e20ee75d28850079e7d4ec2594b937af8b7",
