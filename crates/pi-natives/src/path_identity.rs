@@ -583,9 +583,10 @@ pub fn verify_owner_only_path_security_expected(
 	)
 }
 
-/// Repair the owner-only ACL for an existing path only when its retained
-/// no-follow handle still identifies the expected object. The expected
-/// identity is checked before any ACL mutation and again after the repair.
+/// Repair an owner-only ACL on a retained expected path.
+///
+/// Its no-follow handle must still identify the expected object before repair
+/// and again after final ACL verification.
 #[napi]
 pub fn repair_owner_only_path_security_expected(
 	path: String,

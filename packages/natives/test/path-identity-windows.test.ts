@@ -13,8 +13,8 @@ import {
 	renameNoReplacePath,
 	repairOwnerOnlyPathSecurityExpected,
 	snapshotDirectoryTree,
-	verifyOwnerOnlyPathSecurityExpected,
 	verifyOwnerOnlyPathSecurity,
+	verifyOwnerOnlyPathSecurityExpected,
 } from "../native/index.js";
 
 const temporaryDirectories: string[] = [];
@@ -142,11 +142,13 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 
 		expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: false, code: "acl_verify_failed" });
 		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: false, code: "acl_verify_failed" });
-		expect(repairOwnerOnlyPathSecurityExpected(file, "directory", fileStat.dev, fileStat.ino)).toMatchObject({ ok: false });
+		expect(repairOwnerOnlyPathSecurityExpected(file, "directory", fileStat.dev, fileStat.ino)).toMatchObject({
+			ok: false,
+		});
 		expect(await fs.readFile(file, "utf8")).toBe(contents);
-		expect(
-			repairOwnerOnlyPathSecurityExpected(directory, "directory", directoryStat.dev, directoryStat.ino),
-		).toEqual({ ok: true });
+		expect(repairOwnerOnlyPathSecurityExpected(directory, "directory", directoryStat.dev, directoryStat.ino)).toEqual(
+			{ ok: true },
+		);
 		expect(repairOwnerOnlyPathSecurityExpected(file, "file", fileStat.dev, fileStat.ino)).toEqual({ ok: true });
 		expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
 		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
