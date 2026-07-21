@@ -7,9 +7,6 @@ set -e
 # (for example Intel/x86_64 macOS) or when you simply want to run gjc from a
 # source checkout.
 #
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install_local_build.sh | sh
-#
 # Options:
 #   --dir <path>   Directory to clone into (default: $HOME/.gajae-code/src)
 #   --ref <ref>    Checkout a specific tag/branch/commit after cloning
@@ -28,13 +25,21 @@ REF=""
 DO_LINK=1
 TEMP_CLONE=""
 TEMP_BUN_INSTALLER=""
-CREATED_DEST=""
+REUSED_CHECKOUT=""
+ORIGINAL_HEAD=""
+ORIGINAL_REF=""
 
 cleanup() {
 	status=$?
 	trap - 0 HUP INT TERM
+	if [ "$status" -ne 0 ] && [ -n "$REUSED_CHECKOUT" ] && [ -n "$ORIGINAL_HEAD" ]; then
+		if [ -n "$ORIGINAL_REF" ]; then
+			git -C "$SRC_DIR" checkout --quiet "$ORIGINAL_REF" || echo "cleanup: could not restore the reused checkout." >&2
+		else
+			git -C "$SRC_DIR" checkout --quiet --detach "$ORIGINAL_HEAD" || echo "cleanup: could not restore the reused checkout." >&2
+		fi
+	fi
 	[ -z "$TEMP_CLONE" ] || rm -rf "$TEMP_CLONE"
-	[ "$status" -eq 0 ] || [ -z "$CREATED_DEST" ] || rm -rf "$CREATED_DEST"
 	[ -z "$TEMP_BUN_INSTALLER" ] || rm -f "$TEMP_BUN_INSTALLER"
 	exit "$status"
 }
@@ -66,6 +71,14 @@ validate_ref() {
 	esac
 }
 
+# Every pathname passed to filesystem utilities is quoted. Reject leading dashes
+# as well: POSIX utilities do not consistently support an end-of-options marker.
+validate_destination() {
+	case "$1" in
+		""|-*) fail "argument parsing" "Destination must not be empty or start with '-'." ;;
+	esac
+}
+
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--dir)
@@ -90,6 +103,7 @@ while [ $# -gt 0 ]; do
 		*) fail "argument parsing" "Unknown option: $1" ;;
 	esac
 done
+validate_destination "$SRC_DIR"
 
 # Compare two dotted versions; succeeds when $1 >= $2.
 version_ge() {
@@ -176,27 +190,32 @@ is_empty_dir() {
 	return 0
 }
 
+save_reused_checkout() {
+	if ! git -C "$SRC_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		fail "destination validation" "Destination is not a Git worktree: $SRC_DIR"
+	fi
+	if ! origin=$(git -C "$SRC_DIR" config --get remote.origin.url); then fail "destination validation" "Could not read the existing checkout origin."; fi
+	[ "$origin" = "$REPO_URL" ] || fail "destination validation" "Existing checkout does not have the expected origin."
+	if ! worktree_status=$(git -C "$SRC_DIR" status --porcelain); then fail "destination validation" "Could not verify the existing checkout state."; fi
+	[ -z "$worktree_status" ] || fail "destination validation" "Existing checkout is not clean."
+	ORIGINAL_HEAD=$(git -C "$SRC_DIR" rev-parse --verify HEAD) || fail "destination validation" "Could not record the existing checkout commit."
+	ORIGINAL_REF=$(git -C "$SRC_DIR" symbolic-ref -q HEAD || true)
+	REUSED_CHECKOUT=1
+}
+
 prepare_checkout() {
 	if [ -e "$SRC_DIR" ]; then
-		if [ ! -d "$SRC_DIR/.git" ]; then
-			if [ -d "$SRC_DIR" ] && is_empty_dir "$SRC_DIR"; then
-				rmdir "$SRC_DIR" || fail "destination preparation" "Could not remove empty destination $SRC_DIR."
-			else
-				fail "destination validation" "Destination exists and is not an empty Git checkout: $SRC_DIR"
-			fi
-		else
-			if ! origin=$(git -C "$SRC_DIR" config --get remote.origin.url); then
-				fail "destination validation" "Could not read the existing checkout origin."
-			fi
-			[ "$origin" = "$REPO_URL" ] || fail "destination validation" "Existing checkout does not have the expected origin."
-			if ! worktree_status=$(git -C "$SRC_DIR" status --porcelain); then
-				fail "destination validation" "Could not verify the existing checkout state."
-			fi
-			[ -z "$worktree_status" ] || fail "destination validation" "Existing checkout is not clean."
+		if [ -d "$SRC_DIR" ] && git -C "$SRC_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+			save_reused_checkout
 			echo "Updating verified checkout at $SRC_DIR..."
 			run_git "fetch" -C "$SRC_DIR" fetch --tags origin
 			checkout_commit
 			return
+		fi
+		if [ -d "$SRC_DIR" ] && is_empty_dir "$SRC_DIR"; then
+			rmdir "$SRC_DIR" || fail "destination preparation" "Could not remove empty destination $SRC_DIR."
+		else
+			fail "destination validation" "Destination exists and is not an empty Git checkout: $SRC_DIR"
 		fi
 	fi
 
@@ -205,46 +224,39 @@ prepare_checkout() {
 	TEMP_CLONE=$(mktemp -d "$parent/.gajae-code.clone.XXXXXX") || fail "clone preparation" "Could not create a temporary sibling checkout."
 	echo "Cloning $REPO into $SRC_DIR..."
 	run_git "clone" clone "$REPO_URL" "$TEMP_CLONE"
-	if ! origin=$(git -C "$TEMP_CLONE" remote get-url origin); then
-		fail "clone validation" "Could not read the temporary checkout origin."
-	fi
+	if ! origin=$(git -C "$TEMP_CLONE" remote get-url origin); then fail "clone validation" "Could not read the temporary checkout origin."; fi
 	[ "$origin" = "$REPO_URL" ] || fail "clone validation" "Temporary checkout does not have the expected origin."
 	SRC_DIR=$TEMP_CLONE
 	run_git "fetch" -C "$SRC_DIR" fetch --tags origin
 	checkout_commit
 }
 
-# Preserve the parsed destination while prepare_checkout temporarily uses TEMP_CLONE.
-DEST_DIR=$SRC_DIR
-
-if ! has_cmd git; then
-	fail "preconditions" "git is required to clone the repository. Install git and re-run."
-fi
-
-# --- Clone or update the checkout ----------------------------------------
-prepare_checkout
-# prepare_checkout resolves in the temporary clone; promote it only after all
-# clone, fetch, and checkout operations succeeded.
-if [ -n "$TEMP_CLONE" ]; then
-	SRC_DIR=$DEST_DIR
-	mv "$TEMP_CLONE" "$SRC_DIR" || fail "promotion" "Could not promote the temporary checkout."
+promote_clone() {
+	# mkdir is an exclusive claim: unlike mv, it cannot turn a concurrent foreign
+	# destination into a nested checkout. The destination is never removed by cleanup.
+	if ! mkdir "$DEST_DIR"; then
+		fail "promotion" "Destination appeared while preparing the clone; it was left untouched: $DEST_DIR"
+	fi
+	if (cd "$TEMP_CLONE" && tar cf - .) | (cd "$DEST_DIR" && tar xpf -); then :; else
+		fail "promotion" "Could not populate the claimed destination."
+	fi
+	rm -rf "$TEMP_CLONE"
 	TEMP_CLONE=""
-	CREATED_DEST=$SRC_DIR
-else
 	SRC_DIR=$DEST_DIR
-fi
+}
+
+DEST_DIR=$SRC_DIR
+if ! has_cmd git; then fail "preconditions" "git is required to clone the repository. Install git and re-run."; fi
+prepare_checkout
+if [ -n "$TEMP_CLONE" ]; then promote_clone; else SRC_DIR=$DEST_DIR; fi
 
 cd "$SRC_DIR" || fail "build preparation" "Could not enter $SRC_DIR."
-
-# --- Build ----------------------------------------------------------------
 require_bun
 
 echo "Installing dependencies..."
 bun install --frozen-lockfile || fail "dependency installation" "bun install failed."
-
 echo "Building native addon..."
 bun run build:native || fail "native build" "bun run build:native failed."
-
 if [ -n "$DO_LINK" ]; then
 	echo "Linking gjc onto PATH..."
 	bun run dev:link || fail "linking" "bun run dev:link failed."

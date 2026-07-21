@@ -1,4 +1,5 @@
 import * as childProcess from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
@@ -226,17 +227,35 @@ export function loadFromCandidates({ candidates, requireCandidate, validateCandi
  * Decide whether a previously extracted embedded addon may be reused. A cached
  * extraction from an earlier build of the same version carries the same version
  * sentinel yet can expose a different native surface, so it is fresh only when
- * its byte size matches the embedded payload. `sizeOf` returns the byte size of
- * a path, or `null` when it cannot be inspected.
- * @param {{ targetPath: string; embeddedPath: string; sizeOf: (path: string) => number | null }} input
+ * its content identity matches the embedded payload. `contentHash` returns a
+ * content-derived identity, or `null` when a path cannot be inspected.
+ * @param {{ targetPath: string; embeddedPath: string; contentHash: (path: string) => string | null }} input
  * @returns {boolean}
  */
-export function cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath, sizeOf }) {
-	const cachedSize = sizeOf(targetPath);
-	if (cachedSize === null) return false;
-	const embeddedSize = sizeOf(embeddedPath);
-	if (embeddedSize === null) return false;
-	return cachedSize === embeddedSize;
+export function cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath, contentHash }) {
+	const cachedHash = contentHash(targetPath);
+	if (cachedHash === null) return false;
+	const embeddedHash = contentHash(embeddedPath);
+	if (embeddedHash === null) return false;
+	return cachedHash === embeddedHash;
+}
+
+/**
+ * Build the candidate list after embedded extraction. A versioned cache entry
+ * rejected as stale is excluded even when replacement fails, so it cannot be
+ * loaded as a fallback.
+ * @param {{ candidates: string[]; embeddedCandidate?: string | null; stagedCandidate?: string | null; rejectedCandidates?: string[] }} input
+ * @returns {string[]}
+ */
+export function resolveRuntimeCandidates({
+	candidates,
+	embeddedCandidate = null,
+	stagedCandidate = null,
+	rejectedCandidates = [],
+}) {
+	const rejected = new Set(rejectedCandidates);
+	const prepended = [embeddedCandidate, stagedCandidate].filter(candidate => typeof candidate === "string");
+	return [...new Set([...prepended, ...candidates.filter(candidate => !rejected.has(candidate))])];
 }
 
 // =========================================================================
@@ -320,28 +339,30 @@ function selectEmbeddedAddonFile(selectedVariant) {
 }
 
 function maybeExtractEmbeddedAddon(ctx, errors) {
-	if (!ctx.isCompiledBinary || !embeddedAddon) return null;
-	if (embeddedAddon.platformTag !== ctx.platformTag || embeddedAddon.version !== ctx.packageVersion) return null;
+	const noExtraction = { candidate: null, rejectedCandidates: [] };
+	if (!ctx.isCompiledBinary || !embeddedAddon) return noExtraction;
+	if (embeddedAddon.platformTag !== ctx.platformTag || embeddedAddon.version !== ctx.packageVersion) return noExtraction;
 
 	const selectedEmbeddedFile = selectEmbeddedAddonFile(ctx.selectedVariant);
-	if (!selectedEmbeddedFile) return null;
+	if (!selectedEmbeddedFile) return noExtraction;
 	const targetPath = path.join(ctx.versionedDir, selectedEmbeddedFile.filename);
+	let rejectedCandidates = [];
 	if (fs.existsSync(targetPath)) {
 		// Guard against intra-version drift: a cached extraction written by an earlier
 		// build of the same version carries the same version sentinel but can expose a
 		// different native surface (e.g. a symbol added mid-cycle). The embedded addon
-		// is the source of truth, so reuse the cached file only when it matches the
-		// embedded payload size and re-extract otherwise.
-		const sizeOf = candidate => {
+		// is the source of truth, so reuse only an identical payload.
+		const contentHash = candidate => {
 			try {
-				return fs.statSync(candidate).size;
+				return createHash("sha256").update(fs.readFileSync(candidate)).digest("hex");
 			} catch {
 				return null;
 			}
 		};
-		if (cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath: selectedEmbeddedFile.filePath, sizeOf })) {
-			return targetPath;
+		if (cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath: selectedEmbeddedFile.filePath, contentHash })) {
+			return { candidate: targetPath, rejectedCandidates };
 		}
+		rejectedCandidates = [targetPath];
 	}
 
 	try {
@@ -349,7 +370,7 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		errors.push(`embedded addon dir: ${message}`);
-		return null;
+		return { candidate: null, rejectedCandidates };
 	}
 
 	try {
@@ -357,11 +378,11 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 		const tempPath = `${targetPath}.tmp.${process.pid}`;
 		fs.writeFileSync(tempPath, buffer);
 		fs.renameSync(tempPath, targetPath);
-		return targetPath;
+		return { candidate: targetPath, rejectedCandidates };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		errors.push(`embedded addon write (${selectedEmbeddedFile.filename}): ${message}`);
-		return null;
+		return { candidate: null, rejectedCandidates };
 	}
 }
 
@@ -520,10 +541,14 @@ export function loadNative() {
 	const ctx = initLoaderContext(require_);
 
 	const errors = [];
-	const embeddedCandidate = maybeExtractEmbeddedAddon(ctx, errors);
-	const stagedCandidate = embeddedCandidate ? null : maybeStageNodeModulesAddon(ctx, errors);
-	const prepended = [embeddedCandidate, stagedCandidate].filter(c => typeof c === "string");
-	const runtimeCandidates = prepended.length > 0 ? [...prepended, ...ctx.candidates] : ctx.candidates;
+	const embeddedExtraction = maybeExtractEmbeddedAddon(ctx, errors);
+	const stagedCandidate = embeddedExtraction.candidate ? null : maybeStageNodeModulesAddon(ctx, errors);
+	const runtimeCandidates = resolveRuntimeCandidates({
+		candidates: ctx.candidates,
+		embeddedCandidate: embeddedExtraction.candidate,
+		stagedCandidate,
+		rejectedCandidates: embeddedExtraction.rejectedCandidates,
+	});
 
 	const loaded = loadFromCandidates({
 		candidates: runtimeCandidates,

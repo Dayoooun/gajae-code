@@ -115,11 +115,23 @@ Build from source remains available on every platform.
 
 ### macOS Intel install
 
-Intel (x86_64) macOS no longer has a published npm/Bun prebuilt native package — only Apple Silicon (`gjc-darwin-arm64`) is published. On an Intel Mac, clone and build from source with the local build installer, which installs Bun if needed, builds the native addon, and links `gjc` to the checkout:
+Intel (x86_64) macOS no longer has a published npm/Bun prebuilt native package. `gjc-darwin-arm64` is the Apple Silicon standalone release binary; it is distinct from the `@gajae-code/natives-darwin-arm64` npm package. On an Intel Mac, clone and build from source with the local build installer, which installs Bun if needed, builds the native addon, and links `gjc` to the checkout:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install_local_build.sh | sh
+(
+  installer=$(mktemp "${TMPDIR:-/tmp}/gjc-local-build.XXXXXX") || exit 1
+  if curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install_local_build.sh -o "$installer"; then
+    sh "$installer"
+    status=$?
+  else
+    status=$?
+  fi
+  rm -f "$installer"
+  exit "$status"
+)
 ```
+
+The URL above intentionally executes code from the mutable `main` branch only after `curl` succeeds. Review the downloaded file first or replace `main` with a reviewed commit SHA when that remote-code boundary is not acceptable.
 
 ### Windows (native install)
 

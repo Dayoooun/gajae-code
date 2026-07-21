@@ -74,9 +74,18 @@ export function loadFromCandidates<T>(input: LoadFromCandidatesInput<T>): LoadFr
 export interface CachedEmbeddedExtractionIsFreshInput {
 	targetPath: string;
 	embeddedPath: string;
-	sizeOf: (path: string) => number | null;
+	contentHash: (path: string) => string | null;
 }
 
 export function cachedEmbeddedExtractionIsFresh(input: CachedEmbeddedExtractionIsFreshInput): boolean;
+
+export interface ResolveRuntimeCandidatesInput {
+	candidates: string[];
+	embeddedCandidate?: string | null;
+	stagedCandidate?: string | null;
+	rejectedCandidates?: string[];
+}
+
+export function resolveRuntimeCandidates(input: ResolveRuntimeCandidatesInput): string[];
 
 export function loadNative(): Record<string, unknown>;
