@@ -305,6 +305,29 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 		expect(loaded.errors).toEqual([`${modern}: missing current version sentinel`]);
 	});
 
+	it("continues from an embedded candidate without the publish sentinel to a compatible fallback", () => {
+		const modern = "/cache/pi_natives.linux-x64-modern.node";
+		const baseline = "/cache/pi_natives.linux-x64-baseline.node";
+		const loaded = loadFromCandidates({
+			candidates: [modern, baseline],
+			requireCandidate: candidate =>
+				candidate === baseline
+					? { __piNativesVCurrent: () => undefined, __piNativesPublishOutcomeV1: () => undefined }
+					: { __piNativesVCurrent: () => undefined },
+			validateCandidate: bindings => {
+				validateCurrentSentinel(bindings);
+				if (typeof bindings.__piNativesPublishOutcomeV1 !== "function")
+					throw new Error("missing publish outcome sentinel");
+			},
+			describeCandidate: candidate => candidate,
+		});
+		expect(loaded.bindings).toEqual({
+			__piNativesVCurrent: expect.any(Function),
+			__piNativesPublishOutcomeV1: expect.any(Function),
+		});
+		expect(loaded.errors).toEqual([`${modern}: missing publish outcome sentinel`]);
+	});
+
 	it("preserves Windows staging ahead of package candidates", () => {
 		const filename = "pi_natives.win32-x64-baseline.node";
 		const versionedDir = "C:\\Users\\u\\AppData\\Local\\gjc\\14.5.2";

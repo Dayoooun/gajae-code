@@ -1447,7 +1447,7 @@ fn rename_managed_file_no_replace(
 		Err("rollback_unavailable") => {
 			publish_post_mutation_failure("rollback_unavailable", "terminal_identity")
 		},
-		Err("interrupted") => publish_unknown_failure("io_error", "rename"),
+		Err("interrupted") => publish_unknown_failure("interrupted", "rename"),
 		Err(
 			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"),
 		) => publish_preflight_failure(code),
@@ -1510,12 +1510,14 @@ fn rename_managed_file_no_replace_inner(
 	{
 		return Err("rollback_unavailable");
 	}
-	let terminal = statat(&destination_parent, &destination_name).map_err(|_| "rollback_unavailable")?;
+	let terminal =
+		statat(&destination_parent, &destination_name).map_err(|_| "rollback_unavailable")?;
 	if terminal.st_dev.to_string() != moved.dev || terminal.st_ino.to_string() != moved.ino {
 		return Err("rollback_unavailable");
 	}
 	let source_parent_identity = identity(&source_parent).map_err(|_| "rollback_unavailable")?;
-	let destination_parent_identity = identity(&destination_parent).map_err(|_| "rollback_unavailable")?;
+	let destination_parent_identity =
+		identity(&destination_parent).map_err(|_| "rollback_unavailable")?;
 	let source_sync = source_parent.sync_all();
 	let destination_sync = if source_parent_identity.dev == destination_parent_identity.dev
 		&& source_parent_identity.ino == destination_parent_identity.ino
@@ -1528,7 +1530,8 @@ fn rename_managed_file_no_replace_inner(
 		return Err("fsync_failed");
 	}
 	let after = regular_identity(&moved_file).map_err(|_| "rollback_unavailable")?;
-	let named_after = statat(&destination_parent, &destination_name).map_err(|_| "rollback_unavailable")?;
+	let named_after =
+		statat(&destination_parent, &destination_name).map_err(|_| "rollback_unavailable")?;
 	crate::path_identity::platform::verify_created_owner_only_file(&moved_file)
 		.map_err(|_| "rollback_unavailable")?;
 	let after_digest = digest_hex(&moved_file).map_err(|_| "rollback_unavailable")?;
@@ -1864,7 +1867,7 @@ fn install(root: &File, source: &str, destination: &str) -> RecoveryFsPublishRes
 		Err("post_mutation_identity_mismatch") => {
 			publish_post_mutation_failure("identity_mismatch", "terminal_identity")
 		},
-		Err("interrupted") => publish_unknown_failure("io_error", "rename"),
+		Err("interrupted") => publish_unknown_failure("interrupted", "rename"),
 		Err(
 			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"),
 		) => publish_preflight_failure(code),
@@ -1908,13 +1911,18 @@ fn install_inner(
 	}
 	// The rename has committed; all following verification failures are durability
 	// proof failures, never a new pre-mutation classification.
-	let installed = open_existing(root, destination, false).map_err(|_| "post_mutation_identity_mismatch")?;
-	let installed_identity = regular_identity(&installed).map_err(|_| "post_mutation_identity_mismatch")?;
-	if installed_identity.dev != source_identity.dev || installed_identity.ino != source_identity.ino {
+	let installed =
+		open_existing(root, destination, false).map_err(|_| "post_mutation_identity_mismatch")?;
+	let installed_identity =
+		regular_identity(&installed).map_err(|_| "post_mutation_identity_mismatch")?;
+	if installed_identity.dev != source_identity.dev || installed_identity.ino != source_identity.ino
+	{
 		return Err("post_mutation_identity_mismatch");
 	}
-	let source_parent_identity = identity(&source_parent).map_err(|_| "post_mutation_identity_mismatch")?;
-	let destination_parent_identity = identity(&destination_parent).map_err(|_| "post_mutation_identity_mismatch")?;
+	let source_parent_identity =
+		identity(&source_parent).map_err(|_| "post_mutation_identity_mismatch")?;
+	let destination_parent_identity =
+		identity(&destination_parent).map_err(|_| "post_mutation_identity_mismatch")?;
 	let source_sync = source_parent.sync_all();
 	let destination_sync = if source_parent_identity.dev == destination_parent_identity.dev
 		&& source_parent_identity.ino == destination_parent_identity.ino
@@ -2300,7 +2308,7 @@ fn rename_managed_tree_no_replace(
 		Err("rollback_unavailable") => {
 			publish_post_mutation_failure("rollback_unavailable", "terminal_identity")
 		},
-		Err("interrupted") => publish_unknown_failure("io_error", "rename"),
+		Err("interrupted") => publish_unknown_failure("interrupted", "rename"),
 		Err(
 			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"),
 		) => publish_preflight_failure(code),

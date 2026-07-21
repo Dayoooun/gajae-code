@@ -4346,14 +4346,6 @@ export class SessionManager {
 			}
 		} catch (error) {
 			const failure = error;
-			const failedSessionFile = this.#sessionFile;
-			if (this.destination.kind !== "managed") {
-				try {
-					await this.storage.unlink(failedSessionFile);
-				} catch {
-					// Preserve ambiguous cleanup evidence while restoring the active manager.
-				}
-			}
 			this.#sessionId = oldSessionId;
 			this.#sessionFile = oldSessionFile;
 			this.#fileEntries = oldFileEntries;

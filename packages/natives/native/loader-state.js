@@ -306,64 +306,56 @@ function resolveCpuVariant(override) {
 	return detectAvx2Support() ? "modern" : "baseline";
 }
 
-function selectEmbeddedAddonFile(selectedVariant) {
-	if (!embeddedAddon) return null;
-	const defaultFile = embeddedAddon.files.find(file => file.variant === "default") || null;
-	if (process.arch !== "x64") return defaultFile || embeddedAddon.files[0] || null;
-	if (selectedVariant === "modern") {
-		return (
-			embeddedAddon.files.find(file => file.variant === "modern") ||
-			embeddedAddon.files.find(file => file.variant === "baseline") ||
-			null
-		);
-	}
-	return embeddedAddon.files.find(file => file.variant === "baseline") || null;
+function embeddedAddonCandidates(selectedVariant) {
+	if (!embeddedAddon) return [];
+	const files = embeddedAddon.files;
+	const candidates = process.arch !== "x64"
+		? [files.find(file => file.variant === "default"), ...files]
+		: selectedVariant === "modern"
+			? [files.find(file => file.variant === "modern"), files.find(file => file.variant === "baseline")]
+			: [files.find(file => file.variant === "baseline"), files.find(file => file.variant === "modern")];
+	return [...new Set(candidates.filter(Boolean))];
 }
 
-function maybeExtractEmbeddedAddon(ctx, errors) {
-	if (!ctx.isCompiledBinary || !embeddedAddon) return null;
-	if (embeddedAddon.platformTag !== ctx.platformTag || embeddedAddon.version !== ctx.packageVersion) return null;
+function maybeExtractEmbeddedAddons(ctx, errors) {
+	if (!ctx.isCompiledBinary || !embeddedAddon) return [];
+	if (embeddedAddon.platformTag !== ctx.platformTag || embeddedAddon.version !== ctx.packageVersion) return [];
 
-	const selectedEmbeddedFile = selectEmbeddedAddonFile(ctx.selectedVariant);
-	if (!selectedEmbeddedFile) return null;
-	const targetPath = path.join(ctx.versionedDir, selectedEmbeddedFile.filename);
-	if (fs.existsSync(targetPath)) {
-		// Guard against intra-version drift: a cached extraction written by an earlier
-		// build of the same version carries the same version sentinel but can expose a
-		// different native surface (e.g. a symbol added mid-cycle). The embedded addon
-		// is the source of truth, so reuse the cached file only when it matches the
-		// embedded payload size and re-extract otherwise.
-		const sizeOf = candidate => {
-			try {
-				return fs.statSync(candidate).size;
-			} catch {
-				return null;
+	const extracted = [];
+	for (const embeddedFile of embeddedAddonCandidates(ctx.selectedVariant)) {
+		const targetPath = path.join(ctx.versionedDir, embeddedFile.filename);
+		if (fs.existsSync(targetPath)) {
+			// Guard against intra-version drift: a cached extraction written by an earlier
+			// build of the same version carries the same version sentinel but can expose a
+			// different native surface (e.g. a symbol added mid-cycle). The embedded addon
+			// is the source of truth, so reuse the cached file only when it matches the
+			// embedded payload size and re-extract otherwise.
+			const sizeOf = candidate => {
+				try {
+					return fs.statSync(candidate).size;
+				} catch {
+					return null;
+				}
+			};
+			if (cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath: embeddedFile.filePath, sizeOf })) {
+				extracted.push(targetPath);
+				continue;
 			}
-		};
-		if (cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath: selectedEmbeddedFile.filePath, sizeOf })) {
-			return targetPath;
+		}
+
+		try {
+			fs.mkdirSync(ctx.versionedDir, { recursive: true });
+			const buffer = fs.readFileSync(embeddedFile.filePath);
+			const tempPath = `${targetPath}.tmp.${process.pid}`;
+			fs.writeFileSync(tempPath, buffer);
+			fs.renameSync(tempPath, targetPath);
+			extracted.push(targetPath);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			errors.push(`embedded addon write (${embeddedFile.filename}): ${message}`);
 		}
 	}
-
-	try {
-		fs.mkdirSync(ctx.versionedDir, { recursive: true });
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		errors.push(`embedded addon dir: ${message}`);
-		return null;
-	}
-
-	try {
-		const buffer = fs.readFileSync(selectedEmbeddedFile.filePath);
-		const tempPath = `${targetPath}.tmp.${process.pid}`;
-		fs.writeFileSync(tempPath, buffer);
-		fs.renameSync(tempPath, targetPath);
-		return targetPath;
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		errors.push(`embedded addon write (${selectedEmbeddedFile.filename}): ${message}`);
-		return null;
-	}
+	return extracted;
 }
 
 /**
@@ -531,9 +523,9 @@ export function loadNative() {
 	const ctx = initLoaderContext(require_);
 
 	const errors = [];
-	const embeddedCandidate = maybeExtractEmbeddedAddon(ctx, errors);
-	const stagedCandidate = embeddedCandidate ? null : maybeStageNodeModulesAddon(ctx, errors);
-	const prepended = [embeddedCandidate, stagedCandidate].filter(c => typeof c === "string");
+	const embeddedCandidates = maybeExtractEmbeddedAddons(ctx, errors);
+	const stagedCandidate = embeddedCandidates.length > 0 ? null : maybeStageNodeModulesAddon(ctx, errors);
+	const prepended = [...embeddedCandidates, stagedCandidate].filter(c => typeof c === "string");
 	const runtimeCandidates = prepended.length > 0 ? [...prepended, ...ctx.candidates] : ctx.candidates;
 
 	const loaded = loadFromCandidates({

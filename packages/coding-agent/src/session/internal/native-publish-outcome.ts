@@ -7,6 +7,7 @@ export type NativePublishReason =
 	| "cross_device"
 	| "permission_denied"
 	| "io_failure"
+	| "interrupted"
 	| "invalid_request"
 	| "identity_violation"
 	| "durability_not_provable"
@@ -55,17 +56,44 @@ export type NativePublishOutcome = {
 const mutationStates = new Set<NativePublishMutationState>(["not_committed", "committed", "unknown"]);
 const durabilityStates = new Set<NativePublishDurabilityState>(["not_attempted", "proven", "not_provable"]);
 const reasons = new Set<NativePublishReason>([
-	"none", "destination_exists", "atomic_unavailable", "cross_device", "permission_denied", "io_failure",
-	"invalid_request", "identity_violation", "durability_not_provable", "unknown",
+	"none",
+	"destination_exists",
+	"atomic_unavailable",
+	"cross_device",
+	"permission_denied",
+	"io_failure",
+	"interrupted",
+	"invalid_request",
+	"identity_violation",
+	"durability_not_provable",
+	"unknown",
 ]);
 const primitives = new Set<NativePublishPrimitive>([
-	"renameat2_noreplace", "renameatx_np_excl", "windows_rename_noreplace", "unsupported", "unknown",
+	"renameat2_noreplace",
+	"renameatx_np_excl",
+	"windows_rename_noreplace",
+	"unsupported",
+	"unknown",
 ]);
 const phases = new Set<NativePublishPhase>([
-	"preflight", "file_sync", "rename", "source_parent_sync", "destination_parent_sync", "terminal_identity", "complete", "unknown",
+	"preflight",
+	"file_sync",
+	"rename",
+	"source_parent_sync",
+	"destination_parent_sync",
+	"terminal_identity",
+	"complete",
+	"unknown",
 ]);
 const preMutationReasons = new Set<NativePublishReason>([
-	"destination_exists", "atomic_unavailable", "cross_device", "permission_denied", "io_failure", "invalid_request", "identity_violation",
+	"destination_exists",
+	"atomic_unavailable",
+	"cross_device",
+	"permission_denied",
+	"io_failure",
+	"interrupted",
+	"invalid_request",
+	"identity_violation",
 ]);
 const int32 = (value: unknown): value is number =>
 	typeof value === "number" && Number.isInteger(value) && value >= -2147483648 && value <= 2147483647;
@@ -86,7 +114,8 @@ const malformed: NativePublishOutcome = Object.freeze({
 
 function validIdentity(value: unknown): boolean {
 	if (value === undefined) return true;
-	if (!ownPlainRecord(value) || !exactKeys(value, ["dev", "ino", "size", "mtimeNs", "ctimeNs", "sha256"])) return false;
+	if (!ownPlainRecord(value) || !exactKeys(value, ["dev", "ino", "size", "mtimeNs", "ctimeNs", "sha256"]))
+		return false;
 	const decimal = (field: unknown) => typeof field === "string" && /^-?[0-9]{1,32}$/.test(field);
 	return (
 		decimal(value.dev) &&
@@ -99,16 +128,24 @@ function validIdentity(value: unknown): boolean {
 }
 
 function validDiagnostic(value: unknown): value is PublishDiagnostic {
-	if (!ownPlainRecord(value) || !exactKeys(value, ["schemaVersion", "collectionState", "osCode", "syncFailures"])) return false;
-	if (value.schemaVersion !== 1 || !["complete", "partial", "unavailable"].includes(value.collectionState as string)) return false;
+	if (!ownPlainRecord(value) || !exactKeys(value, ["schemaVersion", "collectionState", "osCode", "syncFailures"]))
+		return false;
+	if (value.schemaVersion !== 1 || !["complete", "partial", "unavailable"].includes(value.collectionState as string))
+		return false;
 	if (value.osCode !== undefined && !int32(value.osCode)) return false;
 	if (value.syncFailures === undefined) return true;
 	if (!Array.isArray(value.syncFailures) || value.syncFailures.length > 4) return false;
 	return value.syncFailures.every(failure => {
 		if (!ownPlainRecord(failure) || !exactKeys(failure, ["phase", "parentRole", "osCode", "kind"])) return false;
+		const phase = failure.phase;
+		const role = failure.parentRole;
+		const compatibleRole =
+			(phase === "source_parent_sync" && ["source", "shared"].includes(role as string)) ||
+			(phase === "destination_parent_sync" && ["destination", "shared"].includes(role as string)) ||
+			(phase === "terminal_identity" && ["source", "destination", "shared", "staged_file"].includes(role as string));
 		return (
-			["source_parent_sync", "destination_parent_sync", "terminal_identity"].includes(failure.phase as string) &&
-			["source", "destination", "shared", "staged_file"].includes(failure.parentRole as string) &&
+			["source_parent_sync", "destination_parent_sync", "terminal_identity"].includes(phase as string) &&
+			compatibleRole &&
 			int32(failure.osCode) &&
 			["unsupported", "io", "permission", "other"].includes(failure.kind as string)
 		);
@@ -121,22 +158,53 @@ function legalOutcome(outcome: NativePublishOutcome): boolean {
 			!outcome.ok &&
 			outcome.durabilityState === "not_attempted" &&
 			preMutationReasons.has(outcome.reason) &&
-			["preflight", "file_sync", "rename"].includes(outcome.phase)
+			((outcome.phase === "rename" &&
+				["destination_exists", "atomic_unavailable", "cross_device", "permission_denied", "io_failure"].includes(
+					outcome.reason,
+				)) ||
+				(outcome.phase === "preflight" &&
+					!["atomic_unavailable", "cross_device", "interrupted"].includes(outcome.reason)) ||
+				(outcome.phase === "file_sync" && outcome.reason === "io_failure"))
 		);
 	if (outcome.mutationState === "unknown")
-		return !outcome.ok && outcome.durabilityState === "not_provable" && outcome.reason === "unknown" && outcome.phase === "rename";
+		return (
+			!outcome.ok &&
+			outcome.durabilityState === "not_provable" &&
+			outcome.reason === "unknown" &&
+			["rename", "terminal_identity"].includes(outcome.phase)
+		);
 	if (outcome.ok)
-		return outcome.reason === "none" && outcome.phase === "complete" && ["proven", "not_attempted"].includes(outcome.durabilityState);
+		return (
+			outcome.reason === "none" &&
+			outcome.phase === "complete" &&
+			["proven", "not_attempted"].includes(outcome.durabilityState)
+		);
 	return (
+		!outcome.ok &&
 		outcome.durabilityState === "not_provable" &&
-		["durability_not_provable", "identity_violation", "io_failure"].includes(outcome.reason) &&
-		["file_sync", "source_parent_sync", "destination_parent_sync", "terminal_identity"].includes(outcome.phase)
+		((outcome.reason === "durability_not_provable" &&
+			["file_sync", "source_parent_sync", "destination_parent_sync"].includes(outcome.phase)) ||
+			(outcome.reason === "identity_violation" && outcome.phase === "terminal_identity") ||
+			(outcome.reason === "io_failure" && outcome.phase === "terminal_identity"))
 	);
 }
 
 /** Treat incompatible native results as an unknown mutation; never infer safety from legacy fields. */
 export function classifyNativePublishOutcome(value: unknown): NativePublishOutcome {
-	if (!ownPlainRecord(value) || !exactKeys(value, ["ok", "code", "identity", "mutationState", "durabilityState", "reason", "primitive", "phase", "diagnostic"]))
+	if (
+		!ownPlainRecord(value) ||
+		!exactKeys(value, [
+			"ok",
+			"code",
+			"identity",
+			"mutationState",
+			"durabilityState",
+			"reason",
+			"primitive",
+			"phase",
+			"diagnostic",
+		])
+	)
 		return malformed;
 	if (
 		typeof value.ok !== "boolean" ||

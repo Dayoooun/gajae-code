@@ -65,6 +65,76 @@ describe("native publish outcome classification", () => {
 		expect(mayCleanCurrentStaging(outcome)).toBe(false);
 		expect(formatNativePublishDiagnostic(outcome)).not.toContain("secret");
 	});
+
+	it("accepts direct no-replace envelopes while preserving unknown failures closed", () => {
+		for (const [reason, code] of [
+			["destination_exists", "already_exists"],
+			["cross_device", "cross_device"],
+			["permission_denied", "permission_denied"],
+			["io_failure", "io_error"],
+		] as const) {
+			const outcome = classifyNativePublishOutcome({ ...preMutation, reason, code, phase: "rename" });
+			expect(outcome.reason).toBe(reason);
+			expect(mayCleanCurrentStaging(outcome)).toBe(true);
+		}
+		const committed = classifyNativePublishOutcome({
+			...preMutation,
+			ok: true,
+			code: undefined,
+			mutationState: "committed",
+			durabilityState: "not_attempted",
+			reason: "none",
+			phase: "complete",
+		});
+		expect(committed.mutationState).toBe("committed");
+		expect(mayCleanCurrentStaging(committed)).toBe(false);
+		const unknown = classifyNativePublishOutcome({
+			...preMutation,
+			code: "interrupted",
+			mutationState: "unknown",
+			durabilityState: "not_provable",
+			reason: "unknown",
+			phase: "rename",
+		});
+		expect(unknown.mutationState).toBe("unknown");
+		expect(mayCleanCurrentStaging(unknown)).toBe(false);
+		expect(classifyNativePublishOutcome({ ...unknown, phase: "terminal_identity" }).mutationState).toBe("unknown");
+		expect(
+			classifyNativePublishOutcome({
+				...preMutation,
+				reason: "cross_device",
+				code: "cross_device",
+				phase: "preflight",
+			}).reason,
+		).toBe("unknown");
+	});
+
+	it("preserves bounded per-parent fsync evidence without accepting fabricated roles", () => {
+		const outcome = classifyNativePublishOutcome({
+			ok: false,
+			code: "fsync_failed",
+			mutationState: "committed",
+			durabilityState: "not_provable",
+			reason: "durability_not_provable",
+			primitive: "renameat2_noreplace",
+			phase: "destination_parent_sync",
+			diagnostic: {
+				schemaVersion: 1,
+				collectionState: "partial",
+				syncFailures: [{ phase: "destination_parent_sync", parentRole: "destination", osCode: 5, kind: "io" }],
+			},
+		});
+		expect(formatNativePublishDiagnostic(outcome)).toContain("destination:destination_parent_sync:io:5");
+		expect(
+			classifyNativePublishOutcome({
+				...outcome,
+				diagnostic: {
+					...outcome.diagnostic,
+					syncFailures: [{ phase: "destination_parent_sync", parentRole: "source", osCode: 5, kind: "io" }],
+				},
+			}).reason,
+		).toBe("unknown");
+	});
 });
 
 describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
