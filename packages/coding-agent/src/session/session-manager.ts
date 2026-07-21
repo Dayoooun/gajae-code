@@ -4581,15 +4581,8 @@ export class SessionManager {
 								managedPublishedArtifacts,
 							);
 						}
-						if (managedTranscript)
+						if (managedTranscript && !managedSourceStore.readExpected(path.basename(oldSessionFile)))
 							await managedSourceStore.publishNoReplace(path.basename(oldSessionFile), managedTranscript.bytes);
-						if (managedPublishedArtifacts)
-							managedDestinationStore.removeTreeExpected(
-								path.basename(newArtifactDir),
-								managedPublishedArtifacts,
-							);
-						if (managedPublishedTranscript)
-							managedDestinationStore.removeExpected(path.basename(newSessionFile), managedPublishedTranscript);
 					};
 					managedTranscript = managedSourceStore.readExpected(path.basename(oldSessionFile));
 					hadSessionFile = managedTranscript !== null;
@@ -4685,13 +4678,6 @@ export class SessionManager {
 							!managedSourceStore.readExpected(path.basename(oldSessionFile))
 						)
 							await managedSourceStore.publishNoReplace(path.basename(oldSessionFile), managedTranscript.bytes);
-						if (managedPublishedArtifacts)
-							managedDestinationStore.removeTreeExpected(
-								path.basename(newArtifactDir),
-								managedPublishedArtifacts,
-							);
-						if (managedPublishedTranscript)
-							managedDestinationStore.removeExpected(path.basename(newSessionFile), managedPublishedTranscript);
 					} catch (rollbackErr) {
 						restoreResidentStateAndThrow(
 							new Error(`Failed to rollback managed move: ${toError(rollbackErr).message}`, {
@@ -4712,7 +4698,8 @@ export class SessionManager {
 			this.#bumpAllRevisions();
 		}
 
-		// Update cwd and sessionDir after the physical move succeeds, but roll the move back if metadata persistence fails.
+		// Update cwd and sessionDir after physical publication succeeds. Metadata failures restore the source
+		// authority but deliberately retain any destination publication evidence rather than deleting it.
 		this.cwd = resolvedCwd;
 		this.sessionDir = newSessionDir;
 		this.destination = nextDestination;

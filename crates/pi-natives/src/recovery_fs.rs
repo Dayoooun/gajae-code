@@ -157,6 +157,7 @@ fn publish_preflight_failure(code: &'static str) -> RecoveryFsPublishResult {
 		"atomic_unavailable" => ("atomic_unavailable", "rename"),
 		"cross_device" => ("cross_device", "rename"),
 		"permission_denied" => ("permission_denied", "preflight"),
+		"invalid_request" => ("invalid_request", "preflight"),
 		"identity_mismatch" => ("identity_violation", "preflight"),
 		_ => ("io_failure", "preflight"),
 	};
@@ -1449,7 +1450,8 @@ fn rename_managed_file_no_replace(
 		},
 		Err("interrupted") => publish_unknown_failure("interrupted", "rename"),
 		Err(
-			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"),
+			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"
+			| "invalid_request"),
 		) => publish_preflight_failure(code),
 
 		Err(code) => publish_unknown_failure(code, "terminal_identity"),
@@ -1492,7 +1494,11 @@ fn rename_managed_file_no_replace_inner(
 	if result != 0 {
 		return Err(match std::io::Error::last_os_error().raw_os_error() {
 			Some(libc::EEXIST) => "already_exists",
-			Some(libc::ENOSYS | libc::EINVAL) => "atomic_unavailable",
+			Some(libc::ENOSYS) => "atomic_unavailable",
+			// The retained syscall uses fixed, validated descriptors, names, and flags.
+			// EINVAL still cannot prove that this filesystem lacks RENAME_NOREPLACE;
+			// retain it as an invalid request rather than weakening no-overwrite authority.
+			Some(libc::EINVAL) => "invalid_request",
 			Some(libc::EXDEV) => "cross_device",
 			Some(libc::EACCES | libc::EPERM) => "permission_denied",
 			Some(libc::EINTR) => "interrupted",
@@ -1869,7 +1875,8 @@ fn install(root: &File, source: &str, destination: &str) -> RecoveryFsPublishRes
 		},
 		Err("interrupted") => publish_unknown_failure("interrupted", "rename"),
 		Err(
-			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"),
+			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"
+			| "invalid_request"),
 		) => publish_preflight_failure(code),
 
 		Err(code) => publish_unknown_failure(code, "terminal_identity"),
@@ -1902,7 +1909,8 @@ fn install_inner(
 	if result != 0 {
 		return Err(match std::io::Error::last_os_error().raw_os_error() {
 			Some(libc::EEXIST) => "already_exists",
-			Some(libc::ENOSYS | libc::EINVAL) => "atomic_unavailable",
+			Some(libc::ENOSYS) => "atomic_unavailable",
+			Some(libc::EINVAL) => "invalid_request",
 			Some(libc::EXDEV) => "cross_device",
 			Some(libc::EACCES | libc::EPERM) => "permission_denied",
 			Some(libc::EINTR) => "interrupted",
@@ -2310,7 +2318,8 @@ fn rename_managed_tree_no_replace(
 		},
 		Err("interrupted") => publish_unknown_failure("interrupted", "rename"),
 		Err(
-			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"),
+			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"
+			| "invalid_request"),
 		) => publish_preflight_failure(code),
 		Err(code) => publish_unknown_failure(code, "terminal_identity"),
 	}
@@ -2346,7 +2355,8 @@ fn rename_managed_tree_no_replace_inner(
 	{
 		return Err(match std::io::Error::last_os_error().raw_os_error() {
 			Some(libc::EEXIST) => "already_exists",
-			Some(libc::ENOSYS | libc::EINVAL) => "atomic_unavailable",
+			Some(libc::ENOSYS) => "atomic_unavailable",
+			Some(libc::EINVAL) => "invalid_request",
 			Some(libc::EXDEV) => "cross_device",
 			Some(libc::EACCES | libc::EPERM) => "permission_denied",
 			Some(libc::EINTR) => "interrupted",

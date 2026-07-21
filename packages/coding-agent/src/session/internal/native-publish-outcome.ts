@@ -12,6 +12,8 @@ export type NativePublishReason =
 	| "identity_violation"
 	| "durability_not_provable"
 	| "unknown";
+export type NativePublishOperation = "direct_rename" | "retained_file" | "retained_tree";
+
 export type NativePublishPrimitive =
 	| "renameat2_noreplace"
 	| "renameatx_np_excl"
@@ -42,9 +44,19 @@ type PublishDiagnostic = {
 	syncFailures?: readonly SyncFailure[];
 };
 
+export type NativePublishIdentity = {
+	readonly dev: string;
+	readonly ino: string;
+	readonly size: string;
+	readonly mtimeNs: string;
+	readonly ctimeNs: string;
+	readonly sha256?: string;
+};
+
 export type NativePublishOutcome = {
 	readonly ok: boolean;
 	readonly code?: string;
+	readonly identity?: NativePublishIdentity;
 	readonly mutationState: NativePublishMutationState;
 	readonly durabilityState: NativePublishDurabilityState;
 	readonly reason: NativePublishReason;
@@ -189,8 +201,15 @@ function legalOutcome(outcome: NativePublishOutcome): boolean {
 	);
 }
 
-/** Treat incompatible native results as an unknown mutation; never infer safety from legacy fields. */
-export function classifyNativePublishOutcome(value: unknown): NativePublishOutcome {
+/**
+ * Treat incompatible native results as an unknown mutation; never infer safety from legacy fields.
+ * Retained descriptor operations have a stricter contract than direct rename: a reported success
+ * includes the terminal identity and all required durability evidence.
+ */
+export function classifyNativePublishOutcome(
+	value: unknown,
+	operation: NativePublishOperation = "direct_rename",
+): NativePublishOutcome {
 	if (
 		!ownPlainRecord(value) ||
 		!exactKeys(value, [
@@ -219,7 +238,14 @@ export function classifyNativePublishOutcome(value: unknown): NativePublishOutco
 	)
 		return malformed;
 	const outcome = value as unknown as NativePublishOutcome;
-	return legalOutcome(outcome) ? outcome : malformed;
+	if (!legalOutcome(outcome)) return malformed;
+	if (operation === "direct_rename") return outcome;
+	if (
+		outcome.primitive !== "renameat2_noreplace" ||
+		(outcome.ok && (!outcome.identity || outcome.durabilityState !== "proven" || outcome.phase !== "complete"))
+	)
+		return malformed;
+	return outcome;
 }
 
 /** Only a fully validated pre-mutation result permits exact cleanup of current staging. */

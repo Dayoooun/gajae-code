@@ -725,13 +725,13 @@ export class ManagedSessionDescendantStore {
 				captured.identity.ctimeNs,
 				digest,
 			);
-			const outcome = classifyNativePublishOutcome(published);
+			const outcome = classifyNativePublishOutcome(published, "retained_file");
 			if (!outcome.ok) throw publishFailure(outcome);
 		} catch (error) {
 			// A committed or unknown native outcome is evidence, not authorization to
 			// probe or remove the destination. Only a validated pre-mutation result
 			// may clean this operation's still-named staging object.
-			const outcome = captured ? classifyNativePublishOutcome(published) : undefined;
+			const outcome = captured ? classifyNativePublishOutcome(published, "retained_file") : undefined;
 			if (captured?.ok && captured.identity && captured.data && outcome && mayCleanCurrentStaging(outcome)) {
 				const staged = this.#authority.readManaged(temporary);
 				if (
@@ -955,7 +955,7 @@ export class ManagedSessionDescendantStore {
 					expected,
 				)
 			: renameNoReplacePath(this.#resolve(sourceRelativePath), this.#resolve(destinationRelativePath));
-		const outcome = classifyNativePublishOutcome(moved);
+		const outcome = classifyNativePublishOutcome(moved, this.#authority ? "retained_tree" : "direct_rename");
 		if (!outcome.ok)
 			throw new ManagedTreeMoveOutcomeError(publishFailure(outcome).message, mayCleanCurrentStaging(outcome));
 		const movedSnapshot = this.#authority

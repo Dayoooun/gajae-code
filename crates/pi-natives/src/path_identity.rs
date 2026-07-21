@@ -2247,7 +2247,10 @@ pub(crate) mod platform {
 		} else {
 			match std::io::Error::last_os_error().raw_os_error() {
 				Some(libc::EEXIST) => Err("quarantine_collision"),
-				Some(libc::ENOSYS | libc::EINVAL) => Err("atomic_unavailable"),
+				Some(libc::ENOSYS) => Err("atomic_unavailable"),
+				// Fixed no-replace syscall arguments make EINVAL an invocation/filesystem
+				// divergence, not proof that the primitive is unavailable.
+				Some(libc::EINVAL) => Err("invalid_request"),
 				Some(libc::EXDEV) => Err("cross_device"),
 				Some(libc::EACCES | libc::EPERM) => Err("permission_denied"),
 				Some(libc::EINTR) => Err("interrupted"),
@@ -2319,7 +2322,8 @@ pub(crate) mod platform {
 		} else {
 			match std::io::Error::last_os_error().raw_os_error() {
 				Some(libc::EEXIST) => Err("quarantine_collision"),
-				Some(libc::ENOSYS | libc::EINVAL) => Err("atomic_unavailable"),
+				Some(libc::ENOSYS) => Err("atomic_unavailable"),
+				Some(libc::EINVAL) => Err("invalid_request"),
 				Some(libc::EXDEV) => Err("cross_device"),
 				Some(libc::EACCES | libc::EPERM) => Err("permission_denied"),
 				Some(libc::EINTR) => Err("interrupted"),

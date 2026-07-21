@@ -109,6 +109,53 @@ describe("native publish outcome classification", () => {
 		).toBe("unknown");
 	});
 
+	it("rejects a direct-rename success envelope when retained publication requires durability proof", () => {
+		const directSuccess = {
+			...preMutation,
+			ok: true,
+			code: undefined,
+			mutationState: "committed",
+			durabilityState: "not_attempted",
+			reason: "none",
+			phase: "complete",
+		};
+		expect(classifyNativePublishOutcome(directSuccess).ok).toBe(true);
+		const retained = classifyNativePublishOutcome(directSuccess, "retained_file");
+		expect(retained.mutationState).toBe("unknown");
+		expect(mayCleanCurrentStaging(retained)).toBe(false);
+	});
+
+	it("accepts a retained success only with terminal identity and proven durability", () => {
+		const retained = classifyNativePublishOutcome(
+			{
+				...preMutation,
+				ok: true,
+				code: undefined,
+				identity: { dev: "1", ino: "2", size: "3", mtimeNs: "4", ctimeNs: "5", sha256: "a".repeat(64) },
+				mutationState: "committed",
+				durabilityState: "proven",
+				reason: "none",
+				phase: "complete",
+			},
+			"retained_tree",
+		);
+		expect(retained.ok).toBe(true);
+	});
+
+	it("keeps an EINVAL-classified retained request out of atomic-unavailable fallback while allowing exact staging cleanup", () => {
+		const outcome = classifyNativePublishOutcome(
+			{
+				...preMutation,
+				code: "invalid_request",
+				reason: "invalid_request",
+				phase: "preflight",
+			},
+			"retained_file",
+		);
+		expect(outcome.reason).toBe("invalid_request");
+		expect(mayCleanCurrentStaging(outcome)).toBe(true);
+	});
+
 	it("preserves bounded per-parent fsync evidence without accepting fabricated roles", () => {
 		const outcome = classifyNativePublishOutcome({
 			ok: false,
