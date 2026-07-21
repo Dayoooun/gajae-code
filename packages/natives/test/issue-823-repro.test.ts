@@ -29,6 +29,7 @@ import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import {
 	detectCompiledBinary,
+	embeddedAddonIsAuthoritative,
 	getAddonFilenames,
 	getOptionalPackageNames,
 	loadFromCandidates,
@@ -125,6 +126,34 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 		// Order matters: embedded-extracted destinations must be probed before the
 		// (potentially-missing) build-host nativeDir path from the bundled module location.
 		expect(candidates.indexOf(versionedModern)).toBeLessThan(candidates.indexOf(buildHostModern));
+	});
+	it("does not trust user or cache candidates after a matching embedded artifact is incompatible", () => {
+		const context = {
+			isCompiledBinary: true,
+			platformTag: "linux-x64",
+			packageVersion: "14.5.2",
+		};
+		expect(
+			embeddedAddonIsAuthoritative(context, {
+				platformTag: "linux-x64",
+				version: "14.5.2",
+				files: [],
+			}),
+		).toBe(true);
+		const embedded = "/cache/embedded.node";
+		const userCache = "/home/u/.local/bin/pi_natives.linux-x64-modern.node";
+		const loaded = loadFromCandidates({
+			candidates: [embedded],
+			requireCandidate: candidate => {
+				if (candidate === embedded) return { stale: true };
+				throw new Error(`unexpected fallback ${candidate}`);
+			},
+			validateCandidate: validateCurrentSentinel,
+			describeCandidate: candidate => candidate,
+		});
+		expect(loaded.bindings).toBeNull();
+		expect(loaded.errors).toEqual([`${embedded}: missing current version sentinel`]);
+		expect(loaded.errors.join("\n")).not.toContain(userCache);
 	});
 
 	it("does not probe user-data candidates when running outside a standalone binary", () => {

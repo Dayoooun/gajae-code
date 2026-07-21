@@ -218,7 +218,9 @@ impl NativeNoReplaceResult {
 				Some("atomic_unavailable") => ("not_committed", "not_attempted", "atomic_unavailable"),
 				Some("cross_device") => ("not_committed", "not_attempted", "cross_device"),
 				Some("permission_denied") => ("not_committed", "not_attempted", "permission_denied"),
-				Some("not_found") => ("not_committed", "not_attempted", "invalid_request"),
+				Some("not_found" | "invalid_request") => {
+					("not_committed", "not_attempted", "invalid_request")
+				},
 				Some("reparse_point" | "identity_mismatch") => {
 					("not_committed", "not_attempted", "identity_violation")
 				},
@@ -768,7 +770,9 @@ pub fn rename_no_replace_path(
 	destination_path: String,
 ) -> NativeNoReplaceResult {
 	if source_path.contains('\0') || destination_path.contains('\0') {
-		return NativeNoReplaceResult::from_exact(NativeExactUnlinkResult::failure("io_error"));
+		return NativeNoReplaceResult::from_exact(NativeExactUnlinkResult::failure(
+			"invalid_request",
+		));
 	}
 	NativeNoReplaceResult::from_exact(platform::rename_path_no_replace(
 		Path::new(&source_path),
@@ -5751,6 +5755,27 @@ mod owner_only_security_tests {
 			b"collision"
 		);
 		assert_eq!(std::fs::read(&destination).expect("read retained destination"), b"source");
+	}
+
+	#[test]
+	fn rename_no_replace_invalid_request_is_a_preflight_failure() {
+		let result =
+			NativeNoReplaceResult::from_exact(NativeExactUnlinkResult::failure("invalid_request"));
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("invalid_request"));
+		assert_eq!(result.mutation_state, "not_committed");
+		assert_eq!(result.durability_state, "not_attempted");
+		assert_eq!(result.reason, "invalid_request");
+		assert_eq!(result.phase, "preflight");
+	}
+
+	#[test]
+	fn rename_no_replace_rejects_nul_request_before_syscall() {
+		let result = rename_no_replace_path("source\0".to_owned(), "destination".to_owned());
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("invalid_request"));
+		assert_eq!(result.reason, "invalid_request");
+		assert_eq!(result.phase, "preflight");
 	}
 }
 #[cfg(all(test, unix))]

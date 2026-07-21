@@ -518,18 +518,26 @@ function initLoaderContext(require_) {
 	};
 }
 
+/** Embedded standalone payloads are the complete trust boundary for their matching build. */
+export function embeddedAddonIsAuthoritative(ctx, addon = embeddedAddon) {
+	return (
+		ctx.isCompiledBinary && addon?.platformTag === ctx.platformTag && addon.version === ctx.packageVersion
+	);
+}
+
 export function loadNative(options = {}) {
 	const require_ = options.requireCandidate ? null : createRequire(import.meta.url);
 	const ctx = options.context ?? initLoaderContext(require_);
 
 	const errors = [];
 	const embeddedCandidates = (options.extractEmbeddedAddons ?? maybeExtractEmbeddedAddons)(ctx, errors);
+	const embeddedIsAuthoritative = embeddedAddonIsAuthoritative(ctx);
 	const stagedCandidate =
-		embeddedCandidates.length > 0
+		embeddedCandidates.length > 0 || embeddedIsAuthoritative
 			? null
 			: (options.stageNodeModulesAddon ?? maybeStageNodeModulesAddon)(ctx, errors);
 	const prepended = [...embeddedCandidates, stagedCandidate].filter(c => typeof c === "string");
-	const runtimeCandidates = prepended.length > 0 ? [...prepended, ...ctx.candidates] : ctx.candidates;
+	const runtimeCandidates = embeddedIsAuthoritative ? prepended : prepended.length > 0 ? [...prepended, ...ctx.candidates] : ctx.candidates;
 	const loaded = loadFromCandidates({
 		candidates: runtimeCandidates,
 		requireCandidate: options.requireCandidate ?? (candidate => require_(candidate)),

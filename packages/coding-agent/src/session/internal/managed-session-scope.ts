@@ -721,10 +721,21 @@ export async function ensureManagedScope(
 		managedDirectoryIdentities.set(scope, { dev: preparedDirectory.dev, ino: preparedDirectory.ino });
 		return { kind: "resolved", scope };
 	} catch (error) {
+		const publication = error instanceof ManagedPublishError ? error : undefined;
+		const message =
+			publication?.classification ??
+			(error instanceof Error ? error.message : "The managed scope could not be initialized.");
+		const code =
+			message === "atomic_unavailable" || message === "invalid_request" || message === "durability_not_provable"
+				? message
+				: "binding_invalid";
 		return {
 			kind: "error",
-			code: "binding_invalid",
-			message: error instanceof Error ? error.message : "The managed scope could not be initialized.",
+			code,
+			message,
+			...(publication
+				? { cause: { classification: publication.classification, diagnostic: publication.diagnostic } }
+				: { cause: { classification: code } }),
 		};
 	}
 }
@@ -870,7 +881,7 @@ export function prepareManagedSessionScopeForWriteSync(
 			kind: "error",
 			code,
 			message,
-			...(publication && code !== "binding_invalid"
+			...(publication
 				? { cause: { classification: publication.classification, diagnostic: publication.diagnostic } }
 				: code === "binding_invalid"
 					? {}
@@ -1996,15 +2007,17 @@ function restorePreparedArtifactRoot(scope: ManagedScope, source: ManagedCandida
 	if (fs.existsSync(quarantine.path)) {
 		const existing = fs.lstatSync(quarantine.path, { bigint: true });
 		if (
-			existing.isSymbolicLink() ||
-			!existing.isDirectory() ||
-			existing.dev !== BigInt(identity.dev) ||
-			existing.ino !== BigInt(identity.ino) ||
-			existing.size !== BigInt(identity.size) ||
-			existing.mtimeNs !== BigInt(identity.mtimeNs)
-		)
-			throw new Error("durability_failed");
-		assertPreparedTree(quarantine.path);
+			!existing.isSymbolicLink() &&
+			existing.isDirectory() &&
+			existing.dev === BigInt(identity.dev) &&
+			existing.ino === BigInt(identity.ino) &&
+			existing.size === BigInt(identity.size) &&
+			existing.mtimeNs === BigInt(identity.mtimeNs)
+		) {
+			assertPreparedTree(quarantine.path);
+		}
+		// A changed source pathname is independent retained authority. Do not replace
+		// it with the detached original; retain both roots for recovery.
 		return;
 	}
 	assertPreparedTree(quarantine.detachedPath);
@@ -2311,10 +2324,21 @@ export async function prepareManagedSessionScopeForWrite(
 		return { kind: "resolved", scope };
 	} catch (error) {
 		if (error instanceof Error && error.message === "durability_failed") return { kind: "resolved", scope };
+		const publication = error instanceof ManagedPublishError ? error : undefined;
+		const message =
+			publication?.classification ??
+			(error instanceof Error ? error.message : "Managed write protocol setup failed.");
+		const code =
+			message === "atomic_unavailable" || message === "invalid_request" || message === "durability_not_provable"
+				? message
+				: "binding_invalid";
 		return {
 			kind: "error",
-			code: "binding_invalid",
-			message: error instanceof Error ? error.message : "Managed write protocol setup failed.",
+			code,
+			message,
+			...(publication
+				? { cause: { classification: publication.classification, diagnostic: publication.diagnostic } }
+				: { cause: { classification: code } }),
 		};
 	}
 }

@@ -1327,7 +1327,10 @@ function managedScopeStartupError(
 	failure: Extract<ReturnType<typeof resolveManagedScopeForWrite>, { kind: "error" }>,
 ): Error {
 	return new Error(`Could not ${action} managed session scope.`, {
-		cause: { classification: failure.code },
+		cause: {
+			classification: failure.cause?.classification ?? failure.code,
+			...(failure.cause?.diagnostic === undefined ? {} : { diagnostic: failure.cause.diagnostic }),
+		},
 	});
 }
 
