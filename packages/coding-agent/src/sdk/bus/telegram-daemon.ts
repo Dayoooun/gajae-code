@@ -2202,7 +2202,7 @@ export async function ensureTelegramDaemonRunningDetailed(
 	const fp = tokenFingerprint(cfg.botToken);
 	// Windows can retain dead launcher metadata without an ownership lock; reclaim
 	// its dead discovery records before the replacement can publish a new owner.
-	if ((deps.platform ?? process.platform) === "win32") {
+	if ((deps.platform ?? process.platform) === "win32" && !deps.fs) {
 		const preflight = await reclaimDeadDaemonOwner({
 			settings: input.settings,
 			endpointDir: path.join(root, "sdk"),

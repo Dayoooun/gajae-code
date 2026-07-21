@@ -1322,6 +1322,7 @@ describe("telegram daemon", () => {
 			{ settings: s, roots: [root], tokenFingerprint: fp, chatId: "42" },
 			{
 				pid: 4242,
+				platform: "win32",
 				pidAlive,
 				pidIncarnation,
 				randomId: () => acquisitionId,
@@ -1353,15 +1354,17 @@ describe("telegram daemon", () => {
 					boundAtStateRead = stateReads;
 					published = true;
 					childProvenanceAvailable = true;
-					expect(
-						await renewDaemonHeartbeat({
-							settings: s,
-							ownerId: boundOwnerId,
-							acquisitionId: boundAcquisitionId,
-							pid: 4243,
-							pidIncarnation,
-						}),
-					).toBe(true);
+					const renewed = await renewDaemonHeartbeat({
+						settings: s,
+						ownerId: boundOwnerId,
+						acquisitionId: boundAcquisitionId,
+						pid: 4243,
+						pidIncarnation,
+					});
+					if (!renewed)
+						throw new Error(
+							`child binding rejected: state=${await fs.promises.readFile(paths.state, "utf8")} lock=${await fs.promises.readFile(paths.lock, "utf8")}`,
+						);
 				}
 				return await fs.promises.readFile(file, encoding);
 			},
@@ -1377,6 +1380,7 @@ describe("telegram daemon", () => {
 				{ settings: s, cwd: root, sessionId: "concurrent-rebound" },
 				{
 					pid: 4244,
+					platform: "win32",
 					pidAlive,
 					pidIncarnation,
 					fs: bindingFs,
@@ -2083,9 +2087,9 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps the wire protocol at 3 while retained legacy stopped-lock reclamation uses generation 14", () => {
+	test("keeps the wire protocol at 3 while stale endpoint startup recovery uses generation 15", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		expect(DAEMON_GENERATION).toBe(14);
+		expect(DAEMON_GENERATION).toBe(15);
 	});
 
 	test("#2028 acquire flags a reload for a live pre-upgrade owner missing the generation field", async () => {
