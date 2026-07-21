@@ -41,7 +41,7 @@ cleanup() {
 	fi
 	[ -z "$TEMP_CLONE" ] || rm -rf "$TEMP_CLONE"
 	[ -z "$TEMP_BUN_INSTALLER" ] || rm -f "$TEMP_BUN_INSTALLER"
-	[ -z "$PROMOTION_STATUS_DIR" ] || rm -rf "$PROMOTION_STATUS_DIR"
+	if [ -n "$PROMOTION_STATUS_DIR" ] && ! rm -rf "$PROMOTION_STATUS_DIR"; then echo "cleanup: could not remove temporary copy-status files." >&2; fi
 	exit "$status"
 }
 trap cleanup 0 HUP INT TERM
@@ -195,18 +195,23 @@ save_reused_checkout() {
 	if ! git -C "$SRC_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 		fail "destination validation" "Destination is not a Git worktree: $SRC_DIR"
 	fi
+	if ! checkout_root=$(git -C "$SRC_DIR" rev-parse --show-toplevel); then
+		fail "destination validation" "Could not determine the existing checkout root."
+	fi
+	if ! requested_dir=$(CDPATH= cd "$SRC_DIR" && pwd -P); then
+		fail "destination validation" "Could not canonicalize the existing checkout path."
+	fi
+	if ! checkout_root=$(CDPATH= cd "$checkout_root" && pwd -P); then
+		fail "destination validation" "Could not canonicalize the existing checkout root."
+	fi
+	[ "$requested_dir" = "$checkout_root" ] || fail "destination validation" "Destination must be the existing checkout root: $SRC_DIR"
+	SRC_DIR=$requested_dir
 	if ! origin=$(git -C "$SRC_DIR" config --get remote.origin.url); then fail "destination validation" "Could not read the existing checkout origin."; fi
 	[ "$origin" = "$REPO_URL" ] || fail "destination validation" "Existing checkout does not have the expected origin."
 	if ! worktree_status=$(git -C "$SRC_DIR" status --porcelain); then fail "destination validation" "Could not verify the existing checkout state."; fi
 	[ -z "$worktree_status" ] || fail "destination validation" "Existing checkout is not clean."
 	ORIGINAL_HEAD=$(git -C "$SRC_DIR" rev-parse --verify HEAD) || fail "destination validation" "Could not record the existing checkout commit."
 	ORIGINAL_REF=$(git -C "$SRC_DIR" symbolic-ref -q HEAD || true)
-	# Store a physical absolute path before later commands change directories. This
-	# keeps failure cleanup pointed at this worktree when the caller used a relative path.
-	if ! SRC_DIR=$(CDPATH= cd "$SRC_DIR" && pwd -P); then
-		fail "destination validation" "Could not canonicalize the existing checkout path."
-	fi
-
 	REUSED_CHECKOUT=1
 }
 
@@ -239,7 +244,7 @@ prepare_checkout() {
 }
 
 remove_owned_destination() {
-	if [ -f "$PROMOTION_MARKER" ] && IFS= read -r marker_token < "$PROMOTION_MARKER" && [ "$marker_token" = "$PROMOTION_TOKEN" ]; then
+	if [ -n "$PROMOTION_MARKER" ] && [ -n "$PROMOTION_TOKEN" ] && [ -f "$PROMOTION_MARKER" ] && IFS= read -r marker_token < "$PROMOTION_MARKER" && [ "$marker_token" = "$PROMOTION_TOKEN" ]; then
 		rm -rf "$DEST_DIR" || echo "cleanup: could not remove the failed destination claim." >&2
 	fi
 }
@@ -248,7 +253,11 @@ promote_clone() {
 	# Claim the final directory exclusively before copying. A unique marker proves
 	# that a failed copy may roll back only this invocation's claim; an existing or
 	# concurrently-created destination is never removed.
-	PROMOTION_TOKEN="${TEMP_CLONE}.$$"
+	PROMOTION_STATUS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/gjc-promotion.XXXXXX") || fail "promotion" "Could not create temporary copy-status files."
+	# mktemp's generated basename is independent of the clone path and contains no
+	# line delimiters, so the marker remains a single, comparable record even when
+	# a destination parent includes a newline.
+	PROMOTION_TOKEN=${PROMOTION_STATUS_DIR##*/}
 	PROMOTION_MARKER="$DEST_DIR/.gajae-code-install-owner"
 	if ! mkdir "$DEST_DIR"; then
 		fail "promotion" "Destination appeared while preparing the clone; it was left untouched: $DEST_DIR"
@@ -259,32 +268,42 @@ promote_clone() {
 		rmdir "$DEST_DIR" || echo "cleanup: could not remove the empty destination claim." >&2
 		fail "promotion" "Could not mark the claimed destination."
 	fi
-	PROMOTION_STATUS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/gjc-promotion.XXXXXX") || {
-		remove_owned_destination
-		fail "promotion" "Could not create temporary copy-status files."
-	}
-	(
+	promotion_status_valid=1
+	if (
 		if cd "$TEMP_CLONE"; then
 			if tar cf - .; then producer_status=0; else producer_status=$?; fi
 		else
 			producer_status=$?
 		fi
-		printf '%s\n' "$producer_status" > "$PROMOTION_STATUS_DIR/producer"
+		printf '%s\n' "$producer_status" > "$PROMOTION_STATUS_DIR/producer" || exit 1
 	) | (
 		if cd "$DEST_DIR"; then
 			if tar xpf -; then extractor_status=0; else extractor_status=$?; fi
 		else
 			extractor_status=$?
 		fi
-		printf '%s\n' "$extractor_status" > "$PROMOTION_STATUS_DIR/extractor"
-	)
-	producer_status=unavailable
-	extractor_status=unavailable
-	if [ -f "$PROMOTION_STATUS_DIR/producer" ]; then IFS= read -r producer_status < "$PROMOTION_STATUS_DIR/producer" || :; fi
-	if [ -f "$PROMOTION_STATUS_DIR/extractor" ]; then IFS= read -r extractor_status < "$PROMOTION_STATUS_DIR/extractor" || :; fi
-	rm -rf "$PROMOTION_STATUS_DIR"
+		printf '%s\n' "$extractor_status" > "$PROMOTION_STATUS_DIR/extractor" || exit 1
+	); then
+		:
+	else
+		promotion_status_valid=
+	fi
+	if [ -f "$PROMOTION_STATUS_DIR/producer" ] && IFS= read -r producer_status < "$PROMOTION_STATUS_DIR/producer"; then
+		case "$producer_status" in ""|*[!0-9]*) promotion_status_valid= ;; esac
+	else
+		promotion_status_valid=
+	fi
+	if [ -f "$PROMOTION_STATUS_DIR/extractor" ] && IFS= read -r extractor_status < "$PROMOTION_STATUS_DIR/extractor"; then
+		case "$extractor_status" in ""|*[!0-9]*) promotion_status_valid= ;; esac
+	else
+		promotion_status_valid=
+	fi
+	if ! rm -rf "$PROMOTION_STATUS_DIR"; then
+		remove_owned_destination
+		fail "promotion" "Could not clean up temporary copy-status files."
+	fi
 	PROMOTION_STATUS_DIR=""
-	if [ "$producer_status" != 0 ] || [ "$extractor_status" != 0 ]; then
+	if [ -z "$promotion_status_valid" ] || [ "$producer_status" != 0 ] || [ "$extractor_status" != 0 ]; then
 		remove_owned_destination
 		fail "promotion" "Could not populate the claimed destination."
 	fi

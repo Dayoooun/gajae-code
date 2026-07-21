@@ -202,16 +202,18 @@ export function resolveLoaderCandidates({
  * @template T
  * @param {{
  *   candidates: string[];
+ *   attestCandidate?: (candidate: string) => void;
  *   requireCandidate: (candidate: string) => T;
  *   validateCandidate: (bindings: T, candidate: string) => void;
  *   describeCandidate: (candidate: string) => string;
  * }} input
  * @returns {{ bindings: T | null; errors: string[] }}
  */
-export function loadFromCandidates({ candidates, requireCandidate, validateCandidate, describeCandidate }) {
+export function loadFromCandidates({ candidates, attestCandidate, requireCandidate, validateCandidate, describeCandidate }) {
 	const errors = [];
 	for (const candidate of candidates) {
 		try {
+			attestCandidate?.(candidate);
 			const bindings = requireCandidate(candidate);
 			validateCandidate(bindings, candidate);
 			return { bindings, errors };
@@ -353,7 +355,7 @@ function selectEmbeddedAddonFile(selectedVariant) {
 }
 
 function maybeExtractEmbeddedAddon(ctx, errors) {
-	const noExtraction = { candidate: null, validatedCandidates: [] };
+	const noExtraction = { candidate: null, validatedCandidates: [], attestCandidate: null };
 	if (!ctx.isCompiledBinary || !embeddedAddon) return noExtraction;
 	if (embeddedAddon.platformTag !== ctx.platformTag || embeddedAddon.version !== ctx.packageVersion) return noExtraction;
 
@@ -386,8 +388,13 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 		}
 	};
 	const isFresh = () => contentHash(targetPath) === embeddedHash;
+	const attestCandidate = candidate => {
+		if (candidate !== targetPath || !isFresh()) {
+			throw new Error(`embedded addon validation (${selectedEmbeddedFile.filename}): immutable cache entry changed before load`);
+		}
+	};
 	if (fs.existsSync(targetPath)) {
-		if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath] };
+		if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath], attestCandidate };
 		errors.push(`embedded addon validation (${selectedEmbeddedFile.filename}): immutable cache entry did not match embedded payload`);
 		return noExtraction;
 	}
@@ -415,7 +422,7 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 		} catch {}
 	}
 
-	if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath] };
+	if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath], attestCandidate };
 	errors.push(`embedded addon validation (${selectedEmbeddedFile.filename}): extracted file did not match embedded payload`);
 	return noExtraction;
 }
@@ -578,6 +585,7 @@ export function loadNative() {
 
 	const loaded = loadFromCandidates({
 		candidates: runtimeCandidates,
+		attestCandidate: embeddedExtraction.attestCandidate || undefined,
 		requireCandidate: candidate => require_(candidate),
 		validateCandidate: (bindings, candidate) => validateLoadedBindings(ctx, bindings, candidate),
 		describeCandidate: candidate => candidate,

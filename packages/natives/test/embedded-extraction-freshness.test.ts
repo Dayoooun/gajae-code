@@ -3,6 +3,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	cachedEmbeddedExtractionIsFresh,
 	getImmutableEmbeddedCachePath,
+	loadFromCandidates,
 	resolveRuntimeCandidates,
 } from "../native/loader-state.js";
 
@@ -134,5 +135,52 @@ describe("resolveRuntimeCandidates", () => {
 				validatedCandidates: [],
 			}),
 		).toEqual([]);
+	});
+});
+
+describe("load-time cache attestation", () => {
+	it("rejects a target replaced after extraction validation and before require", () => {
+		const immutablePath = getImmutableEmbeddedCachePath({
+			cacheDir: "/cache",
+			filename: "pi_natives.linux-x64-modern.node",
+			contentHash: currentHash,
+		});
+		expect(immutablePath).not.toBeNull();
+
+		let targetHash = currentHash;
+		expect(
+			cachedEmbeddedExtractionIsFresh({
+				targetPath: immutablePath!,
+				embeddedPath,
+				contentHash: hashes({ [embeddedPath]: currentHash, [immutablePath!]: targetHash }),
+			}),
+		).toBe(true);
+		targetHash = staleHash;
+
+		let required = false;
+		const loaded = loadFromCandidates({
+			candidates: [immutablePath!],
+			attestCandidate: candidate => {
+				if (
+					!cachedEmbeddedExtractionIsFresh({
+						targetPath: candidate,
+						embeddedPath,
+						contentHash: hashes({ [embeddedPath]: currentHash, [immutablePath!]: targetHash }),
+					})
+				) {
+					throw new Error("immutable cache entry changed before load");
+				}
+			},
+			requireCandidate: () => {
+				required = true;
+				return { __piNativesVCurrent: () => undefined };
+			},
+			validateCandidate: () => undefined,
+			describeCandidate: candidate => candidate,
+		});
+
+		expect(required).toBe(false);
+		expect(loaded.bindings).toBeNull();
+		expect(loaded.errors).toEqual([`${immutablePath}: immutable cache entry changed before load`]);
 	});
 });

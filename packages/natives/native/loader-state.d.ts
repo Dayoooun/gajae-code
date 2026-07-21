@@ -59,6 +59,8 @@ export function resolveLoaderCandidates(input: ResolveLoaderCandidatesInput): st
 
 export interface LoadFromCandidatesInput<T> {
 	candidates: string[];
+	/** Runs immediately before loading a candidate and must throw when it is no longer eligible. */
+	attestCandidate?: (candidate: string) => void;
 	requireCandidate: (candidate: string) => T;
 	validateCandidate: (bindings: T, candidate: string) => void;
 	describeCandidate: (candidate: string) => string;

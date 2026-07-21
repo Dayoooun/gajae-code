@@ -21,7 +21,7 @@ function writeExecutable(name: string, body: string): void {
 	fs.chmodSync(target, 0o755);
 }
 
-function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFails?: boolean; bun?: "path" | "failing-link"; tar?: "failing-producer" | "failing-extractor"; markerWriteFails?: boolean } = {}): void {
+function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFails?: boolean; bun?: "path" | "failing-link"; tar?: "failing-producer" | "failing-extractor"; markerWriteFails?: boolean; statusWriteFails?: boolean } = {}): void {
 	writeExecutable(
 		"git",
 		[
@@ -35,6 +35,7 @@ function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFa
 			'if [ "${3:-}" = "status" ]; then [ "${TEST_DIRTY:-}" = "1" ] && printf " M changed\\n"; exit 0; fi',
 			'if [ "${3:-}" = "symbolic-ref" ]; then [ -z "${TEST_HEAD_REF+x}" ] || printf "%s\\n" "$TEST_HEAD_REF"; exit 0; fi',
 			'if [ "${3:-}" = "rev-parse" ] && [ "${4:-}" = "--is-inside-work-tree" ] && [ "${TEST_NOT_GIT:-}" = "1" ]; then exit 1; fi',
+			'if [ "${3:-}" = "rev-parse" ] && [ "${4:-}" = "--show-toplevel" ]; then printf "%s\\n" "${TEST_TOPLEVEL:-$2}"; exit 0; fi',
 			'if [ "${3:-}" = "rev-parse" ]; then printf "%040d\\n" 0; exit 0; fi',
 			"exit 0",
 		].join("\n"),
@@ -63,6 +64,12 @@ function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFa
 		writeExecutable(
 			"mkdir",
 			['if [ "${TEST_MARKER_FAIL_DEST:-}" = "${1:-}" ]; then', '  /bin/mkdir "$@"', '  chmod a-w "$1"', '  exit 0', "fi", 'exec /bin/mkdir "$@"'].join("\n"),
+		);
+	}
+	if (options.statusWriteFails) {
+		writeExecutable(
+			"mktemp",
+			['result=$(/usr/bin/mktemp "$@")', 'case "$result" in *gjc-promotion.*) rmdir "$result" ;; esac', 'printf "%s\\n" "$result"'].join("\n"),
 		);
 	}
 	if (options.tar) {
@@ -138,6 +145,16 @@ describe("install_local_build.sh", () => {
 		result = await run(["--dir", checkout], { TEST_DIRTY: "1" });
 		expect(result.stderr).toContain("not clean");
 	});
+	test("refuses a nested directory of an otherwise valid checkout", async () => {
+		writeTools({ bun: "path" });
+		const checkout = path.join(sandbox.root, "checkout");
+		const nested = path.join(checkout, "nested");
+		fs.mkdirSync(path.join(nested, ".git"), { recursive: true });
+		const result = await run(["--dir", nested], { TEST_TOPLEVEL: checkout });
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr).toContain("checkout root");
+		expect(fs.readFileSync(sandbox.log, "utf8")).not.toContain("<fetch>");
+	});
 
 	test("preserves a concurrent foreign destination and deletes only the temporary clone", async () => {
 		writeTools({ bun: "path" });
@@ -173,6 +190,25 @@ describe("install_local_build.sh", () => {
 		const result = await run(["--dir", destination], { TEST_MARKER_FAIL_DEST: destination });
 		expect(result.exitCode).not.toBe(0);
 		expect(result.stderr).toContain("Could not mark");
+		expect(fs.existsSync(destination)).toBe(false);
+		expect(temporaryClones()).toEqual([]);
+	});
+	test("rolls back a marker-proven destination claim when copy-status bookkeeping fails", async () => {
+		writeTools({ bun: "path", statusWriteFails: true });
+		const destination = path.join(sandbox.root, "failed-status-bookkeeping");
+		const result = await run(["--dir", destination]);
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr).toContain("Could not populate");
+		expect(fs.existsSync(destination)).toBe(false);
+		expect(temporaryClones()).toEqual([]);
+	});
+	test("rolls back a marker-proven claim below a newline-containing parent", async () => {
+		writeTools({ bun: "path", tar: "failing-producer" });
+		const parent = path.join(sandbox.root, "newline\nparent");
+		const destination = path.join(parent, "failed-promotion");
+		const result = await run(["--dir", destination]);
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr).toContain("Could not populate");
 		expect(fs.existsSync(destination)).toBe(false);
 		expect(temporaryClones()).toEqual([]);
 	});
