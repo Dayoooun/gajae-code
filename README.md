@@ -107,13 +107,21 @@ Prebuilt standalone release binaries are published only for:
 
 - **Linux** — x64 and arm64
 - **Windows** — x64
-- **macOS** — Apple Silicon (arm64) and Intel (x64)
+- **macOS** — Apple Silicon (arm64)
+
+Intel (x86_64) macOS no longer has a prebuilt standalone binary. Build it from source with [`scripts/install_local_build.sh`](scripts/install_local_build.sh) (see below).
 
 The npm/Bun package path and build-from-source also remain available on every platform.
 
 ### macOS Intel install
 
-Standalone release binaries are published for both Apple Silicon (`gjc-darwin-arm64`) and Intel (`gjc-darwin-x64`) macOS. You can also install through the npm/Bun package path or build from source:
+Intel (x86_64) macOS no longer ships a prebuilt standalone binary — only Apple Silicon (`gjc-darwin-arm64`) is published. On an Intel Mac, clone and build from source with the local build installer, which installs Bun if needed, builds the native addon, and links `gjc` to the checkout:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install_local_build.sh | sh
+```
+
+You can also install through the npm/Bun package path:
 
 ```sh
 bun install -g gajae-code

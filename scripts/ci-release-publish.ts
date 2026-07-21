@@ -11,7 +11,7 @@
  *   3. Publish only those retained `.tgz` files. Existing same-version packages
  *      are resumed only after registry tarball, raw package/package.json bytes,
  *      SRI, and resolved internal dependencies match expected evidence.
- *   4. Write final closed evidence only after all 14 packages verify.
+ *   4. Write final closed evidence only after all 13 packages verify.
  *
  * Use `--prepare-evidence` first, upload expected evidence to the draft release,
  * then use `--publish-from-evidence --release-serialization-key <shared-cross-version-key>`
@@ -140,7 +140,6 @@ export function parseReleasePublishCli(argv: readonly string[]): ReleasePublishC
 }
 const nativePlatformPackages: readonly PublishPackage[] = [
 	{ dir: "packages/natives-darwin-arm64", kind: "native-platform", nativePrefixes: ["pi_natives.darwin-arm64"] },
-	{ dir: "packages/natives-darwin-x64", kind: "native-platform", nativePrefixes: ["pi_natives.darwin-x64"] },
 	{ dir: "packages/natives-linux-arm64", kind: "native-platform", nativePrefixes: ["pi_natives.linux-arm64"] },
 	{ dir: "packages/natives-linux-x64", kind: "native-platform", nativePrefixes: ["pi_natives.linux-x64"] },
 	{ dir: "packages/natives-win32-x64", kind: "native-platform", nativePrefixes: ["pi_natives.win32-x64"] },

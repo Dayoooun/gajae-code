@@ -30,7 +30,6 @@ export const PUBLIC_PACKAGE_DEFINITIONS: readonly PublicPackageDefinition[] = [
 	{ dir: "packages/coding-agent", name: "@gajae-code/coding-agent" },
 	{ dir: "packages/natives", name: "@gajae-code/natives" },
 	{ dir: "packages/natives-darwin-arm64", name: "@gajae-code/natives-darwin-arm64" },
-	{ dir: "packages/natives-darwin-x64", name: "@gajae-code/natives-darwin-x64" },
 	{ dir: "packages/natives-linux-arm64", name: "@gajae-code/natives-linux-arm64" },
 	{ dir: "packages/natives-linux-x64", name: "@gajae-code/natives-linux-x64" },
 	{ dir: "packages/natives-win32-x64", name: "@gajae-code/natives-win32-x64" },

@@ -70,7 +70,6 @@ function stableRelease(assets?: Array<{ name: string; browser_download_url: stri
 			{ name: "gjc-linux-x64", browser_download_url: "https://assets.example/gjc-linux-x64" },
 			{ name: "gjc-linux-arm64", browser_download_url: "https://assets.example/gjc-linux-arm64" },
 			{ name: "gjc-darwin-arm64", browser_download_url: "https://assets.example/gjc-darwin-arm64" },
-			{ name: "gjc-darwin-x64", browser_download_url: "https://assets.example/gjc-darwin-x64" },
 			{ name: "gjc-windows-x64.exe", browser_download_url: "https://assets.example/gjc-windows-x64.exe" },
 			{ name: "gajae-release-packages-expected-v1.json", browser_download_url: EXPECTED_ASSET_URL },
 			{ name: "gajae-release-packages-v1.json", browser_download_url: FINAL_ASSET_URL },
@@ -357,7 +356,6 @@ describe("public docs/site/version sync guard", () => {
 			{ name: "gjc-linux-x64", browser_download_url: "https://assets.example/gjc-linux-x64" },
 			{ name: "gjc-linux-arm64", browser_download_url: "https://assets.example/gjc-linux-arm64" },
 			{ name: "gjc-darwin-arm64", browser_download_url: "https://assets.example/gjc-darwin-arm64" },
-			{ name: "gjc-darwin-x64", browser_download_url: "https://assets.example/gjc-darwin-x64" },
 			{ name: "gjc-windows-x64.exe", browser_download_url: "https://assets.example/gjc-windows-x64.exe" },
 			{ name: "gajae-release-packages-expected-v1.json", browser_download_url: EXPECTED_ASSET_URL },
 		];

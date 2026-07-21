@@ -116,7 +116,6 @@ describe("unscoped gajae-code package publication", () => {
 		const nativesIndex = publishDirs.indexOf("packages/natives");
 		const platformDirs = [
 			"packages/natives-darwin-arm64",
-			"packages/natives-darwin-x64",
 			"packages/natives-linux-arm64",
 			"packages/natives-linux-x64",
 			"packages/natives-win32-x64",
@@ -171,7 +170,6 @@ describe("unscoped gajae-code package publication", () => {
 		const executedNames: string[] = [];
 		const platformNames = [
 			"@gajae-code/natives-darwin-arm64",
-			"@gajae-code/natives-darwin-x64",
 			"@gajae-code/natives-linux-arm64",
 			"@gajae-code/natives-linux-x64",
 			"@gajae-code/natives-win32-x64",
@@ -224,7 +222,6 @@ describe("unscoped gajae-code package publication", () => {
 		expect(manifest.files?.some((entry) => entry === "native" || entry.endsWith(".node"))).toBe(false);
 		expect(manifest.optionalDependencies).toEqual({
 			"@gajae-code/natives-darwin-arm64": "workspace:*",
-			"@gajae-code/natives-darwin-x64": "workspace:*",
 			"@gajae-code/natives-linux-arm64": "workspace:*",
 			"@gajae-code/natives-linux-x64": "workspace:*",
 			"@gajae-code/natives-win32-x64": "workspace:*",
@@ -234,7 +231,6 @@ describe("unscoped gajae-code package publication", () => {
 	test("native platform package manifests constrain host os and cpu", async () => {
 		const cases: Array<[string, string, string]> = [
 			["packages/natives-darwin-arm64", "darwin", "arm64"],
-			["packages/natives-darwin-x64", "darwin", "x64"],
 			["packages/natives-linux-arm64", "linux", "arm64"],
 			["packages/natives-linux-x64", "linux", "x64"],
 			["packages/natives-win32-x64", "win32", "x64"],
@@ -298,12 +294,12 @@ describe("release bump set equals publish set", () => {
 	});
 });
 describe("immutable stable release contracts", () => {
-	test("publisher configuration equals the closed 14-package evidence definition", () => {
+	test("publisher configuration equals the closed 13-package evidence definition", () => {
 		const publishedDirs = publishPackages.map(pkg => pkg.dir).sort();
 		const evidencedDirs = PUBLIC_PACKAGE_DEFINITIONS.map(definition => definition.dir).sort();
 
-		expect(PUBLIC_PACKAGE_DEFINITIONS).toHaveLength(14);
-		expect(publishPackages).toHaveLength(14);
+		expect(PUBLIC_PACKAGE_DEFINITIONS).toHaveLength(13);
+		expect(publishPackages).toHaveLength(13);
 		expect(publishedDirs).toEqual(evidencedDirs);
 	});
 
@@ -418,15 +414,16 @@ describe("immutable stable release contracts", () => {
 
 
 describe("native release binary coverage", () => {
-	test("release workflow builds Intel macOS (darwin-x64) binaries again", async () => {
+	test("release workflow no longer builds Intel macOS (darwin-x64) binaries", async () => {
 		const workflow = await Bun.file(path.join(repoRoot, ".github/workflows/ci.yml")).text();
 
-		// The deprecated macos-13 runner pool stays retired; Intel coverage now
-		// rides the supported macos-15-intel runner.
+		// Intel macOS prebuilt coverage is retired: the macos-15-intel runner and
+		// the darwin-x64 binary/native targets are gone. Intel users build from
+		// source via scripts/install_local_build.sh.
 		expect(workflow).not.toContain("{ os: macos-13, platform: darwin, arch: x64 }");
-		expect(workflow).toContain("{ os: macos-15-intel, platform: darwin, arch: x64, variant: baseline }");
-		expect(workflow).toContain("target_id: darwin-x64");
-		expect(workflow).toContain("binary_path: packages/coding-agent/binaries/gjc-darwin-x64");
+		expect(workflow).not.toContain("macos-15-intel");
+		expect(workflow).not.toContain("target_id: darwin-x64");
+		expect(workflow).not.toContain("binary_path: packages/coding-agent/binaries/gjc-darwin-x64");
 		expect(workflow).toContain("{ os: macos-14, platform: darwin, arch: arm64 }");
 		expect(workflow).toContain("target_id: darwin-arm64");
 		expect(workflow).toContain("pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*");
@@ -484,7 +481,7 @@ describe("native release binary coverage", () => {
 		}
 
 		// libc is a linux-only selector; other platform packages must not set it.
-		for (const dir of ["packages/natives-darwin-arm64", "packages/natives-darwin-x64", "packages/natives-win32-x64"]) {
+		for (const dir of ["packages/natives-darwin-arm64", "packages/natives-win32-x64"]) {
 			const manifest = await readManifest(dir);
 			expect(manifest.libc).toBeUndefined();
 		}

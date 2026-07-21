@@ -237,6 +237,7 @@ install_binary() {
         echo "Fallback options:"
         echo "  - Install via Bun/npm source package: bun install -g gajae-code"
         echo "  - Re-run this installer with --source to build/use the npm package path"
+        echo "  - Clone & build from source (recommended for Intel macOS): curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install_local_build.sh | sh"
         echo "  - Choose a release that publishes ${BINARY}"
         echo "Expected asset URL: $BINARY_URL"
         exit 1

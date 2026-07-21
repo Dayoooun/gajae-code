@@ -86,7 +86,6 @@ const STABLE_BINARY_ASSETS = [
 	"gjc-linux-x64",
 	"gjc-linux-arm64",
 	"gjc-darwin-arm64",
-	"gjc-darwin-x64",
 	"gjc-windows-x64.exe",
 ] as const;
 const STABLE_TAG_RE = /^v(\d+\.\d+\.\d+)$/;
