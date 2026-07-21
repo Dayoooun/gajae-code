@@ -31,6 +31,12 @@ ORIGINAL_HEAD=""
 ORIGINAL_REF=""
 PROMOTION_MARKER=""
 PROMOTION_TOKEN=""
+
+remove_owned_destination() {
+	if [ -n "$PROMOTION_MARKER" ] && [ -n "$PROMOTION_TOKEN" ] && [ -f "$PROMOTION_MARKER" ] && IFS= read -r marker_token < "$PROMOTION_MARKER" && [ "$marker_token" = "$PROMOTION_TOKEN" ]; then
+		rm -rf "$DEST_DIR" || echo "cleanup: could not remove the failed destination claim." >&2
+	fi
+}
 cleanup() {
 	status=$?
 	trap - 0 HUP INT TERM
@@ -247,12 +253,6 @@ prepare_checkout() {
 	SRC_DIR=$TEMP_CLONE
 	run_git "fetch" -C "$SRC_DIR" fetch --tags origin
 	checkout_commit
-}
-
-remove_owned_destination() {
-	if [ -n "$PROMOTION_MARKER" ] && [ -n "$PROMOTION_TOKEN" ] && [ -f "$PROMOTION_MARKER" ] && IFS= read -r marker_token < "$PROMOTION_MARKER" && [ "$marker_token" = "$PROMOTION_TOKEN" ]; then
-		rm -rf "$DEST_DIR" || echo "cleanup: could not remove the failed destination claim." >&2
-	fi
 }
 
 promote_clone() {

@@ -122,15 +122,21 @@ beforeEach(() => {
 afterEach(() => fs.rmSync(sandbox.root, { recursive: true, force: true }));
 
 describe("install_local_build.sh", () => {
-	test("validates option arity, refs, and option-like destinations before filesystem tools", async () => {
+	test("preserves invalid argument failures without cleanup errors", async () => {
 		writeTools({ bun: "path" });
-		for (const args of [["--ref"], ["--ref", "-branch"], ["--ref", "branch name"], ["--dir", "-destination"]]) {
+		for (const [args, expectedStderr] of [
+			[["--ref"], "argument parsing: Option --ref requires a value.\n"],
+			[["--ref", "-branch"], "argument parsing: Ref must not be empty, start with '-', or contain whitespace.\n"],
+			[["--ref", "branch name"], "argument parsing: Ref must not be empty, start with '-', or contain whitespace.\n"],
+			[["--dir", "-destination"], "argument parsing: Destination must not be empty or start with '-'.\n"],
+		] as const) {
 			const result = await run(args);
-			expect(result.exitCode).not.toBe(0);
-			expect(result.stderr).toContain("argument parsing");
+			expect(result.exitCode).toBe(1);
+			expect(result.stderr).toBe(expectedStderr);
 		}
 		const environmentDestination = await run([], { GJC_SRC_DIR: "-environment-destination" });
-		expect(environmentDestination.exitCode).not.toBe(0);
+		expect(environmentDestination.exitCode).toBe(1);
+		expect(environmentDestination.stderr).toBe("argument parsing: Destination must not be empty or start with '-'.\n");
 		expect(fs.readFileSync(sandbox.log, "utf8")).toBe("");
 	});
 

@@ -204,25 +204,32 @@ export function resolveLoaderCandidates({
  *   candidates: string[];
  *   attestCandidate?: (candidate: string) => void;
  *   bindCandidate?: (candidate: string) => string;
- *   bindCandidate?: (candidate: string) => string;
+ *   cleanupCandidate?: (candidate: string) => void;
  *   requireCandidate: (candidate: string) => T;
  *   validateCandidate: (bindings: T, candidate: string) => void;
  *   describeCandidate: (candidate: string) => string;
  * }} input
  * @returns {{ bindings: T | null; errors: string[] }}
  */
-export function loadFromCandidates({ candidates, attestCandidate, bindCandidate, requireCandidate, validateCandidate, describeCandidate }) {
+export function loadFromCandidates({ candidates, attestCandidate, bindCandidate, cleanupCandidate, requireCandidate, validateCandidate, describeCandidate }) {
 	const errors = [];
 	for (const candidate of candidates) {
+		let loadCandidate;
 		try {
 			attestCandidate?.(candidate);
-			const loadCandidate = bindCandidate ? bindCandidate(candidate) : candidate;
+			loadCandidate = bindCandidate ? bindCandidate(candidate) : candidate;
 			const bindings = requireCandidate(loadCandidate);
 			validateCandidate(bindings, candidate);
 			return { bindings, errors };
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			errors.push(`${describeCandidate(candidate)}: ${message}`);
+		} finally {
+			if (loadCandidate) {
+				try {
+					cleanupCandidate?.(loadCandidate);
+				} catch {}
+			}
 		}
 	}
 	return { bindings: null, errors };
@@ -275,6 +282,92 @@ export function resolveRuntimeCandidates({
 	const allowed = candidate => !validated || validated.has(candidate);
 	const prepended = [embeddedCandidate, stagedCandidate].filter(candidate => typeof candidate === "string" && allowed(candidate));
 	return [...new Set([...prepended, ...candidates.filter(allowed)])];
+}
+
+const PRIVATE_LOAD_DIR_PREFIX = ".pi-natives-load-";
+const deferredPrivateLoadDirs = new Set();
+let privateLoadExitCleanupRegistered = false;
+
+/**
+ * Remove abandoned private load directories left by a previous process. Only
+ * directories bearing the loader-owned prefix are eligible for removal.
+ * @param {{ cacheDir: string }} input
+ * @returns {number}
+ */
+export function prunePrivateLoadDirectories({ cacheDir }) {
+	let entries;
+	try {
+		entries = fs.readdirSync(cacheDir, { withFileTypes: true });
+	} catch {
+		return 0;
+	}
+
+	let removed = 0;
+	for (const entry of entries) {
+		if (!entry.isDirectory() || !entry.name.startsWith(PRIVATE_LOAD_DIR_PREFIX)) continue;
+		try {
+			fs.rmSync(path.join(cacheDir, entry.name), { recursive: true, force: true });
+			removed++;
+		} catch {
+			// A Windows process can retain the loaded .node until it exits. Keep it
+			// for the next startup rather than risking an unsafe cleanup attempt.
+		}
+	}
+	return removed;
+}
+
+/**
+ * Clean a one-use, attested addon copy. Windows keeps loaded native modules
+ * locked, so its deletion is deferred to process exit and retried at startup.
+ * @param {{ loadDir: string; platform?: NodeJS.Platform | string }} input
+ */
+export function cleanupPrivateLoadDirectory({ loadDir, platform = process.platform }) {
+	if (platform === "win32") {
+		deferredPrivateLoadDirs.add(loadDir);
+		if (!privateLoadExitCleanupRegistered) {
+			privateLoadExitCleanupRegistered = true;
+			process.once("exit", () => {
+				for (const deferredLoadDir of deferredPrivateLoadDirs) {
+					try {
+						fs.rmSync(deferredLoadDir, { recursive: true, force: true });
+					} catch {}
+				}
+			});
+		}
+		return;
+	}
+	try {
+		fs.rmSync(loadDir, { recursive: true, force: true });
+	} catch {}
+}
+
+function createPrivateLoadBinding(ctx, expectedCandidate, filename, contentHash, label) {
+	const loadDirs = new Map();
+	const bindCandidate = candidate => {
+		let loadDir;
+		if (candidate !== expectedCandidate) throw new Error(`${label} (${filename}): unexpected cache entry`);
+		try {
+			const candidateBytes = fs.readFileSync(candidate);
+			if (createHash("sha256").update(candidateBytes).digest("hex") !== contentHash) {
+				throw new Error(`${label} (${filename}): immutable cache entry changed before load`);
+			}
+			loadDir = fs.mkdtempSync(path.join(ctx.versionedDir, PRIVATE_LOAD_DIR_PREFIX));
+			const loadPath = path.join(loadDir, filename);
+			fs.writeFileSync(loadPath, candidateBytes, { flag: "wx", mode: 0o500 });
+			loadDirs.set(loadPath, loadDir);
+			return loadPath;
+		} catch (err) {
+			if (loadDir) cleanupPrivateLoadDirectory({ loadDir });
+			throw err;
+		}
+	};
+	const cleanupCandidate = loadPath => {
+		const loadDir = loadDirs.get(loadPath);
+		if (!loadDir) return;
+		loadDirs.delete(loadPath);
+		cleanupPrivateLoadDirectory({ loadDir });
+	};
+	return { bindCandidate, cleanupCandidate };
 }
 
 // =========================================================================
@@ -364,7 +457,7 @@ function selectEmbeddedAddonFile(selectedVariant) {
  * standalone parent without admitting mutable versioned cache filenames.
  */
 function maybeCacheLocalCompiledAddon(ctx, errors) {
-	const noExtraction = { candidate: null, validatedCandidates: [], bindCandidate: null };
+	const noExtraction = { candidate: null, validatedCandidates: [], bindCandidate: null, cleanupCandidate: null };
 	if (!ctx.isCompiledBinary || embeddedAddon) return noExtraction;
 
 	for (const filename of ctx.addonFilenames) {
@@ -385,28 +478,13 @@ function maybeCacheLocalCompiledAddon(ctx, errors) {
 				return false;
 			}
 		};
-		const bindCandidate = candidate => {
-			if (candidate !== targetPath) throw new Error(`local addon validation (${filename}): unexpected cache entry`);
-			let loadDir;
-			try {
-				// Do not pass a shared cache pathname to the loader: it can be replaced
-				// after its hash was checked. Bind freshly-read, attested bytes instead.
-				const candidateBytes = fs.readFileSync(candidate);
-				if (createHash("sha256").update(candidateBytes).digest("hex") !== contentHash)
-					throw new Error(`local addon validation (${filename}): immutable cache entry changed before load`);
-				loadDir = fs.mkdtempSync(path.join(ctx.versionedDir, ".pi-natives-load-"));
-				const loadPath = path.join(loadDir, filename);
-				fs.writeFileSync(loadPath, candidateBytes, { flag: "wx", mode: 0o500 });
-				return loadPath;
-			} catch (err) {
-				if (loadDir) {
-					try {
-						fs.rmSync(loadDir, { recursive: true, force: true });
-					} catch {}
-				}
-				throw err;
-			}
-		};
+		const { bindCandidate, cleanupCandidate } = createPrivateLoadBinding(
+			ctx,
+			targetPath,
+			filename,
+			contentHash,
+			"local addon validation",
+		);
 		if (!fs.existsSync(targetPath)) {
 			try {
 				fs.mkdirSync(ctx.versionedDir, { recursive: true });
@@ -424,14 +502,14 @@ function maybeCacheLocalCompiledAddon(ctx, errors) {
 				errors.push(`local addon write (${filename}): ${message}`);
 			}
 		}
-		if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath], bindCandidate };
+		if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath], bindCandidate, cleanupCandidate };
 		errors.push(`local addon validation (${filename}): immutable cache entry did not match built artifact`);
 	}
 	return noExtraction;
 }
 
 function maybeExtractEmbeddedAddon(ctx, errors) {
-	const noExtraction = { candidate: null, validatedCandidates: [], bindCandidate: null };
+	const noExtraction = { candidate: null, validatedCandidates: [], bindCandidate: null, cleanupCandidate: null };
 	if (!ctx.isCompiledBinary || !embeddedAddon) return noExtraction;
 	if (embeddedAddon.platformTag !== ctx.platformTag || embeddedAddon.version !== ctx.packageVersion) return noExtraction;
 
@@ -464,34 +542,15 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 		}
 	};
 	const isFresh = () => contentHash(targetPath) === embeddedHash;
-	const bindCandidate = candidate => {
-		if (candidate !== targetPath) {
-			throw new Error(`embedded addon validation (${selectedEmbeddedFile.filename}): unexpected cache entry`);
-		}
-
-		let loadDir;
-		try {
-			// The content-addressed cache path can be replaced after validation. Copy
-			// validated bytes into a fresh 0700 directory, then load only that path.
-			loadDir = fs.mkdtempSync(path.join(ctx.versionedDir, ".pi-natives-load-"));
-			const loadPath = path.join(loadDir, selectedEmbeddedFile.filename);
-			const candidateBytes = fs.readFileSync(candidate);
-			if (createHash("sha256").update(candidateBytes).digest("hex") !== embeddedHash) {
-				throw new Error(`embedded addon validation (${selectedEmbeddedFile.filename}): immutable cache entry changed before load`);
-			}
-			fs.writeFileSync(loadPath, candidateBytes, { flag: "wx", mode: 0o500 });
-			return loadPath;
-		} catch (err) {
-			if (loadDir) {
-				try {
-					fs.rmSync(loadDir, { recursive: true, force: true });
-				} catch {}
-			}
-			throw err;
-		}
-	};
+	const { bindCandidate, cleanupCandidate } = createPrivateLoadBinding(
+		ctx,
+		targetPath,
+		selectedEmbeddedFile.filename,
+		embeddedHash,
+		"embedded addon validation",
+	);
 	if (fs.existsSync(targetPath)) {
-		if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath], bindCandidate };
+		if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath], bindCandidate, cleanupCandidate };
 		errors.push(`embedded addon validation (${selectedEmbeddedFile.filename}): immutable cache entry did not match embedded payload`);
 		return noExtraction;
 	}
@@ -519,7 +578,7 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 		} catch {}
 	}
 
-	if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath], bindCandidate };
+	if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath], bindCandidate, cleanupCandidate };
 	errors.push(`embedded addon validation (${selectedEmbeddedFile.filename}): extracted file did not match embedded payload`);
 	return noExtraction;
 }
@@ -602,6 +661,7 @@ function initLoaderContext(require_) {
 	const nativeDir = path.join(import.meta.dir, "..", "native");
 	const execDir = path.dirname(process.execPath);
 	const versionedDir = path.join(getNativesDir(), packageVersion);
+	prunePrivateLoadDirectories({ cacheDir: versionedDir });
 	const userDataDir =
 		process.platform === "win32"
 			? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "gjc")
@@ -684,6 +744,7 @@ export function loadNative() {
 	const loaded = loadFromCandidates({
 		candidates: runtimeCandidates,
 		bindCandidate: attestedAddon.bindCandidate || undefined,
+		cleanupCandidate: attestedAddon.cleanupCandidate || undefined,
 		requireCandidate: candidate => require_(candidate),
 		validateCandidate: (bindings, candidate) => validateLoadedBindings(ctx, bindings, candidate),
 		describeCandidate: candidate => candidate,

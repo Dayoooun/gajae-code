@@ -63,6 +63,8 @@ export interface LoadFromCandidatesInput<T> {
 	attestCandidate?: (candidate: string) => void;
 	/** Binds a validated candidate to the stable path passed to the module loader. */
 	bindCandidate?: (candidate: string) => string;
+	/** Runs after every bound load attempt, including validation and require failures. */
+	cleanupCandidate?: (candidate: string) => void;
 	requireCandidate: (candidate: string) => T;
 	validateCandidate: (bindings: T, candidate: string) => void;
 	describeCandidate: (candidate: string) => string;
@@ -101,5 +103,13 @@ export interface ResolveRuntimeCandidatesInput {
 }
 
 export function resolveRuntimeCandidates(input: ResolveRuntimeCandidatesInput): string[];
+
+export interface PrivateLoadDirectoryInput {
+	loadDir: string;
+	platform?: NodeJS.Platform | string;
+}
+
+export function cleanupPrivateLoadDirectory(input: PrivateLoadDirectoryInput): void;
+export function prunePrivateLoadDirectories(input: { cacheDir: string }): number;
 
 export function loadNative(): Record<string, unknown>;

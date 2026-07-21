@@ -1,9 +1,15 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
 import { describe, expect, it } from "bun:test";
 
 import {
 	cachedEmbeddedExtractionIsFresh,
+	cleanupPrivateLoadDirectory,
 	getImmutableEmbeddedCachePath,
 	loadFromCandidates,
+	prunePrivateLoadDirectories,
 	resolveRuntimeCandidates,
 } from "../native/loader-state.js";
 
@@ -162,12 +168,14 @@ describe("load-time cache attestation", () => {
 
 		const privateLoadPath = "/private/pi-natives-load-123/pi_natives.linux-x64-modern.node";
 		let requiredPath: string | null = null;
+		const cleanedPaths: string[] = [];
 		const loaded = loadFromCandidates({
 			candidates: [immutablePath!],
 			bindCandidate: candidate => {
 				expect(candidate).toBe(immutablePath);
 				return privateLoadPath;
 			},
+			cleanupCandidate: candidate => cleanedPaths.push(candidate),
 			requireCandidate: candidate => {
 				// Simulate a concurrent replacement precisely as loading begins.
 				targetHash = staleHash;
@@ -180,7 +188,47 @@ describe("load-time cache attestation", () => {
 
 		expect(targetHash).toBe(staleHash);
 		expect(requiredPath).toBe(privateLoadPath);
+		expect(cleanedPaths).toEqual([privateLoadPath]);
 		expect(loaded.errors).toEqual([]);
 		expect(loaded.bindings).not.toBeNull();
+	});
+
+	it("cleans a private copy after a failed load attempt", () => {
+		const privateLoadPath = "/private/pi-natives-load-456/pi_natives.linux-x64-modern.node";
+		const cleanedPaths: string[] = [];
+		const loaded = loadFromCandidates({
+			candidates: ["/cache/pi_natives.linux-x64-modern.node"],
+			bindCandidate: () => privateLoadPath,
+			cleanupCandidate: candidate => cleanedPaths.push(candidate),
+			requireCandidate: () => {
+				throw new Error("native load failed");
+			},
+			validateCandidate: () => undefined,
+			describeCandidate: candidate => candidate,
+		});
+
+		expect(loaded.bindings).toBeNull();
+		expect(cleanedPaths).toEqual([privateLoadPath]);
+	});
+
+	it("defers Windows cleanup and prunes only loader-owned directories at startup", () => {
+		const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-natives-private-load-"));
+		const deferredDir = path.join(cacheDir, ".pi-natives-load-locked");
+		const staleDir = path.join(cacheDir, ".pi-natives-load-stale");
+		const unrelatedDir = path.join(cacheDir, "keep-me");
+		try {
+			fs.mkdirSync(deferredDir);
+			fs.mkdirSync(staleDir);
+			fs.mkdirSync(unrelatedDir);
+
+			cleanupPrivateLoadDirectory({ loadDir: deferredDir, platform: "win32" });
+			expect(fs.existsSync(deferredDir)).toBe(true);
+			expect(prunePrivateLoadDirectories({ cacheDir })).toBe(2);
+			expect(fs.existsSync(deferredDir)).toBe(false);
+			expect(fs.existsSync(staleDir)).toBe(false);
+			expect(fs.existsSync(unrelatedDir)).toBe(true);
+		} finally {
+			fs.rmSync(cacheDir, { recursive: true, force: true });
+		}
 	});
 });
