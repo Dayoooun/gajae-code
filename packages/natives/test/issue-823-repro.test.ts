@@ -201,7 +201,9 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 		});
 
 		expect(candidates).toContain(path.join(nativeDir, filename));
-		expect(candidates).not.toContain("/repo/node_modules/@gajae-code/natives-darwin-x64/native/pi_natives.darwin-x64-modern.node");
+		expect(candidates).not.toContain(
+			"/repo/node_modules/@gajae-code/natives-darwin-x64/native/pi_natives.darwin-x64-modern.node",
+		);
 	});
 	it("prefers the current workspace addon over a stale optional package addon", () => {
 		const localDir = "/repo/packages/natives/native";

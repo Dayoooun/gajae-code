@@ -83,7 +83,8 @@ export interface ResolveRuntimeCandidatesInput {
 	candidates: string[];
 	embeddedCandidate?: string | null;
 	stagedCandidate?: string | null;
-	rejectedCandidates?: string[];
+	versionedDir?: string;
+	validatedVersionedCandidates?: string[];
 }
 
 export function resolveRuntimeCandidates(input: ResolveRuntimeCandidatesInput): string[];

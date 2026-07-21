@@ -241,21 +241,25 @@ export function cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath, cont
 }
 
 /**
- * Build the candidate list after embedded extraction. A versioned cache entry
- * rejected as stale is excluded even when replacement fails, so it cannot be
- * loaded as a fallback.
- * @param {{ candidates: string[]; embeddedCandidate?: string | null; stagedCandidate?: string | null; rejectedCandidates?: string[] }} input
+ * Build the candidate list after embedded extraction. In compiled mode, only
+ * versioned cache entries whose content was validated against the selected
+ * embedded payload may be loaded; every other sibling is excluded.
+ * @param {{ candidates: string[]; embeddedCandidate?: string | null; stagedCandidate?: string | null; versionedDir?: string; validatedVersionedCandidates?: string[] }} input
  * @returns {string[]}
  */
 export function resolveRuntimeCandidates({
 	candidates,
 	embeddedCandidate = null,
 	stagedCandidate = null,
-	rejectedCandidates = [],
+	versionedDir,
+	validatedVersionedCandidates,
 }) {
-	const rejected = new Set(rejectedCandidates);
+	const validated = validatedVersionedCandidates && new Set(validatedVersionedCandidates);
 	const prepended = [embeddedCandidate, stagedCandidate].filter(candidate => typeof candidate === "string");
-	return [...new Set([...prepended, ...candidates.filter(candidate => !rejected.has(candidate))])];
+	const allowedCandidates = candidates.filter(candidate =>
+		!validated || path.dirname(candidate) !== versionedDir || validated.has(candidate),
+	);
+	return [...new Set([...prepended.filter(candidate => !validated || path.dirname(candidate) !== versionedDir || validated.has(candidate)), ...allowedCandidates])];
 }
 
 // =========================================================================
@@ -339,30 +343,24 @@ function selectEmbeddedAddonFile(selectedVariant) {
 }
 
 function maybeExtractEmbeddedAddon(ctx, errors) {
-	const noExtraction = { candidate: null, rejectedCandidates: [] };
+	const noExtraction = { candidate: null, validatedVersionedCandidates: [] };
 	if (!ctx.isCompiledBinary || !embeddedAddon) return noExtraction;
 	if (embeddedAddon.platformTag !== ctx.platformTag || embeddedAddon.version !== ctx.packageVersion) return noExtraction;
 
 	const selectedEmbeddedFile = selectEmbeddedAddonFile(ctx.selectedVariant);
 	if (!selectedEmbeddedFile) return noExtraction;
 	const targetPath = path.join(ctx.versionedDir, selectedEmbeddedFile.filename);
-	let rejectedCandidates = [];
-	if (fs.existsSync(targetPath)) {
-		// Guard against intra-version drift: a cached extraction written by an earlier
-		// build of the same version carries the same version sentinel but can expose a
-		// different native surface (e.g. a symbol added mid-cycle). The embedded addon
-		// is the source of truth, so reuse only an identical payload.
-		const contentHash = candidate => {
-			try {
-				return createHash("sha256").update(fs.readFileSync(candidate)).digest("hex");
-			} catch {
-				return null;
-			}
-		};
-		if (cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath: selectedEmbeddedFile.filePath, contentHash })) {
-			return { candidate: targetPath, rejectedCandidates };
+	const contentHash = candidate => {
+		try {
+			return createHash("sha256").update(fs.readFileSync(candidate)).digest("hex");
+		} catch {
+			return null;
 		}
-		rejectedCandidates = [targetPath];
+	};
+	const isFresh = () =>
+		cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath: selectedEmbeddedFile.filePath, contentHash });
+	if (fs.existsSync(targetPath) && isFresh()) {
+		return { candidate: targetPath, validatedVersionedCandidates: [targetPath] };
 	}
 
 	try {
@@ -370,7 +368,7 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		errors.push(`embedded addon dir: ${message}`);
-		return { candidate: null, rejectedCandidates };
+		return noExtraction;
 	}
 
 	try {
@@ -378,12 +376,15 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 		const tempPath = `${targetPath}.tmp.${process.pid}`;
 		fs.writeFileSync(tempPath, buffer);
 		fs.renameSync(tempPath, targetPath);
-		return { candidate: targetPath, rejectedCandidates };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		errors.push(`embedded addon write (${selectedEmbeddedFile.filename}): ${message}`);
-		return { candidate: null, rejectedCandidates };
+		return noExtraction;
 	}
+
+	if (isFresh()) return { candidate: targetPath, validatedVersionedCandidates: [targetPath] };
+	errors.push(`embedded addon validation (${selectedEmbeddedFile.filename}): extracted file did not match embedded payload`);
+	return noExtraction;
 }
 
 /**
@@ -547,7 +548,8 @@ export function loadNative() {
 		candidates: ctx.candidates,
 		embeddedCandidate: embeddedExtraction.candidate,
 		stagedCandidate,
-		rejectedCandidates: embeddedExtraction.rejectedCandidates,
+		versionedDir: ctx.isCompiledBinary ? ctx.versionedDir : undefined,
+		validatedVersionedCandidates: ctx.isCompiledBinary ? embeddedExtraction.validatedVersionedCandidates : undefined,
 	});
 
 	const loaded = loadFromCandidates({

@@ -28,7 +28,6 @@ TEMP_BUN_INSTALLER=""
 REUSED_CHECKOUT=""
 ORIGINAL_HEAD=""
 ORIGINAL_REF=""
-
 cleanup() {
 	status=$?
 	trap - 0 HUP INT TERM
@@ -200,6 +199,12 @@ save_reused_checkout() {
 	[ -z "$worktree_status" ] || fail "destination validation" "Existing checkout is not clean."
 	ORIGINAL_HEAD=$(git -C "$SRC_DIR" rev-parse --verify HEAD) || fail "destination validation" "Could not record the existing checkout commit."
 	ORIGINAL_REF=$(git -C "$SRC_DIR" symbolic-ref -q HEAD || true)
+	# Store a physical absolute path before later commands change directories. This
+	# keeps failure cleanup pointed at this worktree when the caller used a relative path.
+	if ! SRC_DIR=$(CDPATH= cd "$SRC_DIR" && pwd -P); then
+		fail "destination validation" "Could not canonicalize the existing checkout path."
+	fi
+
 	REUSED_CHECKOUT=1
 }
 
@@ -232,13 +237,30 @@ prepare_checkout() {
 }
 
 promote_clone() {
-	# mkdir is an exclusive claim: unlike mv, it cannot turn a concurrent foreign
-	# destination into a nested checkout. The destination is never removed by cleanup.
+	# Claim the final directory exclusively before copying. A unique marker proves
+	# that a failed copy may roll back only this invocation's claim; an existing or
+	# concurrently-created destination is never removed.
+	PROMOTION_TOKEN="${TEMP_CLONE}.$$"
+	PROMOTION_MARKER="$DEST_DIR/.gajae-code-install-owner"
 	if ! mkdir "$DEST_DIR"; then
 		fail "promotion" "Destination appeared while preparing the clone; it was left untouched: $DEST_DIR"
 	fi
-	if (cd "$TEMP_CLONE" && tar cf - .) | (cd "$DEST_DIR" && tar xpf -); then :; else
+	if ! printf '%s\n' "$PROMOTION_TOKEN" > "$PROMOTION_MARKER"; then
+		fail "promotion" "Could not mark the claimed destination."
+	fi
+	if (cd "$TEMP_CLONE" && tar cf - .) | (cd "$DEST_DIR" && tar xpf -); then
+		:
+	else
+		if [ -f "$PROMOTION_MARKER" ] && IFS= read -r marker_token < "$PROMOTION_MARKER" && [ "$marker_token" = "$PROMOTION_TOKEN" ]; then
+			rm -rf "$DEST_DIR" || echo "cleanup: could not remove the failed destination claim." >&2
+		fi
 		fail "promotion" "Could not populate the claimed destination."
+	fi
+	if ! rm -f "$PROMOTION_MARKER"; then
+		if [ -f "$PROMOTION_MARKER" ] && IFS= read -r marker_token < "$PROMOTION_MARKER" && [ "$marker_token" = "$PROMOTION_TOKEN" ]; then
+			rm -rf "$DEST_DIR" || echo "cleanup: could not remove the failed destination claim." >&2
+		fi
+		fail "promotion" "Could not finalize the claimed destination."
 	fi
 	rm -rf "$TEMP_CLONE"
 	TEMP_CLONE=""
@@ -248,7 +270,7 @@ promote_clone() {
 DEST_DIR=$SRC_DIR
 if ! has_cmd git; then fail "preconditions" "git is required to clone the repository. Install git and re-run."; fi
 prepare_checkout
-if [ -n "$TEMP_CLONE" ]; then promote_clone; else SRC_DIR=$DEST_DIR; fi
+if [ -n "$TEMP_CLONE" ]; then promote_clone; fi
 
 cd "$SRC_DIR" || fail "build preparation" "Could not enter $SRC_DIR."
 require_bun

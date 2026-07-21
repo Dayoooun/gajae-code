@@ -21,7 +21,7 @@ function writeExecutable(name: string, body: string): void {
 	fs.chmodSync(target, 0o755);
 }
 
-function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFails?: boolean; bun?: "path" | "failing-link" } = {}): void {
+function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFails?: boolean; bun?: "path" | "failing-link"; tar?: "failing-copy" } = {}): void {
 	writeExecutable(
 		"git",
 		[
@@ -59,10 +59,14 @@ function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFa
 			].join("\n"),
 		);
 	}
+	if (options.tar) {
+		writeExecutable("tar", ['[ "${1:-}" = "xpf" ] && { printf partial > partial-copy; exit 44; }', "exit 0"].join("\n"));
+	}
 }
 
 async function run(args: string[], extra: Record<string, string> = {}) {
 	const proc = Bun.spawn(["sh", installer, ...args], {
+		cwd: repoRoot,
 		env: { PATH: `${sandbox.bin}:/usr/bin:/bin`, HOME: sandbox.home, TMPDIR: sandbox.root, TEST_LOG: sandbox.log, BUN_INSTALL: path.join(sandbox.root, "bun home"), ...extra },
 		stdout: "pipe",
 		stderr: "pipe",
@@ -132,7 +136,15 @@ describe("install_local_build.sh", () => {
 		expect(fs.readdirSync(destination)).toEqual(["keep"]);
 		expect(temporaryClones()).toEqual([]);
 	});
-
+	test("rolls back an ownership-proven destination claim after a copy failure", async () => {
+		writeTools({ bun: "path", tar: "failing-copy" });
+		const destination = path.join(sandbox.root, "failed-copy");
+		const result = await run(["--dir", destination]);
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr).toContain("Could not populate");
+		expect(fs.existsSync(destination)).toBe(false);
+		expect(temporaryClones()).toEqual([]);
+	});
 	test("cleans an invocation-owned partial clone after clone failure", async () => {
 		writeTools({ cloneFails: true, bun: "path" });
 		const result = await run(["--dir", path.join(sandbox.root, "destination")]);
@@ -166,24 +178,32 @@ describe("install_local_build.sh", () => {
 		expect(log).not.toContain("dev:link");
 	});
 
-	test("restores reused regular and linked worktrees after a link failure", async () => {
+	test("restores relative regular and linked worktrees after a link failure", async () => {
 		writeTools({ bun: "failing-link" });
 		const freshDestination = path.join(sandbox.root, "failed-link");
 		let result = await run(["--dir", freshDestination]);
 		expect(result.exitCode).not.toBe(0);
 		expect(fs.existsSync(freshDestination)).toBe(true);
 		expect(temporaryClones()).toEqual([]);
-		for (const linked of [false, true]) {
+		for (const { linked, headRef } of [
+			{ linked: false, headRef: "refs/heads/main" },
+			{ linked: true, headRef: undefined },
+		]) {
 			fs.writeFileSync(sandbox.log, "");
 			const checkout = path.join(sandbox.root, linked ? "linked" : "regular");
 			fs.mkdirSync(checkout);
 			if (linked) fs.writeFileSync(path.join(checkout, ".git"), "gitdir: /elsewhere");
 			else fs.mkdirSync(path.join(checkout, ".git"));
-			const result = await run(["--dir", checkout], { TEST_HEAD_REF: "refs/heads/main" });
+			const relativeCheckout = path.relative(repoRoot, checkout);
+			result = await run(["--dir", relativeCheckout], headRef ? { TEST_HEAD_REF: headRef } : {});
 			expect(result.exitCode).not.toBe(0);
 			expect(result.stderr).toContain("linking");
 			const log = fs.readFileSync(sandbox.log, "utf8");
-			expect(log).toContain("<checkout> <--quiet> <refs/heads/main>");
+			if (headRef) {
+				expect(log).toContain(`git <-C> <${checkout}> <checkout> <--quiet> <${headRef}>`);
+			} else {
+				expect(log).toContain(`git <-C> <${checkout}> <checkout> <--quiet> <--detach> <${"0".repeat(40)}>`);
+			}
 			expect(temporaryClones()).toEqual([]);
 		}
 	});

@@ -51,12 +51,28 @@ describe("cachedEmbeddedExtractionIsFresh", () => {
 });
 
 describe("resolveRuntimeCandidates", () => {
-	it("does not fall back to a rejected versioned target when its replacement fails", () => {
+	it("excludes every unvalidated versioned sibling when replacement fails", () => {
+		const modernPath = "/cache/pi_natives.linux-x64-modern.node";
+		const baselinePath = "/cache/pi_natives.linux-x64-baseline.node";
 		expect(
 			resolveRuntimeCandidates({
-				candidates: [cachedPath, "/legacy/pi_natives.node"],
-				rejectedCandidates: [cachedPath],
+				candidates: [modernPath, baselinePath, "/legacy/pi_natives.node"],
+				versionedDir: "/cache",
+				validatedVersionedCandidates: [],
 			}),
 		).toEqual(["/legacy/pi_natives.node"]);
+	});
+
+	it("permits only the content-validated versioned candidate", () => {
+		const modernPath = "/cache/pi_natives.linux-x64-modern.node";
+		const baselinePath = "/cache/pi_natives.linux-x64-baseline.node";
+		expect(
+			resolveRuntimeCandidates({
+				candidates: [modernPath, baselinePath, "/legacy/pi_natives.node"],
+				embeddedCandidate: modernPath,
+				versionedDir: "/cache",
+				validatedVersionedCandidates: [modernPath],
+			}),
+		).toEqual([modernPath, "/legacy/pi_natives.node"]);
 	});
 });
