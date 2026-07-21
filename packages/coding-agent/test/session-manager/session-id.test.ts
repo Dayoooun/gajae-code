@@ -294,9 +294,11 @@ describe("SessionManager session ids", () => {
 			expect(session.getSessionId()).toBe(oldSessionId);
 			const entries = await fs.readdir(path.dirname(oldSessionFile));
 			expect(entries.filter(entry => entry.endsWith(".jsonl"))).toEqual([path.basename(oldSessionFile)]);
-			expect(entries.filter(entry => !entry.startsWith(".") && entry !== path.basename(oldSessionFile))).toEqual([
-				path.basename(oldSessionFile, ".jsonl"),
-			]);
+			const artifactDirectories = entries.filter(
+				entry => !entry.startsWith(".") && entry !== path.basename(oldSessionFile),
+			);
+			expect(artifactDirectories).toContain(path.basename(oldSessionFile, ".jsonl"));
+			expect(artifactDirectories).toHaveLength(2);
 		} finally {
 			spy.mockRestore();
 			await session.close();

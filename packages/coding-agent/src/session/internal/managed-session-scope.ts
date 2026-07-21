@@ -24,6 +24,7 @@ import {
 	ensureManagedDirectory,
 	fsyncManagedArtifactTree,
 	type ManagedDirectoryRoot,
+	ManagedPublishError,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
 	type ManagedStorageLock,
@@ -143,7 +144,12 @@ export type ManagedScopeErrorCode =
 
 export type ManagedScopeResolution =
 	| { kind: "resolved"; scope: ManagedScope }
-	| { kind: "error"; code: ManagedScopeErrorCode; message: string; cause?: { readonly classification: string } };
+	| {
+			kind: "error";
+			code: ManagedScopeErrorCode;
+			message: string;
+			cause?: { readonly classification: string; readonly diagnostic?: string };
+	  };
 
 export interface ManagedCandidate {
 	sessionId: string;
@@ -825,14 +831,19 @@ export function prepareManagedSessionScopeForWriteSync(
 		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY), root, policy);
 		return { kind: "resolved", scope };
 	} catch (error) {
-		const message = error instanceof Error ? error.message : "Managed write protocol setup failed.";
+		const publication = error instanceof ManagedPublishError ? error : undefined;
+		const message = publication?.classification ?? (error instanceof Error ? error.message : "Managed write protocol setup failed.");
 		const code =
 			message === "atomic_unavailable" || message === "durability_not_provable" ? message : "binding_invalid";
 		return {
 			kind: "error",
 			code,
 			message,
-			...(code === "binding_invalid" ? {} : { cause: { classification: code } }),
+			...(publication && code !== "binding_invalid"
+				? { cause: { classification: publication.classification, diagnostic: publication.diagnostic } }
+				: code === "binding_invalid"
+					? {}
+					: { cause: { classification: code } }),
 		};
 	}
 }

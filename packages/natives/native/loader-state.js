@@ -417,6 +417,12 @@ function validateLoadedBindings(ctx, bindings, candidate) {
 				"release than this loader — reinstall to re-sync.",
 		);
 	}
+	if (typeof bindings.__piNativesPublishOutcomeV1 !== "function") {
+		throw new Error(
+			`Loaded ${candidate} but it lacks retained-publish capability sentinel ` +
+			"`__piNativesPublishOutcomeV1`; trying the next compatible artifact.",
+		);
+	}
 	if (typeof bindings.renameNoReplacePath !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required atomic publish capability \`renameNoReplacePath\`.`);
 	}

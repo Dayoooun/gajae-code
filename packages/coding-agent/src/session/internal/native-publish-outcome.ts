@@ -27,16 +27,18 @@ export type NativePublishPhase =
 	| "complete"
 	| "unknown";
 
+type SyncFailure = {
+	phase: Exclude<NativePublishPhase, "preflight" | "file_sync" | "rename" | "complete" | "unknown">;
+	parentRole: "source" | "destination" | "shared" | "staged_file";
+	osCode: number;
+	kind: "unsupported" | "io" | "permission" | "other";
+};
+
 type PublishDiagnostic = {
 	schemaVersion: 1;
 	collectionState: "complete" | "partial" | "unavailable";
 	osCode?: number;
-	syncFailures?: readonly {
-		phase: NativePublishPhase;
-		parentRole: "source" | "destination" | "shared" | "staged_file";
-		osCode: number;
-		kind: "unsupported" | "io" | "permission" | "other";
-	}[];
+	syncFailures?: readonly SyncFailure[];
 };
 
 export type NativePublishOutcome = {
@@ -50,37 +52,27 @@ export type NativePublishOutcome = {
 	readonly diagnostic: PublishDiagnostic;
 };
 
-const mutations = new Set<NativePublishMutationState>(["not_committed", "committed", "unknown"]);
-const durability = new Set<NativePublishDurabilityState>(["not_attempted", "proven", "not_provable"]);
+const mutationStates = new Set<NativePublishMutationState>(["not_committed", "committed", "unknown"]);
+const durabilityStates = new Set<NativePublishDurabilityState>(["not_attempted", "proven", "not_provable"]);
 const reasons = new Set<NativePublishReason>([
-	"none",
-	"destination_exists",
-	"atomic_unavailable",
-	"cross_device",
-	"permission_denied",
-	"io_failure",
-	"invalid_request",
-	"identity_violation",
-	"durability_not_provable",
-	"unknown",
+	"none", "destination_exists", "atomic_unavailable", "cross_device", "permission_denied", "io_failure",
+	"invalid_request", "identity_violation", "durability_not_provable", "unknown",
 ]);
 const primitives = new Set<NativePublishPrimitive>([
-	"renameat2_noreplace",
-	"renameatx_np_excl",
-	"windows_rename_noreplace",
-	"unsupported",
-	"unknown",
+	"renameat2_noreplace", "renameatx_np_excl", "windows_rename_noreplace", "unsupported", "unknown",
 ]);
 const phases = new Set<NativePublishPhase>([
-	"preflight",
-	"file_sync",
-	"rename",
-	"source_parent_sync",
-	"destination_parent_sync",
-	"terminal_identity",
-	"complete",
-	"unknown",
+	"preflight", "file_sync", "rename", "source_parent_sync", "destination_parent_sync", "terminal_identity", "complete", "unknown",
 ]);
+const preMutationReasons = new Set<NativePublishReason>([
+	"destination_exists", "atomic_unavailable", "cross_device", "permission_denied", "io_failure", "invalid_request", "identity_violation",
+]);
+const int32 = (value: unknown): value is number =>
+	typeof value === "number" && Number.isInteger(value) && value >= -2147483648 && value <= 2147483647;
+const ownPlainRecord = (value: unknown): value is Record<string, unknown> =>
+	Boolean(value) && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype;
+const exactKeys = (value: Record<string, unknown>, keys: readonly string[]) =>
+	Object.keys(value).every(key => keys.includes(key));
 
 const malformed: NativePublishOutcome = Object.freeze({
 	ok: false,
@@ -92,75 +84,79 @@ const malformed: NativePublishOutcome = Object.freeze({
 	diagnostic: Object.freeze({ schemaVersion: 1, collectionState: "unavailable" }),
 });
 
+function validIdentity(value: unknown): boolean {
+	if (value === undefined) return true;
+	if (!ownPlainRecord(value) || !exactKeys(value, ["dev", "ino", "size", "mtimeNs", "ctimeNs", "sha256"])) return false;
+	const decimal = (field: unknown) => typeof field === "string" && /^-?[0-9]{1,32}$/.test(field);
+	return (
+		decimal(value.dev) &&
+		decimal(value.ino) &&
+		decimal(value.size) &&
+		decimal(value.mtimeNs) &&
+		decimal(value.ctimeNs) &&
+		(value.sha256 === undefined || (typeof value.sha256 === "string" && /^[a-f0-9]{64}$/.test(value.sha256)))
+	);
+}
+
 function validDiagnostic(value: unknown): value is PublishDiagnostic {
-	if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) return false;
-	const diagnostic = value as Record<string, unknown>;
-	if (
-		!Object.keys(diagnostic).every(key =>
-			["schemaVersion", "collectionState", "osCode", "syncFailures"].includes(key),
-		)
-	)
-		return false;
-	if (
-		diagnostic.schemaVersion !== 1 ||
-		!(["complete", "partial", "unavailable"] as const).includes(diagnostic.collectionState as "complete")
-	)
-		return false;
-	const osCode = diagnostic.osCode;
-	if (
-		osCode !== undefined &&
-		(typeof osCode !== "number" || !Number.isInteger(osCode) || osCode < -2147483648 || osCode > 2147483647)
-	)
-		return false;
-	const failures = diagnostic.syncFailures;
-	if (failures === undefined) return true;
-	if (!Array.isArray(failures) || failures.length > 4) return false;
-	return failures.every(failure => {
-		if (!failure || typeof failure !== "object" || Object.getPrototypeOf(failure) !== Object.prototype) return false;
-		const entry = failure as Record<string, unknown>;
+	if (!ownPlainRecord(value) || !exactKeys(value, ["schemaVersion", "collectionState", "osCode", "syncFailures"])) return false;
+	if (value.schemaVersion !== 1 || !["complete", "partial", "unavailable"].includes(value.collectionState as string)) return false;
+	if (value.osCode !== undefined && !int32(value.osCode)) return false;
+	if (value.syncFailures === undefined) return true;
+	if (!Array.isArray(value.syncFailures) || value.syncFailures.length > 4) return false;
+	return value.syncFailures.every(failure => {
+		if (!ownPlainRecord(failure) || !exactKeys(failure, ["phase", "parentRole", "osCode", "kind"])) return false;
 		return (
-			Object.keys(entry).every(key => ["phase", "parentRole", "osCode", "kind"].includes(key)) &&
-			phases.has(entry.phase as NativePublishPhase) &&
-			["source", "destination", "shared", "staged_file"].includes(entry.parentRole as string) &&
-			["unsupported", "io", "permission", "other"].includes(entry.kind as string) &&
-			typeof entry.osCode === "number" &&
-			Number.isInteger(entry.osCode) &&
-			entry.osCode >= -2147483648 &&
-			entry.osCode <= 2147483647
+			["source_parent_sync", "destination_parent_sync", "terminal_identity"].includes(failure.phase as string) &&
+			["source", "destination", "shared", "staged_file"].includes(failure.parentRole as string) &&
+			int32(failure.osCode) &&
+			["unsupported", "io", "permission", "other"].includes(failure.kind as string)
 		);
 	});
 }
 
-/** Treat incompatible native results as an unknown mutation; never infer safety from legacy fields. */
-export function classifyNativePublishOutcome(value: unknown): NativePublishOutcome {
-	if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) return malformed;
-	const result = value as Record<string, unknown>;
-	if (
-		typeof result.ok !== "boolean" ||
-		!mutations.has(result.mutationState as NativePublishMutationState) ||
-		!durability.has(result.durabilityState as NativePublishDurabilityState) ||
-		!reasons.has(result.reason as NativePublishReason) ||
-		!primitives.has(result.primitive as NativePublishPrimitive) ||
-		!phases.has(result.phase as NativePublishPhase) ||
-		!validDiagnostic(result.diagnostic) ||
-		(result.code !== undefined && typeof result.code !== "string")
-	)
-		return malformed;
-	const outcome = result as unknown as NativePublishOutcome;
-	if (
-		(outcome.mutationState !== "committed" && outcome.durabilityState === "proven") ||
-		(outcome.ok && (outcome.mutationState !== "committed" || outcome.reason !== "none")) ||
-		(outcome.ok && outcome.durabilityState !== "proven" && outcome.durabilityState !== "not_attempted") ||
-		(outcome.reason === "atomic_unavailable" && outcome.mutationState === "committed") ||
-		(outcome.mutationState === "not_committed" && outcome.ok)
-	)
-		return malformed;
-
-	return outcome;
+function legalOutcome(outcome: NativePublishOutcome): boolean {
+	if (outcome.mutationState === "not_committed")
+		return (
+			!outcome.ok &&
+			outcome.durabilityState === "not_attempted" &&
+			preMutationReasons.has(outcome.reason) &&
+			["preflight", "file_sync", "rename"].includes(outcome.phase)
+		);
+	if (outcome.mutationState === "unknown")
+		return !outcome.ok && outcome.durabilityState === "not_provable" && outcome.reason === "unknown" && outcome.phase === "rename";
+	if (outcome.ok)
+		return outcome.reason === "none" && outcome.phase === "complete" && ["proven", "not_attempted"].includes(outcome.durabilityState);
+	return (
+		outcome.durabilityState === "not_provable" &&
+		["durability_not_provable", "identity_violation", "io_failure"].includes(outcome.reason) &&
+		["file_sync", "source_parent_sync", "destination_parent_sync", "terminal_identity"].includes(outcome.phase)
+	);
 }
 
+/** Treat incompatible native results as an unknown mutation; never infer safety from legacy fields. */
+export function classifyNativePublishOutcome(value: unknown): NativePublishOutcome {
+	if (!ownPlainRecord(value) || !exactKeys(value, ["ok", "code", "identity", "mutationState", "durabilityState", "reason", "primitive", "phase", "diagnostic"]))
+		return malformed;
+	if (
+		typeof value.ok !== "boolean" ||
+		(value.code !== undefined && (typeof value.code !== "string" || !/^[a-z0-9_]{1,64}$/.test(value.code))) ||
+		!mutationStates.has(value.mutationState as NativePublishMutationState) ||
+		!durabilityStates.has(value.durabilityState as NativePublishDurabilityState) ||
+		!reasons.has(value.reason as NativePublishReason) ||
+		!primitives.has(value.primitive as NativePublishPrimitive) ||
+		!phases.has(value.phase as NativePublishPhase) ||
+		!validIdentity(value.identity) ||
+		!validDiagnostic(value.diagnostic)
+	)
+		return malformed;
+	const outcome = value as unknown as NativePublishOutcome;
+	return legalOutcome(outcome) ? outcome : malformed;
+}
+
+/** Only a fully validated pre-mutation result permits exact cleanup of current staging. */
 export function mayCleanCurrentStaging(outcome: NativePublishOutcome): boolean {
-	return !outcome.ok && outcome.mutationState === "not_committed";
+	return outcome.mutationState === "not_committed" && outcome.durabilityState === "not_attempted";
 }
 
 /** Stable, bounded text for startup errors. Native paths and messages are intentionally excluded. */

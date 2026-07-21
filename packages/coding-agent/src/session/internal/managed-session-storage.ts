@@ -34,13 +34,38 @@ const LOCK_HEARTBEAT_MS = 10_000;
 const LOCK_WAIT_MS = 5_000;
 
 const LOCK_STALE_RECHECK_MS = 100;
-function publishFailure(outcome: NativePublishOutcome): Error {
-	if (outcome.reason === "destination_exists") return new Error("destination_conflict");
-	if (outcome.reason === "atomic_unavailable") return new Error("atomic_unavailable");
-	if (outcome.reason === "durability_not_provable") return new Error("durability_not_provable");
-	return new Error(
-		`${outcome.code ?? (outcome.reason === "unknown" ? "durability_failed" : outcome.reason)}: ${formatNativePublishDiagnostic(outcome)}`,
-	);
+export class ManagedPublishError extends Error {
+	readonly classification:
+		| "destination_conflict"
+		| "atomic_unavailable"
+		| "durability_not_provable"
+		| "identity_mismatch"
+		| "io_error"
+		| "durability_failed";
+	readonly diagnostic: string;
+
+	constructor(classification: ManagedPublishError["classification"], outcome: NativePublishOutcome) {
+		super(classification);
+		this.name = "ManagedPublishError";
+		this.classification = classification;
+		this.diagnostic = formatNativePublishDiagnostic(outcome);
+	}
+}
+
+function publishFailure(outcome: NativePublishOutcome): ManagedPublishError {
+	const classification =
+		outcome.reason === "destination_exists"
+			? "destination_conflict"
+			: outcome.reason === "atomic_unavailable"
+				? "atomic_unavailable"
+				: outcome.reason === "durability_not_provable"
+					? "durability_not_provable"
+					: outcome.reason === "identity_violation"
+						? "identity_mismatch"
+						: outcome.reason === "io_failure"
+							? "io_error"
+							: "durability_failed";
+	return new ManagedPublishError(classification, outcome);
 }
 
 /** A same-filesystem rename updates the moved root's ctime but no other tree identity. */

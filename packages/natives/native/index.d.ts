@@ -465,6 +465,13 @@ export declare class Shell {
 }
 
 /**
+ * Publish-result wire-contract sentinel. The loader requires this in addition
+ * to the release sentinel, so a same-version modern artifact built before the
+ * retained-publish contract cannot be selected over a compatible baseline.
+ */
+export declare function __piNativesPublishOutcomeV1(): void
+
+/**
  * Version sentinel — exists solely so the JS loader can prove at load time
  * that the `.node` file on disk is from the same package release as the
  * `index.js` ESM wrapper invoking it.
@@ -1981,7 +1988,10 @@ export interface RecoveryFsPublishDiagnostic {
   osCode?: number
 }
 
-/** Explicit mutation and durability outcome for retained no-replace publication. */
+/**
+ * Explicit mutation and durability outcome for retained no-replace
+ * publication.
+ */
 export interface RecoveryFsPublishResult {
   ok: boolean
   code?: string

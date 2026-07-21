@@ -1499,19 +1499,23 @@ fn rename_managed_file_no_replace_inner(
 			_ => "io_error",
 		});
 	}
-	let moved_file = open_existing(root, destination, false)?;
-	crate::path_identity::platform::verify_created_owner_only_file(&moved_file)?;
-	let moved = regular_identity(&moved_file)?;
-	if !same_expected_after_rename(&moved_file, dev, ino, size, mtime_ns, sha256)? {
+	// The namespace mutation is authoritative immediately after renameat2 returns
+	// success. Every following failure is therefore committed-but-unproven.
+	let moved_file = open_existing(root, destination, false).map_err(|_| "rollback_unavailable")?;
+	crate::path_identity::platform::verify_created_owner_only_file(&moved_file)
+		.map_err(|_| "rollback_unavailable")?;
+	let moved = regular_identity(&moved_file).map_err(|_| "rollback_unavailable")?;
+	if !same_expected_after_rename(&moved_file, dev, ino, size, mtime_ns, sha256)
+		.map_err(|_| "rollback_unavailable")?
+	{
 		return Err("rollback_unavailable");
 	}
-	let terminal =
-		statat(&destination_parent, &destination_name).map_err(|_| "identity_mismatch")?;
+	let terminal = statat(&destination_parent, &destination_name).map_err(|_| "rollback_unavailable")?;
 	if terminal.st_dev.to_string() != moved.dev || terminal.st_ino.to_string() != moved.ino {
 		return Err("rollback_unavailable");
 	}
-	let source_parent_identity = identity(&source_parent)?;
-	let destination_parent_identity = identity(&destination_parent)?;
+	let source_parent_identity = identity(&source_parent).map_err(|_| "rollback_unavailable")?;
+	let destination_parent_identity = identity(&destination_parent).map_err(|_| "rollback_unavailable")?;
 	let source_sync = source_parent.sync_all();
 	let destination_sync = if source_parent_identity.dev == destination_parent_identity.dev
 		&& source_parent_identity.ino == destination_parent_identity.ino
@@ -1523,11 +1527,11 @@ fn rename_managed_file_no_replace_inner(
 	if source_sync.is_err() || destination_sync.is_err() {
 		return Err("fsync_failed");
 	}
-	let after = regular_identity(&moved_file)?;
-	let named_after =
-		statat(&destination_parent, &destination_name).map_err(|_| "identity_mismatch")?;
-	crate::path_identity::platform::verify_created_owner_only_file(&moved_file)?;
-	let after_digest = digest_hex(&moved_file)?;
+	let after = regular_identity(&moved_file).map_err(|_| "rollback_unavailable")?;
+	let named_after = statat(&destination_parent, &destination_name).map_err(|_| "rollback_unavailable")?;
+	crate::path_identity::platform::verify_created_owner_only_file(&moved_file)
+		.map_err(|_| "rollback_unavailable")?;
+	let after_digest = digest_hex(&moved_file).map_err(|_| "rollback_unavailable")?;
 	if after.dev != moved.dev
 		|| after.ino != moved.ino
 		|| after.size != moved.size
@@ -1902,14 +1906,15 @@ fn install_inner(
 			_ => "io_error",
 		});
 	}
-	let installed = open_existing(root, destination, false)?;
-	let installed_identity = regular_identity(&installed)?;
-	if installed_identity.dev != source_identity.dev || installed_identity.ino != source_identity.ino
-	{
+	// The rename has committed; all following verification failures are durability
+	// proof failures, never a new pre-mutation classification.
+	let installed = open_existing(root, destination, false).map_err(|_| "post_mutation_identity_mismatch")?;
+	let installed_identity = regular_identity(&installed).map_err(|_| "post_mutation_identity_mismatch")?;
+	if installed_identity.dev != source_identity.dev || installed_identity.ino != source_identity.ino {
 		return Err("post_mutation_identity_mismatch");
 	}
-	let source_parent_identity = identity(&source_parent)?;
-	let destination_parent_identity = identity(&destination_parent)?;
+	let source_parent_identity = identity(&source_parent).map_err(|_| "post_mutation_identity_mismatch")?;
+	let destination_parent_identity = identity(&destination_parent).map_err(|_| "post_mutation_identity_mismatch")?;
 	let source_sync = source_parent.sync_all();
 	let destination_sync = if source_parent_identity.dev == destination_parent_identity.dev
 		&& source_parent_identity.ino == destination_parent_identity.ino

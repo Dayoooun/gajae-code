@@ -4345,23 +4345,9 @@ export class SessionManager {
 					throw new Error("managed_fork_transcript_changed");
 			}
 		} catch (error) {
-			let failure = error;
+			const failure = error;
 			const failedSessionFile = this.#sessionFile;
-			if (this.destination.kind === "managed") {
-				try {
-					if (forkTranscriptStore && forkTranscriptPublication)
-						forkTranscriptStore.removeExpected(path.basename(failedSessionFile), forkTranscriptPublication);
-					if (forkArtifactPublication)
-						forkArtifactPublication.cleanupStore.removeTreeExpected(
-							forkArtifactPublication.cleanupRelativePath,
-							forkArtifactPublication.snapshot,
-						);
-				} catch (cleanupError) {
-					failure = new Error(`Failed to clean up managed fork destination: ${toError(cleanupError).message}`, {
-						cause: toError(error),
-					});
-				}
-			} else {
+			if (this.destination.kind !== "managed") {
 				try {
 					await this.storage.unlink(failedSessionFile);
 				} catch {
@@ -4468,8 +4454,7 @@ export class SessionManager {
 			};
 		} catch (error) {
 			try {
-				if (publishedSnapshot) parentStore.removeTreeExpected(destinationName, publishedSnapshot);
-				else if (stagingSnapshot && mayCleanManagedTreeStaging(error))
+				if (stagingSnapshot && mayCleanManagedTreeStaging(error))
 					parentStore.removeTreeExpected(stagingName, stagingSnapshot);
 			} catch (cleanupError) {
 				throw new Error(`Failed to clean up managed fork artifacts: ${toError(cleanupError).message}`, {
