@@ -21,7 +21,7 @@ function writeExecutable(name: string, body: string): void {
 	fs.chmodSync(target, 0o755);
 }
 
-function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFails?: boolean; bun?: "path" | "failing-link"; tar?: "failing-producer" | "failing-extractor" | "blocking-extractor"; markerWriteFails?: boolean; statusWriteFails?: boolean } = {}): void {
+function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFails?: boolean; bun?: "path" | "failing-link"; tar?: "failing-producer" | "failing-extractor" | "blocking-extractor" | "interrupting-producer"; markerWriteFails?: boolean; statusWriteFails?: boolean } = {}): void {
 	writeExecutable(
 		"git",
 		[
@@ -79,6 +79,9 @@ function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFa
 				options.tar === "failing-producer" ? '[ "${1:-}" = "cf" ] && exit 43' : "",
 				options.tar === "failing-extractor" ? '[ "${1:-}" = "xpf" ] && { printf partial > partial-copy; exit 44; }' : "",
 				options.tar === "blocking-extractor" ? '[ "${1:-}" = "xpf" ] && { printf partial > partial-copy; : > "$TEST_INTERRUPT_READY"; while [ ! -f "$TEST_INTERRUPT_RELEASE" ]; do sleep 0.01; done; }' : "",
+				options.tar === "interrupting-producer"
+					? '[ "${1:-}" = "cf" ] && { : > "$TEST_INTERRUPT_READY"; kill -TERM "$PPID"; while [ ! -f "$TEST_INTERRUPT_RELEASE" ]; do sleep 0.01; done; }'
+					: "",
 				"exit 0",
 			].join("\n"),
 		);
@@ -231,7 +234,25 @@ describe("install_local_build.sh", () => {
 		expect(fs.existsSync(destination)).toBe(false);
 		expect(temporaryClones()).toEqual([]);
 	});
-	test("signal cleanup removes owned partial promotions and preserves foreign destinations", async () => {
+	test("defers a producer-start interruption until promotion child setup can terminate and reap it", async () => {
+		writeTools({ bun: "path", tar: "interrupting-producer" });
+		const destination = path.join(sandbox.root, "interrupted-setup");
+		const ready = path.join(sandbox.root, "interrupted-setup.ready");
+		const release = path.join(sandbox.root, "interrupted-setup.release");
+		const proc = start(["--dir", destination], { TEST_INTERRUPT_READY: ready, TEST_INTERRUPT_RELEASE: release });
+		const stdout = new Response(proc.stdout).text();
+		const stderr = new Response(proc.stderr).text();
+		try {
+			await waitForPath(ready);
+			const [resultStdout, resultStderr, exitCode] = await Promise.all([stdout, stderr, proc.exited]);
+			expect(exitCode, `${resultStdout}\n${resultStderr}`).not.toBe(0);
+			expect(fs.existsSync(destination)).toBe(false);
+			expect(temporaryClones()).toEqual([]);
+		} finally {
+			fs.writeFileSync(release, "");
+		}
+	});
+	test("deterministically terminates and reaps promotion children before rollback during teardown interruptions", async () => {
 		writeTools({ bun: "path", tar: "blocking-extractor" });
 		for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"] as const) {
 			for (const foreign of [false, true]) {

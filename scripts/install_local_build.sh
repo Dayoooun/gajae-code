@@ -33,6 +33,26 @@ PROMOTION_MARKER=""
 PROMOTION_TOKEN=""
 PROMOTION_PRODUCER_PID=""
 PROMOTION_EXTRACTOR_PID=""
+PROMOTION_INTERRUPTION_STATUS=""
+
+begin_promotion_child_setup() {
+	PROMOTION_INTERRUPTION_STATUS=""
+	# A signal can arrive after a child is forked but before $! is recorded. Defer
+	# cleanup only across that registration window, then replay it once both PIDs
+	# are available for termination and reaping.
+	trap 'PROMOTION_INTERRUPTION_STATUS=129' HUP
+	trap 'PROMOTION_INTERRUPTION_STATUS=130' INT
+	trap 'PROMOTION_INTERRUPTION_STATUS=143' TERM
+}
+
+finish_promotion_child_setup() {
+	trap 'exit 129' HUP
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	if [ -n "$PROMOTION_INTERRUPTION_STATUS" ]; then
+		exit "$PROMOTION_INTERRUPTION_STATUS"
+	fi
+}
 
 remove_owned_destination() {
 	if [ -n "$PROMOTION_MARKER" ] && [ -n "$PROMOTION_TOKEN" ] && [ -f "$PROMOTION_MARKER" ] && IFS= read -r marker_token < "$PROMOTION_MARKER" && [ "$marker_token" = "$PROMOTION_TOKEN" ]; then
@@ -297,6 +317,7 @@ promote_clone() {
 	if ! mkfifo "$promotion_fifo"; then
 		fail "promotion" "Could not create a temporary copy pipe."
 	fi
+	begin_promotion_child_setup
 	(
 		cd "$TEMP_CLONE" || exit
 		exec tar cf - . > "$promotion_fifo"
@@ -307,6 +328,7 @@ promote_clone() {
 		exec tar xpf - < "$promotion_fifo"
 	) &
 	PROMOTION_EXTRACTOR_PID=$!
+	finish_promotion_child_setup
 	if wait "$PROMOTION_PRODUCER_PID"; then producer_status=0; else producer_status=$?; fi
 	PROMOTION_PRODUCER_PID=""
 	if wait "$PROMOTION_EXTRACTOR_PID"; then extractor_status=0; else extractor_status=$?; fi

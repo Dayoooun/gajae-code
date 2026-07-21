@@ -132,29 +132,27 @@ it("keeps a detached broker's active native load private while a concurrent sour
 	expect(await Bun.file(pathSentinel).exists()).toBe(false);
 });
 
-it("starts the source session host with isolated bootstrap policy and independently observed workspace cwd", async () => {
+it("starts the default source session host without loading hostile workspace bunfig, dotenv, or preload configuration while independently reporting its workspace cwd", async () => {
 	const root = await tempRoot();
 	const workspace = path.join(root, "workspace ü");
 	const agentDir = path.join(root, "agent");
 	const stateRoot = path.join(workspace, ".gjc", "state");
-	const cwdSentinel = path.join(root, "host-cwd");
-	const observer = path.join(root, "session-host-cwd-observer");
-	const brokerConfig = path.resolve(import.meta.dir, "../src/sdk/broker/internal-source.bunfig.toml");
+	const preloadSentinel = path.join(root, "host-preload-sentinel");
+	const dotenvSentinel = path.join(root, "host-dotenv-sentinel");
+	const preload = path.join(root, "host-preload.ts");
 	await fs.mkdir(workspace, { recursive: true });
 	await fs.mkdir(agentDir, { recursive: true });
+	await Bun.write(path.join(workspace, "bunfig.toml"), `preload = [${JSON.stringify(preload)}]\n`);
+	await Bun.write(path.join(workspace, ".env"), "GJC_2178_HOST_DOTENV=dotenv-loaded\n");
 	await Bun.write(
-		observer,
+		preload,
 		[
-			"#!/bin/sh",
-			`printf '%s' "$PWD" > ${JSON.stringify(cwdSentinel)}`,
-			`exec "$GJC_TEST_BUN" --no-env-file --config=${JSON.stringify(brokerConfig)} ${JSON.stringify(cliEntrypoint)} sdk session-host-internal`,
+			`await Bun.write(${JSON.stringify(preloadSentinel)}, process.cwd());`,
+			`if (process.env.GJC_2178_HOST_DOTENV) await Bun.write(${JSON.stringify(dotenvSentinel)}, process.env.GJC_2178_HOST_DOTENV);`,
 		].join("\n"),
 	);
-	await fs.chmod(observer, 0o755);
 	const previousCommand = process.env.GJC_SDK_SESSION_COMMAND;
-	const previousBun = process.env.GJC_TEST_BUN;
-	process.env.GJC_SDK_SESSION_COMMAND = observer;
-	process.env.GJC_TEST_BUN = process.execPath;
+	delete process.env.GJC_SDK_SESSION_COMMAND;
 	const broker = new Broker({ agentDir });
 	try {
 		await broker.start();
@@ -168,7 +166,9 @@ it("starts the source session host with isolated bootstrap policy and independen
 		const sessionId = (created.result as { sessionId?: unknown }).sessionId;
 		expect(typeof sessionId).toBe("string");
 		if (typeof sessionId !== "string") throw new Error("session.create did not return a session id");
-		expect(await Bun.file(cwdSentinel).text()).toBe(workspace);
+		expect(created.result).toMatchObject({ cwd: workspace });
+		expect(await Bun.file(preloadSentinel).exists()).toBe(false);
+		expect(await Bun.file(dotenvSentinel).exists()).toBe(false);
 		expect(await broker.handleRequest("session.close", { sessionId }, "source-host-close")).toMatchObject({
 			ok: true,
 			result: { sessionId },
@@ -176,8 +176,6 @@ it("starts the source session host with isolated bootstrap policy and independen
 	} finally {
 		if (previousCommand === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
 		else process.env.GJC_SDK_SESSION_COMMAND = previousCommand;
-		if (previousBun === undefined) delete process.env.GJC_TEST_BUN;
-		else process.env.GJC_TEST_BUN = previousBun;
 		await broker.stop();
 	}
 }, 30_000);
