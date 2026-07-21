@@ -474,7 +474,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:defaultPidAlive": "437658a2f14ac5daa2a3e84dcd637078566e71a88841cd750efab6d48fc94c3f",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:defaultPidIncarnation": "377afc123d25710c634df1fcc7f39a0c24d2034e0c31e8ed407435cc4c55a313",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:ensureTelegramDaemonRunning": "0dbc6e3450ee72827d720cf492b69c4659e2f366d4d2ff4c008cc19f793a5a19",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:ensureTelegramDaemonRunningDetailed": "0842c3c54b31fc8d2dd9ee67db0772afb667a712a9f5dd66cdca19b9ad89a5f4",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:ensureTelegramDaemonRunningDetailed": "3bdf06a54c2043834c3baefac0f4d61e4b7775e85993181e6d4b0c2e674274cf",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:hasSafeDaemonStateShape": "9cbc3723dec8704b55e2350c9679f7de9219affc99b2820de0a03fb72ee4172b",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:isCurrentCompatibleOwner": "a1952b6356fd090a4f2031b3ffdfc090448bf3f2ced243a473c81f33f222da50",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:isFreshLiveOwner": "e6ae047ab6c06d2fbfd1f534f13db6d81ab390ff91feb02f75296be28e94163a",

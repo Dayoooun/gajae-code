@@ -2213,10 +2213,12 @@ export async function ensureTelegramDaemonRunningDetailed(
 			pidAlive: deps.pidAlive,
 			pidIncarnation: deps.pidIncarnation,
 		});
-		if (!preflight.recovered && preflight.reason !== "not-confirmed-dead")
+		if (!preflight.recovered && preflight.reason !== "not-confirmed-dead") {
 			logger.warn(
 				`notifications: startup recovery unsafe (${preflight.reason}); run \`gjc notify recovery\` for diagnostics`,
 			);
+			return "blocked_identity";
+		}
 	}
 	let spawned = await withTelegramSetupLease(
 		cfg.botToken,
