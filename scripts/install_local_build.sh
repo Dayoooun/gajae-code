@@ -31,11 +31,23 @@ ORIGINAL_HEAD=""
 ORIGINAL_REF=""
 PROMOTION_MARKER=""
 PROMOTION_TOKEN=""
+PROMOTION_PRODUCER_PID=""
+PROMOTION_EXTRACTOR_PID=""
 
 remove_owned_destination() {
 	if [ -n "$PROMOTION_MARKER" ] && [ -n "$PROMOTION_TOKEN" ] && [ -f "$PROMOTION_MARKER" ] && IFS= read -r marker_token < "$PROMOTION_MARKER" && [ "$marker_token" = "$PROMOTION_TOKEN" ]; then
 		rm -rf "$DEST_DIR" || echo "cleanup: could not remove the failed destination claim." >&2
 	fi
+}
+terminate_promotion_children() {
+	for pid in "$PROMOTION_PRODUCER_PID" "$PROMOTION_EXTRACTOR_PID"; do
+		[ -z "$pid" ] || kill -TERM "$pid" 2>/dev/null || true
+	done
+	for pid in "$PROMOTION_PRODUCER_PID" "$PROMOTION_EXTRACTOR_PID"; do
+		[ -z "$pid" ] || wait "$pid" 2>/dev/null || true
+	done
+	PROMOTION_PRODUCER_PID=""
+	PROMOTION_EXTRACTOR_PID=""
 }
 cleanup() {
 	status=$?
@@ -47,7 +59,10 @@ cleanup() {
 			git -C "$SRC_DIR" checkout --quiet --detach "$ORIGINAL_HEAD" || echo "cleanup: could not restore the reused checkout." >&2
 		fi
 	fi
-	if [ "$status" -ne 0 ]; then remove_owned_destination; fi
+	if [ "$status" -ne 0 ]; then
+		terminate_promotion_children
+		remove_owned_destination
+	fi
 	[ -z "$TEMP_CLONE" ] || rm -rf "$TEMP_CLONE"
 	[ -z "$TEMP_BUN_INSTALLER" ] || rm -f "$TEMP_BUN_INSTALLER"
 	if [ -n "$PROMOTION_STATUS_DIR" ] && ! rm -rf "$PROMOTION_STATUS_DIR"; then echo "cleanup: could not remove temporary copy-status files." >&2; fi
@@ -275,23 +290,28 @@ promote_clone() {
 		fail "promotion" "Could not mark the claimed destination."
 	fi
 	promotion_status_valid=1
-	if (
-		if cd "$TEMP_CLONE"; then
-			if tar cf - .; then producer_status=0; else producer_status=$?; fi
-		else
-			producer_status=$?
-		fi
-		printf '%s\n' "$producer_status" > "$PROMOTION_STATUS_DIR/producer" || exit 1
-	) | (
-		if cd "$DEST_DIR"; then
-			if tar xpf -; then extractor_status=0; else extractor_status=$?; fi
-		else
-			extractor_status=$?
-		fi
-		printf '%s\n' "$extractor_status" > "$PROMOTION_STATUS_DIR/extractor" || exit 1
-	); then
-		:
-	else
+	# Keep direct child PIDs so signal cleanup can terminate and reap both sides
+	# before it rolls back the claimed destination. A FIFO avoids shell pipeline
+	# process ambiguity: each tar command is the tracked child itself.
+	promotion_fifo="$PROMOTION_STATUS_DIR/copy"
+	if ! mkfifo "$promotion_fifo"; then
+		fail "promotion" "Could not create a temporary copy pipe."
+	fi
+	(
+		cd "$TEMP_CLONE" || exit
+		exec tar cf - . > "$promotion_fifo"
+	) &
+	PROMOTION_PRODUCER_PID=$!
+	(
+		cd "$DEST_DIR" || exit
+		exec tar xpf - < "$promotion_fifo"
+	) &
+	PROMOTION_EXTRACTOR_PID=$!
+	if wait "$PROMOTION_PRODUCER_PID"; then producer_status=0; else producer_status=$?; fi
+	PROMOTION_PRODUCER_PID=""
+	if wait "$PROMOTION_EXTRACTOR_PID"; then extractor_status=0; else extractor_status=$?; fi
+	PROMOTION_EXTRACTOR_PID=""
+	if ! printf '%s\n' "$producer_status" > "$PROMOTION_STATUS_DIR/producer" || ! printf '%s\n' "$extractor_status" > "$PROMOTION_STATUS_DIR/extractor"; then
 		promotion_status_valid=
 	fi
 	if [ -f "$PROMOTION_STATUS_DIR/producer" ] && IFS= read -r producer_status < "$PROMOTION_STATUS_DIR/producer"; then

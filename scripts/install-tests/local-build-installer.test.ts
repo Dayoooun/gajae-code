@@ -217,7 +217,7 @@ describe("install_local_build.sh", () => {
 		const destination = path.join(sandbox.root, "failed-status-bookkeeping");
 		const result = await run(["--dir", destination]);
 		expect(result.exitCode).not.toBe(0);
-		expect(result.stderr).toContain("Could not populate");
+		expect(result.stderr).toContain("Could not create a temporary copy pipe.");
 		expect(fs.existsSync(destination)).toBe(false);
 		expect(temporaryClones()).toEqual([]);
 	});
@@ -250,7 +250,6 @@ describe("install_local_build.sh", () => {
 					fs.writeFileSync(path.join(destination, ".gajae-code-install-owner"), "foreign-token\n");
 				}
 				proc.kill(signal);
-				fs.writeFileSync(release, "");
 				const [resultStdout, resultStderr, exitCode] = await Promise.all([stdout, stderr, proc.exited]);
 				expect(exitCode, `${resultStdout}\n${resultStderr}`).not.toBe(0);
 				if (foreign) {
@@ -258,6 +257,9 @@ describe("install_local_build.sh", () => {
 				} else {
 					expect(fs.existsSync(destination)).toBe(false);
 				}
+				// The extractor remains blocked unless the installer terminated and
+				// reaped it before rollback. Unblock only after rollback is observable.
+				fs.writeFileSync(release, "");
 			}
 		}
 	});

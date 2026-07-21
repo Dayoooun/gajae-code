@@ -301,6 +301,22 @@ function writePrivateLoadDirectoryOwner(loadDir) {
 	});
 }
 
+function removePrivateLoadDirectory(loadDir, platform) {
+	if (platform !== "win32") {
+		fs.rmSync(loadDir, { recursive: true, force: true });
+		return;
+	}
+
+	// Do not remove the owner record until every addon payload has been removed.
+	// Windows can reject removal of a loaded .node; retaining the owner lets a
+	// later launch prove the owner is dead and retry this directory safely.
+	for (const entry of fs.readdirSync(loadDir, { withFileTypes: true })) {
+		if (entry.name === PRIVATE_LOAD_OWNER_FILENAME) continue;
+		fs.rmSync(path.join(loadDir, entry.name), { recursive: entry.isDirectory(), force: false });
+	}
+	fs.unlinkSync(privateLoadDirectoryOwnerPath(loadDir));
+	fs.rmdirSync(loadDir);
+}
 function isProcessAlive(pid) {
 	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
 	try {
@@ -318,10 +334,10 @@ function isProcessAlive(pid) {
  * Remove private load directories only after their owning process is proven
  * dead. Directories without a valid owner record are retained fail-closed: a
  * concurrently starting process creates that record before writing its addon.
- * @param {{ cacheDir: string; isProcessAlive?: (pid: number) => boolean }} input
+ * @param {{ cacheDir: string; isProcessAlive?: (pid: number) => boolean; platform?: NodeJS.Platform | string }} input
  * @returns {number}
  */
-export function prunePrivateLoadDirectories({ cacheDir, isProcessAlive: processIsAlive = isProcessAlive }) {
+export function prunePrivateLoadDirectories({ cacheDir, isProcessAlive: processIsAlive = isProcessAlive, platform = process.platform }) {
 	let entries;
 	try {
 		entries = fs.readdirSync(cacheDir, { withFileTypes: true });
@@ -341,11 +357,11 @@ export function prunePrivateLoadDirectories({ cacheDir, isProcessAlive: processI
 		}
 		if (!owner || !Number.isSafeInteger(owner.pid) || processIsAlive(owner.pid)) continue;
 		try {
-			fs.rmSync(loadDir, { recursive: true, force: true });
+			removePrivateLoadDirectory(loadDir, platform);
 			removed++;
 		} catch {
-			// A Windows process can retain the loaded .node until it exits. Keep it
-			// for the next startup rather than risking an unsafe cleanup attempt.
+			// A Windows process can retain the loaded .node until it exits. Keep its
+			// owner record for the next startup rather than losing liveness evidence.
 		}
 	}
 	return removed;
@@ -358,14 +374,14 @@ export function prunePrivateLoadDirectories({ cacheDir, isProcessAlive: processI
  * after proving this owner is no longer alive.
  * @param {{ loadDir: string; platform?: NodeJS.Platform | string }} input
  */
-export function cleanupPrivateLoadDirectory({ loadDir }) {
+export function cleanupPrivateLoadDirectory({ loadDir, platform = process.platform }) {
 	deferredPrivateLoadDirs.add(loadDir);
 	if (!privateLoadExitCleanupRegistered) {
 		privateLoadExitCleanupRegistered = true;
 		process.once("exit", () => {
 			for (const deferredLoadDir of deferredPrivateLoadDirs) {
 				try {
-					fs.rmSync(deferredLoadDir, { recursive: true, force: true });
+					removePrivateLoadDirectory(deferredLoadDir, platform);
 				} catch {}
 			}
 		});
