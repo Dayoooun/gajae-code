@@ -32,6 +32,7 @@ import {
 	getAddonFilenames,
 	getOptionalPackageNames,
 	loadFromCandidates,
+	loadNative,
 	resolveLoaderCandidates,
 	resolveOptionalPackageNativeDirs,
 } from "../native/loader-state.js";
@@ -326,6 +327,45 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 			__piNativesPublishOutcomeV1: expect.any(Function),
 		});
 		expect(loaded.errors).toEqual([`${modern}: missing publish outcome sentinel`]);
+	});
+
+	it("loads an embedded baseline through loadNative when the preferred embedded modern artifact lacks a required sentinel", () => {
+		const modern = "/cache/pi_natives.linux-x64-modern.node";
+		const baseline = "/cache/pi_natives.linux-x64-baseline.node";
+		const attempted: string[] = [];
+		let stageCalls = 0;
+		const bindings = loadNative({
+			context: {
+				isCompiledBinary: true,
+				platformTag: "linux-x64",
+				addonLabel: "linux-x64 (modern)",
+				addonFilenames: [],
+				versionedDir: "/cache",
+				candidates: ["/filesystem-fallback.node"],
+			},
+			extractEmbeddedAddons: () => [modern, baseline],
+			stageNodeModulesAddon: () => {
+				stageCalls++;
+				return "/staged-filesystem-fallback.node";
+			},
+			requireCandidate: candidate => {
+				attempted.push(candidate);
+				return candidate === baseline
+					? { __piNativesVCurrent: (): void => undefined, __piNativesPublishOutcomeV1: (): void => undefined }
+					: { __piNativesVCurrent: (): void => undefined };
+			},
+			validateCandidate: value => {
+				validateCurrentSentinel(value);
+				if (typeof value.__piNativesPublishOutcomeV1 !== "function")
+					throw new Error("missing publish outcome sentinel");
+			},
+		});
+		expect(bindings).toEqual({
+			__piNativesVCurrent: expect.any(Function),
+			__piNativesPublishOutcomeV1: expect.any(Function),
+		});
+		expect(attempted).toEqual([modern, baseline]);
+		expect(stageCalls).toBe(0);
 	});
 
 	it("preserves Windows staging ahead of package candidates", () => {

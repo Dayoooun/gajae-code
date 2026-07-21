@@ -85,6 +85,20 @@ function bindManagedWriteAuthority(scope: ManagedScope, authority: ManagedCandid
 	boundManagedWriteAuthorities.set(scope, authority);
 }
 
+/** A prepared scope is a retained authority boundary, not a path that may be re-adopted. */
+function assertRetainedManagedDirectoryIdentity(scope: ManagedScope): void {
+	const expected = managedDirectoryIdentities.get(scope);
+	if (!expected) return;
+	const current = fs.lstatSync(scope.directoryPath, { bigint: true });
+	if (
+		!current.isDirectory() ||
+		current.isSymbolicLink() ||
+		current.dev !== expected.dev ||
+		current.ino !== expected.ino
+	)
+		throw new Error("Managed session directory changed");
+}
+
 export function managedDirectoryAuthorityForScope(scope: ManagedScope): native.RecoveryFsRoot | undefined {
 	if (!managedDirectoryAuthorities.has(scope)) throw new Error("Managed session directory authority was not prepared");
 	return managedDirectoryAuthorities.get(scope);
@@ -688,6 +702,7 @@ export async function ensureManagedScope(
 	policy: ManagedSessionSecurityPolicy = "default",
 ): Promise<ManagedScopeResolution> {
 	try {
+		assertRetainedManagedDirectoryIdentity(scope);
 		const root = scopeRoot(scope, policy);
 		ensureManagedDirectory(scope.sessionsRoot, root, policy);
 		ensureManagedDirectory(scope.directoryPath, root, policy);
@@ -698,7 +713,13 @@ export async function ensureManagedScope(
 		} catch (error) {
 			if ((error as Error).message !== "destination_conflict") throw error;
 		}
-		return validateExistingBinding(scope) ?? { kind: "resolved", scope };
+		const validated = validateExistingBinding(scope);
+		if (validated) return validated;
+		const preparedDirectory = fs.lstatSync(scope.directoryPath, { bigint: true });
+		if (!preparedDirectory.isDirectory() || preparedDirectory.isSymbolicLink())
+			throw new Error("Managed session directory changed");
+		managedDirectoryIdentities.set(scope, { dev: preparedDirectory.dev, ino: preparedDirectory.ino });
+		return { kind: "resolved", scope };
 	} catch (error) {
 		return {
 			kind: "error",
@@ -774,6 +795,7 @@ export function prepareManagedSessionScopeForWriteSync(
 	authority?: ManagedCandidateWriteAuthority,
 ): ManagedScopeResolution {
 	try {
+		assertRetainedManagedDirectoryIdentity(scope);
 		const root = authority?.rootAuthority ?? scopeRoot(scope, policy);
 		if (authority) bindManagedWriteAuthority(scope, authority);
 		ensureManagedDirectory(scope.sessionsRoot, root, policy);

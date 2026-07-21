@@ -181,6 +181,9 @@ export function validateNativeSecurityResult(
 			) {
 				throw new Error("Malformed ACL security failure evidence");
 			}
+			if (operation === "verify" && result.operation !== "query") {
+				throw new Error("Verify failure unexpectedly reports ACL mutation");
+			}
 		} else if (result.operation !== undefined || result.attribute !== undefined) {
 			throw new Error("Unexpected ACL fields on owner-only security failure");
 		}

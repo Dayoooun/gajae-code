@@ -1322,6 +1322,15 @@ function freezeInternalReadSnapshot<T>(value: T): T {
 	return copy;
 }
 
+function managedScopeStartupError(
+	action: "resolve" | "prepare",
+	failure: Extract<ReturnType<typeof resolveManagedScopeForWrite>, { kind: "error" }>,
+): Error {
+	return new Error(`Could not ${action} managed session scope.`, {
+		cause: { classification: failure.code },
+	});
+}
+
 /** Resolve and prepare the default v2 session scope before any managed writer exists. */
 function computeDefaultSessionDir(
 	cwd: string,
@@ -1330,12 +1339,12 @@ function computeDefaultSessionDir(
 ): string {
 	if (!(storage instanceof FileSessionStorage)) throw new SessionManagedStorageError();
 	const resolved = resolveManagedScopeForWrite({ cwd, agentDir: path.resolve(sessionsRoot, ".."), sessionsRoot });
-	if (resolved.kind === "error") throw new Error(`Could not resolve managed session scope: ${resolved.message}`);
+	if (resolved.kind === "error") throw managedScopeStartupError("resolve", resolved);
 	const prepared = prepareManagedSessionScopeForWriteSync(
 		resolved.scope,
 		process.platform === "win32" ? "windows-existing-verify-first" : "default",
 	);
-	if (prepared.kind === "error") throw new Error(`Could not prepare managed session scope: ${prepared.message}`);
+	if (prepared.kind === "error") throw managedScopeStartupError("prepare", prepared);
 	return prepared.scope.directoryPath;
 }
 
@@ -1470,12 +1479,12 @@ function managedDestination(cwd: string, storage: SessionStorage, agentDir?: str
 		agentDir: agentDir ?? path.resolve(sessionsRoot, ".."),
 		sessionsRoot,
 	});
-	if (resolved.kind === "error") throw new Error(`Could not resolve managed session scope: ${resolved.message}`);
+	if (resolved.kind === "error") throw managedScopeStartupError("resolve", resolved);
 	const prepared = prepareManagedSessionScopeForWriteSync(
 		resolved.scope,
 		process.platform === "win32" ? "windows-existing-verify-first" : "default",
 	);
-	if (prepared.kind === "error") throw new Error(`Could not prepare managed session scope: ${prepared.message}`);
+	if (prepared.kind === "error") throw managedScopeStartupError("prepare", prepared);
 	return freezeManagedDestination(prepared.scope);
 }
 
@@ -4469,7 +4478,6 @@ export class SessionManager {
 		const previousSessionDir = this.sessionDir;
 		const previousSessionFile = this.#sessionFile;
 		const previousDestination = this.destination;
-		const previousArtifactDir = previousSessionFile?.slice(0, -6);
 
 		const nextDestination =
 			this.storage instanceof FileSessionStorage
@@ -4720,60 +4728,35 @@ export class SessionManager {
 				await this.#appendHeaderPatch({ cwd: resolvedCwd });
 			}
 		} catch (error) {
-			const failedSessionFile = this.#sessionFile;
-			const failedArtifactDir = failedSessionFile?.slice(0, -6);
-			try {
-				await this.#closePersistWriter().catch(() => {});
-				this.#persistChain = Promise.resolve();
-				this.#persistError = undefined;
-				this.#persistErrorReported = false;
-				if (rollbackManagedMove) {
+			await this.#closePersistWriter().catch(() => {});
+			this.#persistChain = Promise.resolve();
+			this.#persistError = undefined;
+			this.#persistErrorReported = false;
+			if (rollbackManagedMove) {
+				try {
 					await rollbackManagedMove();
-					this.#sessionFile = previousSessionFile;
-					this.cwd = previousCwd;
-					this.sessionDir = previousSessionDir;
-					this.destination = previousDestination;
-					this.#managedTranscriptStoreCache =
-						managedMove && managedSourceStore
-							? { directory: path.resolve(previousSessionDir), store: managedSourceStore }
-							: null;
-					const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-					if (header) applyHeaderPatch(header, { cwd: previousCwd });
-					this.#headerExportRevision++;
-					throw error;
-				}
-				if (
-					this.storage instanceof FileSessionStorage &&
-					failedArtifactDir &&
-					previousArtifactDir &&
-					failedArtifactDir !== previousArtifactDir &&
-					fs.existsSync(failedArtifactDir)
-				) {
-					await movePathAcrossDevicesSafe(failedArtifactDir, previousArtifactDir);
-				}
-				if (
-					this.storage instanceof FileSessionStorage &&
-					failedSessionFile &&
-					previousSessionFile &&
-					failedSessionFile !== previousSessionFile &&
-					fs.existsSync(failedSessionFile)
-				) {
-					await movePathAcrossDevicesSafe(failedSessionFile, previousSessionFile);
+				} catch (rollbackError) {
+					throw new Error(`Failed to rollback managed move: ${toError(rollbackError).message}`, {
+						cause: toError(error),
+					});
 				}
 				this.#sessionFile = previousSessionFile;
 				this.cwd = previousCwd;
 				this.sessionDir = previousSessionDir;
 				this.destination = previousDestination;
-				this.#managedTranscriptStoreCache = null;
+				this.#managedTranscriptStoreCache =
+					managedMove && managedSourceStore
+						? { directory: path.resolve(previousSessionDir), store: managedSourceStore }
+						: null;
 				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header) applyHeaderPatch(header, { cwd: previousCwd });
 				this.#headerExportRevision++;
-				if (previousSessionFile && this.storage.existsSync(previousSessionFile)) await this.#rewriteFile();
-			} catch (rollbackError) {
-				throw new Error(`Failed to rollback session move: ${toError(rollbackError).message}`, {
-					cause: toError(error),
-				});
+				throw error;
 			}
+			// The destination has already been published. Retain it rather than moving it
+			// back over the source after a metadata failure.
+			this.#managedTranscriptStoreCache = null;
+			this.#headerExportRevision++;
 			throw error;
 		}
 
@@ -7507,53 +7490,11 @@ export class SessionManager {
 			return { kind: "forked", manager };
 		} catch (error) {
 			if (manager) {
-				const sessionFile = manager.#sessionFile;
 				const cleanupErrors: Error[] = [];
 				try {
 					await manager.close();
 				} catch (cleanupError) {
 					cleanupErrors.push(toError(cleanupError));
-				}
-				if (sessionFile) {
-					if (destination.kind === "managed") {
-						try {
-							if (managedForkStore && managedForkTranscript)
-								managedForkStore.removeExpected(path.basename(sessionFile), managedForkTranscript);
-						} catch (cleanupError) {
-							cleanupErrors.push(toError(cleanupError));
-						}
-					} else {
-						try {
-							await manager.storage.unlink(sessionFile);
-						} catch (cleanupError) {
-							if (!isEnoent(cleanupError)) cleanupErrors.push(toError(cleanupError));
-						}
-						if (manager.storage instanceof FileSessionStorage) {
-							try {
-								await fs.promises.rm(sessionFile.slice(0, -6), { recursive: true, force: true });
-							} catch (cleanupError) {
-								cleanupErrors.push(toError(cleanupError));
-							}
-							try {
-								const sessionFileName = path.basename(sessionFile);
-								const transientPrefix = `.${sessionFileName}.`;
-								const backupPrefix = `${sessionFileName}.`;
-								for (const name of await fs.promises.readdir(path.dirname(sessionFile))) {
-									if (
-										(name.startsWith(transientPrefix) && name.endsWith(".tmp")) ||
-										(name.startsWith(backupPrefix) && name.endsWith(".bak"))
-									) {
-										await fs.promises.rm(path.join(path.dirname(sessionFile), name), {
-											recursive: true,
-											force: true,
-										});
-									}
-								}
-							} catch (cleanupError) {
-								if (!isEnoent(cleanupError)) cleanupErrors.push(toError(cleanupError));
-							}
-						}
-					}
 				}
 				if (removeSessionDirOnFailure) {
 					try {

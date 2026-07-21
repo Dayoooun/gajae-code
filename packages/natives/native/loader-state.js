@@ -518,20 +518,22 @@ function initLoaderContext(require_) {
 	};
 }
 
-export function loadNative() {
-	const require_ = createRequire(import.meta.url);
-	const ctx = initLoaderContext(require_);
+export function loadNative(options = {}) {
+	const require_ = options.requireCandidate ? null : createRequire(import.meta.url);
+	const ctx = options.context ?? initLoaderContext(require_);
 
 	const errors = [];
-	const embeddedCandidates = maybeExtractEmbeddedAddons(ctx, errors);
-	const stagedCandidate = embeddedCandidates.length > 0 ? null : maybeStageNodeModulesAddon(ctx, errors);
+	const embeddedCandidates = (options.extractEmbeddedAddons ?? maybeExtractEmbeddedAddons)(ctx, errors);
+	const stagedCandidate =
+		embeddedCandidates.length > 0
+			? null
+			: (options.stageNodeModulesAddon ?? maybeStageNodeModulesAddon)(ctx, errors);
 	const prepended = [...embeddedCandidates, stagedCandidate].filter(c => typeof c === "string");
 	const runtimeCandidates = prepended.length > 0 ? [...prepended, ...ctx.candidates] : ctx.candidates;
-
 	const loaded = loadFromCandidates({
 		candidates: runtimeCandidates,
-		requireCandidate: candidate => require_(candidate),
-		validateCandidate: (bindings, candidate) => validateLoadedBindings(ctx, bindings, candidate),
+		requireCandidate: options.requireCandidate ?? (candidate => require_(candidate)),
+		validateCandidate: options.validateCandidate ?? ((bindings, candidate) => validateLoadedBindings(ctx, bindings, candidate)),
 		describeCandidate: candidate => candidate,
 	});
 	if (loaded.bindings) return loaded.bindings;

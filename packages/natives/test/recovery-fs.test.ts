@@ -27,7 +27,17 @@ describe.skipIf(process.platform !== "linux")("native recovery filesystem author
 
 		const created = authority.create("state.tmp", Buffer.from('{"generation":1}\n'));
 		expect(created).toMatchObject({ ok: true, identity: { size: "17" } });
-		expect(authority.install("state.tmp", "state.json")).toMatchObject({ ok: true });
+		const installed = authority.install("state.tmp", "state.json");
+		expect(installed).toMatchObject({
+			ok: true,
+			mutationState: "committed",
+			durabilityState: "proven",
+			reason: "none",
+			primitive: "renameat2_noreplace",
+			phase: "complete",
+			diagnostic: { schemaVersion: 1, collectionState: "complete" },
+		});
+		expect(await fs.readFile(path.join(root, "state.json"))).toEqual(Buffer.from('{"generation":1}\n'));
 		expect(authority.stat("state.json")).toMatchObject({
 			ok: true,
 			identity: {

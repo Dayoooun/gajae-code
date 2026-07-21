@@ -4,6 +4,8 @@
 //! [`open_recovery_fs_root`]. Relative names are walked one component at a
 //! time without following symlinks, and regular files must be single-linked.
 
+#[cfg(all(test, target_os = "linux"))]
+use std::{cell::RefCell, collections::VecDeque};
 #[cfg(target_os = "linux")]
 use std::{
 	ffi::CString,
@@ -29,6 +31,82 @@ const MAX_MANAGED_TREE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 
 #[cfg(target_os = "linux")]
 static MANAGED_REPLACEMENT_ID: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone, Copy)]
+enum RetainedPublishFault {
+	Rename(i32),
+	Sync(Option<i32>),
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+	static RETAINED_PUBLISH_FAULTS: RefCell<VecDeque<RetainedPublishFault>> = const { RefCell::new(VecDeque::new()) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn set_retained_publish_faults(faults: impl IntoIterator<Item = RetainedPublishFault>) {
+	RETAINED_PUBLISH_FAULTS
+		.with(|configured| *configured.borrow_mut() = faults.into_iter().collect());
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn take_retained_publish_fault(rename: bool) -> Option<Option<i32>> {
+	RETAINED_PUBLISH_FAULTS.with(|configured| {
+		let mut configured = configured.borrow_mut();
+		match configured.front().copied() {
+			Some(RetainedPublishFault::Rename(code)) if rename => {
+				configured.pop_front();
+				Some(Some(code))
+			},
+			Some(RetainedPublishFault::Sync(code)) if !rename => {
+				configured.pop_front();
+				Some(code)
+			},
+			_ => None,
+		}
+	})
+}
+
+#[cfg(target_os = "linux")]
+fn renameat2_no_replace(
+	source_parent: &File,
+	source_name: &CString,
+	destination_parent: &File,
+	destination_name: &CString,
+) -> std::io::Result<()> {
+	#[cfg(test)]
+	if let Some(Some(code)) = take_retained_publish_fault(true) {
+		return Err(std::io::Error::from_raw_os_error(code));
+	}
+	// SAFETY: both parents own valid fds and both names are live NUL-terminated
+	// strings for this syscall.
+	let result = unsafe {
+		libc::syscall(
+			libc::SYS_renameat2,
+			source_parent.as_raw_fd(),
+			source_name.as_ptr(),
+			destination_parent.as_raw_fd(),
+			destination_name.as_ptr(),
+			libc::RENAME_NOREPLACE,
+		)
+	};
+	if result == 0 {
+		Ok(())
+	} else {
+		Err(std::io::Error::last_os_error())
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn sync_parent(parent: &File) -> std::io::Result<()> {
+	#[cfg(test)]
+	if let Some(code) = take_retained_publish_fault(false) {
+		return code
+			.map_or_else(|| parent.sync_all(), |code| Err(std::io::Error::from_raw_os_error(code)));
+	}
+	parent.sync_all()
+}
 
 #[napi(object)]
 #[derive(PartialEq, Eq)]
@@ -271,7 +349,7 @@ fn sync_distinct_parents(
 	destination_parent: &File,
 	shared: bool,
 ) -> Result<(), RetainedPublishError> {
-	collect_parent_sync_failures(source_parent, destination_parent, shared, File::sync_all)
+	collect_parent_sync_failures(source_parent, destination_parent, shared, sync_parent)
 }
 
 #[cfg(target_os = "linux")]
@@ -1571,7 +1649,6 @@ fn rename_managed_file_no_replace_inner(
 	ctime_ns: &str,
 	sha256: &str,
 ) -> Result<RecoveryFsResult, RetainedPublishError> {
-	use std::os::fd::AsRawFd;
 	let source_file = open_existing(root, source, false)?;
 	crate::path_identity::platform::verify_created_owner_only_file(&source_file)?;
 	if !same_expected(&source_file, dev, ino, size, mtime_ns, ctime_ns, sha256)? {
@@ -1580,21 +1657,11 @@ fn rename_managed_file_no_replace_inner(
 
 	let (source_parent, source_name) = open_parent(root, source)?;
 	let (destination_parent, destination_name) = open_parent(root, destination)?;
-	// SAFETY: both parents are retained descriptors, names are validated, and
-	// RENAME_NOREPLACE is atomic.
-	let result = unsafe {
-		libc::syscall(
-			libc::SYS_renameat2,
-			source_parent.as_raw_fd(),
-			source_name.as_ptr(),
-			destination_parent.as_raw_fd(),
-			destination_name.as_ptr(),
-			libc::RENAME_NOREPLACE,
-		)
-	};
-	if result != 0 {
+	let result =
+		renameat2_no_replace(&source_parent, &source_name, &destination_parent, &destination_name);
+	if let Err(error) = result {
 		return Err(
-			match std::io::Error::last_os_error().raw_os_error() {
+			match error.raw_os_error() {
 				Some(libc::EEXIST) => "already_exists",
 				Some(libc::ENOSYS) => "atomic_unavailable",
 				// The retained syscall uses fixed, validated descriptors, names, and flags.
@@ -1991,26 +2058,15 @@ fn install_inner(
 	source: &str,
 	destination: &str,
 ) -> Result<RecoveryFsResult, RetainedPublishError> {
-	use std::os::fd::AsRawFd;
 	let source_file = open_existing(root, source, false)?;
 	let source_identity = regular_identity(&source_file)?;
 	let (source_parent, source_name) = open_parent(root, source)?;
 	let (destination_parent, destination_name) = open_parent(root, destination)?;
-	// SAFETY: both parents own valid fds and both names are live NUL-terminated
-	// strings for this syscall.
-	let result = unsafe {
-		libc::syscall(
-			libc::SYS_renameat2,
-			source_parent.as_raw_fd(),
-			source_name.as_ptr(),
-			destination_parent.as_raw_fd(),
-			destination_name.as_ptr(),
-			libc::RENAME_NOREPLACE,
-		)
-	};
-	if result != 0 {
+	let result =
+		renameat2_no_replace(&source_parent, &source_name, &destination_parent, &destination_name);
+	if let Err(error) = result {
 		return Err(
-			match std::io::Error::last_os_error().raw_os_error() {
+			match error.raw_os_error() {
 				Some(libc::EEXIST) => "already_exists",
 				Some(libc::ENOSYS) => "atomic_unavailable",
 				Some(libc::EINVAL) => "invalid_request",
@@ -2444,21 +2500,11 @@ fn rename_managed_tree_no_replace_inner(
 	}
 	let (source_parent, source_name) = open_parent(root, source)?;
 	let (destination_parent, destination_name) = open_parent(root, destination)?;
-	// SAFETY: both parents are retained, names are validated, and RENAME_NOREPLACE
-	// is atomic.
-	if unsafe {
-		libc::syscall(
-			libc::SYS_renameat2,
-			source_parent.as_raw_fd(),
-			source_name.as_ptr(),
-			destination_parent.as_raw_fd(),
-			destination_name.as_ptr(),
-			libc::RENAME_NOREPLACE,
-		)
-	} != 0
+	if let Err(error) =
+		renameat2_no_replace(&source_parent, &source_name, &destination_parent, &destination_name)
 	{
 		return Err(
-			match std::io::Error::last_os_error().raw_os_error() {
+			match error.raw_os_error() {
 				Some(libc::EEXIST) => "already_exists",
 				Some(libc::ENOSYS) => "atomic_unavailable",
 				Some(libc::EINVAL) => "invalid_request",
@@ -2631,5 +2677,208 @@ mod tests {
 		assert_eq!(shared.len(), 1);
 		assert_eq!(shared[0].parent_role, "shared");
 		assert_eq!(shared[0].phase, "source_parent_sync");
+	}
+
+	use std::{
+		fs,
+		path::PathBuf,
+		time::{SystemTime, UNIX_EPOCH},
+	};
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new() -> Self {
+			let path = std::env::temp_dir().join(format!(
+				"pi-recovery-fs-fault-test-{}-{}",
+				std::process::id(),
+				SystemTime::now()
+					.duration_since(UNIX_EPOCH)
+					.expect("clock before epoch")
+					.as_nanos(),
+			));
+			fs::create_dir(&path).expect("create temporary root");
+			Self(path)
+		}
+
+		fn root(&self) -> File {
+			File::open(&self.0).expect("open temporary root")
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	fn managed_file(root: &File, path: &str, contents: &[u8]) -> RecoveryFsIdentity {
+		create(root, path, contents, MAX_MANAGED_CONTENT_BYTES)
+			.expect("create managed source")
+			.identity
+			.expect("managed source identity")
+	}
+
+	fn file_digest(contents: &[u8]) -> String {
+		hex_digest(Sha256::digest(contents).into())
+	}
+
+	fn assert_unsynced(result: &RecoveryFsPublishResult, role: &str, failures: usize) {
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("fsync_failed"));
+		assert_eq!(result.mutation_state, "committed");
+		assert_eq!(result.durability_state, "not_provable");
+		assert_eq!(result.reason, "durability_not_provable");
+		let evidence = result
+			.diagnostic
+			.sync_failures
+			.as_ref()
+			.expect("sync evidence");
+		assert_eq!(evidence.len(), failures);
+		assert_eq!(evidence[0].parent_role, role);
+	}
+
+	#[test]
+	fn retained_publication_faults_preserve_committed_file_tree_and_install_contents() {
+		let source_contents = b"source-only";
+		for (faults, role, failures) in [
+			(
+				vec![RetainedPublishFault::Sync(Some(libc::EIO)), RetainedPublishFault::Sync(None)],
+				"source",
+				1,
+			),
+			(
+				vec![RetainedPublishFault::Sync(None), RetainedPublishFault::Sync(Some(libc::EACCES))],
+				"destination",
+				1,
+			),
+			(
+				vec![
+					RetainedPublishFault::Sync(Some(libc::EIO)),
+					RetainedPublishFault::Sync(Some(libc::EACCES)),
+				],
+				"source",
+				2,
+			),
+		] {
+			let temporary = TempDir::new();
+			let root = temporary.root();
+			ensure_managed_directory(&root, "source-parent").expect("create source parent");
+			ensure_managed_directory(&root, "destination-parent").expect("create destination parent");
+			let identity = managed_file(&root, "source-parent/source", source_contents);
+			set_retained_publish_faults(faults);
+			let result = rename_managed_file_no_replace(
+				&root,
+				"source-parent/source",
+				"destination-parent/destination",
+				&identity.dev,
+				&identity.ino,
+				&identity.size,
+				&identity.mtime_ns,
+				&identity.ctime_ns,
+				&file_digest(source_contents),
+			);
+			assert_unsynced(&result, role, failures);
+			assert!(!temporary.0.join("source-parent/source").exists());
+			assert_eq!(
+				fs::read(temporary.0.join("destination-parent/destination"))
+					.expect("read committed destination"),
+				source_contents
+			);
+		}
+
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let source = b"install";
+		managed_file(&root, "source", source);
+		set_retained_publish_faults([RetainedPublishFault::Sync(Some(libc::EIO))]);
+		let result = install(&root, "source", "destination");
+		assert_unsynced(&result, "shared", 1);
+		assert!(!temporary.0.join("source").exists());
+		assert_eq!(
+			fs::read(temporary.0.join("destination")).expect("read committed install"),
+			source
+		);
+
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		ensure_managed_directory(&root, "source").expect("create source tree");
+		managed_file(&root, "source/receipt", b"tree");
+		let expected = snapshot_managed_tree(&root, "source")
+			.expect("snapshot source tree")
+			.snapshot
+			.expect("source tree snapshot");
+		set_retained_publish_faults([RetainedPublishFault::Sync(Some(libc::EIO))]);
+		let result = rename_managed_tree_no_replace(&root, "source", "destination", &expected);
+		assert_unsynced(&result, "shared", 1);
+		assert!(!temporary.0.join("source").exists());
+		assert_eq!(
+			fs::read(temporary.0.join("destination/receipt")).expect("read committed tree"),
+			b"tree"
+		);
+	}
+
+	#[test]
+	fn retained_publication_rename_faults_are_unknown_or_preflight_without_loss() {
+		for (fault, mutation_state, durability_state, reason, code) in [
+			(libc::EINTR, "unknown", "not_provable", "unknown", "interrupted"),
+			(libc::EXDEV, "not_committed", "not_attempted", "cross_device", "cross_device"),
+			(libc::EACCES, "not_committed", "not_attempted", "permission_denied", "permission_denied"),
+		] {
+			let temporary = TempDir::new();
+			let root = temporary.root();
+			managed_file(&root, "source", b"authoritative-source");
+			set_retained_publish_faults([RetainedPublishFault::Rename(fault)]);
+			let result = install(&root, "source", "destination");
+			assert!(!result.ok);
+			assert_eq!(result.code.as_deref(), Some(code));
+			assert_eq!(result.mutation_state, mutation_state);
+			assert_eq!(result.durability_state, durability_state);
+			assert_eq!(result.reason, reason);
+			assert_eq!(
+				fs::read(temporary.0.join("source")).expect("source remains authoritative"),
+				b"authoritative-source"
+			);
+			assert!(!temporary.0.join("destination").exists());
+		}
+	}
+
+	#[test]
+	fn retained_publish_faults_are_thread_local_under_concurrent_installs() {
+		let first = std::thread::spawn(|| {
+			let temporary = TempDir::new();
+			let root = temporary.root();
+			managed_file(&root, "source", b"first");
+			set_retained_publish_faults([RetainedPublishFault::Sync(Some(libc::EIO))]);
+			let result = install(&root, "source", "destination");
+			(
+				result
+					.diagnostic
+					.sync_failures
+					.expect("first sync evidence")[0]
+					.os_code,
+				fs::read(temporary.0.join("destination")).expect("first committed destination"),
+			)
+		});
+		let second = std::thread::spawn(|| {
+			let temporary = TempDir::new();
+			let root = temporary.root();
+			managed_file(&root, "source", b"second");
+			set_retained_publish_faults([RetainedPublishFault::Sync(Some(libc::EACCES))]);
+			let result = install(&root, "source", "destination");
+			(
+				result
+					.diagnostic
+					.sync_failures
+					.expect("second sync evidence")[0]
+					.os_code,
+				fs::read(temporary.0.join("destination")).expect("second committed destination"),
+			)
+		});
+		assert_eq!(first.join().expect("first install thread"), (Some(libc::EIO), b"first".to_vec()));
+		assert_eq!(
+			second.join().expect("second install thread"),
+			(Some(libc::EACCES), b"second".to_vec())
+		);
 	}
 }

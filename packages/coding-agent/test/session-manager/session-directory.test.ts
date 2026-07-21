@@ -11,7 +11,10 @@ import {
 	prepareManagedSessionScopeForWrite,
 	resolveManagedScope,
 } from "../../src/session/internal/managed-session-scope";
-import { publishManagedFileNoReplace } from "../../src/session/internal/managed-session-storage";
+import {
+	publishManagedFileNoReplace,
+	validateNativeSecurityResult,
+} from "../../src/session/internal/managed-session-storage";
 import { SessionManager } from "../../src/session/session-manager";
 import { FileSessionStorage } from "../../src/session/session-storage";
 
@@ -113,6 +116,47 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 		expect(await fs.readdir(external)).toEqual([]);
 	});
 
+	it("retains only bounded startup diagnostics when managed preparation rejects a symlink", async () => {
+		const { agentDir, cwd, sessionsRoot } = await sharedStickyFixture();
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+		const external = path.join(path.dirname(agentDir), "startup-diagnostic-external");
+		await fs.mkdir(external);
+		await fs.symlink(external, sessionsRoot);
+
+		let failure: unknown;
+		try {
+			SessionManager.managedDestination(cwd, agentDir);
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(Error);
+		const startupError = failure as Error;
+		expect(startupError.message).toBe("Could not resolve managed session scope.");
+		expect(startupError.message).not.toContain(external);
+		expect(JSON.stringify(startupError.cause)).not.toContain(external);
+		expect(startupError.cause).toEqual({ classification: "sessions_root_unavailable" });
+	});
+
+	it("redacts startup scope failures from the default session-directory wrapper", async () => {
+		const { agentDir, cwd, sessionsRoot } = await sharedStickyFixture();
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+		const external = path.join(path.dirname(agentDir), "startup-default-diagnostic-external");
+		await fs.mkdir(external);
+		await fs.symlink(external, sessionsRoot);
+
+		expect(() => SessionManager.getDefaultSessionDir(cwd, agentDir)).toThrow(
+			"Could not resolve managed session scope.",
+		);
+		try {
+			SessionManager.getDefaultSessionDir(cwd, agentDir);
+		} catch (error) {
+			const startupError = error as Error;
+			expect(startupError.message).not.toContain(external);
+			expect(JSON.stringify(startupError.cause)).not.toContain(external);
+			expect(startupError.cause).toEqual({ classification: "sessions_root_unavailable" });
+		}
+	});
+
 	it("rejects a symlinked managed scope leaf without following it", async () => {
 		const { agentDir, cwd, sessionsRoot } = await sharedStickyFixture();
 		await fs.mkdir(sessionsRoot, { recursive: true, mode: 0o700 });
@@ -125,6 +169,67 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 		await expect(prepareManagedSessionScopeForWrite(resolved.scope)).resolves.toMatchObject({ kind: "error" });
 		expect((await fs.lstat(resolved.scope.directoryPath)).isSymbolicLink()).toBe(true);
 		expect(await fs.readdir(external)).toEqual([]);
+	});
+
+	it.skipIf(process.getuid?.() !== 0)(
+		"fails closed for foreign-owned existing managed intermediates and leaves them unchanged",
+		async () => {
+			const { agentDir, cwd, sessionsRoot } = await sharedStickyFixture();
+			await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+			await fs.mkdir(sessionsRoot, { mode: 0o700 });
+			const marker = path.join(sessionsRoot, "foreign-marker");
+			await fs.writeFile(marker, "do-not-touch");
+			await fs.chown(sessionsRoot, 65534, 65534);
+			const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot });
+			if (resolved.kind !== "resolved") throw new Error(resolved.message);
+
+			await expect(prepareManagedSessionScopeForWrite(resolved.scope)).resolves.toMatchObject({ kind: "error" });
+			expect(await fs.readFile(marker, "utf8")).toBe("do-not-touch");
+		},
+	);
+
+	it.skipIf(process.getuid?.() !== 0)(
+		"fails closed for a foreign-owned managed leaf without adopting it",
+		async () => {
+			const { agentDir, cwd, sessionsRoot } = await sharedStickyFixture();
+			await fs.mkdir(sessionsRoot, { recursive: true, mode: 0o700 });
+			const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot });
+			if (resolved.kind !== "resolved") throw new Error(resolved.message);
+			await fs.mkdir(resolved.scope.directoryPath, { mode: 0o700 });
+			const marker = path.join(resolved.scope.directoryPath, "foreign-marker");
+			await fs.writeFile(marker, "do-not-touch");
+			await fs.chown(resolved.scope.directoryPath, 65534, 65534);
+
+			await expect(prepareManagedSessionScopeForWrite(resolved.scope)).resolves.toMatchObject({ kind: "error" });
+			expect(await fs.readFile(marker, "utf8")).toBe("do-not-touch");
+		},
+	);
+
+	it("distinguishes ACL/default-ACL observation from repair failure evidence", () => {
+		const observation = { ok: false, code: "acl_present", operation: "query", attribute: "access" } as const;
+		const repair = { ok: false, code: "acl_denied", operation: "clear", attribute: "default" } as const;
+		expect(validateNativeSecurityResult(observation, "verify", "directory")).toEqual(observation);
+		expect(validateNativeSecurityResult(repair, "apply", "directory")).toEqual(repair);
+		expect(() => validateNativeSecurityResult(repair, "verify", "directory")).toThrow(
+			"Verify failure unexpectedly reports ACL mutation",
+		);
+	});
+
+	it("does not re-adopt a replaced managed leaf or write into its external replacement", async () => {
+		const { agentDir, cwd, sessionsRoot } = await sharedStickyFixture();
+		const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot });
+		if (resolved.kind !== "resolved") throw new Error(resolved.message);
+		expect((await prepareManagedSessionScopeForWrite(resolved.scope)).kind).toBe("resolved");
+		const external = path.join(path.dirname(agentDir), "external-replacement");
+		await fs.rename(resolved.scope.directoryPath, external);
+		await fs.mkdir(resolved.scope.directoryPath, { mode: 0o700 });
+		const sentinel = path.join(resolved.scope.directoryPath, "external-sentinel");
+		await fs.writeFile(sentinel, "do-not-touch");
+
+		await expect(prepareManagedSessionScopeForWrite(resolved.scope)).resolves.toMatchObject({ kind: "error" });
+		expect(await fs.readFile(sentinel, "utf8")).toBe("do-not-touch");
+		expect(await fs.readdir(resolved.scope.directoryPath)).toEqual(["external-sentinel"]);
+		expect((await fs.lstat(external)).isDirectory()).toBe(true);
 	});
 });
 
