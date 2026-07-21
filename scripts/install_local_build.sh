@@ -25,6 +25,7 @@ REF=""
 DO_LINK=1
 TEMP_CLONE=""
 TEMP_BUN_INSTALLER=""
+PROMOTION_STATUS_DIR=""
 REUSED_CHECKOUT=""
 ORIGINAL_HEAD=""
 ORIGINAL_REF=""
@@ -40,6 +41,7 @@ cleanup() {
 	fi
 	[ -z "$TEMP_CLONE" ] || rm -rf "$TEMP_CLONE"
 	[ -z "$TEMP_BUN_INSTALLER" ] || rm -f "$TEMP_BUN_INSTALLER"
+	[ -z "$PROMOTION_STATUS_DIR" ] || rm -rf "$PROMOTION_STATUS_DIR"
 	exit "$status"
 }
 trap cleanup 0 HUP INT TERM
@@ -236,6 +238,12 @@ prepare_checkout() {
 	checkout_commit
 }
 
+remove_owned_destination() {
+	if [ -f "$PROMOTION_MARKER" ] && IFS= read -r marker_token < "$PROMOTION_MARKER" && [ "$marker_token" = "$PROMOTION_TOKEN" ]; then
+		rm -rf "$DEST_DIR" || echo "cleanup: could not remove the failed destination claim." >&2
+	fi
+}
+
 promote_clone() {
 	# Claim the final directory exclusively before copying. A unique marker proves
 	# that a failed copy may roll back only this invocation's claim; an existing or
@@ -246,20 +254,42 @@ promote_clone() {
 		fail "promotion" "Destination appeared while preparing the clone; it was left untouched: $DEST_DIR"
 	fi
 	if ! printf '%s\n' "$PROMOTION_TOKEN" > "$PROMOTION_MARKER"; then
+		# mkdir claimed this empty path exclusively. rmdir avoids recursively deleting
+		# anything if another process has since populated or replaced it.
+		rmdir "$DEST_DIR" || echo "cleanup: could not remove the empty destination claim." >&2
 		fail "promotion" "Could not mark the claimed destination."
 	fi
-	if (cd "$TEMP_CLONE" && tar cf - .) | (cd "$DEST_DIR" && tar xpf -); then
-		:
-	else
-		if [ -f "$PROMOTION_MARKER" ] && IFS= read -r marker_token < "$PROMOTION_MARKER" && [ "$marker_token" = "$PROMOTION_TOKEN" ]; then
-			rm -rf "$DEST_DIR" || echo "cleanup: could not remove the failed destination claim." >&2
+	PROMOTION_STATUS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/gjc-promotion.XXXXXX") || {
+		remove_owned_destination
+		fail "promotion" "Could not create temporary copy-status files."
+	}
+	(
+		if cd "$TEMP_CLONE"; then
+			if tar cf - .; then producer_status=0; else producer_status=$?; fi
+		else
+			producer_status=$?
 		fi
+		printf '%s\n' "$producer_status" > "$PROMOTION_STATUS_DIR/producer"
+	) | (
+		if cd "$DEST_DIR"; then
+			if tar xpf -; then extractor_status=0; else extractor_status=$?; fi
+		else
+			extractor_status=$?
+		fi
+		printf '%s\n' "$extractor_status" > "$PROMOTION_STATUS_DIR/extractor"
+	)
+	producer_status=unavailable
+	extractor_status=unavailable
+	if [ -f "$PROMOTION_STATUS_DIR/producer" ]; then IFS= read -r producer_status < "$PROMOTION_STATUS_DIR/producer" || :; fi
+	if [ -f "$PROMOTION_STATUS_DIR/extractor" ]; then IFS= read -r extractor_status < "$PROMOTION_STATUS_DIR/extractor" || :; fi
+	rm -rf "$PROMOTION_STATUS_DIR"
+	PROMOTION_STATUS_DIR=""
+	if [ "$producer_status" != 0 ] || [ "$extractor_status" != 0 ]; then
+		remove_owned_destination
 		fail "promotion" "Could not populate the claimed destination."
 	fi
 	if ! rm -f "$PROMOTION_MARKER"; then
-		if [ -f "$PROMOTION_MARKER" ] && IFS= read -r marker_token < "$PROMOTION_MARKER" && [ "$marker_token" = "$PROMOTION_TOKEN" ]; then
-			rm -rf "$DEST_DIR" || echo "cleanup: could not remove the failed destination claim." >&2
-		fi
+		remove_owned_destination
 		fail "promotion" "Could not finalize the claimed destination."
 	fi
 	rm -rf "$TEMP_CLONE"

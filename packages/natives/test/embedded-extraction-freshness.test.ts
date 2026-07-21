@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
 
-import { cachedEmbeddedExtractionIsFresh, resolveRuntimeCandidates } from "../native/loader-state.js";
+import {
+	cachedEmbeddedExtractionIsFresh,
+	getImmutableEmbeddedCachePath,
+	resolveRuntimeCandidates,
+} from "../native/loader-state.js";
 
 const hashes = (map: Record<string, string | null>) => (p: string) => (p in map ? map[p] : null);
 
@@ -50,29 +54,85 @@ describe("cachedEmbeddedExtractionIsFresh", () => {
 	});
 });
 
+const currentHash = "a".repeat(64);
+const staleHash = "b".repeat(64);
+
+describe("getImmutableEmbeddedCachePath", () => {
+	it("binds each cache pathname to one payload identity and rejects unsafe identities", () => {
+		expect(
+			getImmutableEmbeddedCachePath({
+				cacheDir: "/cache",
+				filename: "pi_natives.linux-x64-modern.node",
+				contentHash: currentHash,
+			}),
+		).toBe(`/cache/pi_natives.linux-x64-modern.${currentHash}.node`);
+		expect(
+			getImmutableEmbeddedCachePath({
+				cacheDir: "/cache",
+				filename: "../pi_natives.node",
+				contentHash: currentHash,
+			}),
+		).toBeNull();
+		expect(
+			getImmutableEmbeddedCachePath({ cacheDir: "/cache", filename: "pi_natives.node", contentHash: "not-a-sha256" }),
+		).toBeNull();
+	});
+});
+
 describe("resolveRuntimeCandidates", () => {
-	it("excludes every unvalidated versioned sibling when replacement fails", () => {
-		const modernPath = "/cache/pi_natives.linux-x64-modern.node";
-		const baselinePath = "/cache/pi_natives.linux-x64-baseline.node";
+	it("excludes stale, sibling-variant, and legacy mutable candidates in compiled mode", () => {
+		const modernPath = getImmutableEmbeddedCachePath({
+			cacheDir: "/cache",
+			filename: "pi_natives.linux-x64-modern.node",
+			contentHash: currentHash,
+		});
+		const stalePath = getImmutableEmbeddedCachePath({
+			cacheDir: "/cache",
+			filename: "pi_natives.linux-x64-modern.node",
+			contentHash: staleHash,
+		});
+		const baselinePath = getImmutableEmbeddedCachePath({
+			cacheDir: "/cache",
+			filename: "pi_natives.linux-x64-baseline.node",
+			contentHash: currentHash,
+		});
+		expect(modernPath).not.toBeNull();
+		expect(stalePath).not.toBeNull();
+		expect(baselinePath).not.toBeNull();
+
 		expect(
 			resolveRuntimeCandidates({
-				candidates: [modernPath, baselinePath, "/legacy/pi_natives.node"],
-				versionedDir: "/cache",
-				validatedVersionedCandidates: [],
+				candidates: [
+					stalePath!,
+					baselinePath!,
+					"/cache/pi_natives.linux-x64-modern.node",
+					"/legacy/pi_natives.node",
+				],
+				embeddedCandidate: modernPath,
+				validatedCandidates: [modernPath!],
 			}),
-		).toEqual(["/legacy/pi_natives.node"]);
+		).toEqual([modernPath]);
 	});
 
-	it("permits only the content-validated versioned candidate", () => {
-		const modernPath = "/cache/pi_natives.linux-x64-modern.node";
-		const baselinePath = "/cache/pi_natives.linux-x64-baseline.node";
+	it("fails closed when a replacement race invalidates the immutable target", () => {
+		const immutablePath = getImmutableEmbeddedCachePath({
+			cacheDir: "/cache",
+			filename: "pi_natives.linux-x64-modern.node",
+			contentHash: currentHash,
+		});
+		expect(immutablePath).not.toBeNull();
+		expect(
+			cachedEmbeddedExtractionIsFresh({
+				targetPath: immutablePath!,
+				embeddedPath,
+				contentHash: hashes({ [immutablePath!]: staleHash, [embeddedPath]: currentHash }),
+			}),
+		).toBe(false);
 		expect(
 			resolveRuntimeCandidates({
-				candidates: [modernPath, baselinePath, "/legacy/pi_natives.node"],
-				embeddedCandidate: modernPath,
-				versionedDir: "/cache",
-				validatedVersionedCandidates: [modernPath],
+				candidates: [immutablePath!, "/cache/pi_natives.linux-x64-modern.node", "/legacy/pi_natives.node"],
+				validatedCandidates: [],
 			}),
-		).toEqual([modernPath, "/legacy/pi_natives.node"]);
+		).toEqual([]);
 	});
 });

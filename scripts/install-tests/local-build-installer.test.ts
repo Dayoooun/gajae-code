@@ -21,7 +21,7 @@ function writeExecutable(name: string, body: string): void {
 	fs.chmodSync(target, 0o755);
 }
 
-function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFails?: boolean; bun?: "path" | "failing-link"; tar?: "failing-copy" } = {}): void {
+function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFails?: boolean; bun?: "path" | "failing-link"; tar?: "failing-producer" | "failing-extractor"; markerWriteFails?: boolean } = {}): void {
 	writeExecutable(
 		"git",
 		[
@@ -59,8 +59,21 @@ function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFa
 			].join("\n"),
 		);
 	}
+	if (options.markerWriteFails) {
+		writeExecutable(
+			"mkdir",
+			['if [ "${TEST_MARKER_FAIL_DEST:-}" = "${1:-}" ]; then', '  /bin/mkdir "$@"', '  chmod a-w "$1"', '  exit 0', "fi", 'exec /bin/mkdir "$@"'].join("\n"),
+		);
+	}
 	if (options.tar) {
-		writeExecutable("tar", ['[ "${1:-}" = "xpf" ] && { printf partial > partial-copy; exit 44; }', "exit 0"].join("\n"));
+		writeExecutable(
+			"tar",
+			[
+				options.tar === "failing-producer" ? '[ "${1:-}" = "cf" ] && exit 43' : "",
+				options.tar === "failing-extractor" ? '[ "${1:-}" = "xpf" ] && { printf partial > partial-copy; exit 44; }' : "",
+				"exit 0",
+			].join("\n"),
+		);
 	}
 }
 
@@ -136,12 +149,30 @@ describe("install_local_build.sh", () => {
 		expect(fs.readdirSync(destination)).toEqual(["keep"]);
 		expect(temporaryClones()).toEqual([]);
 	});
-	test("rolls back an ownership-proven destination claim after a copy failure", async () => {
-		writeTools({ bun: "path", tar: "failing-copy" });
-		const destination = path.join(sandbox.root, "failed-copy");
+	test("rolls back an ownership-proven destination claim after a tar producer failure", async () => {
+		writeTools({ bun: "path", tar: "failing-producer" });
+		const destination = path.join(sandbox.root, "failed-producer");
 		const result = await run(["--dir", destination]);
 		expect(result.exitCode).not.toBe(0);
 		expect(result.stderr).toContain("Could not populate");
+		expect(fs.existsSync(destination)).toBe(false);
+		expect(temporaryClones()).toEqual([]);
+	});
+	test("rolls back an ownership-proven destination claim after a tar extractor failure", async () => {
+		writeTools({ bun: "path", tar: "failing-extractor" });
+		const destination = path.join(sandbox.root, "failed-extractor");
+		const result = await run(["--dir", destination]);
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr).toContain("Could not populate");
+		expect(fs.existsSync(destination)).toBe(false);
+		expect(temporaryClones()).toEqual([]);
+	});
+	test("rolls back an empty destination claim when ownership-marker creation fails", async () => {
+		writeTools({ bun: "path", markerWriteFails: true });
+		const destination = path.join(sandbox.root, "failed-marker");
+		const result = await run(["--dir", destination], { TEST_MARKER_FAIL_DEST: destination });
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr).toContain("Could not mark");
 		expect(fs.existsSync(destination)).toBe(false);
 		expect(temporaryClones()).toEqual([]);
 	});

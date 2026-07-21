@@ -79,12 +79,21 @@ export interface CachedEmbeddedExtractionIsFreshInput {
 
 export function cachedEmbeddedExtractionIsFresh(input: CachedEmbeddedExtractionIsFreshInput): boolean;
 
+export interface GetImmutableEmbeddedCachePathInput {
+	cacheDir: string;
+	filename: string;
+	contentHash: string;
+}
+
+/** Returns null unless filename and contentHash can form a safe immutable cache identity. */
+export function getImmutableEmbeddedCachePath(input: GetImmutableEmbeddedCachePathInput): string | null;
+
 export interface ResolveRuntimeCandidatesInput {
 	candidates: string[];
 	embeddedCandidate?: string | null;
 	stagedCandidate?: string | null;
-	versionedDir?: string;
-	validatedVersionedCandidates?: string[];
+	/** When present, excludes every candidate not validated against embedded content. */
+	validatedCandidates?: string[];
 }
 
 export function resolveRuntimeCandidates(input: ResolveRuntimeCandidatesInput): string[];

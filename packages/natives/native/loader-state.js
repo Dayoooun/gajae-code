@@ -241,25 +241,35 @@ export function cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath, cont
 }
 
 /**
- * Build the candidate list after embedded extraction. In compiled mode, only
- * versioned cache entries whose content was validated against the selected
- * embedded payload may be loaded; every other sibling is excluded.
- * @param {{ candidates: string[]; embeddedCandidate?: string | null; stagedCandidate?: string | null; versionedDir?: string; validatedVersionedCandidates?: string[] }} input
+ * Return the only cache pathname eligible for an embedded payload. The SHA-256
+ * identity is part of the filename so a same-version or sibling variant cannot
+ * substitute a mutable versioned filename.
+ * @param {{ cacheDir: string; filename: string; contentHash: string }} input
+ * @returns {string | null}
+ */
+export function getImmutableEmbeddedCachePath({ cacheDir, filename, contentHash }) {
+	if (filename !== path.basename(filename) || !/^[a-f0-9]{64}$/.test(contentHash)) return null;
+	const extension = path.extname(filename);
+	if (extension !== ".node") return null;
+	return path.join(cacheDir, `${path.basename(filename, extension)}.${contentHash}${extension}`);
+}
+/**
+ * Build the candidate list after embedded extraction. When content-validated
+ * candidates are supplied (compiled mode), every other candidate is excluded
+ * fail-closed, including mutable versioned and user-data filenames.
+ * @param {{ candidates: string[]; embeddedCandidate?: string | null; stagedCandidate?: string | null; validatedCandidates?: string[] }} input
  * @returns {string[]}
  */
 export function resolveRuntimeCandidates({
 	candidates,
 	embeddedCandidate = null,
 	stagedCandidate = null,
-	versionedDir,
-	validatedVersionedCandidates,
+	validatedCandidates,
 }) {
-	const validated = validatedVersionedCandidates && new Set(validatedVersionedCandidates);
-	const prepended = [embeddedCandidate, stagedCandidate].filter(candidate => typeof candidate === "string");
-	const allowedCandidates = candidates.filter(candidate =>
-		!validated || path.dirname(candidate) !== versionedDir || validated.has(candidate),
-	);
-	return [...new Set([...prepended.filter(candidate => !validated || path.dirname(candidate) !== versionedDir || validated.has(candidate)), ...allowedCandidates])];
+	const validated = validatedCandidates && new Set(validatedCandidates);
+	const allowed = candidate => !validated || validated.has(candidate);
+	const prepended = [embeddedCandidate, stagedCandidate].filter(candidate => typeof candidate === "string" && allowed(candidate));
+	return [...new Set([...prepended, ...candidates.filter(allowed)])];
 }
 
 // =========================================================================
@@ -343,13 +353,31 @@ function selectEmbeddedAddonFile(selectedVariant) {
 }
 
 function maybeExtractEmbeddedAddon(ctx, errors) {
-	const noExtraction = { candidate: null, validatedVersionedCandidates: [] };
+	const noExtraction = { candidate: null, validatedCandidates: [] };
 	if (!ctx.isCompiledBinary || !embeddedAddon) return noExtraction;
 	if (embeddedAddon.platformTag !== ctx.platformTag || embeddedAddon.version !== ctx.packageVersion) return noExtraction;
 
 	const selectedEmbeddedFile = selectEmbeddedAddonFile(ctx.selectedVariant);
 	if (!selectedEmbeddedFile) return noExtraction;
-	const targetPath = path.join(ctx.versionedDir, selectedEmbeddedFile.filename);
+
+	let buffer;
+	try {
+		buffer = fs.readFileSync(selectedEmbeddedFile.filePath);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		errors.push(`embedded addon read (${selectedEmbeddedFile.filename}): ${message}`);
+		return noExtraction;
+	}
+	const embeddedHash = createHash("sha256").update(buffer).digest("hex");
+	const targetPath = getImmutableEmbeddedCachePath({
+		cacheDir: ctx.versionedDir,
+		filename: selectedEmbeddedFile.filename,
+		contentHash: embeddedHash,
+	});
+	if (!targetPath) {
+		errors.push(`embedded addon cache identity (${selectedEmbeddedFile.filename}): invalid filename or content hash`);
+		return noExtraction;
+	}
 	const contentHash = candidate => {
 		try {
 			return createHash("sha256").update(fs.readFileSync(candidate)).digest("hex");
@@ -357,10 +385,11 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 			return null;
 		}
 	};
-	const isFresh = () =>
-		cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath: selectedEmbeddedFile.filePath, contentHash });
-	if (fs.existsSync(targetPath) && isFresh()) {
-		return { candidate: targetPath, validatedVersionedCandidates: [targetPath] };
+	const isFresh = () => contentHash(targetPath) === embeddedHash;
+	if (fs.existsSync(targetPath)) {
+		if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath] };
+		errors.push(`embedded addon validation (${selectedEmbeddedFile.filename}): immutable cache entry did not match embedded payload`);
+		return noExtraction;
 	}
 
 	try {
@@ -371,18 +400,22 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 		return noExtraction;
 	}
 
+	const tempPath = `${targetPath}.tmp.${process.pid}`;
 	try {
-		const buffer = fs.readFileSync(selectedEmbeddedFile.filePath);
-		const tempPath = `${targetPath}.tmp.${process.pid}`;
-		fs.writeFileSync(tempPath, buffer);
-		fs.renameSync(tempPath, targetPath);
+		fs.writeFileSync(tempPath, buffer, { flag: "wx" });
+		// link(2) creates the content-addressed target without replacing a
+		// concurrently-created entry. A replacement is revalidated below.
+		fs.linkSync(tempPath, targetPath);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		errors.push(`embedded addon write (${selectedEmbeddedFile.filename}): ${message}`);
-		return noExtraction;
+	} finally {
+		try {
+			fs.unlinkSync(tempPath);
+		} catch {}
 	}
 
-	if (isFresh()) return { candidate: targetPath, validatedVersionedCandidates: [targetPath] };
+	if (isFresh()) return { candidate: targetPath, validatedCandidates: [targetPath] };
 	errors.push(`embedded addon validation (${selectedEmbeddedFile.filename}): extracted file did not match embedded payload`);
 	return noExtraction;
 }
@@ -441,17 +474,9 @@ function validateLoadedBindings(ctx, bindings, candidate) {
 
 function buildHelpMessage(ctx) {
 	if (ctx.isCompiledBinary) {
-		const expectedPaths = ctx.addonFilenames.map(filename => `  ${path.join(ctx.versionedDir, filename)}`).join("\n");
-		const downloadHints = ctx.addonFilenames
-			.map(filename => {
-				const downloadUrl = `https://github.com/Yeachan-Heo/gajae-code/releases/latest/download/${filename}`;
-				const targetPath = path.join(ctx.versionedDir, filename);
-				return `  curl -fsSL "${downloadUrl}" -o "${targetPath}"`;
-			})
-			.join("\n");
 		return (
-			`The compiled binary should extract one of:\n${expectedPaths}\n\n` +
-			`If missing, delete ${ctx.versionedDir} and re-run, or download manually:\n${downloadHints}`
+			`The compiled binary should extract a content-validated native addon under:\n  ${ctx.versionedDir}\n\n` +
+			`If extraction fails, delete ${ctx.versionedDir} and re-run the binary.`
 		);
 	}
 	return (
@@ -548,8 +573,7 @@ export function loadNative() {
 		candidates: ctx.candidates,
 		embeddedCandidate: embeddedExtraction.candidate,
 		stagedCandidate,
-		versionedDir: ctx.isCompiledBinary ? ctx.versionedDir : undefined,
-		validatedVersionedCandidates: ctx.isCompiledBinary ? embeddedExtraction.validatedVersionedCandidates : undefined,
+		validatedCandidates: ctx.isCompiledBinary ? embeddedExtraction.validatedCandidates : undefined,
 	});
 
 	const loaded = loadFromCandidates({
