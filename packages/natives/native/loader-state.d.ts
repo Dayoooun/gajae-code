@@ -87,6 +87,7 @@ export interface LoaderContext {
 	addonFilenames?: string[];
 	versionedDir?: string;
 	candidates?: string[];
+	selectedVariant?: "modern" | "baseline" | null;
 }
 
 export function embeddedAddonIsAuthoritative(
