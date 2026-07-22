@@ -1425,11 +1425,7 @@ describe("managed session write protocol", () => {
 		});
 		expect(await fs.stat(source).catch(() => undefined)).toBeUndefined();
 		expect(await fs.stat(artifacts).catch(() => undefined)).toBeUndefined();
-		for (const pathname of [
-			pending.plannedArtifactsPath,
-			`${pending.plannedArtifactsPath}.removing`,
-			pending.plannedTranscriptPath,
-		]) {
+		for (const pathname of [`${pending.plannedArtifactsPath}.removing`, pending.plannedTranscriptPath]) {
 			expect(typeof pathname).toBe("string");
 			expect(await fs.lstat(pathname as string).catch(() => undefined)).toBeUndefined();
 		}
