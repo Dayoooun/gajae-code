@@ -443,7 +443,17 @@ async function migrateLegacyLocal(
 			}
 			await fs.rename(path.join(staging, entry), path.join(localRoot, entry));
 		}
-		await retireLegacyTree(legacySource.root, manifest);
+		try {
+			await retireLegacyTree(legacySource.root, manifest);
+		} catch (error) {
+			if (
+				!(error instanceof Error) ||
+				error.message !== "Legacy local:// migration retirement failed: cleanup_pending"
+			)
+				throw error;
+			await fs.writeFile(marker, "cleanup_pending\n", { mode: 0o600, flag: "wx" });
+			return;
+		}
 		await fs.writeFile(marker, "verified\n", { mode: 0o600, flag: "wx" });
 	} finally {
 		await fs.rm(staging, { recursive: true, force: true });
