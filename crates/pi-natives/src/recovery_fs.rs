@@ -37,6 +37,7 @@ static MANAGED_REPLACEMENT_ID: AtomicU64 = AtomicU64::new(0);
 enum RetainedPublishFault {
 	Rename(i32),
 	Sync(Option<i32>),
+	PostRenameSnapshot(&'static str),
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -60,6 +61,20 @@ fn take_retained_publish_fault(rename: bool) -> Option<Option<i32>> {
 				Some(Some(code))
 			},
 			Some(RetainedPublishFault::Sync(code)) if !rename => {
+				configured.pop_front();
+				Some(code)
+			},
+			_ => None,
+		}
+	})
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn take_post_rename_snapshot_fault() -> Option<&'static str> {
+	RETAINED_PUBLISH_FAULTS.with(|configured| {
+		let mut configured = configured.borrow_mut();
+		match configured.front().copied() {
+			Some(RetainedPublishFault::PostRenameSnapshot(code)) => {
 				configured.pop_front();
 				Some(code)
 			},
@@ -160,6 +175,7 @@ pub struct RecoveryFsPublishSyncFailure {
 #[cfg(target_os = "linux")]
 enum RetainedPublishError {
 	Code(&'static str),
+	PostMutationCode(&'static str),
 	SyncFailures(Vec<RecoveryFsPublishSyncFailure>),
 }
 
@@ -1633,6 +1649,9 @@ fn rename_managed_file_no_replace(
 			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"
 			| "invalid_request"),
 		)) => publish_preflight_failure(code),
+		Err(RetainedPublishError::PostMutationCode(code)) => {
+			publish_post_mutation_failure(code, "terminal_identity")
+		},
 		Err(RetainedPublishError::Code(code)) => publish_unknown_failure(code, "terminal_identity"),
 	}
 }
@@ -2048,6 +2067,9 @@ fn install(root: &File, source: &str, destination: &str) -> RecoveryFsPublishRes
 			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"
 			| "invalid_request"),
 		)) => publish_preflight_failure(code),
+		Err(RetainedPublishError::PostMutationCode(code)) => {
+			publish_post_mutation_failure(code, "terminal_identity")
+		},
 		Err(RetainedPublishError::Code(code)) => publish_unknown_failure(code, "terminal_identity"),
 	}
 }
@@ -2433,6 +2455,18 @@ fn snapshot_managed_tree(
 }
 
 #[cfg(target_os = "linux")]
+fn snapshot_managed_tree_after_rename(
+	root: &File,
+	relative_path: &str,
+) -> Result<crate::path_identity::NativeDirectoryTreeResult, &'static str> {
+	#[cfg(test)]
+	if let Some(code) = take_post_rename_snapshot_fault() {
+		return Err(code);
+	}
+	snapshot_managed_tree(root, relative_path)
+}
+
+#[cfg(target_os = "linux")]
 fn tree_matches_after_rename(
 	actual: &crate::path_identity::NativeDirectoryTreeSnapshot,
 	expected: &crate::path_identity::NativeDirectoryTreeSnapshot,
@@ -2481,6 +2515,9 @@ fn rename_managed_tree_no_replace(
 			code @ ("already_exists" | "atomic_unavailable" | "cross_device" | "permission_denied"
 			| "invalid_request"),
 		)) => publish_preflight_failure(code),
+		Err(RetainedPublishError::PostMutationCode(code)) => {
+			publish_post_mutation_failure(code, "terminal_identity")
+		},
 		Err(RetainedPublishError::Code(code)) => publish_unknown_failure(code, "terminal_identity"),
 	}
 }
@@ -2517,7 +2554,7 @@ fn rename_managed_tree_no_replace_inner(
 		);
 	}
 	let post_mutation = (|| -> Result<RecoveryFsIdentity, RetainedPublishError> {
-		let after = snapshot_managed_tree(root, destination)?
+		let after = snapshot_managed_tree_after_rename(root, destination)?
 			.snapshot
 			.ok_or("io_error")?;
 		if !tree_matches_after_rename(&after, expected) {
@@ -2531,7 +2568,7 @@ fn rename_managed_tree_no_replace_inner(
 			source_parent_identity.dev == destination_parent_identity.dev
 				&& source_parent_identity.ino == destination_parent_identity.ino,
 		)?;
-		let terminal = snapshot_managed_tree(root, destination)?
+		let terminal = snapshot_managed_tree_after_rename(root, destination)?
 			.snapshot
 			.ok_or("io_error")?;
 		if terminal != after {
@@ -2548,6 +2585,7 @@ fn rename_managed_tree_no_replace_inner(
 	})();
 	match post_mutation {
 		Ok(identity) => Ok(RecoveryFsResult::success(identity)),
+		Err(RetainedPublishError::Code(code)) => Err(RetainedPublishError::PostMutationCode(code)),
 		Err(error) => Err(error),
 	}
 }
@@ -2816,6 +2854,41 @@ mod tests {
 			fs::read(temporary.0.join("destination/receipt")).expect("read committed tree"),
 			b"tree"
 		);
+	}
+
+	#[test]
+	fn retained_tree_post_rename_snapshot_failures_remain_committed_not_provable() {
+		for (fault, reason) in [
+			(RetainedPublishFault::PostRenameSnapshot("io_error"), "io_failure"),
+			(RetainedPublishFault::PostRenameSnapshot("identity_mismatch"), "identity_violation"),
+		] {
+			let temporary = TempDir::new();
+			let root = temporary.root();
+			ensure_managed_directory(&root, "source").expect("create source tree");
+			managed_file(&root, "source/receipt", b"tree");
+			let expected = snapshot_managed_tree(&root, "source")
+				.expect("snapshot source tree")
+				.snapshot
+				.expect("source tree snapshot");
+			set_retained_publish_faults([fault]);
+			let result = rename_managed_tree_no_replace(&root, "source", "destination", &expected);
+			assert!(!result.ok);
+			assert_eq!(
+				result.code.as_deref(),
+				Some(match fault {
+					RetainedPublishFault::PostRenameSnapshot(code) => code,
+					_ => unreachable!("post-rename snapshot fault"),
+				})
+			);
+			assert_eq!(result.mutation_state, "committed");
+			assert_eq!(result.durability_state, "not_provable");
+			assert_eq!(result.reason, reason);
+			assert!(!temporary.0.join("source").exists());
+			assert_eq!(
+				fs::read(temporary.0.join("destination/receipt")).expect("read committed tree"),
+				b"tree"
+			);
+		}
 	}
 
 	#[test]
