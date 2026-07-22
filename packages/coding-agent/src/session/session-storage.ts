@@ -888,14 +888,10 @@ export class FileSessionStorage implements SessionStorage {
 			}
 		}
 
-		if (
-			artifactsRemoved &&
-			(detachedArtifactsPath || expectedArtifactsIdentity) &&
-			!detachedArtifactsPath?.endsWith(".removing")
-		) {
+		if (artifactsRemoved && expectedArtifactsIdentity && !detachedArtifactsPath) {
 			throw new SessionDeleteVerificationError(
 				"artifacts",
-				"Artifact phase receipt conflicts with pending artifact cleanup",
+				"Artifact phase receipt requires detached artifact evidence",
 			);
 		}
 		const artifactsDir = transcriptPath.slice(0, -6);
