@@ -88,7 +88,7 @@ function writeTools(options: { cloneFails?: boolean; curlFails?: boolean; bashFa
 	}
 }
 
-function start(args: string[], extra: Record<string, string> = {}) {
+function start(args: readonly string[], extra: Record<string, string> = {}) {
 	return Bun.spawn(["sh", installer, ...args], {
 		cwd: repoRoot,
 		env: { PATH: `${sandbox.bin}:/usr/bin:/bin`, HOME: sandbox.home, TMPDIR: sandbox.root, TEST_LOG: sandbox.log, BUN_INSTALL: path.join(sandbox.root, "bun home"), ...extra },
@@ -97,7 +97,7 @@ function start(args: string[], extra: Record<string, string> = {}) {
 	});
 }
 
-async function run(args: string[], extra: Record<string, string> = {}) {
+async function run(args: readonly string[], extra: Record<string, string> = {}) {
 	const proc = start(args, extra);
 	const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
 	return { exitCode, stdout, stderr };
