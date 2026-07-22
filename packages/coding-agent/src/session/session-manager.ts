@@ -59,6 +59,7 @@ import {
 	listManagedCandidates,
 	type ManagedCandidateWriteAuthority,
 	type ManagedMigrationPolicy,
+	type ManagedOpenCandidateResult,
 	type ManagedScope,
 	managedDirectoryAuthorityForScope,
 	managedRootForScope,
@@ -7089,9 +7090,11 @@ export class SessionManager {
 		const storage = new FileSessionStorage();
 		const managedDestinationStore = managedStoreFromContext(destination.securityContext, destination.directory);
 		const assertManagedDestinationBound = (): void => {
-			assertManagedDirectoryRoot(destination.securityContext.rootAuthority);
 			managedDestinationStore.assertBound();
+			if (!destination.securityContext.retainedAuthority)
+				assertManagedDirectoryRoot(destination.securityContext.rootAuthority);
 		};
+
 		assertManagedDestinationBound();
 		const inspected = inspectResumeSessionFile(filePath, storage);
 		if ("kind" in inspected) {
@@ -7147,18 +7150,26 @@ export class SessionManager {
 					}
 				: {}),
 		};
-		const opened = await openManagedCandidateForWrite(
-			resolved.scope,
-			candidate,
-			expectedIdentity ?? inspected.identity,
-			migrationPolicy,
-			authority,
-		);
-		assertManagedDestinationBound();
+		let opened: ManagedOpenCandidateResult;
+		try {
+			opened = await openManagedCandidateForWrite(
+				resolved.scope,
+				candidate,
+				expectedIdentity ?? inspected.identity,
+				migrationPolicy,
+				authority,
+			);
+		} catch (error) {
+			if (error instanceof Error && error.message.startsWith("Managed root authority changed"))
+				managedDestinationStore.assertBound();
+			throw error;
+		}
 		if (opened.kind === "error") {
+			managedDestinationStore.assertBound();
 			if (opened.code === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
 			throw new Error(`Could not open managed session: ${opened.message}`);
 		}
+		assertManagedDestinationBound();
 		return opened.path;
 	}
 
@@ -7501,11 +7512,9 @@ export class SessionManager {
 				}
 				if (removeSessionDirOnFailure) {
 					try {
-						await fs.promises.rmdir(dir);
+						await fs.promises.rm(dir, { recursive: true, force: true });
 					} catch (cleanupError) {
-						const code = (cleanupError as NodeJS.ErrnoException).code;
-						if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST")
-							cleanupErrors.push(toError(cleanupError));
+						cleanupErrors.push(toError(cleanupError));
 					}
 				}
 				if (cleanupErrors.length > 0) {

@@ -460,8 +460,8 @@ export class ManagedSessionDescendantStore {
 		retained?: { authority: RecoveryFsRoot; authorityBaseDir: string },
 		policy?: ManagedSessionSecurityPolicy,
 	) {
-		assertManagedDirectoryRoot(root);
 		managedRelativePath(root, baseDir);
+
 		this.#root = root;
 		this.#baseDir = path.resolve(baseDir);
 		this.#policy = policy ?? "default";
@@ -471,20 +471,17 @@ export class ManagedSessionDescendantStore {
 			const captured = retained.authority.snapshotManagedTree(relative);
 			if (!captured.ok || !captured.snapshot)
 				throw new Error(captured.code ?? "Managed subtree identity unavailable");
-			const subtreeStat = fs.lstatSync(this.#baseDir, { bigint: true });
-			if (
-				captured.snapshot.rootDev !== subtreeStat.dev.toString() ||
-				captured.snapshot.rootIno !== subtreeStat.ino.toString()
-			)
-				throw new Error("Managed descendant root identity changed");
 			this.#subtreeRoot = Object.freeze({
 				canonicalPath: this.#baseDir,
-				dev: subtreeStat.dev,
-				ino: subtreeStat.ino,
+				dev: BigInt(captured.snapshot.rootDev),
+				ino: BigInt(captured.snapshot.rootIno),
 			});
 			this.#authority = retained.authority;
+			this.#assertBound();
+
 			return;
 		}
+		assertManagedDirectoryRoot(root);
 		ensureManagedDirectory(this.#baseDir, root, this.#policy);
 		const subtreeStat = fs.lstatSync(this.#baseDir, { bigint: true });
 		this.#subtreeRoot = Object.freeze({ canonicalPath: this.#baseDir, dev: subtreeStat.dev, ino: subtreeStat.ino });
@@ -1270,6 +1267,7 @@ export async function publishManagedFileNoReplace(
 	let stagingIdentity: { dev: bigint; ino: bigint } | undefined;
 	let failure: unknown;
 	let outcome: NativePublishOutcome | undefined;
+	let renameAttempted = false;
 
 	try {
 		assertOwned?.();
@@ -1287,6 +1285,7 @@ export async function publishManagedFileNoReplace(
 		stagingIdentity = { dev: staged.dev, ino: staged.ino };
 		assertOwned?.();
 
+		renameAttempted = true;
 		outcome = classifyNativePublishOutcome(renameNoReplacePath(staging, destination));
 
 		if (!outcome.ok) throw publishFailure(outcome);
@@ -1310,7 +1309,7 @@ export async function publishManagedFileNoReplace(
 	} finally {
 		if (fd !== undefined) fs.closeSync(fd);
 
-		if (stagingIdentity && outcome && mayCleanCurrentStaging(outcome)) {
+		if (stagingIdentity && (!renameAttempted || (outcome && mayCleanCurrentStaging(outcome)))) {
 			await fsp
 				.lstat(staging, { bigint: true })
 				.then(stat => {

@@ -71,7 +71,6 @@ const managedDirectoryAuthorities = new WeakMap<ManagedScope, native.RecoveryFsR
 const boundManagedWriteAuthorities = new WeakMap<ManagedScope, ManagedCandidateWriteAuthority>();
 
 function bindManagedWriteAuthority(scope: ManagedScope, authority: ManagedCandidateWriteAuthority): void {
-	assertManagedDirectoryRoot(authority.rootAuthority);
 	if (
 		authority.retainedAuthority &&
 		authority.retainedDirectory !== undefined &&
@@ -81,6 +80,8 @@ function bindManagedWriteAuthority(scope: ManagedScope, authority: ManagedCandid
 			authority: authority.retainedAuthority,
 			authorityBaseDir: scope.directoryPath,
 		}).assertBound();
+	} else {
+		assertManagedDirectoryRoot(authority.rootAuthority);
 	}
 	managedRoots.set(scope, authority.rootAuthority);
 	boundManagedWriteAuthorities.set(scope, authority);
@@ -160,7 +161,6 @@ export type ManagedScopeErrorCode =
 	| "atomic_unavailable"
 	| "invalid_request"
 	| "durability_failed"
-
 	| "durability_not_provable";
 
 export type ManagedScopeResolution =
@@ -617,7 +617,6 @@ function fsyncCanonicalBinding(bindingPath: string, expected: string): void {
 	)
 		throw new Error("binding_invalid");
 }
-
 
 type CandidatePreflight =
 	| { kind: "capture"; identity: { dev: bigint; ino: bigint; size: number; mtimeNs: bigint } }
@@ -2445,7 +2444,7 @@ export async function openManagedCandidateForWrite(
 		if (prepared.kind === "error")
 			return {
 				kind: "error",
-				code: prepared.code,
+				code: expectedFailure(new Error(prepared.code)),
 
 				message: prepared.message,
 			};
@@ -2535,6 +2534,7 @@ export async function openManagedCandidateForWrite(
 		} catch (error) {
 			if ((error as Error).message !== "destination_conflict") throw error;
 		}
+		revalidatePickerConsent(scope, afterLock, expectedIdentity);
 		lock.assertOwned();
 		if (!preparedReceiptMatches(preparedReceipt, scope, afterLock, intendedDestination, artifactPlan))
 			throw new Error("durability_failed");
@@ -2646,7 +2646,7 @@ export async function deleteManagedSessionCandidate(
 	if (prepared.kind === "error")
 		return {
 			kind: "error",
-			code: prepared.code,
+			code: expectedFailure(new Error(prepared.code)),
 			message: prepared.message,
 		};
 	const current = validateCandidateForScope(scope, candidate);
