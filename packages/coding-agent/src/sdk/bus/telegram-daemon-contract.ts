@@ -31,6 +31,7 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * generation 19, authoritative terminal session-close delivery and cleanup
  * fencing, attested generation-bearing pre-incarnation owner handoff in
  * generation 20, guarded modern generation-absent predecessor signaling in
- * generation 21, and dead Windows v0.10 owner replacement in generation 22.
+ * generation 21, dead Windows v0.10 owner replacement in generation 22, and
+ * retained native cleanup authority revalidation in generation 23.
  */
-export const DAEMON_GENERATION = 22;
+export const DAEMON_GENERATION = 23;

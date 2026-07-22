@@ -32,8 +32,8 @@ export type ChatDaemonAction = "stop" | "reload";
  * authority declaration contract with bounded frame-delivery acknowledgement.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 9,
-	slack: 9,
+	discord: 10,
+	slack: 10,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
