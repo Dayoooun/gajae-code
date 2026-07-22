@@ -1304,8 +1304,8 @@ describe("managed session write protocol", () => {
 		expect(detachedQ1).toBe(q1);
 		expect(await fs.stat(source).catch(() => undefined)).toBeUndefined();
 		expect(await fs.stat(q1)).toBeDefined();
-
 		let q2: string | undefined;
+
 		const deleteSessionVerified = FileSessionStorage.prototype.deleteSessionVerified;
 		const deleteReplay = vi.spyOn(FileSessionStorage.prototype, "deleteSessionVerified").mockImplementation(function (
 			this: FileSessionStorage,

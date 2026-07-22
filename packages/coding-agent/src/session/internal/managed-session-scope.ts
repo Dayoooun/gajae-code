@@ -2447,6 +2447,8 @@ export async function reconcileManagedTombstones(scope: ManagedScope): Promise<v
 						transcriptIdentity: target.identity,
 						plannedArtifactsPath: active.plannedArtifactsPath,
 						plannedTranscriptPath: active.plannedTranscriptPath,
+						detachedTranscriptPath: active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
+
 						artifactsRemoved: true,
 					});
 				}
@@ -2872,6 +2874,7 @@ export async function deleteManagedSessionCandidate(
 					transcriptIdentity: target.identity,
 					plannedArtifactsPath: active.plannedArtifactsPath,
 					plannedTranscriptPath: active.plannedTranscriptPath,
+					detachedTranscriptPath: active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
 					artifactsRemoved: true,
 				});
 			}

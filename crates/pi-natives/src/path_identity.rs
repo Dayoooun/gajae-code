@@ -2500,39 +2500,62 @@ pub(crate) mod platform {
 	}
 
 	#[derive(Clone, Copy)]
+
 	struct ExchangePlaceholderIdentity {
-		dev: u64,
-		ino: u64,
+		dev:       u64,
+		ino:       u64,
+		directory: bool,
 	}
 
 	fn create_exchange_placeholder(
 		parent_fd: libc::c_int,
 		name: &CString,
+		directory: bool,
 	) -> Result<ExchangePlaceholderIdentity, &'static str> {
-		// An empty directory cannot be replaced by a regular-file rename. Keeping it
-		// at the canonical name prevents both O_EXCL creators and rename-published
-		// successors from winning before detach commits or restores.
-		// SAFETY: `parent_fd` is a live directory descriptor and `name` is a live,
-		// NUL-terminated pathname relative to that descriptor.
-		if unsafe { libc::mkdirat(parent_fd, name.as_ptr(), 0o700) } != 0 {
+		// Darwin RENAME_SWAP requires same-kind entries. The placeholder also keeps the
+		// mutable name occupied until the exchanged object is identity-checked.
+		let created = if directory {
+			// SAFETY: `parent_fd` is live and `name` is a NUL-terminated component.
+			unsafe { libc::mkdirat(parent_fd, name.as_ptr(), 0o700) }
+		} else {
+			// SAFETY: `parent_fd` is live and `name` is a NUL-terminated component.
+			let fd = unsafe {
+				libc::openat(
+					parent_fd,
+					name.as_ptr(),
+					libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC,
+					0o600,
+				)
+			};
+			if fd >= 0 {
+				// SAFETY: this branch owns the placeholder descriptor exactly once.
+				unsafe { libc::close(fd) };
+				0
+			} else {
+				-1
+			}
+		};
+		if created != 0 {
 			return match std::io::Error::last_os_error().raw_os_error() {
 				Some(libc::EEXIST) => Err("quarantine_collision"),
 				_ => Err("io_error"),
 			};
 		}
+
 		// SAFETY: zero is a valid initialized representation for this output struct.
 		let mut placeholder: libc::stat = unsafe { std::mem::zeroed() };
 		// SAFETY: the descriptor and CString are live; the initialized output struct is
 		// writable.
 		if unsafe {
 			libc::fstatat(parent_fd, name.as_ptr(), &mut placeholder, libc::AT_SYMLINK_NOFOLLOW)
-		} != 0 || placeholder.st_mode & libc::S_IFMT != libc::S_IFDIR
+		} != 0 || (placeholder.st_mode & libc::S_IFMT == libc::S_IFDIR) != directory
 		{
 			return Err("io_error");
 		}
 		Ok(ExchangePlaceholderIdentity {
 			dev: placeholder.st_dev as u64,
 			ino: placeholder.st_ino as u64,
+			directory,
 		})
 	}
 
@@ -2548,7 +2571,6 @@ pub(crate) mod platform {
 		CString::new(format!(".gjc-exact-unlink-placeholder-{:x}-{:x}", expected.dev, expected.ino))
 			.expect("placeholder quarantine name contains no NUL")
 	}
-
 	fn remove_exchange_placeholder(
 		parent_fd: libc::c_int,
 		name: &CString,
@@ -2569,9 +2591,11 @@ pub(crate) mod platform {
 		// writable.
 		let matches = unsafe {
 			libc::fstatat(parent_fd, detached_name.as_ptr(), &mut detached, libc::AT_SYMLINK_NOFOLLOW)
-		} == 0 && detached.st_mode & libc::S_IFMT == libc::S_IFDIR
+		} == 0 && (detached.st_mode & libc::S_IFMT == libc::S_IFDIR)
+			== expected.directory
 			&& detached.st_dev as u64 == expected.dev
 			&& detached.st_ino as u64 == expected.ino;
+
 		if !matches {
 			return match rename_no_replace(parent_fd, parent_fd, &detached_name, name) {
 				Ok(()) => ExchangePlaceholderRemoval::RestoredMismatch,
@@ -2580,7 +2604,18 @@ pub(crate) mod platform {
 		}
 		// SAFETY: the verified placeholder has already been detached from the
 		// canonical pathname; cleanup cannot delete a successor published there.
-		if unsafe { libc::unlinkat(parent_fd, detached_name.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
+		if unsafe {
+			libc::unlinkat(
+				parent_fd,
+				detached_name.as_ptr(),
+				if expected.directory {
+					libc::AT_REMOVEDIR
+				} else {
+					0
+				},
+			)
+		} == 0
+		{
 			ExchangePlaceholderRemoval::Removed
 		} else {
 			ExchangePlaceholderRemoval::RetainedFailure(
@@ -2739,14 +2774,15 @@ pub(crate) mod platform {
 			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("io_error");
 		};
-		let placeholder = match create_exchange_placeholder(parent_fd, &quarantine) {
-			Ok(placeholder) => placeholder,
-			Err(code) => {
-				// SAFETY: this branch owns the live descriptor and closes it exactly once.
-				unsafe { libc::close(parent_fd) };
-				return NativeExactUnlinkResult::failure(code);
-			},
-		};
+		let placeholder =
+			match create_exchange_placeholder(parent_fd, &quarantine, identity.directory) {
+				Ok(placeholder) => placeholder,
+				Err(code) => {
+					// SAFETY: this branch owns the live descriptor and closes it exactly once.
+					unsafe { libc::close(parent_fd) };
+					return NativeExactUnlinkResult::failure(code);
+				},
+			};
 		// Exchange keeps the canonical pathname occupied by an empty directory while
 		// the detached object is verified. A regular-file rename cannot replace that
 		// directory, so a rename-published successor cannot be deleted by cleanup.
@@ -3617,7 +3653,9 @@ pub(crate) mod platform {
 			)
 			.map_err(|_| "io_error")?;
 			let placeholder =
-				create_exchange_placeholder(fd, &fence).map_err(|_| "cleanup_pending")?;
+				create_exchange_placeholder(fd, &fence, expected_child.kind == "directory")
+					.map_err(|_| "cleanup_pending")?;
+
 			// The expected child remains reachable only through the exchange until final
 			// removal. A replacement installed before this exchange is moved to `fence`
 			// and fails identity validation rather than being unlinked.
@@ -3790,7 +3828,7 @@ pub(crate) mod platform {
 				&& remove_detached_tree_fd(detached_fd, "", &expected.entries).is_ok();
 			let fence = if already_final { &final_name } else { &name };
 			let placeholder = removed
-				.then(|| create_exchange_placeholder(parent, fence))
+				.then(|| create_exchange_placeholder(parent, fence, true))
 				.transpose();
 			let fenced = match placeholder {
 				Ok(Some(placeholder)) => {
@@ -3849,8 +3887,10 @@ pub(crate) mod platform {
 				} else {
 					NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_retained_path)
 				}
-			} else {
+			} else if !removed {
 				NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_retained_path)
+			} else {
+				NativeExactUnlinkResult::failure("cleanup_pending")
 			}
 		};
 		// SAFETY: this branch owns the parent descriptor exactly once.
@@ -6581,6 +6621,7 @@ mod exact_unlink_placeholder_tests {
 		platform::set_before_tree_root_unlink_hook(None);
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("cleanup_pending"));
+		assert!(result.detached_path.is_none());
 		assert_eq!(fs::read(target.join("replacement")).expect("read replacement"), b"replacement");
 		assert_eq!(fs::metadata(&displaced).expect("stat displaced root").ino(), expected_root);
 		fs::remove_dir_all(root).expect("remove temporary directory");
