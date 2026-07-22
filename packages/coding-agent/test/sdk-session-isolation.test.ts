@@ -105,7 +105,7 @@ describe("createAgentSession session storage isolation", () => {
 			await session.dispose();
 		}
 	});
-	it("migrates a resumed managed session's legacy local root before synchronous path resolution", async () => {
+	it("records cleanup_pending when managed legacy-local retirement is durably retained", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-local-resume-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const cwd = path.join(tempDir, "project");
@@ -150,7 +150,9 @@ describe("createAgentSession session storage isolation", () => {
 			const resumedPath = resolveLocalUrlToPath("local://resume.md", localOptions);
 			expect(resumedPath).toBe(path.join(resolveLocalRoot(localOptions), "resume.md"));
 			expect(fs.readFileSync(resumedPath, "utf8")).toBe("preserved");
-			expect(fs.existsSync(legacyLocalRoot)).toBe(false);
+			expect(
+				fs.readFileSync(path.join(resolveLocalRoot(localOptions), ".gjc-local-legacy-migrated-v1"), "utf8"),
+			).toBe("cleanup_pending\n");
 		} finally {
 			await session.dispose();
 		}

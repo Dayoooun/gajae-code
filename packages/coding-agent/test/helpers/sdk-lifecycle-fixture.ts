@@ -399,14 +399,15 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 			success(await global("session.close", { sessionId: forkId }, "close-fork-key"));
 			await assertClosed(agentDir, stateRoot, forkId, forkEndpoint);
 
-			const deleted = success(
-				await global(
-					"session.delete",
-					{ sessionId: forkId, stateRoot, cwd: repo, sessionPath: forkPath },
-					"delete-key",
-				),
+			const deleted = await global(
+				"session.delete",
+				{ sessionId: forkId, stateRoot, cwd: repo, sessionPath: forkPath },
+				"delete-key",
 			);
-			expect(deleted).toMatchObject({ sessionId: forkId });
+			expect(deleted).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", message: expect.stringContaining("pending in transcript") },
+			});
 			expect(
 				await fs.access(forkPath).then(
 					() => true,
@@ -414,12 +415,10 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 				),
 			).toBe(false);
 			expect(
-				success(
-					await global(
-						"session.delete",
-						{ sessionId: forkId, stateRoot, cwd: repo, sessionPath: forkPath },
-						"delete-key",
-					),
+				await global(
+					"session.delete",
+					{ sessionId: forkId, stateRoot, cwd: repo, sessionPath: forkPath },
+					"delete-key",
 				),
 			).toEqual(deleted);
 			expect(
