@@ -7450,6 +7450,8 @@ export class SessionManager {
 		let managedForkTranscript: ManagedFileSnapshot | null = null;
 		let manager: SessionManager | undefined;
 		let authorityFailure: StrictSessionOpenFailure | undefined;
+		let createdForkSnapshot: native.NativeDirectoryTreeSnapshot | undefined;
+
 		try {
 			manager = new SessionManager(cwd, dir, true, snapshot.storage, destination);
 			await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
@@ -7481,6 +7483,13 @@ export class SessionManager {
 				throw new Error("Captured fork source authority changed before destination write.");
 			}
 			await manager.#rewriteFile();
+			if (removeSessionDirOnFailure) {
+				const capturedFork = native.snapshotDirectoryTree(dir);
+				if (!capturedFork.ok || !capturedFork.snapshot)
+					throw new Error(capturedFork.code ?? "fork_destination_snapshot_failed");
+				createdForkSnapshot = capturedFork.snapshot;
+			}
+
 			if (destination.kind === "managed" && manager.#sessionFile) {
 				managedForkStore = manager.#managedTranscriptStore();
 				managedForkTranscript = managedForkStore.readExpected(path.basename(manager.#sessionFile));
@@ -7510,12 +7519,10 @@ export class SessionManager {
 				} catch (cleanupError) {
 					cleanupErrors.push(toError(cleanupError));
 				}
-				if (removeSessionDirOnFailure) {
-					try {
-						await fs.promises.rm(dir, { recursive: true, force: true });
-					} catch (cleanupError) {
-						cleanupErrors.push(toError(cleanupError));
-					}
+				if (createdForkSnapshot) {
+					const removed = native.exactRemoveDirectoryTree(dir, createdForkSnapshot);
+					if (!removed.ok && removed.code !== "not_found")
+						cleanupErrors.push(new Error(removed.code ?? "fork_destination_cleanup_failed"));
 				}
 				if (cleanupErrors.length > 0) {
 					throw new Error(`Failed to clean up fork destination: ${cleanupErrors[0]!.message}`, {
