@@ -6099,12 +6099,30 @@ mod exact_unlink_placeholder_tests {
 
 	use super::{ExactFileIdentity, NativeExactUnlinkResult, platform, sha256};
 
-	fn exchange_hook_test_guard() -> MutexGuard<'static, ()> {
+	struct ExchangeHookTestGuard {
+		_guard: MutexGuard<'static, ()>,
+	}
+
+	impl Drop for ExchangeHookTestGuard {
+		fn drop(&mut self) {
+			platform::set_after_exchange_hook(None);
+			platform::set_before_exchange_hook(None);
+			platform::set_after_placeholder_detach_hook(None);
+			platform::set_after_tree_validation_hook(None);
+			platform::set_before_tree_child_unlink_hook(None);
+			platform::set_before_tree_root_unlink_hook(None);
+			platform::set_after_tree_rename_hook(None);
+		}
+	}
+
+	fn exchange_hook_test_guard() -> ExchangeHookTestGuard {
 		static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-		GUARD
-			.get_or_init(|| Mutex::new(()))
-			.lock()
-			.unwrap_or_else(|poisoned| poisoned.into_inner())
+		ExchangeHookTestGuard {
+			_guard: GUARD
+				.get_or_init(|| Mutex::new(()))
+				.lock()
+				.unwrap_or_else(|poisoned| poisoned.into_inner()),
+		}
 	}
 
 	#[test]
@@ -6632,6 +6650,7 @@ mod exact_unlink_placeholder_tests {
 
 	#[test]
 	fn tree_removal_recursively_removes_the_detached_root() {
+		let _guard = exchange_hook_test_guard();
 		let root = std::env::temp_dir().join(format!(
 			"gjc-tree-complete-removal-{}-{}",
 			std::process::id(),
