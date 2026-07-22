@@ -306,7 +306,9 @@ const defaultCloseAdapter: SessionStorageWriterCloseAdapter = {
 	},
 };
 
-type NativeExactUnlinkResult = { ok: true; detachedPath?: string } | { ok: false; code: string; detachedPath?: string };
+type NativeExactUnlinkResult =
+	| { ok: true; detachedPath?: string; retainedPlaceholderPath?: string; retainedUnknownPath?: string }
+	| { ok: false; code: string; detachedPath?: string; retainedPlaceholderPath?: string; retainedUnknownPath?: string };
 type NativeExactUnlink = (
 	path: string,
 	identity: {
@@ -942,11 +944,22 @@ export class FileSessionStorage implements SessionStorage {
 				directory: true,
 				quarantineName: path.basename(plannedArtifactsPath),
 			});
-			if (!detach.ok || !detach.detachedPath) {
+			if (!detach.detachedPath) {
 				throw new SessionDeleteVerificationError(
 					"artifacts",
 					`Exact artifact detach rejected: ${detach.ok ? "missing_path" : detach.code}`,
 				);
+			}
+			if (!detach.ok) {
+				return {
+					kind: "cleanup_pending",
+					phase: "artifacts",
+					error: new SessionDeleteVerificationError("artifacts", `Exact artifact detach retained: ${detach.code}`),
+					artifactsIdentity,
+					detachedArtifactsPath: detach.detachedPath,
+					artifactsTree,
+					transcriptIdentity,
+				};
 			}
 			const removal = removeDirectoryTreeExact(detach.detachedPath, artifactsTree);
 			if (!removal.ok) {
