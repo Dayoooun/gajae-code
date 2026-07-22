@@ -259,6 +259,19 @@ export interface VerifiedSessionDeleteTarget {
 	detachedArtifactsPath?: string;
 	/** Identity-bound quarantine path retained when transcript unlink deferred cleanup. */
 	detachedTranscriptPath?: string;
+	/** Native-retained publisher successor observed during transcript cleanup. */
+	retainedTranscriptSuccessorPath?: string;
+	/** Native-retained exchange placeholder observed during transcript cleanup. */
+	retainedTranscriptPlaceholderPath?: string;
+	/** Native-retained transcript entry whose identity could not be verified. */
+	retainedTranscriptUnknownPath?: string;
+	/** Native-retained publisher successor observed during cleanup. */
+	retainedArtifactsSuccessorPath?: string;
+	/** Native-retained exchange placeholder observed during cleanup. */
+	retainedArtifactsPlaceholderPath?: string;
+	/** Native-retained entry whose identity could not be verified. */
+	retainedArtifactsUnknownPath?: string;
+
 	/** Caller-published, no-replace quarantine pathname for the next artifact detach. */
 	plannedArtifactsPath?: string;
 	/** Caller-published, no-replace quarantine pathname for the next transcript detach. */
@@ -288,6 +301,9 @@ export type VerifiedSessionDeleteResult =
 			artifactsTree: NativeDirectoryTreeSnapshot;
 			/** Transcript identity (unchanged) for retry binding. */
 			transcriptIdentity: SessionStorageFileIdentity;
+			retainedSuccessorPath?: string;
+			retainedPlaceholderPath?: string;
+			retainedUnknownPath?: string;
 	  }
 	| {
 			kind: "cleanup_pending";
@@ -297,6 +313,9 @@ export type VerifiedSessionDeleteResult =
 			transcriptIdentity: SessionStorageFileIdentity;
 			/** Optional identity-bound transcript quarantine path for restart cleanup. */
 			detachedTranscriptPath?: string;
+			retainedSuccessorPath?: string;
+			retainedPlaceholderPath?: string;
+			retainedUnknownPath?: string;
 	  };
 
 /** Default OS-close dispatcher: a direct `fs.closeSync`. */
@@ -307,8 +326,21 @@ const defaultCloseAdapter: SessionStorageWriterCloseAdapter = {
 };
 
 type NativeExactUnlinkResult =
-	| { ok: true; detachedPath?: string; retainedPlaceholderPath?: string; retainedUnknownPath?: string }
-	| { ok: false; code: string; detachedPath?: string; retainedPlaceholderPath?: string; retainedUnknownPath?: string };
+	| {
+			ok: true;
+			detachedPath?: string;
+			retainedSuccessorPath?: string;
+			retainedPlaceholderPath?: string;
+			retainedUnknownPath?: string;
+	  }
+	| {
+			ok: false;
+			code: string;
+			detachedPath?: string;
+			retainedSuccessorPath?: string;
+			retainedPlaceholderPath?: string;
+			retainedUnknownPath?: string;
+	  };
 type NativeExactUnlink = (
 	path: string,
 	identity: {
@@ -768,7 +800,13 @@ export class FileSessionStorage implements SessionStorage {
 			expectedArtifactsIdentity,
 			expectedArtifactsTree,
 			detachedArtifactsPath,
+			retainedArtifactsSuccessorPath,
+			retainedArtifactsPlaceholderPath,
+			retainedArtifactsUnknownPath,
 			detachedTranscriptPath,
+			retainedTranscriptSuccessorPath,
+			retainedTranscriptPlaceholderPath,
+			retainedTranscriptUnknownPath,
 			plannedArtifactsPath,
 			plannedTranscriptPath,
 			artifactsRemoved,
@@ -885,6 +923,15 @@ export class FileSessionStorage implements SessionStorage {
 					artifactsIdentity: expectedArtifactsIdentity,
 					detachedArtifactsPath: retainedRoot,
 					artifactsTree: expectedArtifactsTree,
+					...((removal.retainedSuccessorPath ?? retainedArtifactsSuccessorPath)
+						? { retainedSuccessorPath: removal.retainedSuccessorPath ?? retainedArtifactsSuccessorPath }
+						: {}),
+					...((removal.retainedPlaceholderPath ?? retainedArtifactsPlaceholderPath)
+						? { retainedPlaceholderPath: removal.retainedPlaceholderPath ?? retainedArtifactsPlaceholderPath }
+						: {}),
+					...((removal.retainedUnknownPath ?? retainedArtifactsUnknownPath)
+						? { retainedUnknownPath: removal.retainedUnknownPath ?? retainedArtifactsUnknownPath }
+						: {}),
 					transcriptIdentity,
 				};
 			}
@@ -950,6 +997,27 @@ export class FileSessionStorage implements SessionStorage {
 					`Exact artifact detach rejected: ${detach.ok ? "missing_path" : detach.code}`,
 				);
 			}
+			if (!detach.ok && process.platform !== "win32") {
+				let descriptor: number | undefined;
+				try {
+					descriptor = fs.openSync(
+						path.dirname(transcriptPath),
+						fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+					);
+					const durableParent = fs.fstatSync(descriptor, { bigint: true });
+					if (
+						!durableParent.isDirectory() ||
+						durableParent.dev !== parentIdentity.dev ||
+						durableParent.ino !== parentIdentity.ino
+					)
+						throw new Error("parent_changed");
+					fs.fsyncSync(descriptor);
+				} catch (error) {
+					throw new SessionDeleteVerificationError("artifacts", "durability_failed", { cause: toError(error) });
+				} finally {
+					if (descriptor !== undefined) fs.closeSync(descriptor);
+				}
+			}
 			if (!detach.ok) {
 				return {
 					kind: "cleanup_pending",
@@ -958,6 +1026,10 @@ export class FileSessionStorage implements SessionStorage {
 					artifactsIdentity,
 					detachedArtifactsPath: detach.detachedPath,
 					artifactsTree,
+					...(detach.retainedSuccessorPath ? { retainedSuccessorPath: detach.retainedSuccessorPath } : {}),
+					...(detach.retainedPlaceholderPath ? { retainedPlaceholderPath: detach.retainedPlaceholderPath } : {}),
+					...(detach.retainedUnknownPath ? { retainedUnknownPath: detach.retainedUnknownPath } : {}),
+
 					transcriptIdentity,
 				};
 			}
@@ -979,6 +1051,15 @@ export class FileSessionStorage implements SessionStorage {
 					artifactsIdentity,
 					detachedArtifactsPath: retainedRoot,
 					artifactsTree,
+					...((removal.retainedSuccessorPath ?? retainedArtifactsSuccessorPath)
+						? { retainedSuccessorPath: removal.retainedSuccessorPath ?? retainedArtifactsSuccessorPath }
+						: {}),
+					...((removal.retainedPlaceholderPath ?? retainedArtifactsPlaceholderPath)
+						? { retainedPlaceholderPath: removal.retainedPlaceholderPath ?? retainedArtifactsPlaceholderPath }
+						: {}),
+					...((removal.retainedUnknownPath ?? retainedArtifactsUnknownPath)
+						? { retainedUnknownPath: removal.retainedUnknownPath ?? retainedArtifactsUnknownPath }
+						: {}),
 					transcriptIdentity,
 				};
 			}
@@ -1018,13 +1099,27 @@ export class FileSessionStorage implements SessionStorage {
 			});
 			if (!deletion.ok) {
 				const error = exactUnlinkFailure(deletion);
-				if (error.kind === "identity" || error.kind === "symlink") throw error;
+				const retainedAuthority =
+					deletion.detachedPath ||
+					deletion.retainedSuccessorPath ||
+					deletion.retainedPlaceholderPath ||
+					deletion.retainedUnknownPath;
+				if ((error.kind === "identity" || error.kind === "symlink") && !retainedAuthority) throw error;
 				return {
 					kind: "cleanup_pending",
 					phase: "transcript",
 					error,
 					transcriptIdentity,
 					detachedTranscriptPath: deletion.detachedPath ?? detachedTranscriptPath,
+					...((deletion.retainedSuccessorPath ?? retainedTranscriptSuccessorPath)
+						? { retainedSuccessorPath: deletion.retainedSuccessorPath ?? retainedTranscriptSuccessorPath }
+						: {}),
+					...((deletion.retainedPlaceholderPath ?? retainedTranscriptPlaceholderPath)
+						? { retainedPlaceholderPath: deletion.retainedPlaceholderPath ?? retainedTranscriptPlaceholderPath }
+						: {}),
+					...((deletion.retainedUnknownPath ?? retainedTranscriptUnknownPath)
+						? { retainedUnknownPath: deletion.retainedUnknownPath ?? retainedTranscriptUnknownPath }
+						: {}),
 				};
 			}
 			return { kind: "deleted" };
@@ -1066,13 +1161,27 @@ export class FileSessionStorage implements SessionStorage {
 		});
 		if (!deletion.ok) {
 			const error = exactUnlinkFailure(deletion);
-			if (error.kind === "identity" || error.kind === "symlink") throw error;
+			const retainedAuthority =
+				deletion.detachedPath ||
+				deletion.retainedSuccessorPath ||
+				deletion.retainedPlaceholderPath ||
+				deletion.retainedUnknownPath;
+			if ((error.kind === "identity" || error.kind === "symlink") && !retainedAuthority) throw error;
 			return {
 				kind: "cleanup_pending",
 				phase: "transcript",
 				error,
 				transcriptIdentity,
 				detachedTranscriptPath: deletion.detachedPath,
+				...((deletion.retainedSuccessorPath ?? retainedTranscriptSuccessorPath)
+					? { retainedSuccessorPath: deletion.retainedSuccessorPath ?? retainedTranscriptSuccessorPath }
+					: {}),
+				...((deletion.retainedPlaceholderPath ?? retainedTranscriptPlaceholderPath)
+					? { retainedPlaceholderPath: deletion.retainedPlaceholderPath ?? retainedTranscriptPlaceholderPath }
+					: {}),
+				...((deletion.retainedUnknownPath ?? retainedTranscriptUnknownPath)
+					? { retainedUnknownPath: deletion.retainedUnknownPath ?? retainedTranscriptUnknownPath }
+					: {}),
 			};
 		}
 		return { kind: "deleted" };

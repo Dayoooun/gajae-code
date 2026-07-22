@@ -298,7 +298,7 @@ describe("SessionManager session ids", () => {
 				entry => !entry.startsWith(".") && entry !== path.basename(oldSessionFile),
 			);
 			expect(artifactDirectories).toContain(path.basename(oldSessionFile, ".jsonl"));
-			expect(artifactDirectories).toHaveLength(2);
+			expect(artifactDirectories).toHaveLength(1);
 		} finally {
 			spy.mockRestore();
 			await session.close();

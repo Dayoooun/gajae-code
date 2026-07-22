@@ -213,6 +213,7 @@ export type ManagedOpenCandidateResult =
 export type ManagedDeleteCandidateResult =
 	| { kind: "deleted"; tombstonePath: string }
 	| { kind: "already_deleted"; tombstonePath: string }
+	| { kind: "cleanup_pending"; tombstonePath: string; phase: "artifacts" | "transcript"; message: string }
 	| { kind: "error"; code: ManagedOpenFailure; message: string };
 
 type NativeIdentity =
@@ -1119,7 +1120,7 @@ function revalidatePickerConsent(
 function receiptPathFor(
 	scope: ManagedScope,
 	source: ManagedCandidate,
-	state: "prepared" | "published" | "committed" = "committed",
+	state: "prepared" | "detached" | "published" | "committed" = "committed",
 ): string {
 	const suffix = state === "committed" ? "" : `.${state}`;
 	return path.join(
@@ -1158,6 +1159,14 @@ function receiptMatches(
 				identity?: { dev?: unknown; ino?: unknown; size?: unknown; mtimeNs?: unknown };
 			};
 			artifactManifest?: unknown;
+			sourceArtifactQuarantine?: { role?: unknown };
+			sourceArtifactCleanup?: {
+				state?: unknown;
+				role?: unknown;
+				retainedPath?: unknown;
+				identity?: { dev?: unknown; ino?: unknown; size?: unknown; mtimeNs?: unknown };
+				tree?: unknown;
+			};
 		};
 		const exact = (
 			recorded: { dev?: unknown; ino?: unknown; size?: unknown; mtimeNs?: unknown } | undefined,
@@ -1198,12 +1207,43 @@ function receiptMatches(
 					item.size >= 0
 				);
 			});
+		const quarantine = record.sourceArtifactQuarantine;
+		const cleanup = record.sourceArtifactCleanup;
+		const cleanupIdentity = cleanup?.identity;
+		const cleanupTree = artifactTreeSnapshot(cleanup?.tree);
+		const validCleanup =
+			cleanup === undefined ||
+			(quarantine?.role === "detached_artifact_root" &&
+				cleanup.state === "cleanup_pending" &&
+				cleanup.role === "exchange_placeholder" &&
+				typeof cleanup.retainedPath === "string" &&
+				cleanupIdentity?.dev !== undefined &&
+				cleanupIdentity.ino !== undefined &&
+				cleanupIdentity.size !== undefined &&
+				cleanupIdentity.mtimeNs !== undefined &&
+				!!cleanupTree &&
+				cleanupAuthorityMatches(
+					{
+						state: "cleanup_pending",
+						role: "exchange_placeholder",
+						retainedPath: cleanup.retainedPath,
+						identity: {
+							dev: BigInt(String(cleanupIdentity.dev)),
+							ino: BigInt(String(cleanupIdentity.ino)),
+							size: BigInt(String(cleanupIdentity.size)),
+							mtimeNs: BigInt(String(cleanupIdentity.mtimeNs)),
+						},
+						tree: cleanupTree,
+					},
+					path.dirname(source.path),
+				));
 		return (
 			record.schemaVersion === 2 &&
 			record.state === "committed" &&
 			record.policy === "copy-retain" &&
 			record.scope === scopeDigest(scope.platform, scope.canonicalCwd) &&
 			validManifest &&
+			validCleanup &&
 			manifestContains(destination.path, manifest as readonly ArtifactManifestEntry[]) &&
 			record.source?.path === source.path &&
 			record.source?.sessionId === source.sessionId &&
@@ -1412,6 +1452,13 @@ type CleanupReceipt = {
 	expectedArtifactsTree?: NativeDirectoryTreeSnapshot;
 	detachedArtifactsPath?: string;
 	detachedTranscriptPath?: string;
+	retainedArtifactsSuccessorPath?: string;
+	retainedArtifactsPlaceholderPath?: string;
+	retainedArtifactsUnknownPath?: string;
+	retainedTranscriptSuccessorPath?: string;
+	retainedTranscriptPlaceholderPath?: string;
+	retainedTranscriptUnknownPath?: string;
+
 	plannedArtifactsPath: string;
 	plannedTranscriptPath: string;
 };
@@ -1445,6 +1492,24 @@ function cleanupReceipt(scope: ManagedScope, tombstone: string, receipt: Cleanup
 		...(receipt.expectedArtifactsTree ? { expectedArtifactsTree: receipt.expectedArtifactsTree } : {}),
 		...(receipt.detachedArtifactsPath ? { detachedArtifactsPath: receipt.detachedArtifactsPath } : {}),
 		...(receipt.detachedTranscriptPath ? { detachedTranscriptPath: receipt.detachedTranscriptPath } : {}),
+		...(receipt.retainedArtifactsSuccessorPath
+			? { retainedArtifactsSuccessorPath: receipt.retainedArtifactsSuccessorPath }
+			: {}),
+		...(receipt.retainedArtifactsPlaceholderPath
+			? { retainedArtifactsPlaceholderPath: receipt.retainedArtifactsPlaceholderPath }
+			: {}),
+		...(receipt.retainedArtifactsUnknownPath
+			? { retainedArtifactsUnknownPath: receipt.retainedArtifactsUnknownPath }
+			: {}),
+		...(receipt.retainedTranscriptSuccessorPath
+			? { retainedTranscriptSuccessorPath: receipt.retainedTranscriptSuccessorPath }
+			: {}),
+		...(receipt.retainedTranscriptPlaceholderPath
+			? { retainedTranscriptPlaceholderPath: receipt.retainedTranscriptPlaceholderPath }
+			: {}),
+		...(receipt.retainedTranscriptUnknownPath
+			? { retainedTranscriptUnknownPath: receipt.retainedTranscriptUnknownPath }
+			: {}),
 		plannedArtifactsPath: receipt.plannedArtifactsPath,
 		plannedTranscriptPath: receipt.plannedTranscriptPath,
 	};
@@ -1519,6 +1584,14 @@ function isQuarantinePath(target: RetiredTarget, pathname: unknown): pathname is
 	);
 }
 
+function isRetainedNativePath(target: RetiredTarget, pathname: unknown): pathname is string {
+	return (
+		typeof pathname === "string" &&
+		path.dirname(pathname) === path.dirname(target.path) &&
+		path.basename(pathname).startsWith(".gjc-")
+	);
+}
+
 function deterministicRemovalRoot(plannedRoot: string): string {
 	return `${plannedRoot}.removing`;
 }
@@ -1560,6 +1633,14 @@ function cleanupRootsAbsent(tombstone: string, target: RetiredTarget, pending: C
 		pending.plannedArtifactsPath,
 		deterministicRemovalRoot(pending.plannedArtifactsPath),
 		...(pending.detachedArtifactsPath ? [pending.detachedArtifactsPath] : []),
+		...[
+			pending.retainedArtifactsSuccessorPath,
+			pending.retainedArtifactsPlaceholderPath,
+			pending.retainedArtifactsUnknownPath,
+			pending.retainedTranscriptSuccessorPath,
+			pending.retainedTranscriptPlaceholderPath,
+			pending.retainedTranscriptUnknownPath,
+		].filter((pathname): pathname is string => isRetainedNativePath(target, pathname)),
 	]);
 	for (const name of fs.readdirSync(path.dirname(tombstone))) {
 		if (!name.startsWith(prefix) || !name.endsWith(".json")) continue;
@@ -1570,6 +1651,12 @@ function cleanupRootsAbsent(tombstone: string, target: RetiredTarget, pending: C
 			detachedArtifactsPath?: unknown;
 			plannedTranscriptPath?: unknown;
 			detachedTranscriptPath?: unknown;
+			retainedArtifactsSuccessorPath?: unknown;
+			retainedArtifactsPlaceholderPath?: unknown;
+			retainedArtifactsUnknownPath?: unknown;
+			retainedTranscriptSuccessorPath?: unknown;
+			retainedTranscriptPlaceholderPath?: unknown;
+			retainedTranscriptUnknownPath?: unknown;
 		};
 		if (isQuarantinePath(target, record.plannedArtifactsPath)) {
 			roots.add(record.plannedArtifactsPath);
@@ -1578,6 +1665,16 @@ function cleanupRootsAbsent(tombstone: string, target: RetiredTarget, pending: C
 		if (isQuarantinePath(target, record.detachedArtifactsPath)) roots.add(record.detachedArtifactsPath);
 		for (const pathname of [record.plannedTranscriptPath, record.detachedTranscriptPath]) {
 			if (isQuarantinePath(target, pathname) && !activeTranscriptRoots.has(pathname)) roots.add(pathname);
+		}
+		for (const pathname of [
+			record.retainedArtifactsSuccessorPath,
+			record.retainedArtifactsPlaceholderPath,
+			record.retainedArtifactsUnknownPath,
+			record.retainedTranscriptSuccessorPath,
+			record.retainedTranscriptPlaceholderPath,
+			record.retainedTranscriptUnknownPath,
+		]) {
+			if (isRetainedNativePath(target, pathname)) roots.add(pathname);
 		}
 	}
 	for (const pathname of roots) {
@@ -1606,12 +1703,37 @@ function sameArtifactRootIdentity(left: SessionStorageFileIdentity, right: Sessi
 	return left.dev === right.dev && left.ino === right.ino;
 }
 
-/**
- * A pending receipt is written before the native no-replace detach. If a crash
- * happens after that detach, the next receipt may only inherit the exact
- * planned quarantine pathname and identity from its predecessor.
- */
+function sameArtifactTreeSnapshot(left: NativeDirectoryTreeSnapshot, right: NativeDirectoryTreeSnapshot): boolean {
+	if (left.rootDev !== right.rootDev || left.rootIno !== right.rootIno || left.entries.length !== right.entries.length)
+		return false;
+	const entryKey = (entry: NativeDirectoryTreeSnapshot["entries"][number]): string =>
+		JSON.stringify([entry.relativePath, entry.kind, entry.dev, entry.ino, entry.size, entry.mtimeNs, entry.sha256]);
+	const leftEntries = left.entries.map(entryKey).sort();
+	const rightEntries = right.entries.map(entryKey).sort();
+	return leftEntries.every((entry, index) => entry === rightEntries[index]);
+}
+
+function assertRetainedArtifactsAuthority(pending: CleanupReceipt): void {
+	if (!pending.detachedArtifactsPath) return;
+	if (!pending.expectedArtifactsIdentity || !pending.expectedArtifactsTree) throw new Error("durability_failed");
+	try {
+		fs.lstatSync(pending.detachedArtifactsPath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw new Error("durability_failed");
+	}
+	const observed = artifactIdentityAt(pending.detachedArtifactsPath);
+	if (
+		!observed ||
+		!sameArtifactRootIdentity(observed, pending.expectedArtifactsIdentity) ||
+		!sameArtifactTreeSnapshot(snapshotArtifactTree(pending.detachedArtifactsPath), pending.expectedArtifactsTree)
+	)
+		throw new Error("binding_invalid");
+}
+
 function probePlannedCleanupDetach(target: RetiredTarget, pending: CleanupReceipt): CleanupReceipt {
+	assertRetainedArtifactsAuthority(pending);
+
 	let detachedArtifactsPath = pending.detachedArtifactsPath;
 	let detachedTranscriptPath = pending.detachedTranscriptPath;
 	for (const pathname of [pending.plannedArtifactsPath, deterministicRemovalRoot(pending.plannedArtifactsPath)]) {
@@ -1675,6 +1797,16 @@ function artifactTreeSnapshot(value: unknown): NativeDirectoryTreeSnapshot | und
 		})
 	)
 		return undefined;
+	const roots = snapshot.entries.filter(entry => {
+		const item = entry as Record<string, unknown>;
+		return (
+			item.relativePath === "" &&
+			item.kind === "directory" &&
+			item.dev === snapshot.rootDev &&
+			item.ino === snapshot.rootIno
+		);
+	});
+	if (roots.length !== 1) return undefined;
 	return snapshot as unknown as NativeDirectoryTreeSnapshot;
 }
 
@@ -1726,7 +1858,19 @@ function pendingCleanupReceipt(
 				plannedPaths.has(record.plannedArtifactsPath as string) ||
 				plannedPaths.has(record.plannedTranscriptPath as string) ||
 				(record.detachedArtifactsPath !== undefined && !isQuarantinePath(target, record.detachedArtifactsPath)) ||
-				(record.detachedTranscriptPath !== undefined && !isQuarantinePath(target, record.detachedTranscriptPath))
+				(record.detachedTranscriptPath !== undefined && !isQuarantinePath(target, record.detachedTranscriptPath)) ||
+				(record.retainedArtifactsSuccessorPath !== undefined &&
+					!isRetainedNativePath(target, record.retainedArtifactsSuccessorPath)) ||
+				(record.retainedArtifactsPlaceholderPath !== undefined &&
+					!isRetainedNativePath(target, record.retainedArtifactsPlaceholderPath)) ||
+				(record.retainedArtifactsUnknownPath !== undefined &&
+					!isRetainedNativePath(target, record.retainedArtifactsUnknownPath)) ||
+				(record.retainedTranscriptSuccessorPath !== undefined &&
+					!isRetainedNativePath(target, record.retainedTranscriptSuccessorPath)) ||
+				(record.retainedTranscriptPlaceholderPath !== undefined &&
+					!isRetainedNativePath(target, record.retainedTranscriptPlaceholderPath)) ||
+				(record.retainedTranscriptUnknownPath !== undefined &&
+					!isRetainedNativePath(target, record.retainedTranscriptUnknownPath))
 			)
 				throw new Error("durability_failed");
 			const artifact = record.expectedArtifactsIdentity as Record<string, unknown> | undefined;
@@ -1749,7 +1893,7 @@ function pendingCleanupReceipt(
 			const expectedArtifactsTree =
 				record.expectedArtifactsTree === undefined ? undefined : artifactTreeSnapshot(record.expectedArtifactsTree);
 			if (record.expectedArtifactsTree !== undefined && !expectedArtifactsTree) throw new Error("durability_failed");
-			if (record.detachedArtifactsPath !== undefined && !expectedArtifactsTree) throw new Error("durability_failed");
+
 			if (
 				latest &&
 				((record.detachedArtifactsPath !== undefined &&
@@ -1768,6 +1912,12 @@ function pendingCleanupReceipt(
 				expectedArtifactsTree,
 				detachedArtifactsPath: record.detachedArtifactsPath as string | undefined,
 				detachedTranscriptPath: record.detachedTranscriptPath as string | undefined,
+				retainedArtifactsSuccessorPath: record.retainedArtifactsSuccessorPath as string | undefined,
+				retainedArtifactsPlaceholderPath: record.retainedArtifactsPlaceholderPath as string | undefined,
+				retainedArtifactsUnknownPath: record.retainedArtifactsUnknownPath as string | undefined,
+				retainedTranscriptSuccessorPath: record.retainedTranscriptSuccessorPath as string | undefined,
+				retainedTranscriptPlaceholderPath: record.retainedTranscriptPlaceholderPath as string | undefined,
+				retainedTranscriptUnknownPath: record.retainedTranscriptUnknownPath as string | undefined,
 				plannedArtifactsPath: record.plannedArtifactsPath as string,
 				plannedTranscriptPath: record.plannedTranscriptPath as string,
 			};
@@ -1817,7 +1967,13 @@ function nextCleanupReceipt(target: RetiredTarget, pending: CleanupReceipt | und
 		expectedArtifactsIdentity,
 		expectedArtifactsTree,
 		detachedArtifactsPath: pending?.detachedArtifactsPath,
+		retainedArtifactsSuccessorPath: pending?.retainedArtifactsSuccessorPath,
+		retainedArtifactsPlaceholderPath: pending?.retainedArtifactsPlaceholderPath,
+		retainedArtifactsUnknownPath: pending?.retainedArtifactsUnknownPath,
 		detachedTranscriptPath: pending?.detachedTranscriptPath,
+		retainedTranscriptSuccessorPath: pending?.retainedTranscriptSuccessorPath,
+		retainedTranscriptPlaceholderPath: pending?.retainedTranscriptPlaceholderPath,
+		retainedTranscriptUnknownPath: pending?.retainedTranscriptUnknownPath,
 		plannedArtifactsPath: path.join(directory, `.gjc-delete-${operation}-artifacts-${attempt}`),
 		plannedTranscriptPath: path.join(directory, `.gjc-delete-${operation}-transcript-${attempt}`),
 	};
@@ -2117,13 +2273,17 @@ function sameDirectoryObject(leftPath: string, rightPath: string): boolean {
 function matchesDetachedArtifactRoot(pathname: string, plan: DetachedArtifactRoot): boolean {
 	try {
 		const stat = fs.lstatSync(pathname, { bigint: true });
+		const snapshot = native.snapshotDirectoryTree(pathname);
+		const root = snapshot.snapshot?.entries.find(entry => entry.relativePath === "" && entry.kind === "directory");
 		return (
 			stat.isDirectory() &&
 			!stat.isSymbolicLink() &&
 			stat.dev === plan.identity.dev &&
 			stat.ino === plan.identity.ino &&
-			stat.size === plan.identity.size &&
 			stat.mtimeNs === plan.identity.mtimeNs &&
+			(process.platform === "win32"
+				? snapshot.ok && !!root && BigInt(root.size) === plan.identity.size
+				: stat.size === plan.identity.size) &&
 			sameDirectoryObject(path.dirname(pathname), path.dirname(plan.detachedPath))
 		);
 	} catch {
@@ -2131,27 +2291,128 @@ function matchesDetachedArtifactRoot(pathname: string, plan: DetachedArtifactRoo
 	}
 }
 
-function detachArtifactRootForMigration(plan: DetachedArtifactRoot): DetachedArtifactRoot {
+function sameArtifactTree(left: NativeDirectoryTreeSnapshot, right: NativeDirectoryTreeSnapshot): boolean {
+	const entryKey = (entry: NativeDirectoryTreeSnapshot["entries"][number]): string =>
+		JSON.stringify([
+			entry.relativePath,
+			entry.kind,
+			entry.dev,
+			entry.ino,
+			entry.size,
+			entry.mtimeNs,
+			entry.ctimeNs,
+			entry.sha256,
+		]);
+	return (
+		left.rootDev === right.rootDev &&
+		left.rootIno === right.rootIno &&
+		left.entries.length === right.entries.length &&
+		left.entries
+			.map(entryKey)
+			.sort()
+			.every((entry, index) => entry === right.entries.map(entryKey).sort()[index])
+	);
+}
+
+type SourceArtifactCleanup = {
+	state: "cleanup_pending";
+	role: "exchange_placeholder";
+	retainedPath: string;
+	identity: DetachedArtifactRoot["identity"];
+	tree: NativeDirectoryTreeSnapshot;
+};
+
+function cleanupAuthorityMatches(cleanup: SourceArtifactCleanup, parent: string): boolean {
+	try {
+		const stat = fs.lstatSync(cleanup.retainedPath, { bigint: true });
+		if (
+			path.dirname(cleanup.retainedPath) !== parent ||
+			!stat.isDirectory() ||
+			stat.isSymbolicLink() ||
+			stat.dev !== cleanup.identity.dev ||
+			stat.ino !== cleanup.identity.ino ||
+			stat.size !== cleanup.identity.size ||
+			stat.mtimeNs !== cleanup.identity.mtimeNs
+		)
+			return false;
+		const snapshot = native.snapshotDirectoryTree(cleanup.retainedPath);
+		return (
+			!!snapshot.ok &&
+			!!snapshot.snapshot &&
+			sameArtifactTree(snapshot.snapshot, cleanup.tree) &&
+			cleanup.tree.entries.length === 1 &&
+			cleanup.tree.entries[0]?.relativePath === "" &&
+			cleanup.tree.entries[0]?.kind === "directory"
+		);
+	} catch {
+		return false;
+	}
+}
+
+function detachArtifactRootForMigration(plan: DetachedArtifactRoot): {
+	detached: DetachedArtifactRoot;
+	cleanup?: SourceArtifactCleanup;
+} {
 	const result = native.exactUnlink(plan.originalPath, {
 		...plan.identity,
 		directory: true,
 		detachOnly: true,
 		quarantineName: path.basename(plan.detachedPath),
 	});
-	if (!result.ok || !result.detachedPath || !matchesDetachedArtifactRoot(result.detachedPath, plan))
+	const cleanSuccess =
+		result.ok && !result.retainedSuccessorPath && !result.retainedPlaceholderPath && !result.retainedUnknownPath;
+	const cleanupPending =
+		!result.ok &&
+		result.code === "cleanup_pending" &&
+		!!result.detachedPath &&
+		!!result.retainedPlaceholderPath &&
+		!result.retainedSuccessorPath &&
+		!result.retainedUnknownPath;
+	if (
+		(!cleanSuccess && !cleanupPending) ||
+		!result.detachedPath ||
+		!matchesDetachedArtifactRoot(result.detachedPath, plan)
+	)
 		throw new Error("durability_failed");
+
 	const detachedPath =
 		process.platform === "win32" ? fs.realpathSync.native(result.detachedPath) : result.detachedPath;
 	if (!matchesDetachedArtifactRoot(detachedPath, plan)) throw new Error("durability_failed");
-	return { ...plan, detachedPath };
+	const detached = { ...plan, detachedPath };
+	if (!cleanupPending) return { detached };
+	const placeholder = result.retainedPlaceholderPath!;
+	const stat = fs.lstatSync(placeholder, { bigint: true });
+	if (!stat.isDirectory() || stat.isSymbolicLink() || path.dirname(placeholder) !== path.dirname(plan.originalPath))
+		throw new Error("durability_failed");
+	const snapshot = native.snapshotDirectoryTree(placeholder);
+	const cleanup: SourceArtifactCleanup = {
+		state: "cleanup_pending",
+		role: "exchange_placeholder",
+		retainedPath: placeholder,
+		identity: { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs },
+		tree: snapshot.snapshot!,
+	};
+	if (!snapshot.ok || !snapshot.snapshot || !cleanupAuthorityMatches(cleanup, path.dirname(plan.originalPath)))
+		throw new Error("durability_failed");
+	return { detached, cleanup };
 }
 
 function restorePreparedArtifactRoot(scope: ManagedScope, source: ManagedCandidate): void {
-	const receipt = receiptPathFor(scope, source, "prepared");
+	const preparedReceipt = receiptPathFor(scope, source, "prepared");
+	const detachedReceipt = receiptPathFor(scope, source, "detached");
+	const receipt = fs.existsSync(detachedReceipt) ? detachedReceipt : preparedReceipt;
 	let record: {
 		sourceArtifactQuarantine?: {
 			path?: unknown;
 			detachedPath?: unknown;
+			identity?: Record<string, unknown>;
+			tree?: unknown;
+			role?: unknown;
+		};
+		sourceArtifactCleanup?: {
+			state?: unknown;
+			role?: unknown;
+			retainedPath?: unknown;
 			identity?: Record<string, unknown>;
 			tree?: unknown;
 		};
@@ -2178,11 +2439,46 @@ function restorePreparedArtifactRoot(scope: ManagedScope, source: ManagedCandida
 		typeof identity.mtimeNs !== "string"
 	)
 		throw new Error("durability_failed");
+	if (receipt === detachedReceipt && quarantine.role !== "detached_artifact_root")
+		throw new Error("durability_failed");
+	if (receipt === detachedReceipt) {
+		const cleanup = record.sourceArtifactCleanup;
+		const cleanupIdentity = cleanup?.identity;
+		const cleanupTree = artifactTreeSnapshot(cleanup?.tree);
+		if (
+			cleanup?.state !== "cleanup_pending" ||
+			cleanup.role !== "exchange_placeholder" ||
+			typeof cleanup.retainedPath !== "string" ||
+			!cleanupIdentity ||
+			typeof cleanupIdentity.dev !== "string" ||
+			typeof cleanupIdentity.ino !== "string" ||
+			typeof cleanupIdentity.size !== "string" ||
+			typeof cleanupIdentity.mtimeNs !== "string" ||
+			!cleanupTree ||
+			!cleanupAuthorityMatches(
+				{
+					state: "cleanup_pending",
+					role: "exchange_placeholder",
+					retainedPath: cleanup.retainedPath,
+					identity: {
+						dev: BigInt(cleanupIdentity.dev),
+						ino: BigInt(cleanupIdentity.ino),
+						size: BigInt(cleanupIdentity.size),
+						mtimeNs: BigInt(cleanupIdentity.mtimeNs),
+					},
+					tree: cleanupTree,
+				},
+				path.dirname(source.path),
+			)
+		)
+			throw new Error("durability_failed");
+	}
+
 	const expectedTree = artifactTreeSnapshot(quarantine.tree)!;
 	const assertPreparedTree = (pathname: string): void => {
 		validateManagedArtifactTree(pathname);
 		const observed = native.snapshotDirectoryTree(pathname);
-		if (!observed.ok || !observed.snapshot || JSON.stringify(observed.snapshot) !== JSON.stringify(expectedTree))
+		if (!observed.ok || !observed.snapshot || !sameArtifactTree(observed.snapshot, expectedTree))
 			throw new Error("durability_failed");
 	};
 	if (fs.existsSync(quarantine.path)) {
@@ -2212,7 +2508,9 @@ function restorePreparedArtifactRoot(scope: ManagedScope, source: ManagedCandida
 	if (!result.ok) throw new Error("durability_failed");
 }
 
-function restoreDetachedArtifactRoot(detached: DetachedArtifactRoot): void {
+function restoreDetachedArtifactRoot(detached: DetachedArtifactRoot, cleanup?: SourceArtifactCleanup): void {
+	if (cleanup && !cleanupAuthorityMatches(cleanup, path.dirname(detached.originalPath)))
+		throw new Error("durability_failed");
 	const result = native.exactRestore(detached.detachedPath, detached.originalPath, {
 		...detached.identity,
 		directory: true,
@@ -2277,7 +2575,7 @@ async function copyArtifacts(
 function migrationReceipt(
 	scope: ManagedScope,
 	lock: ManagedStorageLock,
-	state: "prepared" | "published" | "committed",
+	state: "prepared" | "artifact_detached" | "published" | "committed",
 	source: ManagedCandidate,
 	destination: ManagedCandidate | { path: string; sessionId: string; cwd: string },
 	manifest: readonly ArtifactManifestEntry[],
@@ -2286,7 +2584,9 @@ function migrationReceipt(
 		detachedPath: string;
 		identity: DetachedArtifactRoot["identity"];
 		tree: NativeDirectoryTreeSnapshot;
+		role?: "detached_artifact_root";
 	},
+	sourceArtifactCleanup?: SourceArtifactCleanup,
 ): Uint8Array {
 	lock.assertOwned();
 	const destinationRecord =
@@ -2304,12 +2604,20 @@ function migrationReceipt(
 					header: { id: destination.sessionId, cwd: destination.cwd },
 				};
 	return new TextEncoder().encode(
-		`${JSON.stringify({ schemaVersion: 2, state, policy: "copy-retain", attemptId: lock.attemptId, scope: scopeDigest(scope.platform, scope.canonicalCwd), source: { path: source.path, sessionId: source.sessionId, header: { id: source.sessionId, cwd: source.cwd }, identity: source.identity, sha256: source.identity.sha256 }, destination: destinationRecord, artifactManifest: manifest, ...(sourceArtifactQuarantine ? { sourceArtifactQuarantine } : {}) }, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value))}\n`,
+		`${JSON.stringify({ schemaVersion: 2, state, policy: "copy-retain", attemptId: lock.attemptId, scope: scopeDigest(scope.platform, scope.canonicalCwd), source: { path: source.path, sessionId: source.sessionId, header: { id: source.sessionId, cwd: source.cwd }, identity: source.identity, sha256: source.identity.sha256 }, destination: destinationRecord, artifactManifest: manifest, ...(sourceArtifactQuarantine ? { sourceArtifactQuarantine } : {}), ...(sourceArtifactCleanup ? { sourceArtifactCleanup } : {}) }, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value))}\n`,
 	);
 }
 
+function detachedReceiptMatches(receipt: string, expected: Uint8Array): boolean {
+	try {
+		return captureManagedFileNoFollow(receipt).bytes.equals(expected);
+	} catch {
+		return false;
+	}
+}
+
 async function removeStagedReceipts(scope: ManagedScope, candidate: ManagedCandidate): Promise<void> {
-	for (const state of ["prepared", "published"] as const) {
+	for (const state of ["prepared", "detached", "published"] as const) {
 		const pathname = receiptPathFor(scope, candidate, state);
 		try {
 			const stat = fs.lstatSync(pathname);
@@ -2431,6 +2739,12 @@ export async function reconcileManagedTombstones(scope: ManagedScope): Promise<v
 							? pending.plannedTranscriptPath
 							: undefined) ??
 						(fs.existsSync(active.plannedTranscriptPath) ? active.plannedTranscriptPath : undefined),
+					retainedArtifactsSuccessorPath: active.retainedArtifactsSuccessorPath,
+					retainedArtifactsPlaceholderPath: active.retainedArtifactsPlaceholderPath,
+					retainedArtifactsUnknownPath: active.retainedArtifactsUnknownPath,
+					retainedTranscriptSuccessorPath: active.retainedTranscriptSuccessorPath,
+					retainedTranscriptPlaceholderPath: active.retainedTranscriptPlaceholderPath,
+					retainedTranscriptUnknownPath: active.retainedTranscriptUnknownPath,
 					plannedArtifactsPath: active.plannedArtifactsPath,
 					plannedTranscriptPath: active.plannedTranscriptPath,
 					...(cleanupArtifactsRemoved(scope, tombstone, target, pending?.attempt ?? active.attempt)
@@ -2449,6 +2763,12 @@ export async function reconcileManagedTombstones(scope: ManagedScope): Promise<v
 						plannedTranscriptPath: active.plannedTranscriptPath,
 						detachedTranscriptPath: active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
 
+						retainedArtifactsSuccessorPath: active.retainedArtifactsSuccessorPath,
+						retainedArtifactsPlaceholderPath: active.retainedArtifactsPlaceholderPath,
+						retainedArtifactsUnknownPath: active.retainedArtifactsUnknownPath,
+						retainedTranscriptSuccessorPath: active.retainedTranscriptSuccessorPath,
+						retainedTranscriptPlaceholderPath: active.retainedTranscriptPlaceholderPath,
+						retainedTranscriptUnknownPath: active.retainedTranscriptUnknownPath,
 						artifactsRemoved: true,
 					});
 				}
@@ -2469,10 +2789,34 @@ export async function reconcileManagedTombstones(scope: ManagedScope): Promise<v
 								deletion.phase === "transcript"
 									? deletion.detachedTranscriptPath
 									: active.detachedTranscriptPath,
+							retainedArtifactsSuccessorPath:
+								deletion.phase === "artifacts"
+									? deletion.retainedSuccessorPath
+									: active.retainedArtifactsSuccessorPath,
+							retainedArtifactsPlaceholderPath:
+								deletion.phase === "artifacts"
+									? deletion.retainedPlaceholderPath
+									: active.retainedArtifactsPlaceholderPath,
+							retainedArtifactsUnknownPath:
+								deletion.phase === "artifacts"
+									? deletion.retainedUnknownPath
+									: active.retainedArtifactsUnknownPath,
+							retainedTranscriptSuccessorPath:
+								deletion.phase === "transcript"
+									? deletion.retainedSuccessorPath
+									: active.retainedTranscriptSuccessorPath,
+							retainedTranscriptPlaceholderPath:
+								deletion.phase === "transcript"
+									? deletion.retainedPlaceholderPath
+									: active.retainedTranscriptPlaceholderPath,
+							retainedTranscriptUnknownPath:
+								deletion.phase === "transcript"
+									? deletion.retainedUnknownPath
+									: active.retainedTranscriptUnknownPath,
 						},
 						lock,
 					);
-					throw new Error("durability_failed");
+					continue;
 				}
 				fsyncManagedParent(target.path);
 				await publishCleanupCompleted(scope, tombstone, target, lock);
@@ -2581,11 +2925,15 @@ export async function openManagedCandidateForWrite(
 	const internal = managedInternalDirectory(scope);
 	let lock: ManagedStorageLock | undefined;
 	let detachedArtifacts: DetachedArtifactRoot | undefined;
+	let sourceArtifactCleanup: SourceArtifactCleanup | undefined;
+
 	try {
 		revalidatePickerConsent(scope, current, expectedIdentity);
 		lock = await acquireManagedLock(path.join(internal, MANAGED_LOCKS_DIRECTORY), operation, scopeRoot(scope));
 		const heldLock = lock;
+
 		const afterLock = revalidatePickerConsent(scope, current, expectedIdentity);
+
 		const listing = listManagedCandidates(scope);
 		if (listing.kind === "error") return { kind: "error", code: "binding_invalid", message: listing.message };
 		const destination = path.join(scope.directoryPath, path.basename(afterLock.path));
@@ -2597,11 +2945,22 @@ export async function openManagedCandidateForWrite(
 				code: "destination_conflict",
 				message: "A distinct v2 transcript already owns this session id.",
 			};
+
 		scopeRoot(scope);
 		revalidatePickerConsent(scope, afterLock, expectedIdentity);
 		restorePreparedArtifactRoot(scope, afterLock);
 		scopeRoot(scope);
-		const sourceSnapshot = captureManagedFileNoFollow(afterLock.path);
+
+		let sourceSnapshot = captureManagedFileNoFollow(afterLock.path);
+		if (
+			sourceSnapshot.identity.dev !== afterLock.identity.dev ||
+			sourceSnapshot.identity.ino !== afterLock.identity.ino ||
+			sourceSnapshot.identity.size !== afterLock.identity.size ||
+			sourceSnapshot.identity.mtimeNs !== afterLock.identity.mtimeNs ||
+			sourceSnapshot.identity.sha256 !== afterLock.identity.sha256 ||
+			sourceSnapshot.bytes.byteLength !== afterLock.identity.size
+		)
+			throw new Error("source_changed");
 		let manifest: readonly ArtifactManifestEntry[] = [];
 		const artifactPlan = planArtifactRootForMigration(afterLock.path, operation);
 		const intendedDestination = { path: destination, sessionId: afterLock.sessionId, cwd: afterLock.cwd };
@@ -2623,6 +2982,7 @@ export async function openManagedCandidateForWrite(
 				message: "The migration destination already exists without validated ownership.",
 			};
 		}
+
 		const preparedReceipt = receiptPathFor(scope, afterLock, "prepared");
 		try {
 			revalidatePickerConsent(scope, afterLock, expectedIdentity);
@@ -2651,15 +3011,52 @@ export async function openManagedCandidateForWrite(
 		} catch (error) {
 			if ((error as Error).message !== "destination_conflict") throw error;
 		}
+
 		revalidatePickerConsent(scope, afterLock, expectedIdentity);
 		lock.assertOwned();
 		if (!preparedReceiptMatches(preparedReceipt, scope, afterLock, intendedDestination, artifactPlan))
 			throw new Error("durability_failed");
 		if (artifactPlan && fs.existsSync(artifactPlan.detachedPath)) throw new Error("destination_conflict");
+
 		revalidatePickerConsent(scope, afterLock, expectedIdentity);
+
 		scopeRoot(scope);
-		detachedArtifacts = artifactPlan ? detachArtifactRootForMigration(artifactPlan) : undefined;
+
+		if (artifactPlan) {
+			const detached = detachArtifactRootForMigration(artifactPlan);
+			detachedArtifacts = detached.detached;
+			sourceArtifactCleanup = detached.cleanup;
+			const detachedReceipt = receiptPathFor(scope, afterLock, "detached");
+			const detachedRecord = migrationReceipt(
+				scope,
+				lock,
+				"artifact_detached",
+				afterLock,
+				intendedDestination,
+				[],
+				{
+					path: detachedArtifacts.originalPath,
+					detachedPath: detachedArtifacts.detachedPath,
+					identity: detachedArtifacts.identity,
+					tree: detachedArtifacts.tree,
+					role: "detached_artifact_root",
+				},
+				sourceArtifactCleanup,
+			);
+			try {
+				await publishManagedFileNoReplace(
+					detachedReceipt,
+					detachedRecord,
+					assertPublicationConsent,
+					scopeRoot(scope),
+				);
+			} catch (error) {
+				if ((error as Error).message !== "destination_conflict") throw error;
+			}
+			if (!detachedReceiptMatches(detachedReceipt, detachedRecord)) throw new Error("durability_failed");
+		}
 		manifest = detachedArtifacts ? artifactManifestFromSnapshot(detachedArtifacts.tree) : [];
+
 		await copyArtifacts(
 			scope,
 			afterLock.path,
@@ -2670,6 +3067,22 @@ export async function openManagedCandidateForWrite(
 			expectedIdentity,
 			detachedArtifacts?.detachedPath,
 		);
+
+		if (!existing) {
+			revalidatePickerConsent(scope, afterLock, expectedIdentity);
+			lock.assertOwned();
+			sourceSnapshot = captureManagedFileNoFollow(afterLock.path);
+			if (
+				sourceSnapshot.identity.dev !== afterLock.identity.dev ||
+				sourceSnapshot.identity.ino !== afterLock.identity.ino ||
+				sourceSnapshot.identity.size !== afterLock.identity.size ||
+				sourceSnapshot.identity.mtimeNs !== afterLock.identity.mtimeNs ||
+				sourceSnapshot.identity.sha256 !== afterLock.identity.sha256 ||
+				sourceSnapshot.bytes.byteLength !== afterLock.identity.size
+			)
+				throw new Error("source_changed");
+		}
+
 		if (!existing) {
 			try {
 				revalidatePickerConsent(scope, afterLock, expectedIdentity);
@@ -2679,6 +3092,7 @@ export async function openManagedCandidateForWrite(
 				if ((error as Error).message !== "destination_conflict") throw error;
 			}
 		}
+
 		// Artifact files, directories, and the transcript must be durable before a receipt can grant shadow authority.
 		scopeRoot(scope);
 		if (manifest.length > 0) fsyncManagedArtifactTree(destination.slice(0, -6));
@@ -2692,12 +3106,14 @@ export async function openManagedCandidateForWrite(
 			!manifestMatches(destination, manifest)
 		)
 			throw new Error("durability_failed");
+
 		if (detachedArtifacts) {
 			revalidatePickerConsent(scope, afterLock, expectedIdentity);
 			scopeRoot(scope);
-			restoreDetachedArtifactRoot(detachedArtifacts);
+			restoreDetachedArtifactRoot(detachedArtifacts, sourceArtifactCleanup);
 			detachedArtifacts = undefined;
 		}
+
 		const latest = validateCandidateForScope(scope, afterLock);
 		if (!latest || !sameCandidate(latest, afterLock) || !manifestMatches(afterLock.path, manifest))
 			return {
@@ -2705,6 +3121,7 @@ export async function openManagedCandidateForWrite(
 				code: "source_changed",
 				message: "The legacy candidate or its artifacts changed before migration commit.",
 			};
+
 		for (const state of ["published", "committed"] as const) {
 			const receipt = receiptPathFor(scope, afterLock, state);
 			try {
@@ -2712,7 +3129,24 @@ export async function openManagedCandidateForWrite(
 				lock.assertOwned();
 				await publishManagedFileNoReplace(
 					receipt,
-					migrationReceipt(scope, lock, state, afterLock, migrated, manifest),
+					migrationReceipt(
+						scope,
+						lock,
+						state,
+						afterLock,
+						migrated,
+						manifest,
+						artifactPlan
+							? {
+									path: artifactPlan.originalPath,
+									detachedPath: artifactPlan.detachedPath,
+									identity: artifactPlan.identity,
+									tree: artifactPlan.tree,
+									role: "detached_artifact_root",
+								}
+							: undefined,
+						sourceArtifactCleanup,
+					),
 					assertPublicationConsent,
 					scopeRoot(scope),
 				);
@@ -2720,6 +3154,7 @@ export async function openManagedCandidateForWrite(
 				if ((error as Error).message !== "destination_conflict") throw error;
 			}
 		}
+
 		const receipt = receiptPathFor(scope, afterLock);
 		lock.assertOwned();
 		if (!receiptMatches(receipt, afterLock, migrated, scope))
@@ -2728,6 +3163,7 @@ export async function openManagedCandidateForWrite(
 				code: "durability_failed",
 				message: "The migration receipt does not bind the copied v2 transcript and artifacts.",
 			};
+
 		revalidatePickerConsent(scope, afterLock, expectedIdentity);
 		scopeRoot(scope);
 		await removeStagedReceipts(scope, afterLock);
@@ -2739,7 +3175,7 @@ export async function openManagedCandidateForWrite(
 		};
 	} catch (error) {
 		try {
-			if (detachedArtifacts) restoreDetachedArtifactRoot(detachedArtifacts);
+			if (detachedArtifacts) restoreDetachedArtifactRoot(detachedArtifacts, sourceArtifactCleanup);
 		} catch {
 			return {
 				kind: "error",
@@ -2858,6 +3294,12 @@ export async function deleteManagedSessionCandidate(
 					active.detachedTranscriptPath ??
 					observedPending?.detachedTranscriptPath ??
 					(pending && fs.existsSync(pending.plannedTranscriptPath) ? pending.plannedTranscriptPath : undefined),
+				retainedArtifactsSuccessorPath: active.retainedArtifactsSuccessorPath,
+				retainedArtifactsPlaceholderPath: active.retainedArtifactsPlaceholderPath,
+				retainedArtifactsUnknownPath: active.retainedArtifactsUnknownPath,
+				retainedTranscriptSuccessorPath: active.retainedTranscriptSuccessorPath,
+				retainedTranscriptPlaceholderPath: active.retainedTranscriptPlaceholderPath,
+				retainedTranscriptUnknownPath: active.retainedTranscriptUnknownPath,
 				plannedArtifactsPath: active.plannedArtifactsPath,
 				plannedTranscriptPath: active.plannedTranscriptPath,
 				...(cleanupArtifactsRemoved(scope, tombstone, target, pending?.attempt ?? active.attempt)
@@ -2875,6 +3317,12 @@ export async function deleteManagedSessionCandidate(
 					plannedArtifactsPath: active.plannedArtifactsPath,
 					plannedTranscriptPath: active.plannedTranscriptPath,
 					detachedTranscriptPath: active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
+					retainedArtifactsSuccessorPath: active.retainedArtifactsSuccessorPath,
+					retainedArtifactsPlaceholderPath: active.retainedArtifactsPlaceholderPath,
+					retainedArtifactsUnknownPath: active.retainedArtifactsUnknownPath,
+					retainedTranscriptSuccessorPath: active.retainedTranscriptSuccessorPath,
+					retainedTranscriptPlaceholderPath: active.retainedTranscriptPlaceholderPath,
+					retainedTranscriptUnknownPath: active.retainedTranscriptUnknownPath,
 					artifactsRemoved: true,
 				});
 			}
@@ -2903,10 +3351,39 @@ export async function deleteManagedSessionCandidate(
 							deletion.phase === "artifacts" ? deletion.detachedArtifactsPath : active.detachedArtifactsPath,
 						detachedTranscriptPath:
 							deletion.phase === "transcript" ? deletion.detachedTranscriptPath : active.detachedTranscriptPath,
+						retainedArtifactsSuccessorPath:
+							deletion.phase === "artifacts"
+								? deletion.retainedSuccessorPath
+								: active.retainedArtifactsSuccessorPath,
+						retainedArtifactsPlaceholderPath:
+							deletion.phase === "artifacts"
+								? deletion.retainedPlaceholderPath
+								: active.retainedArtifactsPlaceholderPath,
+						retainedArtifactsUnknownPath:
+							deletion.phase === "artifacts"
+								? deletion.retainedUnknownPath
+								: active.retainedArtifactsUnknownPath,
+						retainedTranscriptSuccessorPath:
+							deletion.phase === "transcript"
+								? deletion.retainedSuccessorPath
+								: active.retainedTranscriptSuccessorPath,
+						retainedTranscriptPlaceholderPath:
+							deletion.phase === "transcript"
+								? deletion.retainedPlaceholderPath
+								: active.retainedTranscriptPlaceholderPath,
+						retainedTranscriptUnknownPath:
+							deletion.phase === "transcript"
+								? deletion.retainedUnknownPath
+								: active.retainedTranscriptUnknownPath,
 					},
 					lock,
 				);
-				throw new Error("durability_failed");
+				return {
+					kind: "cleanup_pending",
+					tombstonePath: tombstone,
+					phase: deletion.phase,
+					message: "Exact cleanup remains pending because descriptor-bound final deletion is unavailable.",
+				};
 			}
 			fsyncManagedParent(target.path);
 			await publishCleanupCompleted(scope, tombstone, target, lock);

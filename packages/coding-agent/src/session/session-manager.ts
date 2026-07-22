@@ -4230,7 +4230,8 @@ export class SessionManager {
 				const candidate = listing.owned.find(candidate => path.resolve(candidate.path) === requestedPath);
 				if (!candidate) throw new Error("Managed session deletion requires exact logical authorization.");
 				const deleted = await deleteManagedSessionCandidate(resolved.scope, candidate);
-				if (deleted.kind === "error") throw new Error(`Could not delete managed session: ${deleted.message}`);
+				if (deleted.kind !== "deleted" && deleted.kind !== "already_deleted")
+					throw new Error(`Could not delete managed session: ${deleted.message}`);
 			} else {
 				await this.storage.deleteSessionWithArtifacts(sessionPath);
 			}
@@ -4360,6 +4361,21 @@ export class SessionManager {
 			}
 		} catch (error) {
 			const failure = error;
+			if (forkArtifactPublication) {
+				try {
+					forkArtifactPublication.cleanupStore.removeTreeExpected(
+						forkArtifactPublication.cleanupRelativePath,
+						forkArtifactPublication.snapshot,
+					);
+				} catch (cleanupError) {
+					const cleanupMessage = toError(cleanupError).message;
+					if (cleanupMessage !== "cleanup_pending") {
+						throw new Error(`Failed to clean up fork artifacts: ${cleanupMessage}`, {
+							cause: toError(failure),
+						});
+					}
+				}
+			}
 			this.#sessionId = oldSessionId;
 			this.#sessionFile = oldSessionFile;
 			this.#fileEntries = oldFileEntries;
@@ -4463,9 +4479,12 @@ export class SessionManager {
 				if (stagingSnapshot && mayCleanManagedTreeStaging(error))
 					parentStore.removeTreeExpected(stagingName, stagingSnapshot);
 			} catch (cleanupError) {
-				throw new Error(`Failed to clean up managed fork artifacts: ${toError(cleanupError).message}`, {
-					cause: toError(error),
-				});
+				const cleanupMessage = toError(cleanupError).message;
+				if (cleanupMessage !== "cleanup_pending") {
+					throw new Error(`Failed to clean up managed fork artifacts: ${cleanupMessage}`, {
+						cause: toError(error),
+					});
+				}
 			}
 			throw error;
 		}
@@ -4632,10 +4651,20 @@ export class SessionManager {
 						if (!retainedTreeSnapshotEquals(terminalArtifacts, managedPublishedArtifacts))
 							throw new Error("managed_move_destination_artifacts_changed");
 					}
-					if (managedArtifacts)
-						managedSourceStore.removeTreeExpected(path.basename(oldArtifactDir), managedArtifacts);
-					if (managedTranscript)
-						managedSourceStore.removeExpected(path.basename(oldSessionFile), managedTranscript);
+					if (managedArtifacts) {
+						try {
+							managedSourceStore.removeTreeExpected(path.basename(oldArtifactDir), managedArtifacts);
+						} catch (cleanupError) {
+							if (toError(cleanupError).message !== "cleanup_pending") throw cleanupError;
+						}
+					}
+					if (managedTranscript) {
+						try {
+							managedSourceStore.removeExpected(path.basename(oldSessionFile), managedTranscript);
+						} catch (cleanupError) {
+							if (toError(cleanupError).message !== "cleanup_pending") throw cleanupError;
+						}
+					}
 				} else {
 					if (hadSessionFile && oldSessionFile !== newSessionFile) {
 						await movePathAcrossDevicesSafe(oldSessionFile, newSessionFile);
@@ -4741,9 +4770,11 @@ export class SessionManager {
 				try {
 					await rollbackManagedMove();
 				} catch (rollbackError) {
-					throw new Error(`Failed to rollback managed move: ${toError(rollbackError).message}`, {
-						cause: toError(error),
-					});
+					if (toError(rollbackError).message !== "cleanup_pending") {
+						throw new Error(`Failed to rollback managed move: ${toError(rollbackError).message}`, {
+							cause: toError(error),
+						});
+					}
 				}
 				this.#sessionFile = previousSessionFile;
 				this.cwd = previousCwd;
@@ -7383,7 +7414,8 @@ export class SessionManager {
 		const candidate = listing.owned.find(item => path.resolve(item.path) === path.resolve(sessionPath));
 		if (!candidate) throw new Error("Session is not an authorized managed candidate.");
 		const deleted = await deleteManagedSessionCandidate(resolved.scope, candidate);
-		if (deleted.kind === "error") throw new Error(`Could not delete managed session: ${deleted.message}`);
+		if (deleted.kind !== "deleted" && deleted.kind !== "already_deleted")
+			throw new Error(`Could not delete managed session: ${deleted.message}`);
 	}
 
 	/** Capture exact source content for a strict fork without granting write ownership. */
@@ -7559,7 +7591,7 @@ export class SessionManager {
 				try {
 					await manager.close();
 				} catch (cleanupError) {
-					cleanupErrors.push(toError(cleanupError));
+					if (toError(cleanupError).message !== "cleanup_pending") cleanupErrors.push(toError(cleanupError));
 				}
 				if (!privateStagingPublished && privateStagingDir && privateStagingSnapshot) {
 					const removed = native.exactRemoveDirectoryTree(privateStagingDir, privateStagingSnapshot);

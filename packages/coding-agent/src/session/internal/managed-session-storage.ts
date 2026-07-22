@@ -787,7 +787,8 @@ export class ManagedSessionDescendantStore {
 						staged.identity.ctimeNs,
 						staged.identity.sha256 ?? createHash("sha256").update(staged.data).digest("hex"),
 					);
-					if (!removed.ok) throw new Error(removed.code ?? "managed_publish_reconcile_failed");
+					if (!removed.ok && removed.code !== "cleanup_pending")
+						throw new Error(removed.code ?? "managed_publish_reconcile_failed");
 				}
 			}
 			throw error;

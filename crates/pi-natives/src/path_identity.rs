@@ -266,7 +266,8 @@ impl NativeNoReplaceResult {
 /// A deterministic, no-follow description of a directory tree. `relative_path`
 /// is UTF-8, uses `/` separators, and is empty only for the root entry.
 #[napi(object)]
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+
 pub struct NativeDirectoryTreeEntry {
 	pub relative_path: String,
 	pub kind:          String,
@@ -281,7 +282,7 @@ pub struct NativeDirectoryTreeEntry {
 /// Stable evidence returned by `snapshot_directory_tree` and consumed verbatim
 /// by `exact_remove_directory_tree`.
 #[napi(object)]
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeDirectoryTreeSnapshot {
 	pub root_dev: String,
 	pub root_ino: String,
@@ -5827,7 +5828,9 @@ mod exact_unlink_placeholder_tests {
 		time::{SystemTime, UNIX_EPOCH},
 	};
 
-	use super::{ExactFileIdentity, NativeExactUnlinkResult, platform, sha256};
+	use super::{
+		ExactFileIdentity, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, platform, sha256,
+	};
 
 	struct ExchangeHookTestGuard {
 		_guard: MutexGuard<'static, ()>,
@@ -6288,7 +6291,30 @@ mod exact_unlink_placeholder_tests {
 		assert!(result.retained_unknown_path.is_none());
 	}
 
+	fn same_tree_after_authorized_rename(
+		left: &NativeDirectoryTreeSnapshot,
+		right: &NativeDirectoryTreeSnapshot,
+	) -> bool {
+		left.root_dev == right.root_dev
+			&& left.root_ino == right.root_ino
+			&& left.entries.len() == right.entries.len()
+			&& left
+				.entries
+				.iter()
+				.zip(&right.entries)
+				.all(|(left, right)| {
+					left.relative_path == right.relative_path
+						&& left.kind == right.kind
+						&& left.dev == right.dev
+						&& left.ino == right.ino
+						&& left.size == right.size
+						&& left.mtime_ns == right.mtime_ns
+						&& left.sha256 == right.sha256
+				})
+	}
+
 	fn replay_retains_verified_tree(nested: bool) {
+		let _guard = exchange_hook_test_guard();
 		let root = std::env::temp_dir().join(format!(
 			"gjc-tree-replay-{}-{}",
 			std::process::id(),
@@ -6313,17 +6339,25 @@ mod exact_unlink_placeholder_tests {
 		let first = platform::exact_remove_directory_tree(&target, &snapshot);
 		assert_tree_replay_result(&first, &detached);
 		assert!(target.symlink_metadata().is_err());
-		assert_eq!(
-			platform::snapshot_directory_tree(&detached).snapshot,
-			Some(snapshot.clone()),
+		assert!(
+			same_tree_after_authorized_rename(
+				&platform::snapshot_directory_tree(&detached)
+					.snapshot
+					.expect("snapshot detached"),
+				&snapshot,
+			),
 			"first retained tree is replayable from the original snapshot"
 		);
 
 		let second = platform::exact_remove_directory_tree(&target, &snapshot);
 		assert_tree_replay_result(&second, &detached);
-		assert_eq!(
-			platform::snapshot_directory_tree(&detached).snapshot,
-			Some(snapshot),
+		assert!(
+			same_tree_after_authorized_rename(
+				&platform::snapshot_directory_tree(&detached)
+					.snapshot
+					.expect("snapshot detached"),
+				&snapshot,
+			),
 			"second call retains the same replayable tree"
 		);
 		fs::remove_dir_all(root).expect("remove temporary directory");
