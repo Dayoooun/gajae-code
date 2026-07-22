@@ -1058,6 +1058,14 @@ pub(crate) mod platform {
 	static AFTER_TREE_VALIDATION_HOOK: OnceLock<
 		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 	> = OnceLock::new();
+	#[cfg(test)]
+	static BEFORE_TREE_CHILD_UNLINK_HOOK: OnceLock<
+		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+	> = OnceLock::new();
+	#[cfg(test)]
+	static BEFORE_TREE_ROOT_UNLINK_HOOK: OnceLock<
+		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+	> = OnceLock::new();
 
 	#[cfg(test)]
 	static AFTER_TREE_RENAME_HOOK: OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> =
@@ -1068,7 +1076,7 @@ pub(crate) mod platform {
 		*AFTER_EXCHANGE_HOOK
 			.get_or_init(|| Mutex::new(None))
 			.lock()
-			.expect("exchange hook lock") = hook;
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
 	}
 
 	#[cfg(test)]
@@ -1076,7 +1084,7 @@ pub(crate) mod platform {
 		*BEFORE_EXCHANGE_HOOK
 			.get_or_init(|| Mutex::new(None))
 			.lock()
-			.expect("before exchange hook lock") = hook;
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
 	}
 
 	#[cfg(test)]
@@ -1086,8 +1094,9 @@ pub(crate) mod platform {
 		*AFTER_PLACEHOLDER_DETACH_HOOK
 			.get_or_init(|| Mutex::new(None))
 			.lock()
-			.expect("placeholder detach hook lock") = hook;
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
 	}
+
 	#[cfg(test)]
 	pub(super) fn set_after_tree_validation_hook(
 		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
@@ -1095,7 +1104,26 @@ pub(crate) mod platform {
 		*AFTER_TREE_VALIDATION_HOOK
 			.get_or_init(|| Mutex::new(None))
 			.lock()
-			.expect("tree validation hook lock") = hook;
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+	#[cfg(test)]
+	pub(super) fn set_before_tree_child_unlink_hook(
+		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+	) {
+		*BEFORE_TREE_CHILD_UNLINK_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(test)]
+	pub(super) fn set_before_tree_root_unlink_hook(
+		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+	) {
+		*BEFORE_TREE_ROOT_UNLINK_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
 	}
 
 	#[cfg(test)]
@@ -1103,7 +1131,7 @@ pub(crate) mod platform {
 		*AFTER_TREE_RENAME_HOOK
 			.get_or_init(|| Mutex::new(None))
 			.lock()
-			.expect("tree rename hook lock") = hook;
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
 	}
 
 	#[cfg(test)]
@@ -1111,8 +1139,8 @@ pub(crate) mod platform {
 		if let Some((entered, resume)) = AFTER_EXCHANGE_HOOK
 			.get_or_init(|| Mutex::new(None))
 			.lock()
-			.expect("exchange hook lock")
-			.as_ref()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
 		{
 			entered.send(()).expect("exchange hook receiver");
 			resume.recv().expect("exchange hook resume");
@@ -1124,8 +1152,8 @@ pub(crate) mod platform {
 		if let Some((entered, resume)) = BEFORE_EXCHANGE_HOOK
 			.get_or_init(|| Mutex::new(None))
 			.lock()
-			.expect("before exchange hook lock")
-			.as_ref()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
 		{
 			entered.send(()).expect("before exchange hook receiver");
 			resume.recv().expect("before exchange hook resume");
@@ -1137,23 +1165,49 @@ pub(crate) mod platform {
 		if let Some((entered, resume)) = AFTER_PLACEHOLDER_DETACH_HOOK
 			.get_or_init(|| Mutex::new(None))
 			.lock()
-			.expect("placeholder detach hook lock")
-			.as_ref()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
 		{
 			entered.send(()).expect("placeholder detach hook receiver");
 			resume.recv().expect("placeholder detach hook resume");
 		}
 	}
+
 	#[cfg(test)]
 	fn pause_after_tree_validation_for_test() {
 		if let Some((entered, resume)) = AFTER_TREE_VALIDATION_HOOK
 			.get_or_init(|| Mutex::new(None))
 			.lock()
-			.expect("tree validation hook lock")
-			.as_ref()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
 		{
 			entered.send(()).expect("tree validation hook receiver");
 			resume.recv().expect("tree validation hook resume");
+		}
+	}
+	#[cfg(test)]
+	fn pause_before_tree_child_unlink_for_test() {
+		if let Some((entered, resume)) = BEFORE_TREE_CHILD_UNLINK_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
+		{
+			entered.send(()).expect("tree child unlink hook receiver");
+			resume.recv().expect("tree child unlink hook resume");
+		}
+	}
+
+	#[cfg(test)]
+	fn pause_before_tree_root_unlink_for_test() {
+		if let Some((entered, resume)) = BEFORE_TREE_ROOT_UNLINK_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
+		{
+			entered.send(()).expect("tree root unlink hook receiver");
+			resume.recv().expect("tree root unlink hook resume");
 		}
 	}
 
@@ -1162,8 +1216,8 @@ pub(crate) mod platform {
 		if let Some((entered, resume)) = AFTER_TREE_RENAME_HOOK
 			.get_or_init(|| Mutex::new(None))
 			.lock()
-			.expect("tree rename hook lock")
-			.as_ref()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
 		{
 			entered.send(()).expect("tree rename hook receiver");
 			resume.recv().expect("tree rename hook resume");
@@ -3556,8 +3610,42 @@ pub(crate) mod platform {
 			} else {
 				0
 			};
-			// SAFETY: the parent descriptor and detached component are live.
-			if unsafe { libc::unlinkat(fd, quarantine.as_ptr(), flags) } != 0 {
+			let fence = CString::new(
+				child_relative
+					.rsplit_once('/')
+					.map_or(child_relative.as_bytes(), |(_, name)| name.as_bytes()),
+			)
+			.map_err(|_| "io_error")?;
+			let placeholder =
+				create_exchange_placeholder(fd, &fence).map_err(|_| "cleanup_pending")?;
+			// The expected child remains reachable only through the exchange until final
+			// removal. A replacement installed before this exchange is moved to `fence`
+			// and fails identity validation rather than being unlinked.
+			#[cfg(test)]
+			pause_before_tree_child_unlink_for_test();
+			if rename_exchange(fd, fd, &quarantine, &fence).is_err() {
+				let _ = remove_exchange_placeholder(fd, &fence, placeholder);
+				return Err("cleanup_pending");
+			}
+			// SAFETY: the parent descriptor and exchanged component are live.
+			let fenced = unsafe { libc::openat(fd, fence.as_ptr(), child_flags) };
+			let matches =
+				fenced >= 0 && descriptor_matches_tree_entry(fenced, expected_child).unwrap_or(false);
+			if fenced >= 0 {
+				// SAFETY: this branch owns the fenced descriptor exactly once.
+				unsafe { libc::close(fenced) };
+			}
+			if !matches {
+				return Err("cleanup_pending");
+			}
+			// SAFETY: the parent descriptor and fenced component are live.
+			if unsafe { libc::unlinkat(fd, fence.as_ptr(), flags) } != 0 {
+				return Err("cleanup_pending");
+			}
+			if !matches!(
+				remove_exchange_placeholder(fd, &quarantine, placeholder),
+				ExchangePlaceholderRemoval::Removed
+			) {
 				return Err("cleanup_pending");
 			}
 		}
@@ -3698,15 +3786,56 @@ pub(crate) mod platform {
 		let result = if detached_fd < 0 {
 			NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_retained_path)
 		} else {
-			let matches = descriptor_matches_tree_entry(detached_fd, root_entry).unwrap_or(false);
-			let removed =
-				matches && remove_detached_tree_fd(detached_fd, "", &expected.entries).is_ok();
+			let removed = descriptor_matches_tree_entry(detached_fd, root_entry).unwrap_or(false)
+				&& remove_detached_tree_fd(detached_fd, "", &expected.entries).is_ok();
+			let fence = if already_final { &final_name } else { &name };
+			let placeholder = removed
+				.then(|| create_exchange_placeholder(parent, fence))
+				.transpose();
+			let fenced = match placeholder {
+				Ok(Some(placeholder)) => {
+					// Fence the final name before the unlink. A same-kind replacement installed
+					// before this exchange is validated at `fence` and retained on mismatch.
+					#[cfg(test)]
+					pause_before_tree_root_unlink_for_test();
+					if rename_exchange(parent, parent, detached_name, fence).is_err() {
+						let _ = remove_exchange_placeholder(parent, fence, placeholder);
+						false
+					} else {
+						// SAFETY: the parent descriptor and exchanged component are live.
+						let fenced_fd = unsafe {
+							libc::openat(
+								parent,
+								fence.as_ptr(),
+								libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+							)
+						};
+						let matches = fenced_fd >= 0
+							&& descriptor_matches_tree_entry(fenced_fd, root_entry).unwrap_or(false);
+						if fenced_fd >= 0 {
+							// SAFETY: this branch owns the fenced root descriptor exactly once.
+							unsafe { libc::close(fenced_fd) };
+						}
+						matches
+					}
+				},
+				_ => false,
+			};
 			// SAFETY: this branch owns the detached root descriptor exactly once.
 			unsafe { libc::close(detached_fd) };
-			if removed
-				// SAFETY: the parent descriptor and detached component are live.
-				&& unsafe { libc::unlinkat(parent, detached_name.as_ptr(), libc::AT_REMOVEDIR) } == 0
-			{
+			if fenced
+				// SAFETY: the parent descriptor and fenced component are live.
+				&& unsafe { libc::unlinkat(parent, fence.as_ptr(), libc::AT_REMOVEDIR) } == 0
+				&& matches!(
+					remove_exchange_placeholder(
+						parent,
+						detached_name,
+						placeholder
+							.expect("fenced root has a placeholder")
+							.expect("removed root has a placeholder"),
+					),
+					ExchangePlaceholderRemoval::Removed
+				) {
 				let absent = |entry: &CString| {
 					// SAFETY: zero is a valid initialized representation for this output struct.
 					let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -6398,7 +6527,7 @@ mod exact_unlink_placeholder_tests {
 	}
 
 	#[test]
-	fn tree_root_replacement_after_detach_is_retained_and_reported() {
+	fn tree_root_replacement_before_final_unlink_is_retained_and_reported() {
 		let _guard = exchange_hook_test_guard();
 		let root = std::env::temp_dir().join(format!(
 			"gjc-tree-root-swap-{}-{}",
@@ -6418,12 +6547,12 @@ mod exact_unlink_placeholder_tests {
 			.expect("snapshot target");
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
-		platform::set_after_tree_rename_hook(Some((entered_tx, resume_rx)));
+		platform::set_before_tree_root_unlink_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let remove = thread::spawn(move || {
 			platform::exact_remove_directory_tree(&target_for_remove, &snapshot)
 		});
-		entered_rx.recv().expect("wait for root detach");
+		entered_rx.recv().expect("wait for root final unlink fence");
 		let detached = root.join("target.removing");
 		let displaced = root.join("expected-root");
 		fs::rename(&detached, &displaced).expect("displace expected detached root");
@@ -6431,16 +6560,16 @@ mod exact_unlink_placeholder_tests {
 		fs::write(detached.join("replacement"), b"replacement").expect("write replacement marker");
 		resume_tx.send(()).expect("resume removal");
 		let result = remove.join().expect("tree removal thread");
-		platform::set_after_tree_rename_hook(None);
+		platform::set_before_tree_root_unlink_hook(None);
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("cleanup_pending"));
-		assert_eq!(fs::read(detached.join("replacement")).expect("read replacement"), b"replacement");
+		assert_eq!(fs::read(target.join("replacement")).expect("read replacement"), b"replacement");
 		assert_eq!(fs::metadata(&displaced).expect("stat displaced root").ino(), expected_root);
 		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 
 	#[test]
-	fn tree_child_replacement_after_validation_is_retained_with_expected_root() {
+	fn tree_child_replacement_before_final_unlink_is_retained_with_expected_root() {
 		let _guard = exchange_hook_test_guard();
 		let root = std::env::temp_dir().join(format!(
 			"gjc-tree-child-swap-{}-{}",
@@ -6463,18 +6592,31 @@ mod exact_unlink_placeholder_tests {
 		fs::write(&replacement, b"replacement").expect("write replacement child");
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
-		platform::set_after_tree_validation_hook(Some((entered_tx, resume_rx)));
+		platform::set_before_tree_child_unlink_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let remove = thread::spawn(move || {
 			platform::exact_remove_directory_tree(&target_for_remove, &snapshot)
 		});
-		entered_rx.recv().expect("wait for tree validation");
+		entered_rx
+			.recv()
+			.expect("wait for child final unlink fence");
+		let detached = root.join("target.removing");
+		let quarantined_child = fs::read_dir(&detached)
+			.expect("list detached target")
+			.map(|entry| entry.expect("read detached entry").path())
+			.find(|path| {
+				path
+					.file_name()
+					.and_then(|name| name.to_str())
+					.is_some_and(|name| name.starts_with(".pi-tree-detached-"))
+			})
+			.expect("find quarantined child");
 		let retained_expected_child = root.join("expected-child");
-		fs::rename(&child, &retained_expected_child).expect("displace expected child");
-		fs::rename(&replacement, &child).expect("install child replacement");
+		fs::rename(&quarantined_child, &retained_expected_child).expect("displace expected child");
+		fs::rename(&replacement, &quarantined_child).expect("install child replacement");
 		resume_tx.send(()).expect("resume removal");
 		let result = remove.join().expect("tree removal thread");
-		platform::set_after_tree_validation_hook(None);
+		platform::set_before_tree_child_unlink_hook(None);
 		let detached = root.join("target.removing");
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("cleanup_pending"));
@@ -6518,6 +6660,50 @@ mod exact_unlink_placeholder_tests {
 			);
 		}
 		fs::remove_dir(root).expect("remove temporary directory");
+	}
+	#[test]
+	fn aborted_tree_hook_does_not_block_the_next_hook() {
+		let _guard = exchange_hook_test_guard();
+		let root = std::env::temp_dir().join(format!(
+			"gjc-tree-hook-abort-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+		let target = root.join("target");
+		fs::create_dir(&target).expect("create target");
+		let snapshot = platform::snapshot_directory_tree(&target)
+			.snapshot
+			.expect("snapshot target");
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		drop(resume_tx);
+		platform::set_after_tree_rename_hook(Some((entered_tx, resume_rx)));
+		let target_for_remove = target.clone();
+		let aborted = thread::spawn(move || {
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot)
+		});
+		entered_rx.recv().expect("wait for aborted hook");
+		assert!(aborted.join().is_err(), "disconnected hook did not abort");
+
+		let next = root.join("next");
+		fs::create_dir(&next).expect("create next target");
+		let snapshot = platform::snapshot_directory_tree(&next)
+			.snapshot
+			.expect("snapshot next target");
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_after_tree_rename_hook(Some((entered_tx, resume_rx)));
+		let next_for_remove = next.clone();
+		let removal =
+			thread::spawn(move || platform::exact_remove_directory_tree(&next_for_remove, &snapshot));
+		entered_rx.recv().expect("wait for next hook");
+		resume_tx.send(()).expect("resume next hook");
+		assert!(removal.join().expect("next removal thread").ok);
+		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 }
 #[cfg(test)]
