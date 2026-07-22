@@ -1530,14 +1530,33 @@ function isAuthorizedArtifactRoot(target: RetiredTarget, plannedRoot: string, pa
 	);
 }
 
-function artifactRootsAbsent(
-	_scope: ManagedScope,
-	tombstone: string,
-	target: RetiredTarget,
-	pending: CleanupReceipt,
-): boolean {
+function transcriptRootMatchesTarget(pathname: string, target: RetiredTarget): boolean {
+	try {
+		const observed = captureManagedFileNoFollow(pathname);
+		const digest = createHash("sha256").update(observed.bytes).digest("hex");
+		return (
+			observed.identity.dev === target.identity.dev &&
+			observed.identity.ino === target.identity.ino &&
+			observed.identity.size === target.identity.size &&
+			observed.identity.mtimeNs === target.identity.mtimeNs &&
+			digest === target.identity.sha256
+		);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw new Error("durability_failed");
+	}
+}
+
+function cleanupRootsAbsent(tombstone: string, target: RetiredTarget, pending: CleanupReceipt): boolean {
 	const prefix = `${path.basename(tombstone, ".json")}.${stableOperationName(target)}.cleanup-pending-`;
+	const activeTranscriptRoots = new Set(
+		[pending.plannedTranscriptPath, pending.detachedTranscriptPath].filter((pathname): pathname is string =>
+			isQuarantinePath(target, pathname),
+		),
+	);
 	const roots = new Set<string>([
+		target.path,
+		target.path.slice(0, -6),
 		pending.plannedArtifactsPath,
 		deterministicRemovalRoot(pending.plannedArtifactsPath),
 		...(pending.detachedArtifactsPath ? [pending.detachedArtifactsPath] : []),
@@ -1549,14 +1568,38 @@ function artifactRootsAbsent(
 		) as {
 			plannedArtifactsPath?: unknown;
 			detachedArtifactsPath?: unknown;
+			plannedTranscriptPath?: unknown;
+			detachedTranscriptPath?: unknown;
 		};
 		if (isQuarantinePath(target, record.plannedArtifactsPath)) {
 			roots.add(record.plannedArtifactsPath);
 			roots.add(deterministicRemovalRoot(record.plannedArtifactsPath));
 		}
 		if (isQuarantinePath(target, record.detachedArtifactsPath)) roots.add(record.detachedArtifactsPath);
+		for (const pathname of [record.plannedTranscriptPath, record.detachedTranscriptPath]) {
+			if (isQuarantinePath(target, pathname) && !activeTranscriptRoots.has(pathname)) roots.add(pathname);
+		}
 	}
-	return [...roots].every(pathname => !fs.existsSync(pathname));
+	for (const pathname of roots) {
+		try {
+			fs.lstatSync(pathname);
+			throw new Error("durability_failed");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+	}
+	for (const pathname of activeTranscriptRoots) {
+		try {
+			fs.lstatSync(pathname);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+		if (!transcriptRootMatchesTarget(pathname, target)) throw new Error("durability_failed");
+		return false;
+	}
+	return true;
 }
 
 function sameArtifactRootIdentity(left: SessionStorageFileIdentity, right: SessionStorageFileIdentity): boolean {
@@ -2349,8 +2392,7 @@ export async function reconcileManagedTombstones(scope: ManagedScope): Promise<v
 						if (!observedPending) continue;
 						if (
 							cleanupArtifactsRemoved(scope, tombstone, target, observedPending.attempt) &&
-							artifactRootsAbsent(scope, tombstone, target, observedPending) &&
-							!fs.existsSync(observedPending.plannedTranscriptPath)
+							cleanupRootsAbsent(tombstone, target, observedPending)
 						) {
 							fsyncManagedParent(target.path);
 							await publishCleanupCompleted(scope, tombstone, target, lock);
@@ -2779,8 +2821,7 @@ export async function deleteManagedSessionCandidate(
 					if (!observedPending) continue;
 					if (
 						cleanupArtifactsRemoved(scope, tombstone, target, observedPending.attempt) &&
-						artifactRootsAbsent(scope, tombstone, target, observedPending) &&
-						!fs.existsSync(observedPending.plannedTranscriptPath)
+						cleanupRootsAbsent(tombstone, target, observedPending)
 					) {
 						fsyncManagedParent(target.path);
 						await publishCleanupCompleted(scope, tombstone, target, lock);

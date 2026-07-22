@@ -3426,6 +3426,144 @@ pub(crate) mod platform {
 		Ok(())
 	}
 
+	fn descriptor_matches_tree_entry(
+		fd: libc::c_int,
+		expected: &NativeDirectoryTreeEntry,
+	) -> Result<bool, &'static str> {
+		// SAFETY: zero is a valid initialized representation for this output struct.
+		let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: the descriptor is live and the initialized output struct is writable.
+		if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		let kind = match stat.st_mode & libc::S_IFMT {
+			libc::S_IFREG => "file",
+			libc::S_IFDIR => "directory",
+			_ => return Ok(false),
+		};
+		if kind != expected.kind
+			|| stat.st_dev as u64 != expected.dev.parse().ok().unwrap_or(u64::MAX)
+			|| stat.st_ino as u64 != expected.ino.parse().ok().unwrap_or(u64::MAX)
+			|| (kind == "file"
+				&& (stat.st_size as u64 != expected.size.parse().ok().unwrap_or(u64::MAX)
+					|| stat_mtime_ns(&stat).to_string() != expected.mtime_ns))
+		{
+			return Ok(false);
+		}
+		if kind == "directory" {
+			return Ok(expected.sha256.is_none());
+		}
+		// SAFETY: `fd` is live; this function owns the duplicate until `File` drops it.
+		let duplicate = unsafe { libc::dup(fd) };
+		if duplicate < 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		// SAFETY: `duplicate` is a newly owned descriptor.
+		let mut file = unsafe { File::from_raw_fd(duplicate) };
+		let digest = hex_digest(digest_reader(&mut file).map_err(|_| "io_error")?);
+		Ok(expected.sha256.as_deref() == Some(digest.as_str()))
+	}
+
+	fn remove_detached_tree_fd(
+		fd: libc::c_int,
+		relative: &str,
+		expected: &[NativeDirectoryTreeEntry],
+	) -> Result<(), &'static str> {
+		let mut names = directory_names(fd)?;
+		names.sort();
+		for name_bytes in names {
+			let physical = CString::new(name_bytes.clone()).map_err(|_| "io_error")?;
+			let direct_relative = std::str::from_utf8(&name_bytes).ok().map(|name| {
+				if relative.is_empty() {
+					name.to_owned()
+				} else {
+					format!("{relative}/{name}")
+				}
+			});
+			let expected_child = match (
+				direct_relative
+					.as_deref()
+					.and_then(|candidate| expected_tree_entry(expected, candidate)),
+				expected_quarantined_tree_entry(expected, relative, &name_bytes),
+			) {
+				(Some(entry), None) | (None, Some(entry)) => entry,
+				_ => return Err("identity_mismatch"),
+			};
+			let child_relative = expected_child.relative_path.as_str();
+			let quarantine = tree_quarantine_name(expected_child);
+			let child_flags = libc::O_RDONLY
+				| libc::O_CLOEXEC
+				| libc::O_NOFOLLOW
+				| if expected_child.kind == "directory" {
+					libc::O_DIRECTORY
+				} else {
+					0
+				};
+			// SAFETY: the parent descriptor and component are live.
+			let child = unsafe { libc::openat(fd, physical.as_ptr(), child_flags) };
+			if child < 0 {
+				return Err(security_code(&std::io::Error::last_os_error()));
+			}
+			let matches = match descriptor_matches_tree_entry(child, expected_child) {
+				Ok(matches) => matches,
+				Err(code) => {
+					// SAFETY: this branch owns the child descriptor exactly once.
+					unsafe { libc::close(child) };
+					return Err(code);
+				},
+			};
+			// SAFETY: this branch owns the child descriptor exactly once.
+			unsafe { libc::close(child) };
+			if !matches {
+				return Err("identity_mismatch");
+			}
+			if physical.as_bytes() != quarantine.as_bytes()
+				&& rename_no_replace(fd, fd, &physical, &quarantine).is_err()
+			{
+				return Err("cleanup_pending");
+			}
+			// Reopen by its detached name and validate through that descriptor before
+			// mutating it. A replacement is retained rather than unlinked.
+			// SAFETY: the parent descriptor and component are live.
+			let detached = unsafe { libc::openat(fd, quarantine.as_ptr(), child_flags) };
+			if detached < 0 {
+				return Err("identity_mismatch");
+			}
+			let matches = match descriptor_matches_tree_entry(detached, expected_child) {
+				Ok(matches) => matches,
+				Err(code) => {
+					// SAFETY: this branch owns the detached descriptor exactly once.
+					unsafe { libc::close(detached) };
+					return Err(code);
+				},
+			};
+			if !matches {
+				// SAFETY: this branch owns the detached descriptor exactly once.
+				unsafe { libc::close(detached) };
+				return Err("identity_mismatch");
+			}
+			if expected_child.kind == "directory" {
+				let result = remove_detached_tree_fd(detached, child_relative, expected);
+				// SAFETY: this branch owns the detached descriptor exactly once.
+				unsafe { libc::close(detached) };
+				result?;
+			} else {
+				// SAFETY: this branch owns the detached descriptor exactly once.
+				unsafe { libc::close(detached) };
+			}
+			let flags = if expected_child.kind == "directory" {
+				libc::AT_REMOVEDIR
+			} else {
+				0
+			};
+			// SAFETY: the parent descriptor and detached component are live.
+			if unsafe { libc::unlinkat(fd, quarantine.as_ptr(), flags) } != 0 {
+				return Err("cleanup_pending");
+			}
+		}
+		Ok(())
+	}
+
 	pub(super) fn exact_remove_directory_tree(
 		path: &Path,
 		expected: &NativeDirectoryTreeSnapshot,
@@ -3519,35 +3657,81 @@ pub(crate) mod platform {
 			}
 			return NativeExactUnlinkResult::detached_failure("identity_mismatch", retained_path);
 		};
-		let result = if already_final {
-			match detached_entry_matches(parent, root_name, root_entry) {
-				Ok(true) => NativeExactUnlinkResult::detached(retained_path),
-				Ok(false) => {
-					NativeExactUnlinkResult::detached_failure("identity_mismatch", retained_path)
-				},
-				Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path),
-			}
+		let detached_name = if already_final {
+			root_name
 		} else {
 			match rename_no_replace(parent, parent, root_name, &final_name) {
 				Ok(()) => {
 					#[cfg(test)]
 					pause_after_tree_rename_for_test();
-					match detached_entry_matches(parent, &final_name, root_entry) {
-						Ok(true) => NativeExactUnlinkResult::detached(final_path),
-						Ok(false) => {
-							NativeExactUnlinkResult::detached_failure("identity_mismatch", final_path)
-						},
-						Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
-					}
+					&final_name
 				},
-				Err(code) => NativeExactUnlinkResult::detached_failure(code, planned_path),
+				Err(code) => {
+					// SAFETY: this branch owns the live descriptors and closes each exactly once.
+					unsafe {
+						libc::close(fd);
+						libc::close(parent);
+					}
+					return NativeExactUnlinkResult::detached_failure(code, planned_path);
+				},
 			}
 		};
-		// SAFETY: this branch owns the live descriptor and closes it exactly once.
-		unsafe {
-			libc::close(fd);
-			libc::close(parent);
-		}
+		// The pre-detach descriptor proves only the object that was validated. Reopen
+		// the detached root by name and require that descriptor to prove its identity
+		// before removing any child.
+		// SAFETY: this branch owns the original root descriptor exactly once.
+		unsafe { libc::close(fd) };
+		// SAFETY: the parent descriptor and detached component are live.
+		let detached_fd = unsafe {
+			libc::openat(
+				parent,
+				detached_name.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		let detached_retained_path = if already_final {
+			retained_path.clone()
+		} else {
+			final_path.clone()
+		};
+
+		let result = if detached_fd < 0 {
+			NativeExactUnlinkResult::detached_failure(
+				"cleanup_pending",
+				detached_retained_path.clone(),
+			)
+		} else {
+			let matches = descriptor_matches_tree_entry(detached_fd, root_entry).unwrap_or(false);
+			let removed =
+				matches && remove_detached_tree_fd(detached_fd, "", &expected.entries).is_ok();
+			// SAFETY: this branch owns the detached root descriptor exactly once.
+			unsafe { libc::close(detached_fd) };
+			if removed
+				// SAFETY: the parent descriptor and detached component are live.
+				&& unsafe { libc::unlinkat(parent, detached_name.as_ptr(), libc::AT_REMOVEDIR) } == 0
+			{
+				let absent = |entry: &CString| {
+					// SAFETY: zero is a valid initialized representation for this output struct.
+					let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+					// SAFETY: the parent descriptor and component are live.
+					(unsafe {
+						libc::fstatat(parent, entry.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW)
+					} != 0) && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
+				};
+				if absent(detached_name) && (already_final || absent(&name)) {
+					NativeExactUnlinkResult::success()
+				} else {
+					NativeExactUnlinkResult::detached_failure(
+						"cleanup_pending",
+						detached_retained_path.clone(),
+					)
+				}
+			} else {
+				NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_retained_path)
+			}
+		};
+		// SAFETY: this branch owns the parent descriptor exactly once.
+		unsafe { libc::close(parent) };
 		result
 	}
 }
@@ -6255,7 +6439,7 @@ mod exact_unlink_placeholder_tests {
 		let result = remove.join().expect("tree removal thread");
 		platform::set_after_tree_rename_hook(None);
 		assert!(!result.ok);
-		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.code.as_deref(), Some("cleanup_pending"));
 		assert_eq!(fs::read(detached.join("replacement")).expect("read replacement"), b"replacement");
 		assert_eq!(fs::metadata(&displaced).expect("stat displaced root").ino(), expected_root);
 		fs::remove_dir_all(root).expect("remove temporary directory");
@@ -6298,7 +6482,8 @@ mod exact_unlink_placeholder_tests {
 		let result = remove.join().expect("tree removal thread");
 		platform::set_after_tree_validation_hook(None);
 		let detached = root.join("target.removing");
-		assert!(result.ok, "{:?}", result.code);
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("cleanup_pending"));
 		assert_eq!(result.detached_path.as_deref(), Some(detached.to_string_lossy().as_ref()));
 		assert_eq!(fs::metadata(&detached).expect("stat detached root").ino(), expected_root);
 		assert_eq!(fs::read(detached.join("child")).expect("read child replacement"), b"replacement");
@@ -6307,6 +6492,38 @@ mod exact_unlink_placeholder_tests {
 			b"expected"
 		);
 		fs::remove_dir_all(root).expect("remove temporary directory");
+	}
+
+	#[test]
+	fn tree_removal_recursively_removes_the_detached_root() {
+		let root = std::env::temp_dir().join(format!(
+			"gjc-tree-complete-removal-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+		let target = root.join("target");
+		fs::create_dir_all(target.join("nested")).expect("create target tree");
+		fs::write(target.join("root-file"), b"root").expect("write root file");
+		fs::write(target.join("nested/file"), b"nested").expect("write nested file");
+		let snapshot = platform::snapshot_directory_tree(&target)
+			.snapshot
+			.expect("snapshot target");
+
+		let result = platform::exact_remove_directory_tree(&target, &snapshot);
+
+		assert!(result.ok, "{:?}", result.code);
+		for path in [&target, &root.join("target.removing")] {
+			assert!(
+				matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+				"detached tree root remained at {}",
+				path.display(),
+			);
+		}
+		fs::remove_dir(root).expect("remove temporary directory");
 	}
 }
 #[cfg(test)]

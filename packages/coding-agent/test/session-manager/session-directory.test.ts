@@ -1326,6 +1326,7 @@ describe("managed session write protocol", () => {
 				expect(latest?.attempt).toBe(2);
 				expect(q2).toEqual(expect.any(String));
 				expect(q2).not.toBe(q1);
+				expect(latest?.detachedTranscriptPath).toBe(q1);
 				expect((identity as { quarantineName?: string }).quarantineName).toBe(path.basename(q2!));
 			}
 			return exactUnlink(pathname, identity);
@@ -1341,6 +1342,7 @@ describe("managed session write protocol", () => {
 		}
 		expect(q2).toEqual(expect.any(String));
 		expect(await fs.stat(q1).catch(() => undefined)).toBeUndefined();
+		expect(await fs.stat(q2!).catch(() => undefined)).toBeUndefined();
 		expect(listManagedCandidates(scope)).toMatchObject({ kind: "complete", owned: [] });
 	});
 
@@ -1483,5 +1485,65 @@ describe("managed session write protocol", () => {
 		const restarted = resolveManagedScope({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
 		if (restarted.kind !== "resolved") throw new Error(restarted.message);
 		expect(listManagedCandidates(restarted.scope)).toMatchObject({ kind: "complete", owned: [] });
+	});
+	it("rejects a dangling artifact replacement in a fresh replay after transcript unlink", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "phase-receipt-replacement.jsonl");
+		const artifacts = source.slice(0, -6);
+		await fs.mkdir(artifacts, { recursive: true });
+		await fs.writeFile(path.join(artifacts, "artifact.txt"), "payload");
+		await fs.writeFile(source, transcript("phase-receipt-replacement", cwd));
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing candidate");
+		const exactUnlink = native.exactUnlink;
+		const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			const result = exactUnlink(pathname, identity);
+			if (pathname === source && result.ok) throw new Error("crash_after_transcript_unlink");
+			return result;
+		});
+		try {
+			await expect(deleteManagedSessionCandidate(scope, listed.owned[0])).resolves.toMatchObject({
+				kind: "error",
+				message: "crash_after_transcript_unlink",
+			});
+		} finally {
+			unlink.mockRestore();
+		}
+		const tombstones = path.join(scope.directoryPath, ".gjc-managed-session-internal", "tombstones");
+		expect((await fs.readdir(tombstones)).some(name => name.includes(".cleanup-artifacts_removed-1.json"))).toBe(
+			true,
+		);
+		expect(await fs.lstat(source).catch(() => undefined)).toBeUndefined();
+		expect(await fs.lstat(artifacts).catch(() => undefined)).toBeUndefined();
+		const replacementTarget = path.join(path.dirname(source), "replacement-target-does-not-exist");
+		await fs.symlink(replacementTarget, artifacts);
+
+		const modulePath = path.resolve(import.meta.dir, "../../src/session/internal/managed-session-scope.ts");
+		const replayScript = `
+			const { prepareManagedSessionScopeForWrite, resolveManagedScope } = await import(${JSON.stringify(modulePath)});
+			const resolved = resolveManagedScope(${JSON.stringify({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot })});
+			const outcome = resolved.kind === "resolved"
+				? await prepareManagedSessionScopeForWrite(resolved.scope)
+				: resolved;
+			console.log(JSON.stringify({ kind: outcome.kind, code: outcome.kind === "error" ? outcome.code : null }));
+		`;
+		const replay = Bun.spawn([process.execPath, "--eval", replayScript], {
+			cwd: path.resolve(import.meta.dir, "../.."),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(replay.stdout).text(),
+			new Response(replay.stderr).text(),
+			replay.exited,
+		]);
+		expect(exitCode).toBe(0);
+		expect(stderr).toBe("");
+		expect(JSON.parse(stdout)).toEqual({ kind: "error", code: "durability_failed" });
+		expect((await fs.readdir(tombstones)).some(name => name.includes(".cleanup-completed-1.json"))).toBe(false);
+		const replacement = await fs.lstat(artifacts);
+		expect(replacement.isSymbolicLink()).toBe(true);
+		expect(await fs.readlink(artifacts)).toBe(replacementTarget);
 	});
 });
