@@ -24,6 +24,7 @@ import {
 	ensureManagedDirectory,
 	fsyncManagedArtifactTree,
 	type ManagedDirectoryRoot,
+	type ManagedFileSnapshot,
 	ManagedPublishError,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
@@ -158,6 +159,8 @@ export type ManagedScopeErrorCode =
 	| "binding_invalid"
 	| "atomic_unavailable"
 	| "invalid_request"
+	| "durability_failed"
+
 	| "durability_not_provable";
 
 export type ManagedScopeResolution =
@@ -564,6 +567,58 @@ function fsyncManagedParent(pathname: string): void {
 	}
 }
 
+function fsyncCanonicalBinding(bindingPath: string, expected: string): void {
+	let captured: ManagedFileSnapshot;
+	try {
+		captured = captureManagedFileNoFollow(bindingPath);
+	} catch {
+		throw new Error("binding_invalid");
+	}
+	if (captured.bytes.toString("utf8") !== expected) throw new Error("binding_invalid");
+	let descriptor: number | undefined;
+	try {
+		descriptor = fs.openSync(bindingPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		const before = fs.fstatSync(descriptor, { bigint: true });
+		if (
+			before.dev !== captured.identity.dev ||
+			before.ino !== captured.identity.ino ||
+			before.size !== BigInt(captured.identity.size) ||
+			before.mtimeNs !== captured.identity.mtimeNs
+		)
+			throw new Error("binding_invalid");
+		fs.fsyncSync(descriptor);
+		const after = fs.fstatSync(descriptor, { bigint: true });
+		if (
+			after.dev !== captured.identity.dev ||
+			after.ino !== captured.identity.ino ||
+			after.size !== BigInt(captured.identity.size) ||
+			after.mtimeNs !== captured.identity.mtimeNs
+		)
+			throw new Error("binding_invalid");
+	} catch (error) {
+		if (error instanceof Error && error.message === "binding_invalid") throw error;
+		throw new Error("durability_failed", { cause: error });
+	} finally {
+		if (descriptor !== undefined) fs.closeSync(descriptor);
+	}
+	fsyncManagedParent(bindingPath);
+	let recaptured: ManagedFileSnapshot;
+	try {
+		recaptured = captureManagedFileNoFollow(bindingPath);
+	} catch {
+		throw new Error("binding_invalid");
+	}
+	if (
+		recaptured.bytes.toString("utf8") !== expected ||
+		recaptured.identity.dev !== captured.identity.dev ||
+		recaptured.identity.ino !== captured.identity.ino ||
+		recaptured.identity.size !== captured.identity.size ||
+		recaptured.identity.mtimeNs !== captured.identity.mtimeNs
+	)
+		throw new Error("binding_invalid");
+}
+
+
 type CandidatePreflight =
 	| { kind: "capture"; identity: { dev: bigint; ino: bigint; size: number; mtimeNs: bigint } }
 	| {
@@ -708,13 +763,17 @@ export async function ensureManagedScope(
 		ensureManagedDirectory(scope.directoryPath, root, policy);
 		const bindingPath = path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
 		const binding = `${JSON.stringify(bindingFor(scope))}\n`;
+		let bindingCollision = false;
 		try {
 			await publishManagedFileNoReplace(bindingPath, new TextEncoder().encode(binding), undefined, root, policy);
 		} catch (error) {
 			if ((error as Error).message !== "destination_conflict") throw error;
+			bindingCollision = true;
 		}
 		const validated = validateExistingBinding(scope);
 		if (validated) return validated;
+		if (bindingCollision) fsyncCanonicalBinding(bindingPath, binding);
+
 		const preparedDirectory = fs.lstatSync(scope.directoryPath, { bigint: true });
 		if (!preparedDirectory.isDirectory() || preparedDirectory.isSymbolicLink())
 			throw new Error("Managed session directory changed");
@@ -726,9 +785,13 @@ export async function ensureManagedScope(
 			publication?.classification ??
 			(error instanceof Error ? error.message : "The managed scope could not be initialized.");
 		const code =
-			message === "atomic_unavailable" || message === "invalid_request" || message === "durability_not_provable"
+			message === "atomic_unavailable" ||
+			message === "invalid_request" ||
+			message === "durability_failed" ||
+			message === "durability_not_provable"
 				? message
 				: "binding_invalid";
+
 		return {
 			kind: "error",
 			code,
@@ -874,7 +937,10 @@ export function prepareManagedSessionScopeForWriteSync(
 			publication?.classification ??
 			(error instanceof Error ? error.message : "Managed write protocol setup failed.");
 		const code =
-			message === "atomic_unavailable" || message === "invalid_request" || message === "durability_not_provable"
+			message === "atomic_unavailable" ||
+			message === "invalid_request" ||
+			message === "durability_failed" ||
+			message === "durability_not_provable"
 				? message
 				: "binding_invalid";
 		return {
@@ -2323,13 +2389,15 @@ export async function prepareManagedSessionScopeForWrite(
 		await reconcileManagedTombstones(scope);
 		return { kind: "resolved", scope };
 	} catch (error) {
-		if (error instanceof Error && error.message === "durability_failed") return { kind: "resolved", scope };
 		const publication = error instanceof ManagedPublishError ? error : undefined;
 		const message =
 			publication?.classification ??
 			(error instanceof Error ? error.message : "Managed write protocol setup failed.");
 		const code =
-			message === "atomic_unavailable" || message === "invalid_request" || message === "durability_not_provable"
+			message === "atomic_unavailable" ||
+			message === "invalid_request" ||
+			message === "durability_failed" ||
+			message === "durability_not_provable"
 				? message
 				: "binding_invalid";
 		return {
@@ -2377,7 +2445,8 @@ export async function openManagedCandidateForWrite(
 		if (prepared.kind === "error")
 			return {
 				kind: "error",
-				code: prepared.code === "binding_conflict" ? "binding_conflict" : "binding_invalid",
+				code: prepared.code,
+
 				message: prepared.message,
 			};
 		current = revalidatePickerConsent(scope, candidate, expectedIdentity);
@@ -2577,7 +2646,7 @@ export async function deleteManagedSessionCandidate(
 	if (prepared.kind === "error")
 		return {
 			kind: "error",
-			code: prepared.code === "binding_conflict" ? "binding_conflict" : "binding_invalid",
+			code: prepared.code,
 			message: prepared.message,
 		};
 	const current = validateCandidateForScope(scope, candidate);

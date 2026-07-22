@@ -1007,6 +1007,7 @@ export class ManagedSessionDescendantStore {
 			!sameDirectoryTreeSnapshotAfterRename(movedSnapshot.snapshot, expected)
 		)
 			throw new ManagedTreeMoveOutcomeError("artifact_destination_mismatch", false);
+		if (!this.#authority) fsyncDirectory(this.#baseDir);
 
 		this.#assertBound();
 		return movedSnapshot.snapshot;
