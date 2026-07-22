@@ -7563,7 +7563,7 @@ export class SessionManager {
 				}
 				if (!privateStagingPublished && privateStagingDir && privateStagingSnapshot) {
 					const removed = native.exactRemoveDirectoryTree(privateStagingDir, privateStagingSnapshot);
-					if (!removed.ok && removed.code !== "not_found")
+					if (!removed.ok && removed.code !== "not_found" && removed.code !== "cleanup_pending")
 						cleanupErrors.push(new Error(removed.code ?? "fork_staging_cleanup_failed"));
 				}
 				if (cleanupErrors.length > 0) {
