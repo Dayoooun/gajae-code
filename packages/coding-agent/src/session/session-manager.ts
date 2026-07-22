@@ -70,6 +70,7 @@ import {
 } from "./internal/managed-session-scope";
 import {
 	assertManagedDirectoryRoot,
+	fsyncManagedArtifactTree,
 	type ManagedDirectoryRoot,
 	type ManagedFileSnapshot,
 	ManagedSessionDescendantStore,
@@ -7524,6 +7525,7 @@ export class SessionManager {
 				if (!capturedStaging.ok || !capturedStaging.snapshot)
 					throw new Error(capturedStaging.code ?? "fork_staging_snapshot_failed");
 				privateStagingSnapshot = capturedStaging.snapshot;
+				fsyncManagedArtifactTree(privateStagingDir);
 				const outcome = classifyNativePublishOutcome(native.renameNoReplacePath(privateStagingDir, dir));
 				if (!outcome.ok) throw new Error(outcome.code ?? "fork_destination_publish_failed");
 				privateStagingPublished = true;

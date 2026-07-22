@@ -313,7 +313,7 @@ function embeddedAddonCandidates(selectedVariant) {
 		? [files.find(file => file.variant === "default"), ...files]
 		: selectedVariant === "modern"
 			? [files.find(file => file.variant === "modern"), files.find(file => file.variant === "baseline")]
-			: [files.find(file => file.variant === "baseline"), files.find(file => file.variant === "modern")];
+			: [files.find(file => file.variant === "baseline")];
 	return [...new Set(candidates.filter(Boolean))];
 }
 

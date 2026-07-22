@@ -461,6 +461,39 @@ describe("SessionManager read-only resume", () => {
 		}
 		expect(fs.readdirSync(residentCacheDir)).toEqual([]);
 	});
+	it.skipIf(process.platform !== "linux")(
+		"does not publish a strict fork when staged tree durability fails",
+		async () => {
+			const root = makeTempDir();
+			const sourcePath = path.join(root, "source.jsonl");
+			const destinationDir = path.join(root, "destination-sessions");
+			const targetCwd = path.join(root, "target");
+			fs.mkdirSync(targetCwd);
+			fs.writeFileSync(sourcePath, sessionText("session-a"));
+			const fsync = fs.fsyncSync;
+			let stagedTreeSyncAttempted = false;
+			const failStagedTreeFsync = vi.spyOn(fs, "fsyncSync").mockImplementation(descriptor => {
+				const stagedDirectory = fs.fstatSync(descriptor).isDirectory();
+				const pathname = fs.readlinkSync(`/proc/self/fd/${descriptor}`);
+				if (stagedDirectory && pathname.includes(".fork-staging-")) {
+					stagedTreeSyncAttempted = true;
+					throw new Error("injected staged-tree fsync failure");
+				}
+				return fsync(descriptor);
+			});
+			try {
+				const captured = SessionManager.captureTranscriptStrict(sourcePath);
+				if (captured.kind !== "captured") throw new Error("Expected strict transcript capture");
+				await expect(SessionManager.forkFromCaptured(captured.snapshot, targetCwd, destinationDir)).rejects.toThrow(
+					"injected staged-tree fsync failure",
+				);
+				expect(stagedTreeSyncAttempted).toBe(true);
+				expect(fs.existsSync(destinationDir)).toBe(false);
+			} finally {
+				failStagedTreeFsync.mockRestore();
+			}
+		},
+	);
 	it("rejects a replaced strict-fork staging root without deleting committed evidence", async () => {
 		const root = makeTempDir();
 		const sourcePath = path.join(root, "source.jsonl");

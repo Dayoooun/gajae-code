@@ -396,6 +396,43 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 		expect(attempted).toEqual([modern, baseline]);
 		expect(stageCalls).toBe(0);
 	});
+	it("loads only the embedded baseline on a non-AVX2 x64 context", () => {
+		const baseline = "/cache/pi_natives.linux-x64-baseline.node";
+		const attempted: string[] = [];
+		const bindings = loadNative({
+			context: {
+				isCompiledBinary: true,
+				platformTag: "linux-x64",
+				addonLabel: "linux-x64 (baseline)",
+				addonFilenames: [],
+				versionedDir: "/cache",
+				candidates: ["/filesystem-fallback.node"],
+				selectedVariant: "baseline",
+			},
+			extractEmbeddedAddons: ctx => {
+				expect(ctx.selectedVariant).toBe("baseline");
+				return [baseline];
+			},
+			stageNodeModulesAddon: () => {
+				throw new Error("non-AVX2 embedded baseline must not stage a fallback");
+			},
+			requireCandidate: candidate => {
+				attempted.push(candidate);
+				if (candidate !== baseline) throw new Error(`unexpected candidate ${candidate}`);
+				return { __piNativesVCurrent: (): void => undefined, __piNativesPublishOutcomeV1: (): void => undefined };
+			},
+			validateCandidate: value => {
+				validateCurrentSentinel(value);
+				if (typeof value.__piNativesPublishOutcomeV1 !== "function")
+					throw new Error("missing publish outcome sentinel");
+			},
+		});
+		expect(bindings).toEqual({
+			__piNativesVCurrent: expect.any(Function),
+			__piNativesPublishOutcomeV1: expect.any(Function),
+		});
+		expect(attempted).toEqual([baseline]);
+	});
 
 	it("preserves Windows staging ahead of package candidates", () => {
 		const filename = "pi_natives.win32-x64-baseline.node";
