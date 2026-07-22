@@ -1344,7 +1344,7 @@ describe("managed session write protocol", () => {
 		expect(listManagedCandidates(scope)).toMatchObject({ kind: "complete", owned: [] });
 	});
 
-	it("reconciles a crash after durable artifact completion and successful transcript unlink", async () => {
+	it("reconciles a fresh-process crash replay after durable artifact completion and successful transcript unlink", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);
 		const source = path.join(legacy, "phase-receipt-crash.jsonl");
@@ -1354,6 +1354,12 @@ describe("managed session write protocol", () => {
 		await fs.writeFile(source, transcript("phase-receipt-crash", cwd));
 		const listed = listManagedCandidates(scope);
 		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing candidate");
+		const persistedIdentity = {
+			...listed.owned[0].identity,
+			dev: String(listed.owned[0].identity.dev),
+			ino: String(listed.owned[0].identity.ino),
+			mtimeNs: String(listed.owned[0].identity.mtimeNs),
+		};
 		const exactUnlink = native.exactUnlink;
 		const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
 			const result = exactUnlink(pathname, identity);
@@ -1361,14 +1367,125 @@ describe("managed session write protocol", () => {
 			return result;
 		});
 		try {
-			await expect(deleteManagedSessionCandidate(scope, listed.owned[0])).resolves.toMatchObject({ kind: "error" });
+			await expect(deleteManagedSessionCandidate(scope, listed.owned[0])).resolves.toEqual({
+				kind: "error",
+				code: "managed_storage_unsupported",
+				message: "crash_after_transcript_unlink",
+			});
 		} finally {
 			unlink.mockRestore();
 		}
+		const tombstones = path.join(scope.directoryPath, ".gjc-managed-session-internal", "tombstones");
+		const tombstoneName = (await fs.readdir(tombstones)).find(
+			name => name.endsWith(".json") && !name.includes(".cleanup-"),
+		);
+		if (!tombstoneName) throw new Error("Missing tombstone");
+		const tombstonePath = path.join(tombstones, tombstoneName);
+		const pendingName = (await fs.readdir(tombstones)).find(name => name.includes(".cleanup-pending-1.json"));
+		const artifactsRemovedName = (await fs.readdir(tombstones)).find(name =>
+			name.includes(".cleanup-artifacts_removed-1.json"),
+		);
+		if (!pendingName || !artifactsRemovedName) throw new Error("Missing durable cleanup receipts");
+		const pending = JSON.parse(await fs.readFile(path.join(tombstones, pendingName), "utf8")) as Record<
+			string,
+			unknown
+		>;
+		const artifactsRemoved = JSON.parse(
+			await fs.readFile(path.join(tombstones, artifactsRemovedName), "utf8"),
+		) as Record<string, unknown>;
+		expect(pending).toMatchObject({
+			schemaVersion: 2,
+			state: "cleanup_pending",
+			tombstone: tombstonePath,
+			attempt: 1,
+			target: {
+				path: source,
+				sessionId: "phase-receipt-crash",
+				cwd,
+				identity: { sha256: listed.owned[0].identity.sha256 },
+			},
+		});
+		expect(artifactsRemoved).toMatchObject({
+			schemaVersion: 2,
+			state: "artifacts_removed",
+			tombstone: tombstonePath,
+			attempt: 1,
+			target: {
+				path: source,
+				sessionId: "phase-receipt-crash",
+				cwd,
+				identity: {
+					dev: persistedIdentity.dev,
+					ino: persistedIdentity.ino,
+					size: persistedIdentity.size,
+					mtimeNs: persistedIdentity.mtimeNs,
+					sha256: persistedIdentity.sha256,
+				},
+			},
+		});
 		expect(await fs.stat(source).catch(() => undefined)).toBeUndefined();
+		expect(await fs.stat(artifacts).catch(() => undefined)).toBeUndefined();
+		for (const pathname of [
+			pending.plannedArtifactsPath,
+			`${pending.plannedArtifactsPath}.removing`,
+			pending.plannedTranscriptPath,
+		]) {
+			expect(typeof pathname).toBe("string");
+			expect(await fs.lstat(pathname as string).catch(() => undefined)).toBeUndefined();
+		}
+
+		const modulePath = path.resolve(import.meta.dir, "../../src/session/internal/managed-session-scope.ts");
+		const replayScript = `
+			const { prepareManagedSessionScopeForWrite, resolveManagedScope } = await import(${JSON.stringify(modulePath)});
+			const resolved = resolveManagedScope(${JSON.stringify({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot })});
+			const outcome = resolved.kind === "resolved"
+				? await prepareManagedSessionScopeForWrite(resolved.scope)
+				: resolved;
+			console.log(JSON.stringify({ kind: outcome.kind, message: outcome.kind === "error" ? outcome.message : null }));
+		`;
+		const replay = Bun.spawn([process.execPath, "--eval", replayScript], {
+			cwd: path.resolve(import.meta.dir, "../.."),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(replay.stdout).text(),
+			new Response(replay.stderr).text(),
+			replay.exited,
+		]);
+		expect(exitCode).toBe(0);
+		expect(stderr).toBe("");
+		expect(JSON.parse(stdout)).toEqual({ kind: "resolved", message: null });
+		const completedName = (await fs.readdir(tombstones)).find(name => name.includes(".cleanup-completed-1.json"));
+		if (!completedName) throw new Error("Missing completion receipt");
+		expect(JSON.parse(await fs.readFile(path.join(tombstones, completedName), "utf8"))).toMatchObject({
+			schemaVersion: 1,
+			state: "cleanup_completed",
+			tombstone: tombstonePath,
+			attempt: 1,
+			target: {
+				path: source,
+				sessionId: "phase-receipt-crash",
+				cwd,
+				identity: {
+					dev: persistedIdentity.dev,
+					ino: persistedIdentity.ino,
+					size: persistedIdentity.size,
+					mtimeNs: persistedIdentity.mtimeNs,
+					sha256: persistedIdentity.sha256,
+				},
+			},
+		});
+		for (const pathname of [
+			source,
+			artifacts,
+			pending.plannedArtifactsPath,
+			`${pending.plannedArtifactsPath}.removing`,
+			pending.plannedTranscriptPath,
+		])
+			expect(await fs.lstat(pathname as string).catch(() => undefined)).toBeUndefined();
 		const restarted = resolveManagedScope({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
 		if (restarted.kind !== "resolved") throw new Error(restarted.message);
-		expect((await prepareManagedSessionScopeForWrite(restarted.scope)).kind).toBe("resolved");
 		expect(listManagedCandidates(restarted.scope)).toMatchObject({ kind: "complete", owned: [] });
 	});
 });

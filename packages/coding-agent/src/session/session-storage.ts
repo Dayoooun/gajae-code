@@ -888,12 +888,6 @@ export class FileSessionStorage implements SessionStorage {
 			}
 		}
 
-		if (artifactsRemoved && expectedArtifactsIdentity && !detachedArtifactsPath) {
-			throw new SessionDeleteVerificationError(
-				"artifacts",
-				"Artifact phase receipt requires detached artifact evidence",
-			);
-		}
 		const artifactsDir = transcriptPath.slice(0, -6);
 		const artifactsIdentity = this.#optionalDirectoryIdentity(artifactsDir);
 		if (artifactsRemoved && artifactsIdentity) {

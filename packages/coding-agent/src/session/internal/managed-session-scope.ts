@@ -1465,6 +1465,7 @@ function cleanupArtifactsRemoved(
 		if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 		const record = value as Record<string, unknown>;
 		const recorded = record.target as Record<string, unknown> | undefined;
+		const identity = recorded?.identity as Record<string, unknown> | undefined;
 		return (
 			record.schemaVersion === 2 &&
 			record.state === "artifacts_removed" &&
@@ -1474,6 +1475,12 @@ function cleanupArtifactsRemoved(
 			recorded?.path === target.path &&
 			recorded.sessionId === target.sessionId &&
 			recorded.cwd === target.cwd &&
+			identity?.canonicalPath === target.identity.canonicalPath &&
+			identity.dev === String(target.identity.dev) &&
+			identity.ino === String(target.identity.ino) &&
+			identity.size === target.identity.size &&
+			identity.mtimeNs === String(target.identity.mtimeNs) &&
+			identity.sha256 === target.identity.sha256 &&
 			retainedArtifactsRootMatches(record)
 		);
 	} catch (error) {
