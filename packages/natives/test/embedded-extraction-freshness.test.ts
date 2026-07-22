@@ -1,8 +1,7 @@
+import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-
-import { describe, expect, it } from "bun:test";
 
 import {
 	cachedEmbeddedExtractionIsFresh,
@@ -122,7 +121,7 @@ describe("resolveRuntimeCandidates", () => {
 				embeddedCandidate: modernPath,
 				validatedCandidates: [modernPath!],
 			}),
-		).toEqual([modernPath]);
+		).toEqual([modernPath!]);
 	});
 
 	it("fails closed when a replacement race invalidates the immutable target", () => {
@@ -172,7 +171,7 @@ describe("load-time cache attestation", () => {
 		const loaded = loadFromCandidates({
 			candidates: [immutablePath!],
 			bindCandidate: candidate => {
-				expect(candidate).toBe(immutablePath);
+				expect(candidate).toBe(immutablePath!);
 				return privateLoadPath;
 			},
 			cleanupCandidate: candidate => cleanedPaths.push(candidate),
@@ -187,7 +186,7 @@ describe("load-time cache attestation", () => {
 		});
 
 		expect(targetHash).toBe(staleHash);
-		expect(requiredPath).toBe(privateLoadPath);
+		expect(requiredPath as string | null).toBe(privateLoadPath);
 		expect(cleanedPaths).toEqual([privateLoadPath]);
 		expect(loaded.errors).toEqual([]);
 		expect(loaded.bindings).not.toBeNull();

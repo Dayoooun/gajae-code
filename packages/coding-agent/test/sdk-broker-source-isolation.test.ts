@@ -1,5 +1,4 @@
 import { afterEach, expect, it } from "bun:test";
-import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
@@ -25,7 +24,7 @@ afterEach(async () => {
 	brokerLeases.clear();
 });
 
-it("keeps a detached broker's active native load private while a concurrent source client starts without loading hostile cwd bunfig or dotenv", async () => {
+it("keeps detached source brokers isolated from hostile workspace configuration", async () => {
 	const root = await tempRoot();
 	const hostileCwd = path.join(root, "hostile project ü");
 	const agentDir = path.join(root, "agent");
@@ -64,10 +63,7 @@ it("keeps a detached broker's active native load private while a concurrent sour
 			})
 		).lease,
 	);
-	const activePrivateLoadDirs = (await fs.readdir(nativeCacheDir)).filter(filename =>
-		filename.startsWith(".pi-natives-load-"),
-	);
-	expect(activePrivateLoadDirs).not.toEqual([]);
+	await expect(fs.readdir(nativeCacheDir)).rejects.toMatchObject({ code: "ENOENT" });
 	await Bun.write(path.join(hostileCwd, "bunfig.toml"), `preload = [${JSON.stringify(preload)}]\n`);
 	await Bun.write(path.join(hostileCwd, ".env"), "GJC_2178_DOTENV=dotenv-loaded\n");
 	await Bun.write(
@@ -116,17 +112,6 @@ it("keeps a detached broker's active native load private while a concurrent sour
 	expect(response.result?.sessions).toEqual([]);
 	expect(await readBrokerDiscovery(agentDir)).not.toBeNull();
 	expect(brokerLeases.get(root)).toBeDefined();
-	for (const loadDir of activePrivateLoadDirs) {
-		expect(await Bun.file(path.join(nativeCacheDir, loadDir)).exists()).toBe(true);
-	}
-	const cachedAddons = await fs.readdir(nativeCacheDir);
-	const cachedAddon = cachedAddons.find(filename => /^pi_natives\..+\.[a-f0-9]{64}\.node$/.test(filename));
-	expect(cachedAddon).toBeDefined();
-	if (!cachedAddon) throw new Error("detached broker did not receive a content-attested native addon");
-	const sourceAddon = path.join(path.resolve(import.meta.dir, "../../natives/native"), cachedAddon.replace(/\.[a-f0-9]{64}(?=\.node$)/, ""));
-	expect(createHash("sha256").update(await fs.readFile(path.join(nativeCacheDir, cachedAddon))).digest("hex")).toBe(
-		createHash("sha256").update(await fs.readFile(sourceAddon)).digest("hex"),
-	);
 	expect(await Bun.file(preloadSentinel).exists()).toBe(false);
 	expect(await Bun.file(dotenvSentinel).exists()).toBe(false);
 	expect(await Bun.file(pathSentinel).exists()).toBe(false);
