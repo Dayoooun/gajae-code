@@ -3480,15 +3480,15 @@ pub(crate) mod platform {
 					format!("{relative}/{name}")
 				}
 			});
-			let expected_child = match (
+			let ((Some(expected_child), None) | (None, Some(expected_child))) = (
 				direct_relative
 					.as_deref()
 					.and_then(|candidate| expected_tree_entry(expected, candidate)),
 				expected_quarantined_tree_entry(expected, relative, &name_bytes),
-			) {
-				(Some(entry), None) | (None, Some(entry)) => entry,
-				_ => return Err("identity_mismatch"),
+			) else {
+				return Err("identity_mismatch");
 			};
+
 			let child_relative = expected_child.relative_path.as_str();
 			let quarantine = tree_quarantine_name(expected_child);
 			let child_flags = libc::O_RDONLY
@@ -3690,16 +3690,13 @@ pub(crate) mod platform {
 			)
 		};
 		let detached_retained_path = if already_final {
-			retained_path.clone()
+			retained_path
 		} else {
-			final_path.clone()
+			final_path
 		};
 
 		let result = if detached_fd < 0 {
-			NativeExactUnlinkResult::detached_failure(
-				"cleanup_pending",
-				detached_retained_path.clone(),
-			)
+			NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_retained_path)
 		} else {
 			let matches = descriptor_matches_tree_entry(detached_fd, root_entry).unwrap_or(false);
 			let removed =
@@ -3721,10 +3718,7 @@ pub(crate) mod platform {
 				if absent(detached_name) && (already_final || absent(&name)) {
 					NativeExactUnlinkResult::success()
 				} else {
-					NativeExactUnlinkResult::detached_failure(
-						"cleanup_pending",
-						detached_retained_path.clone(),
-					)
+					NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_retained_path)
 				}
 			} else {
 				NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_retained_path)
@@ -5981,7 +5975,7 @@ mod exact_unlink_placeholder_tests {
 		GUARD
 			.get_or_init(|| Mutex::new(()))
 			.lock()
-			.expect("exchange hook test guard")
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
 	}
 
 	#[test]
