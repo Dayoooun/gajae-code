@@ -134,17 +134,24 @@ describe.skipIf(process.platform !== "linux")("native recovery filesystem author
 		expect(replacement).toMatchObject({ ok: true });
 		const replaced = authority.readManaged("receipt");
 		if (!replaced.identity?.sha256) throw new Error("Expected replacement digest evidence");
-		expect(
-			authority.removeManaged(
-				"receipt",
-				replaced.identity.dev,
-				replaced.identity.ino,
-				replaced.identity.size,
-				replaced.identity.mtimeNs,
-				replaced.identity.ctimeNs,
-				replaced.identity.sha256,
-			),
-		).toMatchObject({ ok: true });
+		const removed = authority.removeManaged(
+			"receipt",
+			replaced.identity.dev,
+			replaced.identity.ino,
+			replaced.identity.size,
+			replaced.identity.mtimeNs,
+			replaced.identity.ctimeNs,
+			replaced.identity.sha256,
+		);
+		const cleanup = removed as { recoveryPath?: string };
+		expect(removed).toMatchObject({
+			ok: false,
+			code: "cleanup_pending",
+			identity: { dev: replaced.identity.dev, ino: replaced.identity.ino },
+		});
+		expect(cleanup.recoveryPath).toMatch(/^\.gjc-recovery\/\.gjc-managed-remove-/);
+		await expect(fs.access(path.join(root, cleanup.recoveryPath ?? ""))).resolves.toBeNull();
+
 		await expect(fs.access(path.join(root, "receipt"))).rejects.toThrow();
 	});
 
@@ -250,7 +257,18 @@ describe.skipIf(process.platform !== "linux")("native recovery filesystem author
 		expect(await fs.readFile(path.join(retained, "destination/nested/receipt"), "utf8")).toBe("trusted");
 		const destinationSnapshot = authority.snapshotManagedTree("destination");
 		if (!destinationSnapshot.snapshot) throw new Error("Expected destination tree snapshot");
-		expect(authority.removeManagedTree("destination", destinationSnapshot.snapshot)).toMatchObject({ ok: true });
+		const removed = authority.removeManagedTree("destination", destinationSnapshot.snapshot);
+		const cleanup = removed as { recoveryPath?: string };
+		expect(removed).toMatchObject({
+			ok: false,
+			code: "cleanup_pending",
+			treeSnapshot: {
+				rootDev: destinationSnapshot.snapshot.rootDev,
+				rootIno: destinationSnapshot.snapshot.rootIno,
+			},
+		});
+		expect(cleanup.recoveryPath).toMatch(/^\.gjc-recovery\/\.gjc-managed-tree-remove-/);
+		await expect(fs.access(path.join(retained, cleanup.recoveryPath ?? ""))).resolves.toBeNull();
 		await expect(fs.access(path.join(retained, "destination"))).rejects.toThrow();
 		expect(authority.close()).toMatchObject({ ok: true });
 	});

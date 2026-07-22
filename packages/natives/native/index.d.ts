@@ -398,7 +398,7 @@ export declare class RecoveryFsRoot {
    */
   appendManaged(relativePath: string, data: Uint8Array, expectedDev: string, expectedIno: string, expectedSize: string, expectedMtimeNs: string, expectedCtimeNs: string, expectedSha256: string): RecoveryFsResult
   /** Remove one exact managed regular file through retained authority. */
-  removeManaged(relativePath: string, expectedDev: string, expectedIno: string, expectedSize: string, expectedMtimeNs: string, expectedCtimeNs: string, expectedSha256: string): RecoveryFsResult
+  removeManaged(relativePath: string, expectedDev: string, expectedIno: string, expectedSize: string, expectedMtimeNs: string, expectedCtimeNs: string, expectedSha256: string): RecoveryFsRetainedCleanupResult
   /**
    * Create each absent directory component beneath the retained root with
    * owner-only security. Existing components are re-opened no-follow.
@@ -418,7 +418,7 @@ export declare class RecoveryFsRoot {
    */
   renameManagedTreeNoReplace(sourceRelativePath: string, destinationRelativePath: string, expected: NativeDirectoryTreeSnapshot): RecoveryFsPublishResult
   /** Remove an exact managed directory tree through retained authority. */
-  removeManagedTree(relativePath: string, expected: NativeDirectoryTreeSnapshot): RecoveryFsResult
+  removeManagedTree(relativePath: string, expected: NativeDirectoryTreeSnapshot): RecoveryFsRetainedCleanupResult
   /**
    * Atomically install an already-created regular file at an absent name.
    * Both names remain relative to this retained root and are never resolved
@@ -2020,6 +2020,19 @@ export interface RecoveryFsResult {
   code?: string
   identity?: RecoveryFsIdentity
   data?: Uint8Array
+}
+
+/**
+ * Fail-closed outcome for a removal whose detached object remains retained.
+ * `recovery_path` identifies evidence only; it grants no authority to replay
+ * or delete the retained object.
+ */
+export interface RecoveryFsRetainedCleanupResult {
+  ok: boolean
+  code?: string
+  recoveryPath?: string
+  identity?: RecoveryFsIdentity
+  treeSnapshot?: NativeDirectoryTreeSnapshot
 }
 
 export declare function renameNoReplacePath(sourcePath: string, destinationPath: string): NativeNoReplaceResult

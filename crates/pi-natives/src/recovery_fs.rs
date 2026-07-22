@@ -143,6 +143,53 @@ pub struct RecoveryFsResult {
 	pub data:     Option<Uint8Array>,
 }
 
+/// Fail-closed outcome for a removal whose detached object remains retained.
+/// `recovery_path` identifies evidence only; it grants no authority to replay
+/// or delete the retained object.
+#[napi(object)]
+pub struct RecoveryFsRetainedCleanupResult {
+	pub ok:            bool,
+	pub code:          Option<String>,
+	pub recovery_path: Option<String>,
+	pub identity:      Option<RecoveryFsIdentity>,
+	pub tree_snapshot: Option<crate::path_identity::NativeDirectoryTreeSnapshot>,
+}
+
+impl RecoveryFsRetainedCleanupResult {
+	fn failure(code: &str) -> Self {
+		Self {
+			ok:            false,
+			code:          Some(code.to_owned()),
+			recovery_path: None,
+			identity:      None,
+			tree_snapshot: None,
+		}
+	}
+
+	fn retained_file(recovery_path: String, identity: RecoveryFsIdentity) -> Self {
+		Self {
+			ok:            false,
+			code:          Some("cleanup_pending".to_owned()),
+			recovery_path: Some(recovery_path),
+			identity:      Some(identity),
+			tree_snapshot: None,
+		}
+	}
+
+	fn retained_tree(
+		recovery_path: String,
+		tree_snapshot: crate::path_identity::NativeDirectoryTreeSnapshot,
+	) -> Self {
+		Self {
+			ok:            false,
+			code:          Some("cleanup_pending".to_owned()),
+			recovery_path: Some(recovery_path),
+			identity:      None,
+			tree_snapshot: Some(tree_snapshot),
+		}
+	}
+}
+
 impl RecoveryFsResult {
 	const fn success(identity: RecoveryFsIdentity) -> Self {
 		Self { ok: true, code: None, identity: Some(identity), data: None }
@@ -633,10 +680,10 @@ impl RecoveryFsRoot {
 		expected_mtime_ns: String,
 		expected_ctime_ns: String,
 		expected_sha256: String,
-	) -> RecoveryFsResult {
+	) -> RecoveryFsRetainedCleanupResult {
 		#[cfg(target_os = "linux")]
 		{
-			with_root_and_recovery(&self.root, &self.recovery, |root, recovery| {
+			with_root_and_recovery_cleanup(&self.root, &self.recovery, |root, recovery| {
 				remove_managed(
 					root,
 					recovery,
@@ -661,7 +708,7 @@ impl RecoveryFsRoot {
 				expected_ctime_ns,
 				expected_sha256,
 			);
-			RecoveryFsResult::failure("unsupported_platform")
+			RecoveryFsRetainedCleanupResult::failure("unsupported_platform")
 		}
 	}
 
@@ -809,17 +856,17 @@ impl RecoveryFsRoot {
 		&self,
 		relative_path: String,
 		expected: crate::path_identity::NativeDirectoryTreeSnapshot,
-	) -> RecoveryFsResult {
+	) -> RecoveryFsRetainedCleanupResult {
 		#[cfg(target_os = "linux")]
 		{
-			with_root_and_recovery(&self.root, &self.recovery, |root, recovery| {
+			with_root_and_recovery_cleanup(&self.root, &self.recovery, |root, recovery| {
 				remove_managed_tree(root, recovery, &relative_path, &expected)
 			})
 		}
 		#[cfg(not(target_os = "linux"))]
 		{
 			let _ = (relative_path, expected);
-			RecoveryFsResult::failure("unsupported_platform")
+			RecoveryFsRetainedCleanupResult::failure("unsupported_platform")
 		}
 	}
 
@@ -1100,6 +1147,20 @@ fn with_root_publish(
 		},
 		operation,
 	)
+}
+
+#[cfg(target_os = "linux")]
+fn with_root_and_recovery_cleanup(
+	root: &Mutex<Option<File>>,
+	recovery: &Mutex<Option<File>>,
+	operation: impl FnOnce(&File, Option<&File>) -> Result<RecoveryFsRetainedCleanupResult, &'static str>,
+) -> RecoveryFsRetainedCleanupResult {
+	let root_guard = root.lock();
+	let Some(root) = root_guard.as_ref() else {
+		return RecoveryFsRetainedCleanupResult::failure("closed");
+	};
+	let recovery_guard = recovery.lock();
+	operation(root, recovery_guard.as_ref()).unwrap_or_else(RecoveryFsRetainedCleanupResult::failure)
 }
 
 #[cfg(target_os = "linux")]
@@ -1755,7 +1816,7 @@ fn remove_managed(
 	expected_mtime_ns: &str,
 	expected_ctime_ns: &str,
 	expected_sha256: &str,
-) -> Result<RecoveryFsResult, &'static str> {
+) -> Result<RecoveryFsRetainedCleanupResult, &'static str> {
 	use std::os::fd::AsRawFd;
 	let (source_parent, name) = open_parent(root, relative_path)?;
 	let authorized = open_existing(root, relative_path, false)?;
@@ -1845,9 +1906,12 @@ fn remove_managed(
 	{
 		return Err("identity_mismatch");
 	}
-	// Canonical absence is committed. The verified quarantine remains recoverable
-	// evidence; deleting it would reopen an unprovable name race.
-	Ok(RecoveryFsResult::success(authorized_identity))
+	// Canonical absence is durable, but cleanup is deliberately not replayed:
+	// the verified quarantine is evidence only, not a deletion capability.
+	Ok(RecoveryFsRetainedCleanupResult::retained_file(
+		format!(".gjc-recovery/{quarantined_relative}"),
+		terminal_identity,
+	))
 }
 
 #[cfg(target_os = "linux")]
@@ -2596,7 +2660,7 @@ fn remove_managed_tree(
 	recovery: Option<&File>,
 	relative_path: &str,
 	expected: &crate::path_identity::NativeDirectoryTreeSnapshot,
-) -> Result<RecoveryFsResult, &'static str> {
+) -> Result<RecoveryFsRetainedCleanupResult, &'static str> {
 	use std::os::fd::AsRawFd;
 	let snapshot = snapshot_managed_tree(root, relative_path)?
 		.snapshot
@@ -2604,7 +2668,7 @@ fn remove_managed_tree(
 	if &snapshot != expected {
 		return Err("identity_mismatch");
 	}
-	let root_identity = identity(root)?;
+	identity(root)?;
 	let (source_parent, name) = open_parent(root, relative_path)?;
 	let quarantine = CString::new(format!(
 		".gjc-managed-tree-remove-{}-{}",
@@ -2644,10 +2708,9 @@ fn remove_managed_tree(
 	if terminal != verified_snapshot {
 		return Err("identity_mismatch");
 	}
-	// Canonical absence is durable. The verified quarantine remains as recoverable
-	// cleanup evidence; deleting descendants here would reopen a destructive race
-	// with a concurrent same-UID actor.
-	Ok(RecoveryFsResult::success(root_identity))
+	// Canonical absence is durable, but cleanup is deliberately not replayed:
+	// the verified quarantine is evidence only, not a deletion capability.
+	Ok(RecoveryFsRetainedCleanupResult::retained_tree(format!(".gjc-recovery/{detached}"), terminal))
 }
 
 #[cfg(all(test, target_os = "linux"))]
