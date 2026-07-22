@@ -7513,11 +7513,19 @@ export class SessionManager {
 					throw new Error("managed_fork_transcript_changed");
 			}
 			if (privateStagingDir && manager.#sessionFile) {
+				const materializedEntries = materializeResidentEntriesForReadSync(
+					manager.#fileEntries,
+					manager.#residentBlobStores(),
+				);
 				const published = native.renameNoReplacePath(privateStagingDir, dir);
 				if (!published.ok) throw new Error(published.code ?? "fork_destination_publish_failed");
 				manager.sessionDir = dir;
 				manager.destination = destination;
 				manager.#sessionFile = path.join(dir, path.basename(manager.#sessionFile));
+				manager.#fileEntries = materializedEntries;
+				manager.#resetResidentTextBlobStore();
+				manager.#reexternalizeFileEntriesForResidentStore();
+				manager.#bumpAllRevisions();
 			}
 			if (manager.#sessionFile) writeTerminalBreadcrumb(manager.cwd, manager.#sessionFile);
 			return { kind: "forked", manager };

@@ -433,6 +433,29 @@ describe("SessionManager read-only resume", () => {
 		});
 		expect(fs.existsSync(destinationDir)).toBe(false);
 	});
+	it("rebinds resident history blobs after publishing an explicit strict fork", async () => {
+		const root = makeTempDir();
+		const sourcePath = path.join(root, "source.jsonl");
+		const destinationDir = path.join(root, "destination-sessions");
+		const targetCwd = path.join(root, "target");
+		const history = "x".repeat(1025);
+		fs.mkdirSync(targetCwd);
+		fs.writeFileSync(sourcePath, sessionText("session-a").replace("resume", history));
+
+		const captured = SessionManager.captureTranscriptStrict(sourcePath);
+		if (captured.kind !== "captured") throw new Error("Expected strict transcript capture");
+		const forked = await SessionManager.forkFromCaptured(captured.snapshot, targetCwd, destinationDir);
+		if (forked.kind !== "forked") throw new Error("Expected strict fork success");
+
+		try {
+			expect(forked.manager.getSessionDir()).toBe(destinationDir);
+			expect(forked.manager.getEntries()).toMatchObject([
+				{ type: "message", message: { role: "user", content: history } },
+			]);
+		} finally {
+			await forked.manager.close();
+		}
+	});
 	it("preserves a foreign destination injected after absence observation when strict fork authority fails", async () => {
 		const root = makeTempDir();
 		const sourcePath = path.join(root, "source.jsonl");
