@@ -1054,6 +1054,14 @@ pub(crate) mod platform {
 	static AFTER_PLACEHOLDER_DETACH_HOOK: OnceLock<
 		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 	> = OnceLock::new();
+	#[cfg(test)]
+	static AFTER_TREE_VALIDATION_HOOK: OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> =
+		OnceLock::new();
+
+	#[cfg(test)]
+	static AFTER_TREE_RENAME_HOOK: OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> =
+		OnceLock::new();
+
 
 	#[cfg(test)]
 	pub(super) fn set_after_exchange_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
@@ -1080,6 +1088,24 @@ pub(crate) mod platform {
 			.lock()
 			.expect("placeholder detach hook lock") = hook;
 	}
+	#[cfg(test)]
+	pub(super) fn set_after_tree_validation_hook(
+		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+	) {
+		*AFTER_TREE_VALIDATION_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.expect("tree validation hook lock") = hook;
+	}
+
+	#[cfg(test)]
+	pub(super) fn set_after_tree_rename_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
+		*AFTER_TREE_RENAME_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.expect("tree rename hook lock") = hook;
+	}
+
 
 	#[cfg(test)]
 	fn pause_after_exchange_for_test() {
@@ -1119,6 +1145,32 @@ pub(crate) mod platform {
 			resume.recv().expect("placeholder detach hook resume");
 		}
 	}
+	#[cfg(test)]
+	fn pause_after_tree_validation_for_test() {
+		if let Some((entered, resume)) = AFTER_TREE_VALIDATION_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.expect("tree validation hook lock")
+			.as_ref()
+		{
+			entered.send(()).expect("tree validation hook receiver");
+			resume.recv().expect("tree validation hook resume");
+		}
+	}
+
+	#[cfg(test)]
+	fn pause_after_tree_rename_for_test() {
+		if let Some((entered, resume)) = AFTER_TREE_RENAME_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.expect("tree rename hook lock")
+			.as_ref()
+		{
+			entered.send(()).expect("tree rename hook receiver");
+			resume.recv().expect("tree rename hook resume");
+		}
+	}
+
 
 	pub(super) fn canonical_existing_directory_identity(
 		path: &Path,
@@ -3228,10 +3280,6 @@ pub(crate) mod platform {
 		}
 	}
 
-	enum TreeRemovalFailure {
-		Code(&'static str),
-		Retained(&'static str),
-	}
 
 	fn expected_tree_entry<'a>(
 		expected: &'a [NativeDirectoryTreeEntry],
@@ -3310,21 +3358,10 @@ pub(crate) mod platform {
 		matching.next().is_none().then_some(entry)
 	}
 
-	fn quarantine_child(
-		parent_fd: libc::c_int,
-		original: &CString,
-		expected: &NativeDirectoryTreeEntry,
-	) -> Result<CString, &'static str> {
-		let candidate = tree_quarantine_name(expected);
-		rename_no_replace(parent_fd, parent_fd, original, &candidate)?;
-		Ok(candidate)
-	}
 
-	/// Validate the whole retained tree before starting any quarantine or
-	/// deletion. Missing expected entries are permitted because a prior attempt
-	/// may have completed their deletion, but every entry still present must
-	/// map uniquely to its durable logical identity (including deterministic
-	/// quarantine names).
+	/// Validate the retained tree before atomically detaching its root. Every
+	/// entry still present must map uniquely to its durable logical identity,
+	/// including deterministic names retained by older attempts.
 	fn validate_tree_fd(
 		fd: libc::c_int,
 		relative: &str,
@@ -3393,107 +3430,6 @@ pub(crate) mod platform {
 		Ok(())
 	}
 
-	fn remove_tree_fd(
-		fd: libc::c_int,
-		relative: &str,
-		expected: &[NativeDirectoryTreeEntry],
-	) -> Result<(), TreeRemovalFailure> {
-		let mut names = directory_names(fd).map_err(TreeRemovalFailure::Code)?;
-		names.sort();
-		let mut seen = std::collections::BTreeSet::new();
-		for name_bytes in names {
-			let physical =
-				CString::new(name_bytes.clone()).map_err(|_| TreeRemovalFailure::Code("io_error"))?;
-			let direct_name = std::str::from_utf8(&name_bytes).ok();
-			let direct_relative = direct_name.map(|name| {
-				if relative.is_empty() {
-					name.to_owned()
-				} else {
-					format!("{relative}/{name}")
-				}
-			});
-			let expected_direct = direct_relative
-				.as_deref()
-				.and_then(|candidate| expected_tree_entry(expected, candidate));
-			let expected_quarantined =
-				expected_quarantined_tree_entry(expected, relative, &name_bytes);
-			let (logical_bytes, expected_child) = match (expected_direct, expected_quarantined) {
-				(Some(entry), None) => (name_bytes.clone(), entry),
-				(None, Some(entry)) => (
-					entry.relative_path.rsplit_once('/').map_or_else(
-						|| entry.relative_path.as_bytes().to_vec(),
-						|(_, name)| name.as_bytes().to_vec(),
-					),
-					entry,
-				),
-				_ => return Err(TreeRemovalFailure::Code("identity_mismatch")),
-			};
-			let logical_name = std::str::from_utf8(&logical_bytes)
-				.map_err(|_| TreeRemovalFailure::Code("not_utf8"))?;
-			let child_relative = if relative.is_empty() {
-				logical_name.to_owned()
-			} else {
-				format!("{relative}/{logical_name}")
-			};
-			if !seen.insert(child_relative.clone()) {
-				return Err(TreeRemovalFailure::Code("identity_mismatch"));
-			}
-			if expected_tree_entry(expected, &child_relative) != Some(expected_child) {
-				return Err(TreeRemovalFailure::Code("identity_mismatch"));
-			}
-
-			if physical.as_bytes() == logical_bytes.as_slice()
-				&& !detached_entry_matches(fd, &physical, expected_child)
-					.map_err(TreeRemovalFailure::Code)?
-			{
-				return Err(TreeRemovalFailure::Code("identity_mismatch"));
-			}
-			let detached = if physical.as_bytes() == logical_bytes.as_slice() {
-				quarantine_child(fd, &physical, expected_child).map_err(TreeRemovalFailure::Code)?
-			} else {
-				physical
-			};
-			let matches = detached_entry_matches(fd, &detached, expected_child)
-				.map_err(TreeRemovalFailure::Code)?;
-			if !matches {
-				return Err(TreeRemovalFailure::Retained("identity_mismatch"));
-			}
-
-			if expected_child.kind == "directory" {
-				// SAFETY: the live descriptor, where used, and NUL-terminated path remain
-				// valid.
-				let child = unsafe {
-					libc::openat(
-						fd,
-						detached.as_ptr(),
-						libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-					)
-				};
-				if child < 0 {
-					return Err(TreeRemovalFailure::Retained(security_code(
-						&std::io::Error::last_os_error(),
-					)));
-				}
-				let result = remove_tree_fd(child, &child_relative, expected);
-				// SAFETY: this branch owns the live descriptor and closes it exactly once.
-				unsafe { libc::close(child) };
-				result?;
-				// SAFETY: the parent descriptor and NUL-terminated CString path remain valid.
-				if unsafe { libc::unlinkat(fd, detached.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-					return Err(TreeRemovalFailure::Retained(security_code(
-						&std::io::Error::last_os_error(),
-					)));
-				}
-			// SAFETY: the parent descriptor and NUL-terminated CString path remain
-			// valid.
-			} else if unsafe { libc::unlinkat(fd, detached.as_ptr(), 0) } != 0 {
-				return Err(TreeRemovalFailure::Retained(security_code(
-					&std::io::Error::last_os_error(),
-				)));
-			}
-		}
-		Ok(())
-	}
 
 	pub(super) fn exact_remove_directory_tree(
 		path: &Path,
@@ -3578,54 +3514,43 @@ pub(crate) mod platform {
 			}
 			return NativeExactUnlinkResult::detached_failure(code, retained_path);
 		}
-		// SAFETY: `fd` is the live directory descriptor whose offset is reset.
-		if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } < 0 {
-			// SAFETY: this branch owns the live descriptor and closes it exactly once.
-			unsafe {
-				libc::close(fd);
-				libc::close(parent);
+		#[cfg(test)]
+		pause_after_tree_validation_for_test();
+		let root_entry = match expected_tree_entry(&expected.entries, "") {
+			Some(entry) => entry,
+			None => {
+				// SAFETY: this branch owns the live descriptors and closes each exactly once.
+				unsafe {
+					libc::close(fd);
+					libc::close(parent);
+				}
+				return NativeExactUnlinkResult::detached_failure("identity_mismatch", retained_path);
+			},
+		};
+		let result = if already_final {
+			match detached_entry_matches(parent, root_name, root_entry) {
+				Ok(true) => NativeExactUnlinkResult::detached(retained_path),
+				Ok(false) => {
+					NativeExactUnlinkResult::detached_failure("identity_mismatch", retained_path)
+				},
+				Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path),
 			}
-			return NativeExactUnlinkResult::detached_failure("io_error", retained_path);
-		}
-		let removal = remove_tree_fd(fd, "", &expected.entries);
-		let result = match removal {
-			Ok(()) if !already_final => match rename_no_replace(parent, parent, root_name, &final_name) {
+		} else {
+			match rename_no_replace(parent, parent, root_name, &final_name) {
 				Ok(()) => {
-					// SAFETY: zero is a valid initialized representation for this output struct.
-					let mut retained: libc::stat = unsafe { std::mem::zeroed() };
-					// SAFETY: the descriptor is live and the initialized output struct is writable.
-					if unsafe { libc::fstat(fd, &mut retained) } != 0
-						|| retained.st_dev as u64 != expected.root_dev.parse().ok().unwrap_or(u64::MAX)
-						|| retained.st_ino as u64 != expected.root_ino.parse().ok().unwrap_or(u64::MAX)
-					{
-						NativeExactUnlinkResult::detached_failure("identity_mismatch", final_path)
-					// SAFETY: the parent descriptor and NUL-terminated CString path remain valid.
-					} else if unsafe { libc::unlinkat(parent, final_name.as_ptr(), libc::AT_REMOVEDIR) }
-						== 0
-					{
-						NativeExactUnlinkResult::success()
-					} else {
-						NativeExactUnlinkResult::detached_failure(
-							security_code(&std::io::Error::last_os_error()),
+					#[cfg(test)]
+					pause_after_tree_rename_for_test();
+					match detached_entry_matches(parent, &final_name, root_entry) {
+						Ok(true) => NativeExactUnlinkResult::detached(final_path),
+						Ok(false) => NativeExactUnlinkResult::detached_failure(
+							"identity_mismatch",
 							final_path,
-						)
+						),
+						Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
 					}
 				},
 				Err(code) => NativeExactUnlinkResult::detached_failure(code, planned_path),
-			},
-			Ok(())
-				// SAFETY: the parent descriptor and NUL-terminated CString path remain valid.
-				if unsafe { libc::unlinkat(parent, root_name.as_ptr(), libc::AT_REMOVEDIR) } == 0 =>
-			{
-				NativeExactUnlinkResult::success()
-			},
-			Ok(()) => NativeExactUnlinkResult::detached_failure(
-				security_code(&std::io::Error::last_os_error()),
-				retained_path,
-			),
-			Err(TreeRemovalFailure::Code(code) | TreeRemovalFailure::Retained(code)) => {
-				NativeExactUnlinkResult::detached_failure(code, retained_path)
-			},
+			}
 		};
 		// SAFETY: this branch owns the live descriptor and closes it exactly once.
 		unsafe {
@@ -6301,6 +6226,83 @@ mod exact_unlink_placeholder_tests {
 			result.retained_placeholder_path.as_deref(),
 			Some("/tmp/.gjc-exact-unlink-placeholder-verified")
 		);
+	}
+
+	#[test]
+	fn tree_root_replacement_after_detach_is_retained_and_reported() {
+		let _guard = exchange_hook_test_guard();
+		let root = std::env::temp_dir().join(format!(
+			"gjc-tree-root-swap-{}-{}",
+			std::process::id(),
+			SystemTime::now().duration_since(UNIX_EPOCH).expect("system time").as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+		let target = root.join("target");
+		fs::create_dir(&target).expect("create target");
+		fs::write(target.join("expected"), b"expected").expect("write expected child");
+		let expected_root = fs::metadata(&target).expect("stat expected root").ino();
+		let snapshot = platform::snapshot_directory_tree(&target)
+			.snapshot
+			.expect("snapshot target");
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_after_tree_rename_hook(Some((entered_tx, resume_rx)));
+		let target_for_remove = target.clone();
+		let remove = thread::spawn(move || platform::exact_remove_directory_tree(&target_for_remove, &snapshot));
+		entered_rx.recv().expect("wait for root detach");
+		let detached = root.join("target.removing");
+		let displaced = root.join("expected-root");
+		fs::rename(&detached, &displaced).expect("displace expected detached root");
+		fs::create_dir(&detached).expect("create replacement detached root");
+		fs::write(detached.join("replacement"), b"replacement").expect("write replacement marker");
+		resume_tx.send(()).expect("resume removal");
+		let result = remove.join().expect("tree removal thread");
+		platform::set_after_tree_rename_hook(None);
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(fs::read(detached.join("replacement")).expect("read replacement"), b"replacement");
+		assert_eq!(fs::metadata(&displaced).expect("stat displaced root").ino(), expected_root);
+		fs::remove_dir_all(root).expect("remove temporary directory");
+	}
+
+	#[test]
+	fn tree_child_replacement_after_validation_is_retained_with_expected_root() {
+		let _guard = exchange_hook_test_guard();
+		let root = std::env::temp_dir().join(format!(
+			"gjc-tree-child-swap-{}-{}",
+			std::process::id(),
+			SystemTime::now().duration_since(UNIX_EPOCH).expect("system time").as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+		let target = root.join("target");
+		fs::create_dir(&target).expect("create target");
+		let child = target.join("child");
+		fs::write(&child, b"expected").expect("write expected child");
+		let expected_root = fs::metadata(&target).expect("stat expected root").ino();
+		let snapshot = platform::snapshot_directory_tree(&target)
+			.snapshot
+			.expect("snapshot target");
+		let replacement = root.join("replacement");
+		fs::write(&replacement, b"replacement").expect("write replacement child");
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_after_tree_validation_hook(Some((entered_tx, resume_rx)));
+		let target_for_remove = target.clone();
+		let remove = thread::spawn(move || platform::exact_remove_directory_tree(&target_for_remove, &snapshot));
+		entered_rx.recv().expect("wait for tree validation");
+		let retained_expected_child = root.join("expected-child");
+		fs::rename(&child, &retained_expected_child).expect("displace expected child");
+		fs::rename(&replacement, &child).expect("install child replacement");
+		resume_tx.send(()).expect("resume removal");
+		let result = remove.join().expect("tree removal thread");
+		platform::set_after_tree_validation_hook(None);
+		let detached = root.join("target.removing");
+		assert!(result.ok, "{:?}", result.code);
+		assert_eq!(result.detached_path.as_deref(), Some(detached.to_string_lossy().as_ref()));
+		assert_eq!(fs::metadata(&detached).expect("stat detached root").ino(), expected_root);
+		assert_eq!(fs::read(detached.join("child")).expect("read child replacement"), b"replacement");
+		assert_eq!(fs::read(&retained_expected_child).expect("read retained expected child"), b"expected");
+		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 }
 #[cfg(test)]
