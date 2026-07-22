@@ -847,7 +847,8 @@ export class FileSessionStorage implements SessionStorage {
 			if (
 				!expectedArtifactsIdentity ||
 				path.dirname(detachedArtifactsPath) !== path.dirname(transcriptPath) ||
-				!path.basename(detachedArtifactsPath).startsWith(".gjc-delete-")
+				(!path.basename(detachedArtifactsPath).startsWith(".gjc-delete-") &&
+					!detachedArtifactsPath.endsWith(".removing"))
 			) {
 				throw new SessionDeleteVerificationError("artifacts", "Detached artifact cleanup evidence is invalid");
 			}
@@ -887,7 +888,11 @@ export class FileSessionStorage implements SessionStorage {
 			}
 		}
 
-		if (artifactsRemoved && (detachedArtifactsPath || expectedArtifactsIdentity)) {
+		if (
+			artifactsRemoved &&
+			(detachedArtifactsPath || expectedArtifactsIdentity) &&
+			!detachedArtifactsPath?.endsWith(".removing")
+		) {
 			throw new SessionDeleteVerificationError(
 				"artifacts",
 				"Artifact phase receipt conflicts with pending artifact cleanup",

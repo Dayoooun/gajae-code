@@ -1055,13 +1055,13 @@ pub(crate) mod platform {
 		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 	> = OnceLock::new();
 	#[cfg(test)]
-	static AFTER_TREE_VALIDATION_HOOK: OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> =
-		OnceLock::new();
+	static AFTER_TREE_VALIDATION_HOOK: OnceLock<
+		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+	> = OnceLock::new();
 
 	#[cfg(test)]
 	static AFTER_TREE_RENAME_HOOK: OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> =
 		OnceLock::new();
-
 
 	#[cfg(test)]
 	pub(super) fn set_after_exchange_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
@@ -1105,7 +1105,6 @@ pub(crate) mod platform {
 			.lock()
 			.expect("tree rename hook lock") = hook;
 	}
-
 
 	#[cfg(test)]
 	fn pause_after_exchange_for_test() {
@@ -1170,7 +1169,6 @@ pub(crate) mod platform {
 			resume.recv().expect("tree rename hook resume");
 		}
 	}
-
 
 	pub(super) fn canonical_existing_directory_identity(
 		path: &Path,
@@ -3280,7 +3278,6 @@ pub(crate) mod platform {
 		}
 	}
 
-
 	fn expected_tree_entry<'a>(
 		expected: &'a [NativeDirectoryTreeEntry],
 		relative: &str,
@@ -3358,7 +3355,6 @@ pub(crate) mod platform {
 		matching.next().is_none().then_some(entry)
 	}
 
-
 	/// Validate the retained tree before atomically detaching its root. Every
 	/// entry still present must map uniquely to its durable logical identity,
 	/// including deterministic names retained by older attempts.
@@ -3429,7 +3425,6 @@ pub(crate) mod platform {
 		}
 		Ok(())
 	}
-
 
 	pub(super) fn exact_remove_directory_tree(
 		path: &Path,
@@ -3516,16 +3511,13 @@ pub(crate) mod platform {
 		}
 		#[cfg(test)]
 		pause_after_tree_validation_for_test();
-		let root_entry = match expected_tree_entry(&expected.entries, "") {
-			Some(entry) => entry,
-			None => {
-				// SAFETY: this branch owns the live descriptors and closes each exactly once.
-				unsafe {
-					libc::close(fd);
-					libc::close(parent);
-				}
-				return NativeExactUnlinkResult::detached_failure("identity_mismatch", retained_path);
-			},
+		let Some(root_entry) = expected_tree_entry(&expected.entries, "") else {
+			// SAFETY: this branch owns the live descriptors and closes each exactly once.
+			unsafe {
+				libc::close(fd);
+				libc::close(parent);
+			}
+			return NativeExactUnlinkResult::detached_failure("identity_mismatch", retained_path);
 		};
 		let result = if already_final {
 			match detached_entry_matches(parent, root_name, root_entry) {
@@ -3542,10 +3534,9 @@ pub(crate) mod platform {
 					pause_after_tree_rename_for_test();
 					match detached_entry_matches(parent, &final_name, root_entry) {
 						Ok(true) => NativeExactUnlinkResult::detached(final_path),
-						Ok(false) => NativeExactUnlinkResult::detached_failure(
-							"identity_mismatch",
-							final_path,
-						),
+						Ok(false) => {
+							NativeExactUnlinkResult::detached_failure("identity_mismatch", final_path)
+						},
 						Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
 					}
 				},
@@ -6234,7 +6225,10 @@ mod exact_unlink_placeholder_tests {
 		let root = std::env::temp_dir().join(format!(
 			"gjc-tree-root-swap-{}-{}",
 			std::process::id(),
-			SystemTime::now().duration_since(UNIX_EPOCH).expect("system time").as_nanos(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
 		));
 		fs::create_dir(&root).expect("create temporary directory");
 		let target = root.join("target");
@@ -6248,7 +6242,9 @@ mod exact_unlink_placeholder_tests {
 		let (resume_tx, resume_rx) = mpsc::channel();
 		platform::set_after_tree_rename_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
-		let remove = thread::spawn(move || platform::exact_remove_directory_tree(&target_for_remove, &snapshot));
+		let remove = thread::spawn(move || {
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot)
+		});
 		entered_rx.recv().expect("wait for root detach");
 		let detached = root.join("target.removing");
 		let displaced = root.join("expected-root");
@@ -6271,7 +6267,10 @@ mod exact_unlink_placeholder_tests {
 		let root = std::env::temp_dir().join(format!(
 			"gjc-tree-child-swap-{}-{}",
 			std::process::id(),
-			SystemTime::now().duration_since(UNIX_EPOCH).expect("system time").as_nanos(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
 		));
 		fs::create_dir(&root).expect("create temporary directory");
 		let target = root.join("target");
@@ -6288,7 +6287,9 @@ mod exact_unlink_placeholder_tests {
 		let (resume_tx, resume_rx) = mpsc::channel();
 		platform::set_after_tree_validation_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
-		let remove = thread::spawn(move || platform::exact_remove_directory_tree(&target_for_remove, &snapshot));
+		let remove = thread::spawn(move || {
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot)
+		});
 		entered_rx.recv().expect("wait for tree validation");
 		let retained_expected_child = root.join("expected-child");
 		fs::rename(&child, &retained_expected_child).expect("displace expected child");
@@ -6301,7 +6302,10 @@ mod exact_unlink_placeholder_tests {
 		assert_eq!(result.detached_path.as_deref(), Some(detached.to_string_lossy().as_ref()));
 		assert_eq!(fs::metadata(&detached).expect("stat detached root").ino(), expected_root);
 		assert_eq!(fs::read(detached.join("child")).expect("read child replacement"), b"replacement");
-		assert_eq!(fs::read(&retained_expected_child).expect("read retained expected child"), b"expected");
+		assert_eq!(
+			fs::read(&retained_expected_child).expect("read retained expected child"),
+			b"expected"
+		);
 		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 }

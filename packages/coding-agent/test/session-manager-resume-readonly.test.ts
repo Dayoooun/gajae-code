@@ -433,7 +433,7 @@ describe("SessionManager read-only resume", () => {
 		});
 		expect(fs.existsSync(destinationDir)).toBe(false);
 	});
-	it("rebinds resident history blobs after publishing an explicit strict fork", async () => {
+	it("disposes staging resident history blobs before publishing an explicit strict fork", async () => {
 		const root = makeTempDir();
 		const sourcePath = path.join(root, "source.jsonl");
 		const destinationDir = path.join(root, "destination-sessions");
@@ -446,14 +446,77 @@ describe("SessionManager read-only resume", () => {
 		if (captured.kind !== "captured") throw new Error("Expected strict transcript capture");
 		const forked = await SessionManager.forkFromCaptured(captured.snapshot, targetCwd, destinationDir);
 		if (forked.kind !== "forked") throw new Error("Expected strict fork success");
+		const artifactsDir = forked.manager.getArtifactsDir();
+		if (!artifactsDir) throw new Error("Expected strict fork artifacts");
+		const residentCacheDir = path.join(artifactsDir, "resident-cache");
 
 		try {
 			expect(forked.manager.getSessionDir()).toBe(destinationDir);
 			expect(forked.manager.getEntries()).toMatchObject([
 				{ type: "message", message: { role: "user", content: history } },
 			]);
+			expect(fs.readdirSync(residentCacheDir)).toHaveLength(1);
 		} finally {
 			await forked.manager.close();
+		}
+		expect(fs.readdirSync(residentCacheDir)).toEqual([]);
+	});
+	it("rejects a replaced strict-fork staging root without deleting committed evidence", async () => {
+		const root = makeTempDir();
+		const sourcePath = path.join(root, "source.jsonl");
+		const destinationDir = path.join(root, "destination-sessions");
+		const publishedEvidenceDir = path.join(root, "published-evidence");
+		const targetCwd = path.join(root, "target");
+		fs.mkdirSync(targetCwd);
+		fs.writeFileSync(sourcePath, sessionText("session-a"));
+		const renameNoReplacePath = native.renameNoReplacePath;
+		const rename = vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
+			const result = renameNoReplacePath(source, destination);
+			if (result.ok && String(source).includes(".fork-staging-")) {
+				fs.renameSync(String(destination), publishedEvidenceDir);
+				fs.mkdirSync(String(destination));
+				fs.writeFileSync(path.join(String(destination), "foreign.txt"), "foreign");
+			}
+			return result;
+		});
+		try {
+			const captured = SessionManager.captureTranscriptStrict(sourcePath);
+			if (captured.kind !== "captured") throw new Error("Expected strict transcript capture");
+			await expect(SessionManager.forkFromCaptured(captured.snapshot, targetCwd, destinationDir)).rejects.toThrow(
+				"fork_destination_terminal_identity_changed",
+			);
+			expect(fs.readFileSync(path.join(destinationDir, "foreign.txt"), "utf8")).toBe("foreign");
+			expect(fs.readdirSync(publishedEvidenceDir).some(entry => entry.endsWith(".jsonl"))).toBe(true);
+		} finally {
+			rename.mockRestore();
+		}
+	});
+	it("preserves published strict-fork evidence when parent durability fails", async () => {
+		const root = makeTempDir();
+		const sourcePath = path.join(root, "source.jsonl");
+		const destinationDir = path.join(root, "destination-sessions");
+		const targetCwd = path.join(root, "target");
+		fs.mkdirSync(targetCwd);
+		fs.writeFileSync(sourcePath, sessionText("session-a"));
+		const open = fs.promises.open;
+		let durabilityAttempted = false;
+		fs.promises.open = (async (...args: Parameters<typeof fs.promises.open>) => {
+			if (String(args[0]) === path.dirname(destinationDir) && args[1] === "r") {
+				durabilityAttempted = true;
+				throw new Error("parent durability failed");
+			}
+			return await open(...args);
+		}) as typeof fs.promises.open;
+		try {
+			const captured = SessionManager.captureTranscriptStrict(sourcePath);
+			if (captured.kind !== "captured") throw new Error("Expected strict transcript capture");
+			await expect(SessionManager.forkFromCaptured(captured.snapshot, targetCwd, destinationDir)).rejects.toThrow(
+				"parent durability failed",
+			);
+			expect(durabilityAttempted).toBe(true);
+			expect(fs.readdirSync(destinationDir).some(entry => entry.endsWith(".jsonl"))).toBe(true);
+		} finally {
+			fs.promises.open = open;
 		}
 	});
 	it("preserves a foreign destination injected after absence observation when strict fork authority fails", async () => {

@@ -1346,6 +1346,65 @@ function retiredTargets(scope: ManagedScope, pathname: string): readonly Retired
  * a returned partial result appends `pending(N + 1)` with the observed detached
  * identity/path. Restart accepts only a contiguous, target-bound sequence.
  */
+type RetainedArtifactsRootReceipt = {
+	path: string;
+	identity: SessionStorageFileIdentity;
+	tree: NativeDirectoryTreeSnapshot;
+};
+
+function retainedArtifactsRootReceipt(receipt: CleanupReceipt): RetainedArtifactsRootReceipt | undefined {
+	const pathname = deterministicRemovalRoot(receipt.plannedArtifactsPath);
+	if (!fs.existsSync(pathname)) return undefined;
+	if (!receipt.expectedArtifactsIdentity) throw new Error("durability_failed");
+	const identity = artifactIdentityAt(pathname);
+	if (!identity || !sameArtifactRootIdentity(identity, receipt.expectedArtifactsIdentity))
+		throw new Error("durability_failed");
+	const tree = snapshotArtifactTree(pathname);
+	return { path: pathname, identity, tree };
+}
+
+function retainedArtifactsRootMatches(record: Record<string, unknown>): boolean {
+	if (record.retainedArtifactsRoot === undefined) return true;
+	if (!record.retainedArtifactsRoot || typeof record.retainedArtifactsRoot !== "object")
+		throw new Error("durability_failed");
+	const retained = record.retainedArtifactsRoot as Record<string, unknown>;
+	const identity = retained.identity;
+	const tree = artifactTreeSnapshot(retained.tree);
+	if (
+		typeof record.plannedArtifactsPath !== "string" ||
+		retained.path !== deterministicRemovalRoot(record.plannedArtifactsPath) ||
+		!identity ||
+		typeof identity !== "object" ||
+		Array.isArray(identity) ||
+		!tree
+	)
+		throw new Error("durability_failed");
+	const artifactIdentity = identity as Record<string, unknown>;
+	if (
+		typeof artifactIdentity.dev !== "string" ||
+		typeof artifactIdentity.ino !== "string" ||
+		typeof artifactIdentity.size !== "number" ||
+		typeof artifactIdentity.mtimeNs !== "string" ||
+		typeof artifactIdentity.sha256 !== "string"
+	)
+		throw new Error("durability_failed");
+	if (!fs.existsSync(retained.path)) return true;
+	const observed = artifactIdentityAt(retained.path);
+	if (
+		!observed ||
+		!sameArtifactRootIdentity(observed, {
+			dev: BigInt(artifactIdentity.dev),
+			ino: BigInt(artifactIdentity.ino),
+			size: artifactIdentity.size,
+			mtimeNs: BigInt(artifactIdentity.mtimeNs),
+			sha256: artifactIdentity.sha256,
+		}) ||
+		JSON.stringify(snapshotArtifactTree(retained.path)) !== JSON.stringify(tree)
+	)
+		throw new Error("durability_failed");
+	return true;
+}
+
 type CleanupReceipt = {
 	attempt: number;
 	target: RetiredTarget;
@@ -1414,9 +1473,11 @@ function cleanupArtifactsRemoved(
 			record.attempt === attempt &&
 			recorded?.path === target.path &&
 			recorded.sessionId === target.sessionId &&
-			recorded.cwd === target.cwd
+			recorded.cwd === target.cwd &&
+			retainedArtifactsRootMatches(record)
 		);
-	} catch {
+	} catch (error) {
+		if ((error as Error).message === "durability_failed") throw error;
 		return false;
 	}
 }
@@ -1427,9 +1488,14 @@ async function publishCleanupArtifactsRemoved(
 	receipt: CleanupReceipt,
 	lock: ManagedStorageLock,
 ): Promise<void> {
+	const retainedArtifactsRoot = retainedArtifactsRootReceipt(receipt);
 	await publishManagedTombstone(
 		cleanupReceiptPath(tombstone, receipt.target, "artifacts_removed", receipt.attempt),
-		{ ...cleanupReceipt(scope, tombstone, receipt), state: "artifacts_removed" },
+		{
+			...cleanupReceipt(scope, tombstone, receipt),
+			state: "artifacts_removed",
+			...(retainedArtifactsRoot ? { retainedArtifactsRoot } : {}),
+		},
 		lock.assertOwned,
 	).catch(error => {
 		if ((error as Error).message !== "destination_conflict") throw error;

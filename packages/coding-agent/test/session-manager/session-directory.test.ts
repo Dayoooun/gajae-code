@@ -1058,6 +1058,86 @@ describe("managed session write protocol", () => {
 		expect((await prepareManagedSessionScopeForWrite(restarted.scope)).kind).toBe("resolved");
 		expect(await fs.stat(source).catch(() => undefined)).toBeUndefined();
 	});
+	it("replays an unchanged retained deterministic .removing root from its artifact receipt", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "retained-root-replay.jsonl");
+		const artifacts = source.slice(0, -6);
+		await fs.mkdir(artifacts, { recursive: true });
+		await fs.writeFile(path.join(artifacts, "artifact.txt"), "payload");
+		await fs.writeFile(source, transcript("retained-root-replay", cwd));
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing candidate");
+		const exactUnlink = native.exactUnlink;
+		const remove = vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation(pathname => {
+			syncFs.renameSync(pathname, `${pathname}.removing`);
+			return { ok: true };
+		});
+		const unlink = vi
+			.spyOn(native, "exactUnlink")
+			.mockImplementation((pathname, identity) =>
+				pathname === source ? { ok: false, code: "io_error" } : exactUnlink(pathname, identity),
+			);
+		try {
+			await expect(deleteManagedSessionCandidate(scope, listed.owned[0])).resolves.toMatchObject({
+				kind: "error",
+				code: "durability_failed",
+			});
+		} finally {
+			remove.mockRestore();
+			unlink.mockRestore();
+		}
+		const restarted = resolveManagedScope({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
+		if (restarted.kind !== "resolved") throw new Error(restarted.message);
+		expect(await prepareManagedSessionScopeForWrite(restarted.scope)).toMatchObject({ kind: "resolved" });
+		expect(await fs.stat(source).catch(() => undefined)).toBeUndefined();
+	});
+	it("rejects a replacement retained deterministic .removing root during replay", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "retained-root-replacement.jsonl");
+		const artifacts = source.slice(0, -6);
+		await fs.mkdir(artifacts, { recursive: true });
+		await fs.writeFile(path.join(artifacts, "artifact.txt"), "payload");
+		await fs.writeFile(source, transcript("retained-root-replacement", cwd));
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing candidate");
+		const exactUnlink = native.exactUnlink;
+		const remove = vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation(pathname => {
+			syncFs.renameSync(pathname, `${pathname}.removing`);
+			return { ok: true };
+		});
+		const unlink = vi
+			.spyOn(native, "exactUnlink")
+			.mockImplementation((pathname, identity) =>
+				pathname === source ? { ok: false, code: "io_error" } : exactUnlink(pathname, identity),
+			);
+		try {
+			await expect(deleteManagedSessionCandidate(scope, listed.owned[0])).resolves.toMatchObject({
+				kind: "error",
+				code: "durability_failed",
+			});
+		} finally {
+			remove.mockRestore();
+			unlink.mockRestore();
+		}
+		const tombstones = path.join(scope.directoryPath, ".gjc-managed-session-internal", "tombstones");
+		const receiptName = (await fs.readdir(tombstones)).find(name => name.includes(".cleanup-artifacts_removed-"));
+		if (!receiptName) throw new Error("Missing artifact receipt");
+		const receipt = JSON.parse(await fs.readFile(path.join(tombstones, receiptName), "utf8")) as {
+			retainedArtifactsRoot?: { path?: unknown };
+		};
+		if (typeof receipt.retainedArtifactsRoot?.path !== "string") throw new Error("Missing retained artifact root");
+		await fs.rm(receipt.retainedArtifactsRoot.path, { recursive: true });
+		await fs.mkdir(receipt.retainedArtifactsRoot.path);
+		await fs.writeFile(path.join(receipt.retainedArtifactsRoot.path, "replacement.txt"), "replacement");
+		const restarted = resolveManagedScope({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
+		if (restarted.kind !== "resolved") throw new Error(restarted.message);
+		await expect(prepareManagedSessionScopeForWrite(restarted.scope)).resolves.toMatchObject({
+			kind: "error",
+			code: "durability_failed",
+		});
+	});
 	it("reconciles partial tree removal from the deterministic .removing root after restart", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);

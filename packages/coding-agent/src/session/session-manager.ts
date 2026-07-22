@@ -7454,6 +7454,7 @@ export class SessionManager {
 		let manager: SessionManager | undefined;
 		let authorityFailure: StrictSessionOpenFailure | undefined;
 		let privateStagingSnapshot: native.NativeDirectoryTreeSnapshot | undefined;
+		let privateStagingPublished = false;
 
 		try {
 			manager = new SessionManager(cwd, privateStagingDir ?? dir, true, snapshot.storage, forkDestination);
@@ -7517,12 +7518,33 @@ export class SessionManager {
 					manager.#fileEntries,
 					manager.#residentBlobStores(),
 				);
-				const published = native.renameNoReplacePath(privateStagingDir, dir);
-				if (!published.ok) throw new Error(published.code ?? "fork_destination_publish_failed");
+				manager.#fileEntries = materializedEntries;
+				manager.#disposeResidentTextBlobStore();
+				const capturedStaging = native.snapshotDirectoryTree(privateStagingDir);
+				if (!capturedStaging.ok || !capturedStaging.snapshot)
+					throw new Error(capturedStaging.code ?? "fork_staging_snapshot_failed");
+				privateStagingSnapshot = capturedStaging.snapshot;
+				const outcome = classifyNativePublishOutcome(native.renameNoReplacePath(privateStagingDir, dir));
+				if (!outcome.ok) throw new Error(outcome.code ?? "fork_destination_publish_failed");
+				privateStagingPublished = true;
+				const terminal = native.snapshotDirectoryTree(dir);
+				if (
+					!terminal.ok ||
+					!terminal.snapshot ||
+					!retainedTreeSnapshotEqualsAfterRename(terminal.snapshot, privateStagingSnapshot)
+				)
+					throw new Error("fork_destination_terminal_identity_changed");
+				await syncSessionMoveDirectory(path.dirname(dir));
+				const durableTerminal = native.snapshotDirectoryTree(dir);
+				if (
+					!durableTerminal.ok ||
+					!durableTerminal.snapshot ||
+					!retainedTreeSnapshotEqualsAfterRename(durableTerminal.snapshot, privateStagingSnapshot)
+				)
+					throw new Error("fork_destination_durability_identity_changed");
 				manager.sessionDir = dir;
 				manager.destination = destination;
 				manager.#sessionFile = path.join(dir, path.basename(manager.#sessionFile));
-				manager.#fileEntries = materializedEntries;
 				manager.#resetResidentTextBlobStore();
 				manager.#reexternalizeFileEntriesForResidentStore();
 				manager.#bumpAllRevisions();
@@ -7537,7 +7559,7 @@ export class SessionManager {
 				} catch (cleanupError) {
 					cleanupErrors.push(toError(cleanupError));
 				}
-				if (privateStagingDir && privateStagingSnapshot) {
+				if (!privateStagingPublished && privateStagingDir && privateStagingSnapshot) {
 					const removed = native.exactRemoveDirectoryTree(privateStagingDir, privateStagingSnapshot);
 					if (!removed.ok && removed.code !== "not_found")
 						cleanupErrors.push(new Error(removed.code ?? "fork_staging_cleanup_failed"));
