@@ -4079,3 +4079,563 @@ test("AC2/AC8: SDK host completes successful session mutations over its live Web
 		page: { items: [{ "ui.theme": "dark" }] },
 	});
 });
+
+test("turn.prompt_status reconciles an accepted prompt across client reconnect without duplicate execution", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-reconcile-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-prompt-reconcile-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const deliveries: unknown[] = [];
+	const handlers = start(sessionContext, undefined, (content: unknown) => {
+		deliveries.push(content);
+	});
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const connect = async () => {
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		const request = async (command: Record<string, unknown>): Promise<Record<string, unknown>> => {
+			const requestId = String(command.id);
+			socket.send(JSON.stringify(command));
+			const responseType = command.type === "query_request" ? "query_response" : "control_response";
+			await waitFor(
+				() => frames.some(frame => frame.type === responseType && frame.id === requestId),
+				`${requestId} response`,
+			);
+			return frames.find(frame => frame.type === responseType && frame.id === requestId)!;
+		};
+		return { socket, frames, request };
+	};
+
+	const first = await connect();
+	const ack = await first.request({
+		type: "control_request",
+		id: "prompt-reconcile",
+		operation: "turn.prompt",
+		input: { text: "reconcile me", clientRef: "recon-ref-1" },
+		idempotencyKey: "recon-ik-1",
+	});
+	// Capture identifiers BEFORE any asymmetric-matcher assertion: bun's
+	// toMatchObject substitutes expect.any matchers into the received object.
+	const { commandId, turnId } = (ack.result ?? {}) as { commandId: string; turnId: string };
+	expect(ack.ok).toBe(true);
+	expect(typeof commandId).toBe("string");
+	expect(typeof turnId).toBe("string");
+	expect((ack.result as Record<string, unknown>).accepted).toBe(true);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+
+	// Client disconnects (e.g. process death) before terminal settlement.
+	await closeSocket(first.socket);
+
+	// Reconnect: the same session runtime authoritatively reconciles by both selectors.
+	const second = await connect();
+	const byPair = await second.request({
+		type: "query_request",
+		id: "status-pair",
+		query: "turn.prompt_status",
+		input: { commandId, turnId },
+	});
+	expect(byPair).toMatchObject({
+		ok: true,
+		result: { status: "in_flight", commandId, turnId, clientRef: "recon-ref-1" },
+	});
+	const byRef = await second.request({
+		type: "query_request",
+		id: "status-ref",
+		query: "turn.prompt_status",
+		input: { clientRef: "recon-ref-1" },
+	});
+	expect(byRef).toMatchObject({ ok: true, result: { status: "in_flight", commandId, turnId } });
+	const wrongPair = await second.request({
+		type: "query_request",
+		id: "status-wrong-pair",
+		query: "turn.prompt_status",
+		input: { commandId, turnId: "turn-other" },
+	});
+	expect(wrongPair).toMatchObject({ ok: true, result: { status: "unknown" } });
+
+	// A retained duplicate clientRef is rejected before execution (safe non-replay).
+	const duplicate = await second.request({
+		type: "control_request",
+		id: "prompt-duplicate-ref",
+		operation: "turn.prompt",
+		input: { text: "duplicate", clientRef: "recon-ref-1" },
+	});
+	expect(duplicate).toMatchObject({ ok: false, error: { code: "client_ref_conflict" } });
+
+	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	const terminal = await second.request({
+		type: "query_request",
+		id: "status-terminal",
+		query: "turn.prompt_status",
+		input: { commandId, turnId },
+	});
+	expect(terminal).toMatchObject({ ok: true, result: { status: "terminal_ok" } });
+
+	// Exactly one execution happened across the whole reconnect/reconcile flow.
+	expect(deliveries).toHaveLength(1);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("ordered turn.prompt ignores envelope idempotencyKey: no replay and no idempotency_conflict", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-ordered-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-prompt-ordered-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const deliveries: unknown[] = [];
+	const handlers = start(sessionContext, undefined, (content: unknown) => {
+		deliveries.push(content);
+	});
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	const prompt = async (id: string, text: string, clientRef?: string) => {
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id,
+				operation: "turn.prompt",
+				input: { text, ...(clientRef ? { clientRef } : {}) },
+				idempotencyKey: "same-envelope-key",
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+			`${id} response`,
+		);
+		return frames.find(frame => frame.type === "control_response" && frame.id === id)!;
+	};
+
+	const first = await prompt("ordered-1", "first ordered prompt", "ordered-ref-1");
+	expect(first).toMatchObject({ ok: true, result: { accepted: true } });
+	const firstIds = first.result as { commandId: string; turnId: string };
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+
+	// Same envelope idempotencyKey with different input: a NEW ordered execution,
+	// not a replay of the first response and not an idempotency_conflict.
+	const second = await prompt("ordered-2", "second ordered prompt", "ordered-ref-2");
+	expect(second).toMatchObject({ ok: true, result: { accepted: true } });
+	const secondIds = second.result as { commandId: string; turnId: string };
+	expect(secondIds.commandId).not.toBe(firstIds.commandId);
+	expect(secondIds.turnId).not.toBe(firstIds.turnId);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+
+	// Same key AND same input still executes anew (ordered, never replayed).
+	const third = await prompt("ordered-3", "first ordered prompt", "ordered-ref-3");
+	expect(third).toMatchObject({ ok: true, result: { accepted: true } });
+	expect(((third.result ?? {}) as { commandId?: string }).commandId).not.toBe(firstIds.commandId);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+
+	expect(deliveries).toHaveLength(3);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("turn.prompt_status validates selectors and rejects invalid clientRef input", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-validation-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-prompt-validation-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	const request = async (command: Record<string, unknown>): Promise<Record<string, unknown>> => {
+		const requestId = String(command.id);
+		socket.send(JSON.stringify(command));
+		const responseType = command.type === "query_request" ? "query_response" : "control_response";
+		await waitFor(
+			() => frames.some(frame => frame.type === responseType && frame.id === requestId),
+			`${requestId} response`,
+		);
+		return frames.find(frame => frame.type === responseType && frame.id === requestId)!;
+	};
+
+	expect(
+		await request({ type: "query_request", id: "q-partial", query: "turn.prompt_status", input: { commandId: "c" } }),
+	).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+	expect(
+		await request({
+			type: "query_request",
+			id: "q-both",
+			query: "turn.prompt_status",
+			input: { commandId: "c", turnId: "t", clientRef: "r" },
+		}),
+	).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+	expect(
+		await request({ type: "query_request", id: "q-none", query: "turn.prompt_status", input: {} }),
+	).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+	expect(
+		await request({
+			type: "query_request",
+			id: "q-cursor",
+			query: "turn.prompt_status",
+			input: { clientRef: "r" },
+			cursor: "x",
+		}),
+	).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+	expect(
+		await request({ type: "query_request", id: "q-unknown", query: "turn.prompt_status", input: { clientRef: "absent" } }),
+	).toMatchObject({ ok: true, result: { status: "unknown" } });
+
+	for (const [id, clientRef] of [
+		["bad-empty", ""],
+		["bad-blank", "   "],
+		["bad-long", "x".repeat(129)],
+	] as const) {
+		const response = await request({
+			type: "control_request",
+			id,
+			operation: "turn.prompt",
+			input: { text: "bad ref", clientRef },
+		});
+		expect(response).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+	}
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("clientRef admission reservation is released when a submission is rejected before acceptance", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-release-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-prompt-release-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const deliveries: string[] = [];
+	const handlers = start(
+		sessionContext,
+		undefined,
+		(content: unknown, options: { onPreflightAccepted?: () => void } | undefined) => {
+			const text = String(content);
+			deliveries.push(text);
+			if (text === "doomed preflight")
+				return Promise.reject(Object.assign(new Error("submission lost"), { code: "unavailable" }));
+			options?.onPreflightAccepted?.();
+			return Promise.resolve();
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	const prompt = async (id: string, text: string, clientRef: string) => {
+		socket.send(JSON.stringify({ type: "control_request", id, operation: "turn.prompt", input: { text, clientRef } }));
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+			`${id} response`,
+		);
+		return frames.find(frame => frame.type === "control_response" && frame.id === id)!;
+	};
+
+	// The rejected submission must release its admission reservation...
+	const doomed = await prompt("release-1", "doomed preflight", "release-ref");
+	expect(doomed.ok).toBe(false);
+	// ...so the same clientRef can be admitted again for a fresh prompt.
+	const freed = await prompt("release-2", "freed retry", "release-ref");
+	expect(freed).toMatchObject({ ok: true, result: { accepted: true } });
+	// And the rejected attempt left no reconciliation record behind.
+	socket.send(
+		JSON.stringify({
+			type: "query_request",
+			id: "release-status",
+			query: "turn.prompt_status",
+			input: { clientRef: "release-ref" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "query_response" && frame.id === "release-status"),
+		"release status response",
+	);
+	const status = frames.find(frame => frame.type === "query_response" && frame.id === "release-status")!;
+	expect(status).toMatchObject({ ok: true, result: { status: "accepted" } });
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("busy rejection releases the clientRef admission so a same-ref retry succeeds after the turn", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-busy-release-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-prompt-busy-release-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	const prompt = async (id: string, text: string, clientRef: string) => {
+		socket.send(JSON.stringify({ type: "control_request", id, operation: "turn.prompt", input: { text, clientRef } }));
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+			`${id} response`,
+		);
+		return frames.find(frame => frame.type === "control_response" && frame.id === id)!;
+	};
+
+	// Occupy the session with a running turn.
+	const first = await prompt("busy-first", "occupy the session", "busy-ref-first");
+	expect(first.ok).toBe(true);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+
+	// While busy, the same clientRef admission is rejected but must not linger.
+	const rejected = await prompt("busy-rejected", "rejected while busy", "busy-ref-retry");
+	expect(rejected).toMatchObject({ ok: false, error: { code: "busy" } });
+
+	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+
+	// After the turn, the same clientRef is admissible again (no phantom reservation).
+	const retry = await prompt("busy-retry", "retry after idle", "busy-ref-retry");
+	expect(retry).toMatchObject({ ok: true, result: { accepted: true } });
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("accepted-then-failed submission retains its reconciliation record and blocks ref reuse", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-accepted-failure-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-prompt-accepted-failure-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(
+		sessionContext,
+		undefined,
+		(_content: unknown, options: { onPreflightAccepted?: () => void } | undefined) => {
+			options?.onPreflightAccepted?.();
+			throw Object.assign(new Error("synchronous accepted failure"), { code: "unavailable" });
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	const request = async (command: Record<string, unknown>): Promise<Record<string, unknown>> => {
+		const requestId = String(command.id);
+		socket.send(JSON.stringify(command));
+		const responseType = command.type === "query_request" ? "query_response" : "control_response";
+		await waitFor(
+			() => frames.some(frame => frame.type === responseType && frame.id === requestId),
+			`${requestId} response`,
+		);
+		return frames.find(frame => frame.type === responseType && frame.id === requestId)!;
+	};
+
+	// The prompt is accepted at preflight, then fails synchronously after acceptance.
+	const ack = await request({
+		type: "control_request",
+		id: "accepted-failure",
+		operation: "turn.prompt",
+		input: { text: "accepted then failed", clientRef: "accepted-failure-ref" },
+	});
+	expect(ack.ok).toBe(true);
+	await waitFor(
+		() => frames.some(frame => frame.type === "agent_failed"),
+		"correlated agent_failed frame",
+	);
+
+	// The reconciliation record is retained with the failed outcome, not released.
+	const status = await request({
+		type: "query_request",
+		id: "accepted-failure-status",
+		query: "turn.prompt_status",
+		input: { clientRef: "accepted-failure-ref" },
+	});
+	expect(status).toMatchObject({
+		ok: true,
+		result: { status: "failed", error: { code: "unavailable" } },
+	});
+
+	// Reusing the ref conflicts while the record is retained.
+	const duplicate = await request({
+		type: "control_request",
+		id: "accepted-failure-duplicate",
+		operation: "turn.prompt",
+		input: { text: "duplicate", clientRef: "accepted-failure-ref" },
+	});
+	expect(duplicate).toMatchObject({ ok: false, error: { code: "client_ref_conflict" } });
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("long-running prompt settles terminally after the delivery buffer expires", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-longrun-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-prompt-longrun-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	const request = async (command: Record<string, unknown>): Promise<Record<string, unknown>> => {
+		const requestId = String(command.id);
+		socket.send(JSON.stringify(command));
+		const responseType = command.type === "query_request" ? "query_response" : "control_response";
+		await waitFor(
+			() => frames.some(frame => frame.type === responseType && frame.id === requestId),
+			`${requestId} response`,
+		);
+		return frames.find(frame => frame.type === responseType && frame.id === requestId)!;
+	};
+
+	const ack = await request({
+		type: "control_request",
+		id: "long-prompt",
+		operation: "turn.prompt",
+		input: { text: "long running turn", clientRef: "long-ref" },
+	});
+	expect(ack.ok).toBe(true);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	const inFlight = await request({
+		type: "query_request",
+		id: "long-inflight",
+		query: "turn.prompt_status",
+		input: { clientRef: "long-ref" },
+	});
+	expect(inFlight).toMatchObject({ ok: true, result: { status: "in_flight" } });
+
+	// Simulate a turn outliving the 5-minute delivery-buffer TTL.
+	const realNow = Date.now;
+	try {
+		Date.now = () => realNow() + 6 * 60_000;
+		await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	} finally {
+		Date.now = realNow;
+	}
+
+	// Authoritative settlement fired at lifecycle ingress even though the delivery
+	// buffer expired: the record is terminal_ok, not permanently in_flight.
+	const settled = await request({
+		type: "query_request",
+		id: "long-settled",
+		query: "turn.prompt_status",
+		input: { clientRef: "long-ref" },
+	});
+	expect(settled).toMatchObject({ ok: true, result: { status: "terminal_ok" } });
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("identical clientRefs in separate session runtimes stay isolated", async () => {
+	const cwdA = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-session-a-"));
+	const cwdB = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-session-b-"));
+	dirs.push(cwdA, cwdB);
+	const sessionA = `sdk-session-a-${Date.now()}`;
+	const sessionB = `sdk-session-b-${Date.now()}`;
+	const contextA = context(cwdA, sessionA);
+	const contextB = context(cwdB, sessionB);
+	const handlersA = start(contextA);
+	const handlersB = start(contextB);
+	const endpointFileA = path.join(cwdA, ".gjc", "state", "sdk", `${sessionA}.json`);
+	const endpointFileB = path.join(cwdB, ".gjc", "state", "sdk", `${sessionB}.json`);
+	await waitFor(() => fs.existsSync(endpointFileA) && fs.existsSync(endpointFileB), "SDK endpoints");
+	const connect = async (endpointFile: string) => {
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		return async (command: Record<string, unknown>): Promise<Record<string, unknown>> => {
+			const requestId = String(command.id);
+			socket.send(JSON.stringify(command));
+			const responseType = command.type === "query_request" ? "query_response" : "control_response";
+			await waitFor(
+				() => frames.some(frame => frame.type === responseType && frame.id === requestId),
+				`${requestId} response`,
+			);
+			return frames.find(frame => frame.type === responseType && frame.id === requestId)!;
+		};
+	};
+	const requestA = await connect(endpointFileA);
+	const requestB = await connect(endpointFileB);
+
+	// The same clientRef may independently exist in both runtimes.
+	const ackA = await requestA({
+		type: "control_request",
+		id: "a-prompt",
+		operation: "turn.prompt",
+		input: { text: "session A prompt", clientRef: "shared-ref" },
+	});
+	expect(ackA.ok).toBe(true);
+	const ackB = await requestB({
+		type: "control_request",
+		id: "b-prompt",
+		operation: "turn.prompt",
+		input: { text: "session B prompt", clientRef: "shared-ref" },
+	});
+	expect(ackB.ok).toBe(true);
+	const idsA = ackA.result as { commandId: string; turnId: string };
+	const idsB = ackB.result as { commandId: string; turnId: string };
+	expect(idsB.commandId).not.toBe(idsA.commandId);
+
+	// Session B never sees session A's record: each runtime answers only for itself.
+	const statusB = await requestB({
+		type: "query_request",
+		id: "b-status",
+		query: "turn.prompt_status",
+		input: { clientRef: "shared-ref" },
+	});
+	expect(statusB).toMatchObject({ ok: true, result: { status: "accepted", commandId: idsB.commandId } });
+	const crossPair = await requestB({
+		type: "query_request",
+		id: "b-cross-pair",
+		query: "turn.prompt_status",
+		input: { commandId: idsA.commandId, turnId: idsA.turnId },
+	});
+	expect(crossPair).toMatchObject({ ok: true, result: { status: "unknown" } });
+
+	await handlersA.get("session_shutdown")?.({ type: "session_shutdown" }, contextA);
+	await handlersB.get("session_shutdown")?.({ type: "session_shutdown" }, contextB);
+});

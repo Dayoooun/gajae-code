@@ -10,5 +10,6 @@ export type {
 	Q10ThinkingEffort,
 	Q10ThinkingMode,
 } from "./models";
+export * from "./prompt-status";
 export * from "./session";
 export * from "./session-directory";

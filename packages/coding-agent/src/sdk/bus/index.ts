@@ -81,6 +81,8 @@ import {
 import { telegramControlCommandUsage } from "./config-commands";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
+import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
+import { createPromptReconciliation } from "./prompt-reconciliation";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import {
 	ASK_SELECTED_ACK_CAPABILITY,
@@ -918,6 +920,11 @@ interface SessionRuntime {
 	/** Records a correlated prompt terminal boundary after agent unwind. */
 	/** Atomically claims a correlated prompt terminal boundary after agent unwind. */
 	recordPromptTerminal: (correlation: { commandId: string; turnId: string } | undefined) => boolean;
+	/** Transitions the authoritative reconciliation record at lifecycle ingress; terminal outcomes settle once. */
+	notePromptReconciliation: (
+		correlation: { commandId: string; turnId: string } | undefined,
+		frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
+	) => void;
 	/** Records correlated lifecycle frames for replay and delivers them only to the accepted requester after acknowledgement. */
 	emitPromptLifecycle: (
 		correlation: { commandId: string; turnId: string } | undefined,
@@ -1781,6 +1788,7 @@ function sdkQuerySurface(
 		followupQueueDepth: 0,
 	}),
 	configOverrides: ReadonlyMap<string, unknown> = new Map(),
+	promptStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown,
 ): SessionSurface {
 	const metadata = () => ({
 		sessionId: id,
@@ -1887,6 +1895,8 @@ function sdkQuerySurface(
 		getExtensions: () => ctx.getExtensions(),
 		getArtifactRange: (id, offset, length) => ctx.getArtifactRange?.(id, offset, length),
 		getJobs: () => ctx.getJobs(),
+		getPromptStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
+			promptStatusLookup(selector),
 		installedQueries: installedOperations(ctx, "query"),
 	};
 }
@@ -1903,6 +1913,7 @@ function containsSecretConfigKey(value: unknown, seen = new Set<object>()): bool
 	);
 }
 
+
 function sdkControlSurface(
 	ctx: ExtensionContext,
 	pendingInteractive: Map<string, PendingInteractiveAsk>,
@@ -1912,10 +1923,13 @@ function sdkControlSurface(
 	onPromptAccepted: (
 		correlation: { commandId: string; turnId: string },
 		requesterConnectionId?: string,
+		clientRef?: string,
 	) => void = () => {},
 	onPromptFailed: (correlation: { commandId: string; turnId: string }, error: unknown) => void = () => {},
 	acceptGateResolution: () => boolean,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>,
+	admitPrompt: (clientRef?: string) => void,
+	releasePromptAdmission: (clientRef?: string) => void,
 	settings?: Settings,
 	configOverrides: Map<string, unknown> = new Map(),
 	configRevision: { current: number } = { current: 0 },
@@ -1992,19 +2006,34 @@ function sdkControlSurface(
 		deliverAs?: "steer" | "followUp",
 		rejectWhenBusy = false,
 		requesterConnectionId?: string,
+		clientRef?: string,
 	) => {
-		if (forceFresh && isSessionBusy()) {
-			throw Object.assign(new Error("Previous turn did not finish aborting before replacement prompt submission."), {
-				code: "busy",
+		const trimmedClientRef = typeof clientRef === "string" ? clientRef.trim() : undefined;
+		if (clientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
+			throw Object.assign(new Error("clientRef must be a non-empty string of at most 128 characters."), {
+				code: "invalid_input",
 			});
+		admitPrompt(trimmedClientRef);
+		try {
+			if (forceFresh && isSessionBusy()) {
+				throw Object.assign(
+					new Error("Previous turn did not finish aborting before replacement prompt submission."),
+					{
+						code: "busy",
+					},
+				);
+			}
+			if (rejectWhenBusy && isSessionBusy())
+				throw Object.assign(
+					new Error("turn.prompt is unavailable while the agent is busy; use turn.steer explicitly."),
+					{
+						code: "busy",
+					},
+				);
+		} catch (error) {
+			releasePromptAdmission(trimmedClientRef);
+			throw error;
 		}
-		if (rejectWhenBusy && isSessionBusy())
-			throw Object.assign(
-				new Error("turn.prompt is unavailable while the agent is busy; use turn.steer explicitly."),
-				{
-					code: "busy",
-				},
-			);
 		const promptImages = Array.isArray(images) ? (images as { data: string; mimeType?: string }[]) : [];
 		const content: string | (TextContent | ImageContent)[] =
 			promptImages.length > 0
@@ -2036,7 +2065,7 @@ function sdkControlSurface(
 		const onPreflightAccepted = () => {
 			if (preflightSettled) return;
 			accepted = true;
-			onPromptAccepted(correlation, requesterConnectionId);
+			onPromptAccepted(correlation, requesterConnectionId, trimmedClientRef);
 			settlePreflight({ status: "accepted" });
 		};
 		// Do not acknowledge the prompt until AgentSession's async preflight
@@ -2073,13 +2102,17 @@ function sdkControlSurface(
 		try {
 			const result = await preflight.promise;
 			if (result.status === "rejected") throw result.error;
-			return { commandId, turnId, accepted: true };
+			return { commandId, turnId, accepted: true, ...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}) };
+		} catch (error) {
+			releasePromptAdmission(trimmedClientRef);
+			throw error;
 		} finally {
 			pendingPreflightCancellations.delete(cancelPreflight);
 		}
 	};
 	const surface: ControlSurface & { cancelPendingPreflights(): void } = {
-		prompt: (text, images) => submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore()),
+		prompt: (text, images, clientRef) =>
+			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef),
 		steer: text => sendSteer(text),
 		followUp: text => submitPrompt(text, undefined, false, "followUp", false, controlRequesterContext.getStore()),
 		abort: () => {
@@ -3170,6 +3203,14 @@ export function createNotificationsExtension(
 		};
 		const promptSubmissions = new Map<string, PromptSubmission>();
 		const promptTerminalTombstones = new Map<string, number>();
+		// Authoritative bounded reconciliation state for Q26 turn.prompt_status
+		// (contract documented in ./prompt-reconciliation and ../prompt-status).
+		// Active records never age into terminal; documented TTL/capacity
+		// eviction is the only removal, after which lookups report `unknown`.
+		const reconciliation = createPromptReconciliation();
+		const admitPromptSubmission = reconciliation.admit;
+		const notePromptReconciliationAccepted = reconciliation.noteAccepted;
+		const lookupPromptStatus = reconciliation.lookup;
 		const removePendingPromptCorrelation = (correlation: { commandId: string; turnId: string }) => {
 			const pendingIndex = pendingPromptCorrelations.findIndex(
 				candidate => candidate.commandId === correlation.commandId && candidate.turnId === correlation.turnId,
@@ -3188,6 +3229,7 @@ export function createNotificationsExtension(
 			addTerminalTombstone(key);
 		};
 		const cleanupPromptRecords = (now = Date.now()) => {
+			reconciliation.cleanup();
 			for (const [key, expiresAt] of promptTerminalTombstones)
 				if (expiresAt <= now) promptTerminalTombstones.delete(key);
 			for (const [key, submission] of promptSubmissions)
@@ -3205,6 +3247,7 @@ export function createNotificationsExtension(
 			frame: PromptLifecycleFrame,
 		) => {
 			cleanupPromptRecords();
+
 			if (!correlation || !runtime) {
 				emitAgentLifecycle(runtime!, frame as Extract<PromptLifecycleFrame, { type: "agent_start" | "agent_end" }>);
 				return;
@@ -3270,8 +3313,17 @@ export function createNotificationsExtension(
 		const recordPromptAccepted = (
 			correlation: { commandId: string; turnId: string },
 			requesterConnectionId?: string,
+			clientRef?: string,
 		) => {
-			if (!requesterConnectionId) return;
+			if (!requesterConnectionId) {
+				// No delivery owner: this submission's lifecycle stays uncorrelated
+				// (clientRef only exists on the control path, which always carries a
+				// connection), so it cannot be reconciled through Q26. Release the
+				// admission reservation instead of leaking the slot.
+				reconciliation.releaseAdmission(clientRef);
+				return;
+			}
+			notePromptReconciliationAccepted(correlation, clientRef);
 			cleanupPromptRecords();
 			while (promptSubmissions.size >= PROMPT_SUBMISSION_CAPACITY) {
 				const oldest = promptSubmissions.entries().next().value as [string, PromptSubmission] | undefined;
@@ -3303,6 +3355,7 @@ export function createNotificationsExtension(
 			return true;
 		};
 		const emitPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
+			reconciliation.noteTransition(correlation, { type: "agent_failed", error });
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || !runtime || !recordPromptTerminal(correlation)) return;
 			const candidate = error as { code?: unknown; message?: unknown };
@@ -3356,6 +3409,7 @@ export function createNotificationsExtension(
 					};
 				},
 				configOverrides,
+				lookupPromptStatus,
 			),
 			id,
 			revisions,
@@ -3371,6 +3425,8 @@ export function createNotificationsExtension(
 			recordPromptFailure,
 			() => runtime?.stopping !== true,
 			trackGateResolution,
+			admitPromptSubmission,
+			reconciliation.releaseAdmission,
 			settings,
 			configOverrides,
 			configRevision,
@@ -3501,6 +3557,7 @@ export function createNotificationsExtension(
 						},
 					),
 				);
+
 				if (rotatesIdentity && response.ok !== true) {
 					identityControlInFlight = false;
 					deferredIdentityRotation = undefined;
@@ -3570,6 +3627,7 @@ export function createNotificationsExtension(
 			pendingPromptCorrelations,
 			activePromptCorrelation: undefined,
 			recordPromptTerminal,
+			notePromptReconciliation: reconciliation.noteTransition,
 			emitPromptLifecycle,
 			emitPromptEvent,
 			pendingInbound: new Set<number>(),
@@ -4660,6 +4718,7 @@ export function createNotificationsExtension(
 		rt.busy = true;
 		const correlation = rt.pendingPromptCorrelations.shift();
 		rt.activePromptCorrelation = correlation;
+		rt.notePromptReconciliation(correlation, { type: "agent_start" });
 		rt.emitPromptLifecycle(correlation, { type: "agent_start", sessionId: id, ...correlation });
 		try {
 			// `activity` is the native live-host lifecycle surface. The separately
@@ -4704,6 +4763,7 @@ export function createNotificationsExtension(
 		rt.busy = false;
 		const correlation = rt.activePromptCorrelation;
 		if (correlation) {
+			rt.notePromptReconciliation(correlation, { type: "agent_end" });
 			if (rt.recordPromptTerminal(correlation))
 				rt.emitPromptLifecycle(correlation, { type: "agent_end", sessionId: id, ...correlation });
 		} else {

@@ -154,6 +154,7 @@ const queries = [
 	["resource.body", "Read a bounded resource continuation."],
 	["artifact.read", "Read a bounded artifact range."],
 	["runtime.jobs.list", "List managed jobs."],
+	["turn.prompt_status", "Read the authoritative reconciliation status of a submitted prompt by command/turn IDs or clientRef."],
 ] as const;
 
 const reverse = [
@@ -191,6 +192,7 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 
 function controlErrors(id: string): string[] {
 	const errors: Record<string, string[]> = {
+		C01: ["client_ref_conflict", "reconciliation_capacity"],
 		C06: ["action_claimed"],
 		C07: ["action_claimed", "terminal_uncertain"],
 		C08: ["action_claimed", "terminal_uncertain"],
@@ -231,7 +233,7 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["Q23", "Q24", "Q25"].includes(id))
+	if (["Q23", "Q24", "Q25", "Q26"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
 	return dispositions();
 }

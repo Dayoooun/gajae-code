@@ -8,6 +8,7 @@ import {
 	cursorSelector,
 } from "./cursor.js";
 import type { RevisionStore } from "./revision-store.js";
+import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
 
 export const TARGET_PAGE_BYTES = 256 * 1024;
 export const RESPONSE_CEILING_BYTES = 1024 * 1024;
@@ -43,6 +44,8 @@ export interface SessionSurface {
 		| Promise<{ bytes: Uint8Array; totalBytes: number } | undefined>;
 
 	getJobs(): unknown | Promise<unknown>;
+	/** Q26 keyed lookup of a submitted prompt's authoritative reconciliation status. */
+	getPromptStatus?(selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown | Promise<unknown>;
 	/** Query rows backed by the session's installed binding map. */
 	installedQueries?: ReadonlySet<string>;
 }
@@ -119,6 +122,7 @@ const names = [
 	"resource.body",
 	"artifact.read",
 	"runtime.jobs.list",
+	"turn.prompt_status",
 ];
 
 export class QueryHandlers {
@@ -147,6 +151,7 @@ export class QueryHandlers {
 				);
 			if (query === "Q02") return await this.#transcriptBody(request);
 			if (query === "Q23") return await this.#resourceBody(request);
+			if (query === "Q26") return await this.#promptStatus(request);
 			if (query === "Q24") return await this.#artifact(request);
 			const source = sources[query];
 			if (!source) return this.#error(request, "invalid_request");
@@ -502,6 +507,49 @@ export class QueryHandlers {
 			page.preview = true;
 		}
 		return { id: request.id, ok: true, page };
+	}
+
+	async #promptStatus(request: QueryRequest): Promise<QueryResponse> {
+		if (request.cursor)
+			return this.#error(request, "invalid_request", false, "turn.prompt_status does not support cursors.");
+		const input = request.input ?? {};
+		for (const key of Object.keys(input))
+			if (key !== "commandId" && key !== "turnId" && key !== "clientRef")
+				return this.#error(request, "invalid_request", false, `turn.prompt_status does not accept selector field "${key}".`);
+		const commandId = typeof input.commandId === "string" && input.commandId ? input.commandId : undefined;
+		const turnId = typeof input.turnId === "string" && input.turnId ? input.turnId : undefined;
+		const rawClientRef = typeof input.clientRef === "string" ? input.clientRef : undefined;
+		const trimmedClientRef = rawClientRef?.trim();
+		if (rawClientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
+			return this.#error(
+				request,
+				"invalid_request",
+				false,
+				"clientRef must be a non-empty string of at most 128 characters.",
+			);
+		const clientRef = trimmedClientRef || undefined;
+		if ((commandId === undefined) !== (turnId === undefined))
+			return this.#error(request, "invalid_request", false, "commandId and turnId must be provided together.");
+		if (commandId !== undefined && clientRef !== undefined)
+			return this.#error(
+				request,
+				"invalid_request",
+				false,
+				"Provide exactly one selector: a commandId/turnId pair or a clientRef.",
+			);
+		if (commandId === undefined && clientRef === undefined)
+			return this.#error(
+				request,
+				"invalid_request",
+				false,
+				"turn.prompt_status requires a commandId/turnId pair or a clientRef.",
+			);
+		if (typeof this.surface.getPromptStatus !== "function")
+			return this.#error(request, "unavailable", false, "turn.prompt_status is unavailable for this session.");
+		const result = await this.surface.getPromptStatus(
+			clientRef !== undefined ? { clientRef } : { commandId: commandId!, turnId: turnId! },
+		);
+		return { id: request.id, ok: true, result };
 	}
 
 	#error(request: QueryRequest, code: string, restartQuery = false, message = code): QueryResponse {
