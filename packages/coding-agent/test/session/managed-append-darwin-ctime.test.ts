@@ -25,7 +25,7 @@ afterEach(async () => {
 	);
 });
 
-async function createStore(): Promise<{
+async function createStore(options?: { withoutNativeAuthority?: boolean }): Promise<{
 	root: string;
 	store: ManagedSessionDescendantStore;
 	filePath: string;
@@ -35,7 +35,16 @@ async function createStore(): Promise<{
 	temporaryDirectories.push(root);
 	// Owner-only directory expected by managed security.
 	await fsp.chmod(root, 0o700);
-	const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+	const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+	let store: ManagedSessionDescendantStore;
+	try {
+		if (options?.withoutNativeAuthority && process.platform === "linux") {
+			Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
+		}
+		store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+	} finally {
+		if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+	}
 	const relativePath = "transcript.jsonl";
 	const initial = Buffer.from(`${JSON.stringify({ type: "session", id: "seed" })}\n`, "utf8");
 	store.publishNoReplaceSync(relativePath, initial);
@@ -80,13 +89,17 @@ function bumpCtimeOnly(pathname: string): void {
 
 describe("ManagedSessionDescendantStore.appendSync fail-closed races", () => {
 	it("rejects size mutation between capture and write-open without appending the request", async () => {
-		const { store, filePath, relativePath } = await createStore();
+		const { store, filePath, relativePath } = await createStore({ withoutNativeAuthority: true });
 		const beforeBytes = fs.readFileSync(filePath);
 		const record = Buffer.from(`${JSON.stringify({ type: "message", id: "m-race" })}\n`, "utf8");
 
-		installWriteOpenHook(filePath, pathname => {
-			fs.appendFileSync(pathname, "stale-race\n");
-		});
+		installWriteOpenHook(
+			filePath,
+			pathname => {
+				fs.appendFileSync(pathname, "stale-race\n");
+			},
+			{ maxCalls: 1 },
+		);
 
 		expect(() => store.appendSync(relativePath, record)).toThrow("identity_mismatch");
 		const after = fs.readFileSync(filePath, "utf8");
