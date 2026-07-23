@@ -61,9 +61,9 @@ describe("issue #2945 provider discovery Bearer auth", () => {
 	});
 
 	let baseUrl: string;
-	async function waitForRequest(): Promise<void> {
+	async function waitFor(condition: () => boolean): Promise<void> {
 		const deadline = Date.now() + 5_000;
-		while (seen.length === 0 && Date.now() < deadline) {
+		while (!condition() && Date.now() < deadline) {
 			await Bun.sleep(25);
 		}
 	}
@@ -78,9 +78,10 @@ describe("issue #2945 provider discovery Bearer auth", () => {
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 		await registry.refresh("online");
-		await waitForRequest();
+		// Wait for the merged end state, not just the HTTP request: discovery
+		// merges into the catalog asynchronously after the response arrives.
+		await waitFor(() => seen.length > 0 && registry.find("local", "local-model-1") !== undefined);
 
-		expect(seen.length).toBeGreaterThan(0);
 		expect(seen[0].url).toBe("/v1/models");
 		expect(seen[0].authorization).toBe(`Bearer ${EXPECTED_KEY}`);
 		expect(registry.find("local", "local-model-1")).toBeDefined();
@@ -95,9 +96,8 @@ describe("issue #2945 provider discovery Bearer auth", () => {
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 		await registry.refresh("online");
-		await waitForRequest();
+		await waitFor(() => seen.length > 0 && registry.find("local", "local-model-1") !== undefined);
 
-		expect(seen.length).toBeGreaterThan(0);
 		expect(seen[0].authorization).toBeUndefined();
 		expect(registry.find("local", "local-model-1")).toBeDefined();
 	});
@@ -112,9 +112,8 @@ describe("issue #2945 provider discovery Bearer auth", () => {
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 		await registry.refresh("online");
-		await waitForRequest();
+		await waitFor(() => seen.length > 0 && registry.getProviderDiscoveryState("local")?.status === "unavailable");
 
-		expect(seen.length).toBeGreaterThan(0);
 		expect(seen[0].authorization).toBe("Bearer wrong-key");
 		expect(registry.find("local", "local-model-1")).toBeUndefined();
 
