@@ -8,11 +8,11 @@ import { tokenFingerprint } from "../src/sdk/bus/config";
 import {
 	DAEMON_GENERATION,
 	DAEMON_VERSION,
+	type DaemonState,
 	daemonPaths,
 	ensureTelegramDaemonRunningDetailed,
 	reloadReservationLockOptions,
 	renewDaemonHeartbeat,
-	type DaemonState,
 	type TelegramDaemonFs,
 } from "../src/sdk/bus/telegram-daemon";
 
@@ -78,8 +78,6 @@ function daemonFs(readdirOverride?: (dir: string) => Promise<string[]>): Telegra
 	};
 }
 
-
-
 function writeLiveOwner(agentDir: string, state: DaemonState): void {
 	const paths = daemonPaths(agentDir);
 	fs.mkdirSync(paths.dir, { recursive: true });
@@ -133,13 +131,13 @@ test("ensure cooldown preserves the first reload and attaches on the second auto
 		processReference: (pid: number) =>
 			pid === 999
 				? {
-					incarnation: "linux:100",
-					termination: "cooperative" as const,
-					signalRoot: (signal: NodeJS.Signals) => {
-						signals.push([pid, signal]);
-						if (signal === "SIGTERM") alive.delete(pid);
-					},
-				}
+						incarnation: "linux:100",
+						termination: "cooperative" as const,
+						signalRoot: (signal: NodeJS.Signals) => {
+							signals.push([pid, signal]);
+							if (signal === "SIGTERM") alive.delete(pid);
+						},
+					}
 				: undefined,
 		spawn: (_command: string, args: string[]) => {
 			spawns++;
@@ -192,7 +190,6 @@ test("ensure cooldown preserves the first reload and attaches on the second auto
 	expect(signals).toHaveLength(1);
 });
 
-
 test("concurrent generation upgrades reserve one reload attempt", async () => {
 	const agentDir = tempDir();
 	const s = settings(agentDir);
@@ -202,9 +199,18 @@ test("concurrent generation upgrades reserve one reload attempt", async () => {
 	let pending: { ownerId: string; pid: number } | undefined;
 	const fsImpl = daemonFs();
 	writeLiveOwner(agentDir, {
-		pid: 999, incarnation: "linux:100", ownerId: "old-owner", tokenFingerprint: tokenFingerprint("123456:secret-token"),
-		chatId: "42", startedAt: now, heartbeatAt: now, roots: [], version: DAEMON_VERSION,
-		generation: DAEMON_GENERATION - 1, acquisitionId: "old-owner", ownershipPhase: "ready",
+		pid: 999,
+		incarnation: "linux:100",
+		ownerId: "old-owner",
+		tokenFingerprint: tokenFingerprint("123456:secret-token"),
+		chatId: "42",
+		startedAt: now,
+		heartbeatAt: now,
+		roots: [],
+		version: DAEMON_VERSION,
+		generation: DAEMON_GENERATION - 1,
+		acquisitionId: "old-owner",
+		ownershipPhase: "ready",
 	});
 	const deps = {
 		fs: fsImpl,
@@ -214,10 +220,14 @@ test("concurrent generation upgrades reserve one reload attempt", async () => {
 		pidIncarnation: () => "linux:100",
 		processReference: (pid: number) =>
 			pid === 999
-				? { incarnation: "linux:100", termination: "cooperative" as const, signalRoot: (signal: NodeJS.Signals) => {
-					signals.push([pid, signal]);
-					if (signal === "SIGTERM") alive.delete(pid);
-				} }
+				? {
+						incarnation: "linux:100",
+						termination: "cooperative" as const,
+						signalRoot: (signal: NodeJS.Signals) => {
+							signals.push([pid, signal]);
+							if (signal === "SIGTERM") alive.delete(pid);
+						},
+					}
 				: undefined,
 		spawn: (_command: string, args: string[]) => {
 			const ownerId = args[args.indexOf("--owner-id") + 1]!;
@@ -228,8 +238,13 @@ test("concurrent generation upgrades reserve one reload attempt", async () => {
 		sleep: async () => {
 			if (!pending) return;
 			await renewDaemonHeartbeat({
-				settings: s, ownerId: pending.ownerId, acquisitionId: pending.ownerId, pid: pending.pid,
-				pidIncarnation: () => "linux:100", now: () => now, fs: fsImpl,
+				settings: s,
+				ownerId: pending.ownerId,
+				acquisitionId: pending.ownerId,
+				pid: pending.pid,
+				pidIncarnation: () => "linux:100",
+				now: () => now,
+				fs: fsImpl,
 			});
 		},
 		waitStepMs: 1,

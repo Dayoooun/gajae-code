@@ -201,7 +201,6 @@ const nodeFs: TelegramDaemonFs = {
 		exactUnlinkNotificationFile(file, identity, `.gjc-delete-daemon-transition-${crypto.randomUUID()}.json`),
 };
 
-
 /**
  * Durably persist a daemon-local Telegram delivery toggle. A real
  * {@link Settings} exposes `flushOrThrow()`, which rejects on a failed config.yml
@@ -7000,7 +6999,6 @@ export class TelegramNotificationDaemon {
 	private stopOwnershipHeartbeatTimer(): void {
 		this.runtime.stopInterval("telegram-owner-heartbeat");
 	}
-
 
 	/** Run a root scan, guarding against overlapping scans from the timer + loop. */
 	private async runScan(): Promise<void> {

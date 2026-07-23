@@ -9936,23 +9936,23 @@ test("session_closed tombstones its endpoint generation so scans do not recreate
 		throw new Error("topic registry was not persisted");
 	};
 
-		await daemon.scanRoots();
-		expect(FakeWs.instances).toHaveLength(1);
-		FakeWs.instances[0]!.dispatchEvent(new Event("open"));
-		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
-			type: "event_replay_result",
-			ok: true,
-			id: "telegram-startup-replay:S",
-			generation: 1,
-			lastSeq: 0,
-			events: [],
-		});
-		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
-			type: "identity_header",
-			sessionId: "S",
-		});
-		await waitForCreate();
-		await waitForTopicRecord();
+	await daemon.scanRoots();
+	expect(FakeWs.instances).toHaveLength(1);
+	FakeWs.instances[0]!.dispatchEvent(new Event("open"));
+	await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+		type: "event_replay_result",
+		ok: true,
+		id: "telegram-startup-replay:S",
+		generation: 1,
+		lastSeq: 0,
+		events: [],
+	});
+	await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+		type: "identity_header",
+		sessionId: "S",
+	});
+	await waitForCreate();
+	await waitForTopicRecord();
 
 	bot.calls = [];
 	await daemon.handleSessionMessage(daemon.sessions.get("S")!, { type: "session_closed", sessionId: "S" });
@@ -9967,18 +9967,18 @@ test("session_closed tombstones its endpoint generation so scans do not recreate
 	fs.writeFileSync(path.join(endpointDir, "S.json"), JSON.stringify({ url: "ws://resumed", token: "ts2", pid: 4242 }));
 	await daemon.scanRoots();
 	expect(FakeWs.instances).toHaveLength(2);
-		FakeWs.instances[1]!.dispatchEvent(new Event("open"));
-		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
-			type: "event_replay_result",
-			ok: true,
-			id: "telegram-startup-replay:S",
-			generation: 1,
-			lastSeq: 0,
-			events: [],
-		});
-		await daemon.handleSessionMessage(daemon.sessions.get("S")!, { type: "identity_header", sessionId: "S" });
-		const resumedCreate = await waitForCreate();
-		expect(resumedCreate.body.name).toBe("GJC S");
+	FakeWs.instances[1]!.dispatchEvent(new Event("open"));
+	await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+		type: "event_replay_result",
+		ok: true,
+		id: "telegram-startup-replay:S",
+		generation: 1,
+		lastSeq: 0,
+		events: [],
+	});
+	await daemon.handleSessionMessage(daemon.sessions.get("S")!, { type: "identity_header", sessionId: "S" });
+	const resumedCreate = await waitForCreate();
+	expect(resumedCreate.body.name).toBe("GJC S");
 });
 
 test("inbound thread message gets a queued reaction, flipped to consumed on ack", async () => {
@@ -11343,7 +11343,6 @@ test("connectSession does not create a Telegram topic before an outbound frame",
 	await new Promise(r => setTimeout(r, 10));
 	expect(bot.calls.find(c => c.method === "createForumTopic")).toBeUndefined();
 });
-
 
 test("identity_header lazily creates a topic and applies its resolved name", async () => {
 	FakeWs.instances = [];
@@ -15450,7 +15449,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		).toBe(false);
 	});
 
-test("identity-less replay buffers frames until a lazy identity create flushes them", async () => {
+	test("identity-less replay buffers frames until a lazy identity create flushes them", async () => {
 		FakeWs.instances = [];
 		const createStarted = Promise.withResolvers<void>();
 		const releaseCreate = Promise.withResolvers<unknown>();
@@ -15884,7 +15883,7 @@ test("identity-less replay buffers frames until a lazy identity create flushes t
 		await creating;
 	});
 
-test("identity-less replay drains after lazy identity creation", async () => {
+	test("identity-less replay drains after lazy identity creation", async () => {
 		FakeWs.instances = [];
 		const createStarted = Promise.withResolvers<void>();
 		const releaseCreate = Promise.withResolvers<unknown>();

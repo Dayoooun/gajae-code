@@ -139,7 +139,9 @@ test("#2960 red-team pre-topic buffered frame flushes once after lazy creation",
 	await sendIdentity(daemon);
 	expect(calls(bot, "createForumTopic")).toHaveLength(1);
 	expect(calls(bot, "sendMessage").filter(call => call.body.text === "buffered exactly once")).toHaveLength(1);
-	expect(calls(bot, "sendMessage").find(call => call.body.text === "buffered exactly once")!.body.message_thread_id).toBe(77);
+	expect(
+		calls(bot, "sendMessage").find(call => call.body.text === "buffered exactly once")!.body.message_thread_id,
+	).toBe(77);
 });
 
 test("#2960 red-team durable-topic reconnect flushes pending frames without recreation", async () => {
@@ -195,7 +197,11 @@ test("#2960 red-team identity, ask, and visible tool activity retain lazy creati
 	await sendIdentity(tool.daemon);
 	await (tool.daemon as any).flushPool();
 	expect(calls(tool.bot, "createForumTopic")).toHaveLength(1);
-	expect(tool.bot.calls.some(call => String(call.body.text).includes("read — started") && call.body.message_thread_id === 77)).toBe(true);
+	expect(
+		tool.bot.calls.some(
+			call => String(call.body.text).includes("read — started") && call.body.message_thread_id === 77,
+		),
+	).toBe(true);
 });
 
 test("#2960 red-team frame-free reconnect storm creates zero topics", async () => {

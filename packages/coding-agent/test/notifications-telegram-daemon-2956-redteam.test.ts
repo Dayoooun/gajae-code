@@ -8,10 +8,10 @@ import { tokenFingerprint } from "../src/sdk/bus/config";
 import {
 	DAEMON_GENERATION,
 	DAEMON_VERSION,
+	type DaemonState,
 	daemonPaths,
 	ensureTelegramDaemonRunningDetailed,
 	renewDaemonHeartbeat,
-	type DaemonState,
 	type TelegramDaemonFs,
 } from "../src/sdk/bus/telegram-daemon";
 
@@ -49,13 +49,27 @@ function daemonFs(readdirOverride?: (dir: string) => Promise<string[]>): Telegra
 		readEndpointFile: async file => {
 			const bytes = await fs.promises.readFile(file);
 			const stat = await fs.promises.lstat(file, { bigint: true });
-			return { bytes, identity: { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs, sha256: crypto.createHash("sha256").update(bytes).digest("hex") } };
+			return {
+				bytes,
+				identity: {
+					dev: stat.dev,
+					ino: stat.ino,
+					size: stat.size,
+					mtimeNs: stat.mtimeNs,
+					sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+				},
+			};
 		},
 		exactUnlink: async (file, identity) => {
 			const bytes = await fs.promises.readFile(file).catch(() => undefined);
 			if (!bytes) return { ok: false, code: "missing" };
 			const stat = await fs.promises.lstat(file, { bigint: true });
-			const matches = stat.dev === identity.dev && stat.ino === identity.ino && stat.size === identity.size && stat.mtimeNs === identity.mtimeNs && crypto.createHash("sha256").update(bytes).digest("hex") === identity.sha256;
+			const matches =
+				stat.dev === identity.dev &&
+				stat.ino === identity.ino &&
+				stat.size === identity.size &&
+				stat.mtimeNs === identity.mtimeNs &&
+				crypto.createHash("sha256").update(bytes).digest("hex") === identity.sha256;
 			if (!matches) return { ok: false, code: "identity_mismatch" };
 			await fs.promises.unlink(file);
 			return { ok: true };
@@ -67,34 +81,109 @@ function writeLiveOwner(agentDir: string, state: DaemonState): void {
 	const paths = daemonPaths(agentDir);
 	fs.mkdirSync(paths.dir, { recursive: true });
 	fs.writeFileSync(paths.state, JSON.stringify(state));
-	fs.writeFileSync(paths.lock, JSON.stringify({ pid: state.pid, incarnation: state.incarnation, ownerId: state.ownerId, acquisitionId: state.acquisitionId ?? state.ownerId, startedAt: state.startedAt }));
+	fs.writeFileSync(
+		paths.lock,
+		JSON.stringify({
+			pid: state.pid,
+			incarnation: state.incarnation,
+			ownerId: state.ownerId,
+			acquisitionId: state.acquisitionId ?? state.ownerId,
+			startedAt: state.startedAt,
+		}),
+	);
 }
-
 
 function oldOwner(now: number): DaemonState {
-	return { pid: 999, incarnation: "linux:100", ownerId: "old-owner", acquisitionId: "old-owner", ownershipPhase: "ready", tokenFingerprint: tokenFingerprint("123456:secret-token"), chatId: "42", startedAt: now, heartbeatAt: now, roots: [], version: DAEMON_VERSION, generation: DAEMON_GENERATION - 1 };
+	return {
+		pid: 999,
+		incarnation: "linux:100",
+		ownerId: "old-owner",
+		acquisitionId: "old-owner",
+		ownershipPhase: "ready",
+		tokenFingerprint: tokenFingerprint("123456:secret-token"),
+		chatId: "42",
+		startedAt: now,
+		heartbeatAt: now,
+		roots: [],
+		version: DAEMON_VERSION,
+		generation: DAEMON_GENERATION - 1,
+	};
 }
 
-
 async function ensureCooldownCase(mode: "dead-within-window" | "live-after-window"): Promise<void> {
-	const agentDir = tempDir(); const s = settings(agentDir); let now = 1_000; const alive = new Set<number>([999, 4242]); let spawns = 0; let pending: { ownerId: string; pid: number } | undefined; let reloadPid = 999;
+	const agentDir = tempDir();
+	const s = settings(agentDir);
+	let now = 1_000;
+	const alive = new Set<number>([999, 4242]);
+	let spawns = 0;
+	let pending: { ownerId: string; pid: number } | undefined;
+	let reloadPid = 999;
 	writeLiveOwner(agentDir, oldOwner(now));
 	const deps = {
-		fs: daemonFs(), pid: 4242, now: () => now, pidAlive: (pid: number) => alive.has(pid), pidIncarnation: () => "linux:100", waitStepMs: 1, readinessTimeoutMs: 10,
-		processReference: (pid: number) => pid === reloadPid ? { incarnation: "linux:100", termination: "cooperative" as const, signalRoot: (signal: NodeJS.Signals) => { if (signal === "SIGTERM") alive.delete(pid); } } : undefined,
-		spawn: (_command: string, args: string[]) => { const pid = 5000 + ++spawns; pending = { ownerId: args[args.indexOf("--owner-id") + 1]!, pid }; alive.add(pid); return { pid, unref() {} }; },
-		sleep: async () => { if (pending) await renewDaemonHeartbeat({ settings: s, ownerId: pending.ownerId, acquisitionId: pending.ownerId, pid: pending.pid, pidIncarnation: () => "linux:100", now: () => now, fs: daemonFs() }); },
+		fs: daemonFs(),
+		pid: 4242,
+		now: () => now,
+		pidAlive: (pid: number) => alive.has(pid),
+		pidIncarnation: () => "linux:100",
+		waitStepMs: 1,
+		readinessTimeoutMs: 10,
+		processReference: (pid: number) =>
+			pid === reloadPid
+				? {
+						incarnation: "linux:100",
+						termination: "cooperative" as const,
+						signalRoot: (signal: NodeJS.Signals) => {
+							if (signal === "SIGTERM") alive.delete(pid);
+						},
+					}
+				: undefined,
+		spawn: (_command: string, args: string[]) => {
+			const pid = 5000 + ++spawns;
+			pending = { ownerId: args[args.indexOf("--owner-id") + 1]!, pid };
+			alive.add(pid);
+			return { pid, unref() {} };
+		},
+		sleep: async () => {
+			if (pending)
+				await renewDaemonHeartbeat({
+					settings: s,
+					ownerId: pending.ownerId,
+					acquisitionId: pending.ownerId,
+					pid: pending.pid,
+					pidIncarnation: () => "linux:100",
+					now: () => now,
+					fs: daemonFs(),
+				});
+		},
 	};
-	expect(await ensureTelegramDaemonRunningDetailed({ settings: s, cwd: path.join(agentDir, "one"), sessionId: "one" }, deps)).toBe("reloaded");
+	expect(
+		await ensureTelegramDaemonRunningDetailed(
+			{ settings: s, cwd: path.join(agentDir, "one"), sessionId: "one" },
+			deps,
+		),
+	).toBe("reloaded");
 	const current = JSON.parse(fs.readFileSync(daemonPaths(agentDir).state, "utf8")) as DaemonState;
 	current.generation = DAEMON_GENERATION - 1;
-	const retry = mode === "dead-within-window" ? current : (now += 600_001, oldOwner(now));
+	if (mode !== "dead-within-window") now += 600_001;
+	const retry = mode === "dead-within-window" ? current : oldOwner(now);
 	if (mode === "dead-within-window") alive.delete(retry.pid);
-	else { reloadPid = retry.pid; alive.add(retry.pid); }
+	else {
+		reloadPid = retry.pid;
+		alive.add(retry.pid);
+	}
 	writeLiveOwner(agentDir, retry);
-	expect(await ensureTelegramDaemonRunningDetailed({ settings: s, cwd: path.join(agentDir, "two"), sessionId: "two" }, deps)).toBe(mode === "dead-within-window" ? "spawned" : "reloaded");
+	expect(
+		await ensureTelegramDaemonRunningDetailed(
+			{ settings: s, cwd: path.join(agentDir, "two"), sessionId: "two" },
+			deps,
+		),
+	).toBe(mode === "dead-within-window" ? "spawned" : "reloaded");
 	expect(spawns).toBe(2);
 }
 
-test("reload cooldown does not suppress dead-owner recovery", async () => { await ensureCooldownCase("dead-within-window"); });
-test("reload cooldown permits a fresh live generation reload after ten minutes", async () => { await ensureCooldownCase("live-after-window"); });
+test("reload cooldown does not suppress dead-owner recovery", async () => {
+	await ensureCooldownCase("dead-within-window");
+});
+test("reload cooldown permits a fresh live generation reload after ten minutes", async () => {
+	await ensureCooldownCase("live-after-window");
+});
