@@ -9,6 +9,7 @@ import type {
 	Q10ThinkingEffort,
 	Q10ThinkingMode,
 	TurnPromptAcceptedResult,
+	TurnPromptInput,
 	TurnPromptReconciliation,
 	TurnPromptStatusSelector,
 } from "@gajae-code/coding-agent/sdk";
@@ -32,6 +33,7 @@ const sdkCapabilityDtoTypes:
 			TurnPromptAcceptedResult,
 			TurnPromptReconciliation,
 			TurnPromptStatusSelector,
+			TurnPromptInput,
 	  ]
 	| undefined = undefined;
 

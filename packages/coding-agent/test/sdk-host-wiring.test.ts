@@ -4532,6 +4532,32 @@ test("long-running prompt settles terminally after the delivery buffer expires",
 		input: { text: "long running turn", clientRef: "long-ref" },
 	});
 	expect(ack.ok).toBe(true);
+	// Expire the transient delivery buffer before lifecycle start, then trigger
+	// cleanup through an unrelated follow-up acceptance. The authoritative pending
+	// correlation must remain queued for the original tracked prompt.
+	const realNow = Date.now;
+	let followUpIds: { commandId: string; turnId: string } | undefined;
+	try {
+		Date.now = () => realNow() + 6 * 60_000;
+		const followUp = await request({
+			type: "control_request",
+			id: "delivery-expiry-trigger",
+			operation: "turn.follow_up",
+			input: { text: "trigger delivery cleanup" },
+		});
+		expect(followUp).toMatchObject({ ok: true, result: { accepted: true } });
+		const result = followUp.result as { commandId: string; turnId: string };
+		followUpIds = { commandId: result.commandId, turnId: result.turnId };
+	} finally {
+		Date.now = realNow;
+	}
+	const untrackedFollowUp = await request({
+		type: "query_request",
+		id: "follow-up-untracked",
+		query: "turn.prompt_status",
+		input: followUpIds,
+	});
+	expect(untrackedFollowUp).toMatchObject({ ok: true, result: { status: "unknown" } });
 	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 	const inFlight = await request({
 		type: "query_request",
@@ -4540,15 +4566,7 @@ test("long-running prompt settles terminally after the delivery buffer expires",
 		input: { clientRef: "long-ref" },
 	});
 	expect(inFlight).toMatchObject({ ok: true, result: { status: "in_flight" } });
-
-	// Simulate a turn outliving the 5-minute delivery-buffer TTL.
-	const realNow = Date.now;
-	try {
-		Date.now = () => realNow() + 6 * 60_000;
-		await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
-	} finally {
-		Date.now = realNow;
-	}
+	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
 
 	// Authoritative settlement fired at lifecycle ingress even though the delivery
 	// buffer expired: the record is terminal_ok, not permanently in_flight.

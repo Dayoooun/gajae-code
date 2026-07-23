@@ -21,7 +21,6 @@
 export const PROMPT_RECONCILIATION_ACTIVE_CAPACITY = 128;
 export const PROMPT_RECONCILIATION_TERMINAL_CAPACITY = 256;
 export const PROMPT_RECONCILIATION_TERMINAL_TTL_MS = 15 * 60_000;
-export const PROMPT_FAILURE_MESSAGE_MAX = 512;
 export const PROMPT_FAILURE_CODE_MAX = 64;
 
 export type PromptReconciliationStatus = "accepted" | "in_flight" | "terminal_ok" | "failed";
@@ -94,17 +93,12 @@ export interface PromptReconciliation {
 	activeCount(): number;
 }
 
-/** Safe-token code capped at 64; message whitespace-normalized, capped at 512, never empty. */
+/** Safe-token code capped at 64; arbitrary failure text is never retained. */
 export function sanitizePromptFailure(error: unknown): { code: string; message: string } {
-	const candidate = error as { code?: unknown; message?: unknown } | undefined;
+	const candidate = error as { code?: unknown } | undefined;
 	const rawCode = typeof candidate?.code === "string" ? candidate.code : "";
-	const code = /^[A-Za-z0-9._-]{1,64}$/.test(rawCode) ? rawCode : "internal";
-	const rawMessage = typeof candidate?.message === "string" ? candidate.message : "";
-	const message = rawMessage
-		.replace(/[\t\r\n]+/g, " ")
-		.trim()
-		.slice(0, PROMPT_FAILURE_MESSAGE_MAX);
-	return { code, message: message || "Prompt submission failed." };
+	const code = rawCode.length <= PROMPT_FAILURE_CODE_MAX && /^[A-Za-z0-9._-]+$/.test(rawCode) ? rawCode : "internal";
+	return { code, message: "Prompt submission failed." };
 }
 
 export function createPromptReconciliation(options: { now?: () => number } = {}): PromptReconciliation {

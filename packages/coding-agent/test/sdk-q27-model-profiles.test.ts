@@ -14,6 +14,7 @@ import { mergeModelProfiles } from "../src/config/model-profiles";
 import { Broker } from "../src/sdk/broker/broker";
 import {
 	readSessionLifecycleFailureForTest,
+	setLifecycleCommandResolverForTest,
 	validateBrokerModelPresetForTest,
 	writeSessionLifecycleFailure,
 } from "../src/sdk/broker/lifecycle";
@@ -249,6 +250,11 @@ describe("broker model-profile validation", () => {
 		const cwd = path.join(await temp(), "repo");
 		await fs.mkdir(cwd);
 		const broker = new Broker({ agentDir });
+		let spawnResolverCalls = 0;
+		setLifecycleCommandResolverForTest(broker, () => {
+			spawnResolverCalls++;
+			return { file: process.execPath, args: ["-e", "process.exit(0)"] };
+		});
 		await broker.start();
 		try {
 			for (const [modelPreset, key] of [
@@ -272,7 +278,20 @@ describe("broker model-profile validation", () => {
 					details: { requestedProfile: "definitely-missing", discoveryQuery: MODEL_PROFILE_DISCOVERY_QUERY },
 				},
 			});
+			await Bun.write(path.join(agentDir, "models.yml"), "profiles: [invalid");
+			expect(
+				await broker.handleRequest(
+					"session.create",
+					{ cwd, modelPreset: "definitely-missing" },
+					"q27-invalid-registry-pre-spawn",
+				),
+			).toMatchObject({
+				ok: false,
+				error: { code: "model_profile_registry_error", details: { availableProfiles: [] } },
+			});
+			expect(spawnResolverCalls).toBe(0);
 		} finally {
+			setLifecycleCommandResolverForTest(broker, undefined);
 			await broker.stop();
 		}
 	});

@@ -1925,6 +1925,7 @@ function sdkControlSurface(
 		correlation: { commandId: string; turnId: string },
 		requesterConnectionId?: string,
 		clientRef?: string,
+		trackReconciliation?: boolean,
 	) => void = () => {},
 	onPromptFailed: (correlation: { commandId: string; turnId: string }, error: unknown) => void = () => {},
 	acceptGateResolution: () => boolean,
@@ -2008,13 +2009,14 @@ function sdkControlSurface(
 		rejectWhenBusy = false,
 		requesterConnectionId?: string,
 		clientRef?: string,
+		trackReconciliation = false,
 	) => {
 		const trimmedClientRef = typeof clientRef === "string" ? clientRef.trim() : undefined;
 		if (clientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
 			throw Object.assign(new Error("clientRef must be a non-empty string of at most 128 characters."), {
 				code: "invalid_input",
 			});
-		admitPrompt(trimmedClientRef);
+		if (trackReconciliation) admitPrompt(trimmedClientRef);
 		try {
 			if (forceFresh && isSessionBusy()) {
 				throw Object.assign(
@@ -2032,7 +2034,7 @@ function sdkControlSurface(
 					},
 				);
 		} catch (error) {
-			releasePromptAdmission(trimmedClientRef);
+			if (trackReconciliation) releasePromptAdmission(trimmedClientRef);
 			throw error;
 		}
 		const promptImages = Array.isArray(images) ? (images as { data: string; mimeType?: string }[]) : [];
@@ -2066,7 +2068,7 @@ function sdkControlSurface(
 		const onPreflightAccepted = () => {
 			if (preflightSettled) return;
 			accepted = true;
-			onPromptAccepted(correlation, requesterConnectionId, trimmedClientRef);
+			onPromptAccepted(correlation, requesterConnectionId, trimmedClientRef, trackReconciliation);
 			settlePreflight({ status: "accepted" });
 		};
 		// Do not acknowledge the prompt until AgentSession's async preflight
@@ -2105,7 +2107,7 @@ function sdkControlSurface(
 			if (result.status === "rejected") throw result.error;
 			return { commandId, turnId, accepted: true, ...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}) };
 		} catch (error) {
-			releasePromptAdmission(trimmedClientRef);
+			if (trackReconciliation) releasePromptAdmission(trimmedClientRef);
 			throw error;
 		} finally {
 			pendingPreflightCancellations.delete(cancelPreflight);
@@ -2113,7 +2115,7 @@ function sdkControlSurface(
 	};
 	const surface: ControlSurface & { cancelPendingPreflights(): void } = {
 		prompt: (text, images, clientRef) =>
-			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef),
+			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef, true),
 		steer: text => sendSteer(text),
 		followUp: text => submitPrompt(text, undefined, false, "followUp", false, controlRequesterContext.getStore()),
 		abort: () => {
@@ -3229,15 +3231,20 @@ export function createNotificationsExtension(
 			removePendingPromptCorrelation(correlation);
 			addTerminalTombstone(key);
 		};
+		const expirePromptDelivery = (key: string, submission: PromptSubmission) => {
+			promptSubmissions.delete(key);
+			if (!submission.terminal) return;
+			const [commandId, turnId] = key.split(":", 2);
+			if (!commandId || !turnId) return;
+			removePendingPromptCorrelation({ commandId, turnId });
+			addTerminalTombstone(key);
+		};
 		const cleanupPromptRecords = (now = Date.now()) => {
 			reconciliation.cleanup();
 			for (const [key, expiresAt] of promptTerminalTombstones)
 				if (expiresAt <= now) promptTerminalTombstones.delete(key);
 			for (const [key, submission] of promptSubmissions)
-				if (submission.createdAt + PROMPT_SUBMISSION_TTL_MS <= now) {
-					const [commandId, turnId] = key.split(":", 2);
-					if (commandId && turnId) finalizePrompt(key, { commandId, turnId });
-				}
+				if (submission.createdAt + PROMPT_SUBMISSION_TTL_MS <= now) expirePromptDelivery(key, submission);
 		};
 		const abandonPrompt = (submission: PromptSubmission) => {
 			submission.abandoned = true;
@@ -3315,23 +3322,20 @@ export function createNotificationsExtension(
 			correlation: { commandId: string; turnId: string },
 			requesterConnectionId?: string,
 			clientRef?: string,
+			trackReconciliation = false,
 		) => {
 			if (!requesterConnectionId) {
-				// No delivery owner: this submission's lifecycle stays uncorrelated
-				// (clientRef only exists on the control path, which always carries a
-				// connection), so it cannot be reconciled through Q26. Release the
-				// admission reservation instead of leaking the slot.
-				reconciliation.releaseAdmission(clientRef);
+				// No delivery owner: tracked prompts cannot be reconciled. Release
+				// their admission reservation instead of leaking the active slot.
+				if (trackReconciliation) reconciliation.releaseAdmission(clientRef);
 				return;
 			}
-			notePromptReconciliationAccepted(correlation, clientRef);
+			if (trackReconciliation) notePromptReconciliationAccepted(correlation, clientRef);
 			cleanupPromptRecords();
 			while (promptSubmissions.size >= PROMPT_SUBMISSION_CAPACITY) {
 				const oldest = promptSubmissions.entries().next().value as [string, PromptSubmission] | undefined;
 				if (!oldest) break;
-				const [key] = oldest;
-				const [commandId, turnId] = key.split(":", 2);
-				if (commandId && turnId) finalizePrompt(key, { commandId, turnId });
+				expirePromptDelivery(oldest[0], oldest[1]);
 			}
 			pendingPromptCorrelations.push(correlation);
 			promptSubmissions.set(promptSubmissionKey(correlation), {

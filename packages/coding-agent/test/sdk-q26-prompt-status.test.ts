@@ -71,16 +71,17 @@ describe("prompt reconciliation record", () => {
 		expect(result.terminalAt).toBeGreaterThan(0);
 	});
 
-	it("sanitizes failures: safe-token code cap, fallback code, never-empty message", () => {
-		expect(sanitizePromptFailure(undefined)).toEqual({ code: "internal", message: "Prompt submission failed." });
-		expect(sanitizePromptFailure(new Error("  plain  "))).toEqual({ code: "internal", message: "plain" });
-		expect(sanitizePromptFailure(Object.assign(new Error(""), { code: `bad code! ${"x".repeat(100)}` }))).toEqual({
-			code: "internal",
-			message: "Prompt submission failed.",
-		});
+	it("retains only a safe-token code and never exposes arbitrary failure text", () => {
+		for (const error of [
+			undefined,
+			new Error("prompt text /home/alice/private bearer sk-secret https://user:pass@example.com?q=token"),
+			Object.assign(new Error("provider payload"), { code: `bad code! ${"x".repeat(100)}` }),
+		]) {
+			expect(sanitizePromptFailure(error)).toEqual({ code: "internal", message: "Prompt submission failed." });
+		}
 		expect(sanitizePromptFailure(Object.assign(new Error("boom"), { code: "ok_code-1.2" }))).toEqual({
 			code: "ok_code-1.2",
-			message: "boom",
+			message: "Prompt submission failed.",
 		});
 	});
 

@@ -3505,14 +3505,7 @@ export async function executeLifecycle(
 							cleanupIntent,
 						),
 					});
-					return reconcileLifecycleCleanup(
-						broker,
-						identity,
-						cleanupIntent,
-						startupFailure?.code
-							? fail(startupFailure.code, startupFailure.message, undefined, startupFailure.details)
-							: undefined,
-					);
+					return reconcileLifecycleCleanup(broker, identity, cleanupIntent);
 				})()
 			: undefined;
 	if (

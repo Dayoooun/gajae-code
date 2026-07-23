@@ -26,6 +26,18 @@
 
 export const PROMPT_CLIENT_REF_MAX_LENGTH = 128;
 
+export interface TurnPromptImageInput {
+	data: string;
+	mimeType?: string;
+}
+
+/** Public input contract for ordered `turn.prompt`. */
+export interface TurnPromptInput {
+	text: string;
+	images?: TurnPromptImageInput[];
+	clientRef?: string;
+}
+
 /** Terminal outcome is preserved exactly; active records never age into terminal. */
 export type PromptReconciliationStatus = "accepted" | "in_flight" | "terminal_ok" | "failed";
 
