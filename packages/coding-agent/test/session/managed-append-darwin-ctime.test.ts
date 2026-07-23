@@ -93,7 +93,7 @@ describe("ManagedSessionDescendantStore.appendSync fail-closed races", () => {
 		const beforeBytes = fs.readFileSync(filePath);
 		const record = Buffer.from(`${JSON.stringify({ type: "message", id: "m-race" })}\n`, "utf8");
 
-		installWriteOpenHook(
+		const openState = installWriteOpenHook(
 			filePath,
 			pathname => {
 				fs.appendFileSync(pathname, "stale-race\n");
@@ -102,9 +102,10 @@ describe("ManagedSessionDescendantStore.appendSync fail-closed races", () => {
 		);
 
 		expect(() => store.appendSync(relativePath, record)).toThrow("identity_mismatch");
+		expect(openState.calls).toBe(1);
 		const after = fs.readFileSync(filePath, "utf8");
+		expect(after).toBe(`${beforeBytes.toString("utf8")}stale-race\n`);
 		expect(after.includes('"id":"m-race"')).toBe(false);
-		expect(after.startsWith(beforeBytes.toString("utf8"))).toBe(true);
 	});
 });
 
