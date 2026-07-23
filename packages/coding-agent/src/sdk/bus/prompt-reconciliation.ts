@@ -100,7 +100,10 @@ export function sanitizePromptFailure(error: unknown): { code: string; message: 
 	const rawCode = typeof candidate?.code === "string" ? candidate.code : "";
 	const code = /^[A-Za-z0-9._-]{1,64}$/.test(rawCode) ? rawCode : "internal";
 	const rawMessage = typeof candidate?.message === "string" ? candidate.message : "";
-	const message = rawMessage.replace(/[\t\r\n]+/g, " ").trim().slice(0, PROMPT_FAILURE_MESSAGE_MAX);
+	const message = rawMessage
+		.replace(/[\t\r\n]+/g, " ")
+		.trim()
+		.slice(0, PROMPT_FAILURE_MESSAGE_MAX);
 	return { code, message: message || "Prompt submission failed." };
 }
 
@@ -210,11 +213,7 @@ export function createPromptReconciliation(options: { now?: () => number } = {})
 		cleanup();
 	};
 
-	const lookup = (selector: {
-		commandId?: string;
-		turnId?: string;
-		clientRef?: string;
-	}): TurnPromptReconciliation => {
+	const lookup = (selector: { commandId?: string; turnId?: string; clientRef?: string }): TurnPromptReconciliation => {
 		cleanup();
 		const key =
 			selector.clientRef !== undefined

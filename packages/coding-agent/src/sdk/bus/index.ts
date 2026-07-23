@@ -31,6 +31,7 @@ import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai";
 import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
 import { logger, postmortem, VERSION } from "@gajae-code/utils";
+import { projectModelProfileCatalog } from "../../config/model-profile-contract";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
@@ -59,13 +60,13 @@ import { SessionSdkHost, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import { projectQ10Models } from "../models.js";
+import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
 import {
 	lifecycleStartupCapabilityForApi,
 	normalizeSdkStartupFailure,
 	type SdkStartupFailure,
 } from "../startup-capability";
-
 import { registerTelegramFileSink } from "./attachment-registry";
 import { ensureDiscordDaemon, ensureSlackDaemon } from "./chat-daemon-control";
 import {
@@ -81,7 +82,6 @@ import {
 import { telegramControlCommandUsage } from "./config-commands";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
-import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
 import { createPromptReconciliation } from "./prompt-reconciliation";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import {
@@ -1856,6 +1856,8 @@ function sdkQuerySurface(
 			const currentThinkingLevel = api.getThinkingLevel();
 			return projectQ10Models({ models, currentModel, currentThinkingLevel });
 		},
+		getModelProfiles: () =>
+			projectModelProfileCatalog(ctx.modelRegistry.getModelProfiles(), ctx.modelRegistry.getError()),
 		getSkillState: () => ctx.getSkillState(),
 		getGates: () => {
 			const workflowGate = ctx.workflowGate;
@@ -1912,7 +1914,6 @@ function containsSecretConfigKey(value: unknown, seen = new Set<object>()): bool
 			containsSecretConfigKey(nested, seen),
 	);
 }
-
 
 function sdkControlSurface(
 	ctx: ExtensionContext,

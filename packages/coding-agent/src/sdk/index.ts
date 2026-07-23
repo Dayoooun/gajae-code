@@ -1,3 +1,14 @@
+export {
+	MODEL_PROFILE_DISCOVERY_QUERY,
+	MODEL_PROFILE_ERROR_DETAIL_MAX_BYTES,
+	type ModelProfileCatalogItem,
+	type ModelProfileErrorCode,
+	type ModelProfileErrorDetails,
+	ModelProfileRegistryError,
+	type ModelProfileRegistryErrorDetails,
+	type UnknownModelProfileDetails,
+	UnknownModelProfileError,
+} from "../config/model-profile-contract";
 export * as bus from "./bus";
 export * from "./client";
 export * as host from "./host";

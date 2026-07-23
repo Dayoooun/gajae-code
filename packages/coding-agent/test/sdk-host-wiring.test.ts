@@ -4115,27 +4115,35 @@ test("turn.prompt_status reconciles an accepted prompt across client reconnect w
 	};
 
 	const first = await connect();
-	const ack = await first.request({
-		type: "control_request",
-		id: "prompt-reconcile",
-		operation: "turn.prompt",
-		input: { text: "reconcile me", clientRef: "recon-ref-1" },
-		idempotencyKey: "recon-ik-1",
-	});
-	// Capture identifiers BEFORE any asymmetric-matcher assertion: bun's
-	// toMatchObject substitutes expect.any matchers into the received object.
-	const { commandId, turnId } = (ack.result ?? {}) as { commandId: string; turnId: string };
-	expect(ack.ok).toBe(true);
-	expect(typeof commandId).toBe("string");
-	expect(typeof turnId).toBe("string");
-	expect((ack.result as Record<string, unknown>).accepted).toBe(true);
+	first.socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "prompt-reconcile",
+			operation: "turn.prompt",
+			input: { text: "reconcile me", clientRef: "recon-ref-1" },
+			idempotencyKey: "recon-ik-1",
+		}),
+	);
+	await waitFor(() => deliveries.length === 1, "prompt accepted before acknowledgement loss");
+
+	// Simulate client-process death without consuming the control response. The
+	// caller retained only its fresh clientRef, not the generated IDs.
+	await closeSocket(first.socket);
 	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 
-	// Client disconnects (e.g. process death) before terminal settlement.
-	await closeSocket(first.socket);
-
-	// Reconnect: the same session runtime authoritatively reconciles by both selectors.
+	// Reconnect: clientRef recovers the canonical generated pair, which then
+	// reconciles identically through the generated-ID selector.
 	const second = await connect();
+	const byRef = await second.request({
+		type: "query_request",
+		id: "status-ref",
+		query: "turn.prompt_status",
+		input: { clientRef: "recon-ref-1" },
+	});
+	expect(byRef).toMatchObject({ ok: true, result: { status: "in_flight", clientRef: "recon-ref-1" } });
+	const { commandId, turnId } = (byRef.result ?? {}) as { commandId: string; turnId: string };
+	expect(typeof commandId).toBe("string");
+	expect(typeof turnId).toBe("string");
 	const byPair = await second.request({
 		type: "query_request",
 		id: "status-pair",
@@ -4146,13 +4154,6 @@ test("turn.prompt_status reconciles an accepted prompt across client reconnect w
 		ok: true,
 		result: { status: "in_flight", commandId, turnId, clientRef: "recon-ref-1" },
 	});
-	const byRef = await second.request({
-		type: "query_request",
-		id: "status-ref",
-		query: "turn.prompt_status",
-		input: { clientRef: "recon-ref-1" },
-	});
-	expect(byRef).toMatchObject({ ok: true, result: { status: "in_flight", commandId, turnId } });
 	const wrongPair = await second.request({
 		type: "query_request",
 		id: "status-wrong-pair",
@@ -4214,10 +4215,7 @@ test("ordered turn.prompt ignores envelope idempotencyKey: no replay and no idem
 				idempotencyKey: "same-envelope-key",
 			}),
 		);
-		await waitFor(
-			() => frames.some(frame => frame.type === "control_response" && frame.id === id),
-			`${id} response`,
-		);
+		await waitFor(() => frames.some(frame => frame.type === "control_response" && frame.id === id), `${id} response`);
 		return frames.find(frame => frame.type === "control_response" && frame.id === id)!;
 	};
 
@@ -4287,9 +4285,9 @@ test("turn.prompt_status validates selectors and rejects invalid clientRef input
 			input: { commandId: "c", turnId: "t", clientRef: "r" },
 		}),
 	).toMatchObject({ ok: false, error: { code: "invalid_request" } });
-	expect(
-		await request({ type: "query_request", id: "q-none", query: "turn.prompt_status", input: {} }),
-	).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+	expect(await request({ type: "query_request", id: "q-none", query: "turn.prompt_status", input: {} })).toMatchObject(
+		{ ok: false, error: { code: "invalid_request" } },
+	);
 	expect(
 		await request({
 			type: "query_request",
@@ -4300,7 +4298,12 @@ test("turn.prompt_status validates selectors and rejects invalid clientRef input
 		}),
 	).toMatchObject({ ok: false, error: { code: "invalid_request" } });
 	expect(
-		await request({ type: "query_request", id: "q-unknown", query: "turn.prompt_status", input: { clientRef: "absent" } }),
+		await request({
+			type: "query_request",
+			id: "q-unknown",
+			query: "turn.prompt_status",
+			input: { clientRef: "absent" },
+		}),
 	).toMatchObject({ ok: true, result: { status: "unknown" } });
 
 	for (const [id, clientRef] of [
@@ -4350,11 +4353,10 @@ test("clientRef admission reservation is released when a submission is rejected 
 		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 	});
 	const prompt = async (id: string, text: string, clientRef: string) => {
-		socket.send(JSON.stringify({ type: "control_request", id, operation: "turn.prompt", input: { text, clientRef } }));
-		await waitFor(
-			() => frames.some(frame => frame.type === "control_response" && frame.id === id),
-			`${id} response`,
+		socket.send(
+			JSON.stringify({ type: "control_request", id, operation: "turn.prompt", input: { text, clientRef } }),
 		);
+		await waitFor(() => frames.some(frame => frame.type === "control_response" && frame.id === id), `${id} response`);
 		return frames.find(frame => frame.type === "control_response" && frame.id === id)!;
 	};
 
@@ -4400,11 +4402,10 @@ test("busy rejection releases the clientRef admission so a same-ref retry succee
 		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 	});
 	const prompt = async (id: string, text: string, clientRef: string) => {
-		socket.send(JSON.stringify({ type: "control_request", id, operation: "turn.prompt", input: { text, clientRef } }));
-		await waitFor(
-			() => frames.some(frame => frame.type === "control_response" && frame.id === id),
-			`${id} response`,
+		socket.send(
+			JSON.stringify({ type: "control_request", id, operation: "turn.prompt", input: { text, clientRef } }),
 		);
+		await waitFor(() => frames.some(frame => frame.type === "control_response" && frame.id === id), `${id} response`);
 		return frames.find(frame => frame.type === "control_response" && frame.id === id)!;
 	};
 
@@ -4471,10 +4472,7 @@ test("accepted-then-failed submission retains its reconciliation record and bloc
 		input: { text: "accepted then failed", clientRef: "accepted-failure-ref" },
 	});
 	expect(ack.ok).toBe(true);
-	await waitFor(
-		() => frames.some(frame => frame.type === "agent_failed"),
-		"correlated agent_failed frame",
-	);
+	await waitFor(() => frames.some(frame => frame.type === "agent_failed"), "correlated agent_failed frame");
 
 	// The reconciliation record is retained with the failed outcome, not released.
 	const status = await request({

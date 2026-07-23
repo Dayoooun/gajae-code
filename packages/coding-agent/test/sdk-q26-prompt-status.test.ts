@@ -91,6 +91,15 @@ describe("prompt reconciliation record", () => {
 		expect(rec.lookup({ commandId: "command-other", turnId: "turn-1" })).toEqual({ status: "unknown" });
 	});
 
+	it("reports unknown after session-runtime restart", () => {
+		const beforeRestart = createPromptReconciliation();
+		beforeRestart.noteAccepted(correlation(), "restart-ref");
+		expect(beforeRestart.lookup({ clientRef: "restart-ref" })).toMatchObject({ status: "accepted" });
+		const afterRestart = createPromptReconciliation();
+		expect(afterRestart.lookup({ clientRef: "restart-ref" })).toEqual({ status: "unknown" });
+		expect(afterRestart.lookup(correlation())).toEqual({ status: "unknown" });
+	});
+
 	it("never ages an active record into terminal", () => {
 		const clock = clocked();
 		const rec = createPromptReconciliation({ now: clock.now });
@@ -108,7 +117,7 @@ describe("prompt reconciliation record", () => {
 		rec.noteTransition(correlation(), { type: "agent_start" });
 		rec.noteTransition(correlation(), { type: "agent_end" });
 		expect(rec.lookup({ clientRef: "ref-1" })).toMatchObject({ status: "terminal_ok" });
-		clock.advance(PROMPT_RECONCILIATION_TERMINAL_TTL_MS + 1);
+		clock.advance(PROMPT_RECONCILIATION_TERMINAL_TTL_MS);
 		// Admission itself enforces cleanup; no preceding lookup is required.
 		expect(() => rec.admit("ref-1")).not.toThrow();
 		expect(rec.lookup({ clientRef: "ref-1" })).toEqual({ status: "unknown" });
@@ -259,7 +268,9 @@ function surface(getPromptStatus?: (selector: { commandId?: string; turnId?: str
 	};
 }
 
-function handlers(getPromptStatus?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown) {
+function handlers(
+	getPromptStatus?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown,
+) {
 	const store = new RevisionStore("s1");
 	const cursors = new CursorRegistry("token", store);
 	return new QueryHandlers(surface(getPromptStatus) as never, "s1", store, cursors);

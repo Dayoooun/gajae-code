@@ -1,3 +1,4 @@
+import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
 import {
 	assertCursorSelector,
 	type CursorEnvelope,
@@ -8,7 +9,6 @@ import {
 	cursorSelector,
 } from "./cursor.js";
 import type { RevisionStore } from "./revision-store.js";
-import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
 
 export const TARGET_PAGE_BYTES = 256 * 1024;
 export const RESPONSE_CEILING_BYTES = 1024 * 1024;
@@ -46,6 +46,8 @@ export interface SessionSurface {
 	getJobs(): unknown | Promise<unknown>;
 	/** Q26 keyed lookup of a submitted prompt's authoritative reconciliation status. */
 	getPromptStatus?(selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown | Promise<unknown>;
+	/** Q27 effective model-profile catalog from the live session registry. */
+	getModelProfiles?(): unknown[] | Promise<unknown[]>;
 	/** Query rows backed by the session's installed binding map. */
 	installedQueries?: ReadonlySet<string>;
 }
@@ -69,7 +71,7 @@ export interface QueryResponse {
 	ok: boolean;
 	page?: QueryPage;
 	result?: unknown;
-	error?: { code: string; message: string; restartQuery?: boolean };
+	error?: { code: string; message: string; restartQuery?: boolean; details?: unknown };
 }
 
 const sources: Record<string, { resource: string; method: keyof SessionSurface; mvcc: boolean }> = {
@@ -95,6 +97,7 @@ const sources: Record<string, { resource: string; method: keyof SessionSurface; 
 	Q21: { resource: "queue", method: "getQueueMessages", mvcc: true },
 	Q22: { resource: "extensions", method: "getExtensions", mvcc: true },
 	Q25: { resource: "jobs", method: "getJobs", mvcc: false },
+	Q27: { resource: "modelProfiles", method: "getModelProfiles", mvcc: true },
 };
 const names = [
 	"transcript.list",
@@ -123,6 +126,7 @@ const names = [
 	"artifact.read",
 	"runtime.jobs.list",
 	"turn.prompt_status",
+	"models.profiles.list",
 ];
 
 export class QueryHandlers {
@@ -153,12 +157,16 @@ export class QueryHandlers {
 			if (query === "Q23") return await this.#resourceBody(request);
 			if (query === "Q26") return await this.#promptStatus(request);
 			if (query === "Q24") return await this.#artifact(request);
+			if (query === "Q27" && request.input && Object.keys(request.input).length > 0)
+				return this.#error(request, "invalid_request", false, "models.profiles.list does not accept input fields.");
+			if (query === "Q27" && typeof this.surface.getModelProfiles !== "function")
+				return this.#error(request, "unavailable", false, "models.profiles.list is unavailable for this session.");
 			const source = sources[query];
 			if (!source) return this.#error(request, "invalid_request");
 			return await this.#pageSource(request, query, source);
 		} catch (error) {
 			if (error instanceof CursorError) return this.#error(request, error.code, error.restartQuery, error.message);
-			if (isTypedError(error)) return this.#error(request, error.code, false, error.message);
+			if (isTypedError(error)) return this.#error(request, error.code, false, error.message, error.details);
 			return this.#error(request, "internal", false, error instanceof Error ? error.message : String(error));
 		}
 	}
@@ -515,7 +523,12 @@ export class QueryHandlers {
 		const input = request.input ?? {};
 		for (const key of Object.keys(input))
 			if (key !== "commandId" && key !== "turnId" && key !== "clientRef")
-				return this.#error(request, "invalid_request", false, `turn.prompt_status does not accept selector field "${key}".`);
+				return this.#error(
+					request,
+					"invalid_request",
+					false,
+					`turn.prompt_status does not accept selector field "${key}".`,
+				);
 		const commandId = typeof input.commandId === "string" && input.commandId ? input.commandId : undefined;
 		const turnId = typeof input.turnId === "string" && input.turnId ? input.turnId : undefined;
 		const rawClientRef = typeof input.clientRef === "string" ? input.clientRef : undefined;
@@ -552,8 +565,12 @@ export class QueryHandlers {
 		return { id: request.id, ok: true, result };
 	}
 
-	#error(request: QueryRequest, code: string, restartQuery = false, message = code): QueryResponse {
-		return { id: request.id, ok: false, error: { code, message, ...(restartQuery ? { restartQuery: true } : {}) } };
+	#error(request: QueryRequest, code: string, restartQuery = false, message = code, details?: unknown): QueryResponse {
+		return {
+			id: request.id,
+			ok: false,
+			error: { code, message, ...(restartQuery ? { restartQuery: true } : {}), ...(details ? { details } : {}) },
+		};
 	}
 }
 function selectorFor(queryId: string, input: Record<string, unknown> | undefined): CursorSelector {
@@ -569,7 +586,7 @@ function idOf(value: unknown): string | undefined {
 function lastId(value: unknown): string | undefined {
 	return Array.isArray(value) ? idOf(value.at(-1)) : undefined;
 }
-function isTypedError(error: unknown): error is { code: string; message: string } {
+function isTypedError(error: unknown): error is { code: string; message: string; details?: unknown } {
 	return Boolean(
 		error &&
 			typeof error === "object" &&
