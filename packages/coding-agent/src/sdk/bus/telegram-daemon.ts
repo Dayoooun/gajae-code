@@ -201,53 +201,6 @@ const nodeFs: TelegramDaemonFs = {
 		exactUnlinkNotificationFile(file, identity, `.gjc-delete-daemon-transition-${crypto.randomUUID()}.json`),
 };
 
-const NOTIFICATION_ARTIFACT_PATTERNS = [
-	/^\.gjc-delete-daemon-transition-.*\.json$/,
-	/^\.gjc-exact-unlink-placeholder-/,
-	/^\.gjc-delete-notification-endpoint-.*\.json$/,
-];
-const NOTIFICATION_ARTIFACT_REAP_GRACE_MS = 10 * 60 * 1_000;
-const NOTIFICATION_ARTIFACT_REAP_LIMIT = 500;
-const NOTIFICATION_ARTIFACT_REAP_INTERVAL_MS = 5 * 60 * 1_000;
-
-/** Remove stale daemon cleanup artifacts without allowing cleanup failures to affect delivery. */
-export async function reapNotificationArtifacts(input: {
-	dir: string;
-	fs?: TelegramDaemonFs;
-	now?: () => number;
-	graceMs?: number;
-	limit?: number;
-}): Promise<number> {
-	const fsImpl = input.fs ?? nodeFs;
-	if (!fsImpl.stat) return 0;
-	let names: string[];
-	try {
-		names = await fsImpl.readdir(input.dir);
-	} catch {
-		return 0;
-	}
-	const requestedLimit = input.limit ?? NOTIFICATION_ARTIFACT_REAP_LIMIT;
-	const limit = Number.isFinite(requestedLimit)
-		? Math.max(0, Math.floor(requestedLimit))
-		: NOTIFICATION_ARTIFACT_REAP_LIMIT;
-	if (limit === 0) return 0;
-	const cutoff = (input.now ?? Date.now)() - (input.graceMs ?? NOTIFICATION_ARTIFACT_REAP_GRACE_MS);
-	let removed = 0;
-	for (const name of names) {
-		if (removed >= limit) break;
-		if (!NOTIFICATION_ARTIFACT_PATTERNS.some(pattern => pattern.test(name))) continue;
-		const file = path.join(input.dir, name);
-		try {
-			const stat = await fsImpl.stat(file);
-			if (stat.mtimeMs >= cutoff) continue;
-			await fsImpl.unlink(file);
-			removed++;
-		} catch {
-			// Best-effort per artifact: races and permission failures must not stop the pass.
-		}
-	}
-	return removed;
-}
 
 /**
  * Durably persist a daemon-local Telegram delivery toggle. A real
@@ -3709,7 +3662,6 @@ export class TelegramNotificationDaemon {
 	private readonly pollConflictBackoff = new OperatorBackoffPolicy({ initialMs: 500, maxMs: 5_000 });
 	private readonly loopBackoff = new OperatorBackoffPolicy({ initialMs: 250, maxMs: 4_000 });
 	private running = false;
-	private lastArtifactReapAt = Number.NEGATIVE_INFINITY;
 	/** Once set, a concurrent startup await can never restore a running daemon. */
 	private stopRequested = false;
 
@@ -7049,29 +7001,10 @@ export class TelegramNotificationDaemon {
 		this.runtime.stopInterval("telegram-owner-heartbeat");
 	}
 
-	private async reapArtifactsIfDue(): Promise<void> {
-		const now = this.runtime.now();
-		if (now - this.lastArtifactReapAt < NOTIFICATION_ARTIFACT_REAP_INTERVAL_MS) return;
-		this.lastArtifactReapAt = now;
-		const paths = daemonPaths(this.opts.settings.getAgentDir());
-		const rootState = await readJson<{ roots?: string[] }>(this.fsImpl, paths.roots).catch(() => undefined);
-		const dirs = [paths.dir, ...new Set((rootState?.roots ?? []).map(root => path.join(root, "sdk")))];
-		let remaining = NOTIFICATION_ARTIFACT_REAP_LIMIT;
-		for (const dir of dirs) {
-			if (remaining === 0) break;
-			remaining -= await reapNotificationArtifacts({
-				dir,
-				fs: this.fsImpl,
-				now: this.opts.now,
-				limit: remaining,
-			});
-		}
-	}
 
 	/** Run a root scan, guarding against overlapping scans from the timer + loop. */
 	private async runScan(): Promise<void> {
 		await this.runtime.runExclusive("telegram-scan", async () => {
-			await this.reapArtifactsIfDue();
 			await this.scanRoots();
 		});
 	}
@@ -7272,21 +7205,6 @@ export class TelegramNotificationDaemon {
 			const latestIdentity = identityIndex < 0 ? undefined : replayed[identityIndex];
 			const replayIdentitySessionId = latestIdentity?.sessionId as string | undefined;
 			const endpointBinding = this.#endpointBinding(session);
-			// An open transport owns an eager topic-create claim. An identity-less replay
-			// that races that claim must await its own public creation before classifying
-			// endpoint authority; otherwise the registry correctly sees an in-flight
-			// claim as ambiguous and rejects a valid bootstrap.
-			if (!this.topics.get(session.sessionId) && this.#ownsLiveOpenEndpoint(session, endpointBinding)) {
-				try {
-					await this.ensureTopic(session.sessionId, this.topicNameFor(session.sessionId, {}), session);
-				} catch (error) {
-					logger.warn(
-						`notifications: Telegram replay topic creation failed: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
-					);
-					this.dropSession(session, "replay_topic_creation_failed");
-					return;
-				}
-			}
 			// Identity-less replay may resume only the exact transport owner. A
 			// rekeyed A→B transport remains denied unless replay proves B.
 			const endpointAuthority = this.#endpointAuthority(endpointBinding, session);
@@ -8643,7 +8561,6 @@ export class TelegramNotificationDaemon {
 			await this.registerBotCommands();
 			await this.loadAliases();
 			await this.loadTopics();
-			await this.reapArtifactsIfDue();
 			await this.loadSeenUpdateIds();
 			await this.replyStore.load();
 			await this.runScan();
