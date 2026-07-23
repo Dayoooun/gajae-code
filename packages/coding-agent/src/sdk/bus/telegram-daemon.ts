@@ -201,6 +201,54 @@ const nodeFs: TelegramDaemonFs = {
 		exactUnlinkNotificationFile(file, identity, `.gjc-delete-daemon-transition-${crypto.randomUUID()}.json`),
 };
 
+const NOTIFICATION_ARTIFACT_PATTERNS = [
+	/^\.gjc-delete-daemon-transition-.*\.json$/,
+	/^\.gjc-exact-unlink-placeholder-/,
+	/^\.gjc-delete-notification-endpoint-.*\.json$/,
+];
+const NOTIFICATION_ARTIFACT_REAP_GRACE_MS = 10 * 60 * 1_000;
+const NOTIFICATION_ARTIFACT_REAP_LIMIT = 500;
+const NOTIFICATION_ARTIFACT_REAP_INTERVAL_MS = 5 * 60 * 1_000;
+
+/** Remove stale daemon cleanup artifacts without allowing cleanup failures to affect delivery. */
+export async function reapNotificationArtifacts(input: {
+	dir: string;
+	fs?: TelegramDaemonFs;
+	now?: () => number;
+	graceMs?: number;
+	limit?: number;
+}): Promise<number> {
+	const fsImpl = input.fs ?? nodeFs;
+	if (!fsImpl.stat) return 0;
+	let names: string[];
+	try {
+		names = await fsImpl.readdir(input.dir);
+	} catch {
+		return 0;
+	}
+	const requestedLimit = input.limit ?? NOTIFICATION_ARTIFACT_REAP_LIMIT;
+	const limit = Number.isFinite(requestedLimit)
+		? Math.max(0, Math.floor(requestedLimit))
+		: NOTIFICATION_ARTIFACT_REAP_LIMIT;
+	if (limit === 0) return 0;
+	const cutoff = (input.now ?? Date.now)() - (input.graceMs ?? NOTIFICATION_ARTIFACT_REAP_GRACE_MS);
+	let removed = 0;
+	for (const name of names) {
+		if (removed >= limit) break;
+		if (!NOTIFICATION_ARTIFACT_PATTERNS.some(pattern => pattern.test(name))) continue;
+		const file = path.join(input.dir, name);
+		try {
+			const stat = await fsImpl.stat(file);
+			if (stat.mtimeMs >= cutoff) continue;
+			await fsImpl.unlink(file);
+			removed++;
+		} catch {
+			// Best-effort per artifact: races and permission failures must not stop the pass.
+		}
+	}
+	return removed;
+}
+
 /**
  * Durably persist a daemon-local Telegram delivery toggle. A real
  * {@link Settings} exposes `flushOrThrow()`, which rejects on a failed config.yml
@@ -231,6 +279,37 @@ const BOT_API_RETRY_ATTEMPTS = 3;
 // Backoff after a failed getUpdates long-poll so a persistent outage does not
 // busy-loop the daemon.
 const POLL_BACKOFF_MS = 1_000;
+const AUTOMATIC_RELOAD_COOLDOWN_MS = 10 * 60 * 1_000;
+// Default freshness-poll window a cooldown contender waits for a sibling's
+// replacement daemon to publish a fresh ready owner before reloading itself.
+const RELOAD_FRESHNESS_WAIT_MS = 15_000;
+// Cooperative-then-forced termination + replacement-readiness bounds the reload
+// controller can spend while holding the reservation lock (mirrors the control
+// plane's graceful/kill defaults plus a readiness wait).
+const RELOAD_CONTROLLER_GRACEFUL_MS = 8_000;
+const RELOAD_CONTROLLER_KILL_MS = 3_000;
+const RELOAD_RESERVATION_HEADROOM_MS = 10_000;
+
+/**
+ * File-lock options whose acquisition budget covers the full reload-reservation
+ * critical section: the in-lock freshness poll plus the controller's
+ * graceful+kill+readiness sequence, with headroom. A contender must be able to
+ * wait out a legitimate slow reload and then attach, never fail startup.
+ */
+export function reloadReservationLockOptions(input: {
+	freshnessWaitMs: number;
+	readinessTimeoutMs: number;
+	retryDelayMs?: number;
+}): { staleMs: number; retries: number; retryDelayMs: number } {
+	const retryDelayMs = Math.max(input.retryDelayMs ?? 100, 1);
+	const criticalMs =
+		Math.max(input.freshnessWaitMs, 0) +
+		RELOAD_CONTROLLER_GRACEFUL_MS +
+		RELOAD_CONTROLLER_KILL_MS +
+		Math.max(input.readinessTimeoutMs, 0) +
+		RELOAD_RESERVATION_HEADROOM_MS;
+	return { staleMs: 10_000, retries: Math.max(1, Math.ceil(criticalMs / retryDelayMs)), retryDelayMs };
+}
 // Telegram clears a chat action after ~5s; refresh slightly sooner to keep the
 // typing indicator alive while the agent is busy.
 const TYPING_REFRESH_INTERVAL_MS = 4_000;
@@ -2889,9 +2968,78 @@ export async function ensureTelegramDaemonRunningDetailed(
 	if (spawned.result === "attached" && spawned.reloadRequired) {
 		const previous = await readNotificationRootRegistration({ ...input, fs: deps.fs });
 		await registerNotificationRoot({ ...input, fs: deps.fs });
-		const controller = new TelegramDaemonController(input.settings, telegramControllerDeps(deps));
-		const upgrade = await controller.reloadForGenerationUpgrade({}, spawned.legacyReloadRequired === true);
-		if (upgrade.outcome !== "ready") {
+		const fsImpl = deps.fs ?? nodeFs;
+		const now = deps.now ?? Date.now;
+		const pidAlive = deps.pidAlive ?? defaultPidAlive;
+		const pidIncarnation = deps.pidIncarnation ?? defaultPidIncarnation;
+		const reloadAttemptPath = path.join(
+			daemonPaths(input.settings.getAgentDir()).dir,
+			"telegram-daemon.reload-attempt.json",
+		);
+		await ensureDir(fsImpl, daemonPaths(input.settings.getAgentDir()).dir);
+		const reloadWaitStepMs = Math.max(deps.waitStepMs ?? 100, 1);
+		const reloadFreshnessWaitMs = Math.max(deps.readinessTimeoutMs ?? RELOAD_FRESHNESS_WAIT_MS, reloadWaitStepMs);
+		const reloadReadinessTimeoutMs = deps.readinessTimeoutMs ?? RELOAD_FRESHNESS_WAIT_MS;
+		const reloadResult = await withFileLock(
+			reloadAttemptPath,
+			async () => {
+				const currentState = await readDaemonState(input.settings, fsImpl);
+				const previousAttempt = await readJson<{
+					lastReloadAt?: number;
+					ownerId?: string;
+					targetGeneration?: number;
+				}>(fsImpl, reloadAttemptPath).catch(() => undefined);
+				const reloadNow = now();
+				const cooldownApplies =
+					previousAttempt?.targetGeneration === DAEMON_GENERATION &&
+					typeof previousAttempt.lastReloadAt === "number" &&
+					Number.isFinite(previousAttempt.lastReloadAt) &&
+					reloadNow - previousAttempt.lastReloadAt < AUTOMATIC_RELOAD_COOLDOWN_MS;
+				if (cooldownApplies) {
+					// A sibling ensure may have just finished its reload. Its replacement
+					// daemon heartbeats only after startup, so wait briefly for the fresh
+					// ready owner instead of issuing a duplicate reload in the gap.
+					const sleep = deps.sleep ?? Bun.sleep;
+					const waitStepMs = reloadWaitStepMs;
+					const waitBudgetMs = reloadFreshnessWaitMs;
+					const deadline = reloadNow + waitBudgetMs;
+					// Iteration-capped so a frozen `now` cannot spin forever.
+					const maxWaits = Math.ceil(waitBudgetMs / waitStepMs);
+					for (let waits = 0; waits <= maxWaits; waits++) {
+						const state = await readDaemonState(input.settings, fsImpl);
+						const t = now();
+						if (
+							isFreshLiveOwner({
+								state,
+								now: t,
+								tokenFingerprint: fp,
+								chatId: cfg.chatId,
+								pidAlive,
+								pidIncarnation,
+							})
+						)
+							return "attached" as const;
+						if (t >= deadline) break;
+						await sleep(waitStepMs);
+					}
+				}
+				await writeJsonAtomic(fsImpl, reloadAttemptPath, {
+					lastReloadAt: reloadNow,
+					ownerId: currentState?.ownerId ?? "",
+					targetGeneration: DAEMON_GENERATION,
+				});
+				const controller = new TelegramDaemonController(input.settings, telegramControllerDeps(deps));
+				const upgrade = await controller.reloadForGenerationUpgrade({}, spawned.legacyReloadRequired === true);
+				return upgrade.outcome === "ready" ? ("reloaded" as const) : upgrade;
+			},
+			reloadReservationLockOptions({
+				freshnessWaitMs: reloadFreshnessWaitMs,
+				readinessTimeoutMs: reloadReadinessTimeoutMs,
+				retryDelayMs: reloadWaitStepMs,
+			}),
+		);
+		if (reloadResult === "attached") return "attached";
+		if (reloadResult !== "reloaded") {
 			await restoreNotificationRootRegistration({
 				settings: input.settings,
 				sessionId: input.sessionId,
@@ -2899,7 +3047,7 @@ export async function ensureTelegramDaemonRunningDetailed(
 				previous,
 				fs: deps.fs,
 			});
-			throw new Error(`Unable to replace stale Telegram daemon: ${upgrade.operation.message}`);
+			throw new Error(`Unable to replace stale Telegram daemon: ${reloadResult.operation.message}`);
 		}
 		return "reloaded";
 	}
@@ -3561,6 +3709,7 @@ export class TelegramNotificationDaemon {
 	private readonly pollConflictBackoff = new OperatorBackoffPolicy({ initialMs: 500, maxMs: 5_000 });
 	private readonly loopBackoff = new OperatorBackoffPolicy({ initialMs: 250, maxMs: 4_000 });
 	private running = false;
+	private lastArtifactReapAt = Number.NEGATIVE_INFINITY;
 	/** Once set, a concurrent startup await can never restore a running daemon. */
 	private stopRequested = false;
 
@@ -4611,18 +4760,15 @@ export class TelegramNotificationDaemon {
 					);
 				} catch {}
 			}
-			// Preserve the transport-session contract: ordinary endpoints own a topic
-			// as soon as they connect. A later authenticated logical rekey is the only
-			// path that may recover a different logical session's durable topic.
 			void (async () => {
 				if (this.#logicalSessionId(session) !== sessionId) return;
-				const topicId = await this.ensureTopic(sessionId, this.topicNameFor(sessionId, {}), session);
+				const topic = this.topics.get(sessionId);
+				if (!topic || topic.authorityState === "delete_pending" || topic.bindingMalformed) return;
 				const topicLease = this.topicAuthorityLeaseFromRegistry(sessionId);
-				if (topicId && topicLease?.topicId === topicId)
-					await this.flushPendingThreadedFrames(sessionId, topicLease);
+				if (topicLease?.topicId === topic.topicId) await this.flushPendingThreadedFrames(sessionId, topicLease);
 			})().catch(err =>
 				logger.warn(
-					`notifications: Telegram initial topic creation failed: ${sanitizeDiagnostic(String(err), this.opts.botToken)}`,
+					`notifications: Telegram topic reattach flush failed: ${sanitizeDiagnostic(String(err), this.opts.botToken)}`,
 				),
 			);
 		});
@@ -5503,19 +5649,16 @@ export class TelegramNotificationDaemon {
 			this.legacyTopicOwners.set(previousSessionId, session);
 			this.preservedInitiatorTopics.add(previousSessionId);
 		}
-		if (candidateSessionId === session.sessionId && !this.topics.get(candidateSessionId))
+		if (candidateSessionId === session.sessionId)
 			void (async () => {
-				const topicId = await this.ensureTopic(
-					candidateSessionId,
-					this.topicNameFor(candidateSessionId, {}),
-					session,
-				);
+				const topic = this.topics.get(candidateSessionId);
+				if (!topic || topic.authorityState === "delete_pending" || topic.bindingMalformed) return;
 				const topicLease = this.topicAuthorityLeaseFromRegistry(candidateSessionId);
-				if (topicId && topicLease?.topicId === topicId)
+				if (topicLease?.topicId === topic.topicId)
 					await this.flushPendingThreadedFrames(candidateSessionId, topicLease);
 			})().catch(err =>
 				logger.warn(
-					`notifications: Telegram recovered topic creation failed: ${sanitizeDiagnostic(String(err), this.opts.botToken)}`,
+					`notifications: Telegram recovered topic reattach flush failed: ${sanitizeDiagnostic(String(err), this.opts.botToken)}`,
 				),
 			);
 		return true;
@@ -6906,9 +7049,29 @@ export class TelegramNotificationDaemon {
 		this.runtime.stopInterval("telegram-owner-heartbeat");
 	}
 
+	private async reapArtifactsIfDue(): Promise<void> {
+		const now = this.runtime.now();
+		if (now - this.lastArtifactReapAt < NOTIFICATION_ARTIFACT_REAP_INTERVAL_MS) return;
+		this.lastArtifactReapAt = now;
+		const paths = daemonPaths(this.opts.settings.getAgentDir());
+		const rootState = await readJson<{ roots?: string[] }>(this.fsImpl, paths.roots).catch(() => undefined);
+		const dirs = [paths.dir, ...new Set((rootState?.roots ?? []).map(root => path.join(root, "sdk")))];
+		let remaining = NOTIFICATION_ARTIFACT_REAP_LIMIT;
+		for (const dir of dirs) {
+			if (remaining === 0) break;
+			remaining -= await reapNotificationArtifacts({
+				dir,
+				fs: this.fsImpl,
+				now: this.opts.now,
+				limit: remaining,
+			});
+		}
+	}
+
 	/** Run a root scan, guarding against overlapping scans from the timer + loop. */
 	private async runScan(): Promise<void> {
 		await this.runtime.runExclusive("telegram-scan", async () => {
+			await this.reapArtifactsIfDue();
 			await this.scanRoots();
 		});
 	}
@@ -8480,6 +8643,7 @@ export class TelegramNotificationDaemon {
 			await this.registerBotCommands();
 			await this.loadAliases();
 			await this.loadTopics();
+			await this.reapArtifactsIfDue();
 			await this.loadSeenUpdateIds();
 			await this.replyStore.load();
 			await this.runScan();
