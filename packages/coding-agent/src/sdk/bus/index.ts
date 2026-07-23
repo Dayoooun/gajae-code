@@ -82,7 +82,7 @@ import {
 import { telegramControlCommandUsage } from "./config-commands";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
-import { createPromptReconciliation } from "./prompt-reconciliation";
+import { createPromptReconciliation, sanitizePromptFailure } from "./prompt-reconciliation";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import {
 	ASK_SELECTED_ACK_CAPABILITY,
@@ -925,6 +925,8 @@ interface SessionRuntime {
 		correlation: { commandId: string; turnId: string } | undefined,
 		frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
 	) => void;
+	/** Settles and emits one sanitized correlated prompt failure. */
+	emitPromptFailure: (correlation: { commandId: string; turnId: string }, error: unknown) => void;
 	/** Records correlated lifecycle frames for replay and delivers them only to the accepted requester after acknowledgement. */
 	emitPromptLifecycle: (
 		correlation: { commandId: string; turnId: string } | undefined,
@@ -3201,6 +3203,7 @@ export function createNotificationsExtension(
 			failed: boolean;
 			error: unknown;
 			terminal: boolean;
+			retainCorrelation: boolean;
 			createdAt: number;
 			bufferedFrames: Array<PromptLifecycleFrame | Record<string, unknown>>;
 		};
@@ -3233,7 +3236,7 @@ export function createNotificationsExtension(
 		};
 		const expirePromptDelivery = (key: string, submission: PromptSubmission) => {
 			promptSubmissions.delete(key);
-			if (!submission.terminal) return;
+			if (!submission.terminal && submission.retainCorrelation) return;
 			const [commandId, turnId] = key.split(":", 2);
 			if (!commandId || !turnId) return;
 			removePendingPromptCorrelation({ commandId, turnId });
@@ -3345,6 +3348,7 @@ export function createNotificationsExtension(
 				failed: false,
 				error: undefined,
 				terminal: false,
+				retainCorrelation: trackReconciliation,
 				createdAt: Date.now(),
 				bufferedFrames: [],
 			});
@@ -3360,18 +3364,15 @@ export function createNotificationsExtension(
 			return true;
 		};
 		const emitPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
-			reconciliation.noteTransition(correlation, { type: "agent_failed", error });
+			const sanitized = sanitizePromptFailure(error);
+			reconciliation.noteTransition(correlation, { type: "agent_failed", error: sanitized });
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || !runtime || !recordPromptTerminal(correlation)) return;
-			const candidate = error as { code?: unknown; message?: unknown };
 			emitPromptLifecycle(correlation, {
 				type: "agent_failed",
 				sessionId: runtime.id,
 				...correlation,
-				error: {
-					code: typeof candidate.code === "string" ? candidate.code : "internal",
-					message: typeof candidate.message === "string" ? candidate.message : "Prompt submission failed.",
-				},
+				error: sanitized,
 			});
 		};
 		const recordPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
@@ -3633,6 +3634,7 @@ export function createNotificationsExtension(
 			activePromptCorrelation: undefined,
 			recordPromptTerminal,
 			notePromptReconciliation: reconciliation.noteTransition,
+			emitPromptFailure,
 			emitPromptLifecycle,
 			emitPromptEvent,
 			pendingInbound: new Set<number>(),
@@ -4768,9 +4770,35 @@ export function createNotificationsExtension(
 		rt.busy = false;
 		const correlation = rt.activePromptCorrelation;
 		if (correlation) {
-			rt.notePromptReconciliation(correlation, { type: "agent_end" });
-			if (rt.recordPromptTerminal(correlation))
-				rt.emitPromptLifecycle(correlation, { type: "agent_end", sessionId: id, ...correlation });
+			const terminalAssistant = (Array.isArray(event.messages) ? [...event.messages].reverse() : []).find(
+				message =>
+					message &&
+					typeof message === "object" &&
+					(message as { role?: unknown }).role === "assistant" &&
+					((message as { stopReason?: unknown }).stopReason === "error" ||
+						(message as { stopReason?: unknown }).stopReason === "aborted"),
+			) as { stopReason?: "error" | "aborted"; errorMessage?: unknown } | undefined;
+			const failureCode =
+				event.stopReason === "cancelled"
+					? "cancelled"
+					: terminalAssistant?.stopReason === "error"
+						? "agent_error"
+						: terminalAssistant?.stopReason === "aborted"
+							? "aborted"
+							: undefined;
+			if (failureCode)
+				rt.emitPromptFailure(correlation, {
+					code: failureCode,
+					message:
+						typeof terminalAssistant?.errorMessage === "string"
+							? terminalAssistant.errorMessage
+							: "Prompt submission failed.",
+				});
+			else {
+				rt.notePromptReconciliation(correlation, { type: "agent_end" });
+				if (rt.recordPromptTerminal(correlation))
+					rt.emitPromptLifecycle(correlation, { type: "agent_end", sessionId: id, ...correlation });
+			}
 		} else {
 			rt.emitPromptLifecycle(undefined, { type: "agent_end", sessionId: id });
 		}

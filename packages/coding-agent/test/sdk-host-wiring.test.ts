@@ -1540,7 +1540,7 @@ test("SDK host buffers synchronous pre-ack accepted failure until after acknowle
 			type: "agent_failed",
 			sessionId,
 			...correlation,
-			error: { code: "unavailable", message: "synchronous accepted failure" },
+			error: { code: "unavailable", message: "Prompt submission failed." },
 		}),
 	]);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
@@ -1788,7 +1788,7 @@ test("SDK host delivers accepted prompt failures after their acknowledgement", a
 		type: "agent_failed",
 		commandId: acknowledgement.result?.commandId,
 		turnId: acknowledgement.result?.turnId,
-		error: { code: "unavailable", message: "prompt failed after preflight" },
+		error: { code: "unavailable", message: "Prompt submission failed." },
 	});
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context(cwd, sessionId));
 });
@@ -4473,6 +4473,10 @@ test("accepted-then-failed submission retains its reconciliation record and bloc
 	});
 	expect(ack.ok).toBe(true);
 	await waitFor(() => frames.some(frame => frame.type === "agent_failed"), "correlated agent_failed frame");
+	const failedFrame = frames.find(frame => frame.type === "agent_failed");
+	expect(failedFrame).toMatchObject({
+		error: { code: "unavailable", message: "Prompt submission failed." },
+	});
 
 	// The reconciliation record is retained with the failed outcome, not released.
 	const status = await request({
@@ -4566,17 +4570,32 @@ test("long-running prompt settles terminally after the delivery buffer expires",
 		input: { clientRef: "long-ref" },
 	});
 	expect(inFlight).toMatchObject({ ok: true, result: { status: "in_flight" } });
-	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	await handlers.get("agent_end")?.(
+		{
+			type: "agent_end",
+			messages: [
+				{
+					role: "assistant",
+					stopReason: "error",
+					errorMessage: "private prompt /home/alice secret-token",
+				},
+			],
+		},
+		sessionContext,
+	);
 
 	// Authoritative settlement fired at lifecycle ingress even though the delivery
-	// buffer expired: the record is terminal_ok, not permanently in_flight.
+	// buffer expired, and the provider error is retained only as a safe failed code.
 	const settled = await request({
 		type: "query_request",
 		id: "long-settled",
 		query: "turn.prompt_status",
 		input: { clientRef: "long-ref" },
 	});
-	expect(settled).toMatchObject({ ok: true, result: { status: "terminal_ok" } });
+	expect(settled).toMatchObject({
+		ok: true,
+		result: { status: "failed", error: { code: "agent_error", message: "Prompt submission failed." } },
+	});
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
