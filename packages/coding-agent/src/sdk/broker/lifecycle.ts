@@ -347,7 +347,9 @@ function text(value: unknown): string | undefined {
 }
 
 function validateBrokerModelPreset(agentDir: string, requestedProfile: string): string | BrokerResponse {
-	const loaded = ModelsConfigFile.relocate(path.join(agentDir, "models.yml")).tryLoad();
+	const modelsConfigFile = ModelsConfigFile.relocate(path.join(agentDir, "models.yml"));
+	modelsConfigFile.invalidate();
+	const loaded = modelsConfigFile.tryLoad();
 	const profiles = mergeModelProfiles(loaded.status === "ok" ? loaded.value.profiles : undefined);
 	try {
 		return validateModelProfileName(requestedProfile, profiles, loaded.status === "error" ? loaded.error : undefined);
