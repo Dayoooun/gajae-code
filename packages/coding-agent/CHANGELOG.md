@@ -5,6 +5,7 @@
 ### Fixed
 
 - Telegram notification topics now fence malformed successful `createForumTopic` responses per session endpoint, preventing repeated ambiguous topic creation while keeping explicit Bot API failures retryable.
+- Managed session scope binding durability verification no longer fails on Windows. `fsyncCanonicalBinding` opened the binding read-only before `fsync`, but Windows `FlushFileBuffers` rejects read-only handles with `EPERM`; every resume/continue/fork of a project with an existing scope binding then aborted with `Could not open managed session: durability_failed`. The durability fsync now opens the binding with write access on Windows (matching the existing win32 fsync-open pattern in managed storage), while POSIX behavior is unchanged.
 
 ## [0.11.8] - 2026-07-23
 ### Added

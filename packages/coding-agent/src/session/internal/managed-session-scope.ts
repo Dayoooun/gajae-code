@@ -579,7 +579,13 @@ function fsyncCanonicalBinding(bindingPath: string, expected: string): void {
 	if (captured.bytes.toString("utf8") !== expected) throw new Error("binding_invalid");
 	let descriptor: number | undefined;
 	try {
-		descriptor = fs.openSync(bindingPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		descriptor = fs.openSync(
+			bindingPath,
+			// Windows FlushFileBuffers requires a writable handle; a read-only fd makes
+			// fsync fail with EPERM. Mirror the win32 fsync-open pattern used elsewhere in
+			// managed storage so binding durability verification does not spuriously fail.
+			(process.platform === "win32" ? fs.constants.O_WRONLY : fs.constants.O_RDONLY) | fs.constants.O_NOFOLLOW,
+		);
 		const before = fs.fstatSync(descriptor, { bigint: true });
 		if (
 			before.dev !== captured.identity.dev ||

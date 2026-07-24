@@ -5,6 +5,7 @@ import * as path from "node:path";
 import type { NativeOwnerOnlySecurityResult } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
 import {
+	ensureManagedScope,
 	prepareManagedSessionScopeForWriteSync,
 	resolveManagedScope,
 	resolveManagedScopeForWrite,
@@ -116,5 +117,40 @@ describe("managed scope write resolver", () => {
 		expect(verify).toHaveBeenCalled();
 		expect(apply).not.toHaveBeenCalled();
 		expect(repair).not.toHaveBeenCalled();
+	});
+});
+
+// Preparing an already-bound managed scope re-validates the existing binding for
+// durability. That verification opens the binding and fsyncs it. On Windows,
+// FlushFileBuffers fails with EPERM on a read-only handle, so opening the binding
+// read-only made the second (and every later) preparation throw `durability_failed`,
+// which aborted resume/continue/fork while brand-new sessions (a separate sync path)
+// still worked. Preparing a scope that already has its binding must stay resolved.
+describe("managed scope binding preparation is durably repeatable", () => {
+	function fixture(): { cwd: string; agentDir: string; sessionsRoot: string } {
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-scope-rebind-home-"));
+		temporaryDirectories.push(home);
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-scope-rebind-cwd-"));
+		temporaryDirectories.push(cwd);
+		const agentDir = path.join(home, "agent");
+		const sessionsRoot = path.join(agentDir, "sessions");
+		fs.mkdirSync(sessionsRoot, { recursive: true, mode: 0o700 });
+		return { cwd, agentDir, sessionsRoot };
+	}
+
+	it("re-resolves a scope whose binding already exists without a spurious durability failure", async () => {
+		const { cwd, agentDir, sessionsRoot } = fixture();
+		const policy = process.platform === "win32" ? "windows-existing-verify-first" : "default";
+
+		// First preparation creates the v2 binding (no collision, no durability fsync).
+		const first = await ensureManagedScope(resolveScope(cwd, agentDir, sessionsRoot), policy);
+		expect(first.kind).toBe("resolved");
+
+		// A fresh preparation (as a later launch would perform) collides with the
+		// existing binding and must revalidate it durably rather than failing closed.
+		const second = await ensureManagedScope(resolveScope(cwd, agentDir, sessionsRoot), policy);
+		expect(second.kind).toBe("resolved");
+		const third = await ensureManagedScope(resolveScope(cwd, agentDir, sessionsRoot), policy);
+		expect(third.kind).toBe("resolved");
 	});
 });
