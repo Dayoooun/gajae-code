@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Browser } from "puppeteer-core";
 import * as attach from "../../src/tools/browser/attach";
-import { type BrowserHandle, releaseBrowser } from "../../src/tools/browser/registry";
+import { type BrowserHandle, registerOwnedWarmupDirForTest, releaseBrowser } from "../../src/tools/browser/registry";
 
 interface FakeBrowserOptions {
 	pid?: number;
@@ -25,8 +25,10 @@ function makeHeadlessHandle(opts: FakeBrowserOptions = {}): { handle: BrowserHan
 		browser,
 		refCount: 1,
 		stealth: { browserSession: null, override: null },
-		...(opts.warmupDir ? { warmupDir: opts.warmupDir } : {}),
 	};
+	// Ownership is registry-internal, so tests take the same registration path the
+	// launch code does instead of setting a field on the handle.
+	if (opts.warmupDir) registerOwnedWarmupDirForTest(handle, opts.warmupDir);
 	return { handle, close };
 }
 
@@ -123,5 +125,42 @@ describe("browser registry headless teardown (#698)", () => {
 		await releaseBrowser(handle, { kill: false });
 
 		expect(close).toHaveBeenCalledTimes(1);
+	});
+
+	it("refuses to delete a directory the registry does not own", async () => {
+		vi.spyOn(attach, "gracefulKillTreeOnce").mockResolvedValue(undefined);
+		// Shaped like a real Chrome profile, and named like a warm-up dir, but never
+		// registered as registry-owned. Disposal must not touch it: ownership comes
+		// from the launch path, not from the path's shape or prefix.
+		const foreign = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-profile-warmup-"));
+		fs.mkdirSync(path.join(foreign, "Default"), { recursive: true });
+		fs.writeFileSync(path.join(foreign, "Default", "Cookies"), "real-profile");
+		fs.writeFileSync(path.join(foreign, "Local State"), "{}");
+		const { handle, close } = makeHeadlessHandle({ pid: 4242 });
+
+		await releaseBrowser(handle, { kill: false });
+
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(fs.existsSync(foreign)).toBe(true);
+		expect(fs.readFileSync(path.join(foreign, "Default", "Cookies"), "utf-8")).toBe("real-profile");
+		fs.rmSync(foreign, { recursive: true, force: true });
+	});
+
+	it("does not delete twice when disposal runs again", async () => {
+		vi.spyOn(attach, "gracefulKillTreeOnce").mockResolvedValue(undefined);
+		const warmupDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-warmup-test-"));
+		const { handle } = makeHeadlessHandle({ pid: 4242, warmupDir });
+
+		await releaseBrowser(handle, { kill: false });
+		expect(fs.existsSync(warmupDir)).toBe(false);
+
+		// A path recreated at the same location after disposal is a different
+		// resource; the consumed ownership entry must not reclaim it.
+		fs.mkdirSync(warmupDir, { recursive: true });
+		handle.refCount = 1;
+		await releaseBrowser(handle, { kill: false });
+
+		expect(fs.existsSync(warmupDir)).toBe(true);
+		fs.rmSync(warmupDir, { recursive: true, force: true });
 	});
 });
