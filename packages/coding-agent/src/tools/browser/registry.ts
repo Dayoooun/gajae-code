@@ -53,6 +53,13 @@ export interface BrowserHandle {
 	cdpUrl?: string;
 	pid?: number;
 	subprocess?: Subprocess;
+	/**
+	 * Temp dir holding the copied Chrome profile warm-up artifacts, when this
+	 * handle was launched with profile reuse and the registry owns the dir.
+	 * Removed on release so repeated headless launches do not leak one Chrome
+	 * user-data-dir per open() into the OS temp directory.
+	 */
+	warmupDir?: string;
 	refCount: number;
 	stealth: { browserSession: CDPSession | null; override: UserAgentOverride | null };
 }
@@ -172,12 +179,20 @@ async function openBrowserHandle(
 				profileWarmupDir = reuse.warmupDir;
 			}
 		}
-		const browser = await launchHeadlessBrowser({
-			headless: kind.headless,
-			viewport: opts.viewport,
-			profileWarmupDir,
-			...(geo ? { geo } : {}),
-		});
+		let browser: Browser;
+		try {
+			browser = await launchHeadlessBrowser({
+				headless: kind.headless,
+				viewport: opts.viewport,
+				profileWarmupDir,
+				...(geo ? { geo } : {}),
+			});
+		} catch (error) {
+			// Launch failed after the warm-up copy landed: drop the temp dir here,
+			// because no handle will exist to carry it into releaseBrowser().
+			removeWarmupDir(profileWarmupDir);
+			throw error;
+		}
 		return {
 			key,
 
@@ -187,6 +202,7 @@ async function openBrowserHandle(
 			browser,
 			refCount: 0,
 			stealth: { browserSession: null, override: null },
+			...(profileWarmupDir ? { warmupDir: profileWarmupDir } : {}),
 		};
 	}
 	if (kind.kind === "connected") {
@@ -438,6 +454,22 @@ export async function releaseBrowser(handle: BrowserHandle, opts: { kill: boolea
 	}
 }
 
+/**
+ * Delete a registry-owned Chrome profile warm-up dir. Best-effort: a leftover
+ * temp dir is preferable to a teardown that throws.
+ */
+function removeWarmupDir(dir: string | undefined): void {
+	if (!dir) return;
+	try {
+		fs.rmSync(dir, { recursive: true, force: true });
+	} catch (err) {
+		logger.debug("Failed to remove Chrome profile warm-up dir", {
+			dir,
+			error: (err as Error).message,
+		});
+	}
+}
+
 async function disposeBrowserHandle(handle: BrowserHandle, opts: { kill: boolean }): Promise<void> {
 	if (handle.kind.kind === "headless") {
 		// Capture the launched Chrome process before close() so a forced (signal-path)
@@ -456,6 +488,9 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: { kill: boolean
 			}
 		}
 		if (opts.kill && proc?.pid !== undefined) await gracefulKillTreeOnce(proc.pid);
+		// Chrome owns files under the warm-up dir until the process is gone, so this
+		// runs after close()/kill rather than alongside them.
+		removeWarmupDir(handle.warmupDir);
 		return;
 	}
 	if (handle.kind.kind === "connected") {

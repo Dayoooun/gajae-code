@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { Browser } from "puppeteer-core";
 import * as attach from "../../src/tools/browser/attach";
 import { type BrowserHandle, releaseBrowser } from "../../src/tools/browser/registry";
@@ -6,6 +9,7 @@ import { type BrowserHandle, releaseBrowser } from "../../src/tools/browser/regi
 interface FakeBrowserOptions {
 	pid?: number;
 	close?: () => Promise<void>;
+	warmupDir?: string;
 }
 
 function makeHeadlessHandle(opts: FakeBrowserOptions = {}): { handle: BrowserHandle; close: ReturnType<typeof vi.fn> } {
@@ -21,6 +25,7 @@ function makeHeadlessHandle(opts: FakeBrowserOptions = {}): { handle: BrowserHan
 		browser,
 		refCount: 1,
 		stealth: { browserSession: null, override: null },
+		...(opts.warmupDir ? { warmupDir: opts.warmupDir } : {}),
 	};
 	return { handle, close };
 }
@@ -73,5 +78,50 @@ describe("browser registry headless teardown (#698)", () => {
 		await releaseBrowser(handle, { kill: true });
 		expect(close).toHaveBeenCalledTimes(1);
 		expect(killSpy).toHaveBeenCalledWith(4242);
+	});
+
+	it("removes the Chrome profile warm-up dir on release", async () => {
+		vi.spyOn(attach, "gracefulKillTreeOnce").mockResolvedValue(undefined);
+		const warmupDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-warmup-test-"));
+		fs.writeFileSync(path.join(warmupDir, "Cookies"), "x");
+		const { handle } = makeHeadlessHandle({ pid: 4242, warmupDir });
+
+		await releaseBrowser(handle, { kill: false });
+
+		expect(fs.existsSync(warmupDir)).toBe(false);
+	});
+
+	it("removes the warm-up dir on a forced release too", async () => {
+		vi.spyOn(attach, "gracefulKillTreeOnce").mockResolvedValue(undefined);
+		const warmupDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-warmup-test-"));
+		const { handle } = makeHeadlessHandle({ pid: 4242, warmupDir });
+
+		await releaseBrowser(handle, { kill: true });
+
+		expect(fs.existsSync(warmupDir)).toBe(false);
+	});
+
+	it("keeps the warm-up dir while refCount is still held", async () => {
+		vi.spyOn(attach, "gracefulKillTreeOnce").mockResolvedValue(undefined);
+		const warmupDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-warmup-test-"));
+		const { handle } = makeHeadlessHandle({ pid: 4242, warmupDir });
+		handle.refCount = 2;
+
+		await releaseBrowser(handle, { kill: false });
+		expect(fs.existsSync(warmupDir)).toBe(true);
+
+		await releaseBrowser(handle, { kill: false });
+		expect(fs.existsSync(warmupDir)).toBe(false);
+	});
+
+	it("tolerates an already-deleted warm-up dir", async () => {
+		vi.spyOn(attach, "gracefulKillTreeOnce").mockResolvedValue(undefined);
+		const warmupDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-warmup-test-"));
+		fs.rmSync(warmupDir, { recursive: true, force: true });
+		const { handle, close } = makeHeadlessHandle({ pid: 4242, warmupDir });
+
+		await releaseBrowser(handle, { kill: false });
+
+		expect(close).toHaveBeenCalledTimes(1);
 	});
 });
