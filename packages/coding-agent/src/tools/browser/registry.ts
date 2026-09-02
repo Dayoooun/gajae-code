@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
@@ -129,15 +130,16 @@ export function browserKeyForTest(
 }
 
 /**
- * Register a warm-up dir as registry-owned for `handle`.
+ * Create and register a warm-up dir as registry-owned for `handle`.
  *
- * Mirrors what the headless launch path does after it creates the dir. Exists so tests
- * can exercise disposal without spawning Chrome; it is the only way to add an ownership
- * entry from outside, which keeps the "deletion targets only dirs this module made"
- * invariant checkable — a handle that never went through here is never deleted.
+ * Exists so tests can exercise disposal without spawning Chrome. The caller cannot
+ * supply the deletion target: this module creates the directory itself before recording
+ * ownership, preserving the same invariant as the production launch path.
  */
-export function registerOwnedWarmupDirForTest(handle: BrowserHandle, dir: string): void {
+export function createOwnedWarmupDirForTest(handle: BrowserHandle): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-profile-warmup-"));
 	ownedWarmupDirs.set(handle, dir);
+	return dir;
 }
 
 export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {

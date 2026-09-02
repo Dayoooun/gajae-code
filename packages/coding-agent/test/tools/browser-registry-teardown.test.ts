@@ -4,12 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Browser } from "puppeteer-core";
 import * as attach from "../../src/tools/browser/attach";
-import { type BrowserHandle, registerOwnedWarmupDirForTest, releaseBrowser } from "../../src/tools/browser/registry";
+import { type BrowserHandle, createOwnedWarmupDirForTest, releaseBrowser } from "../../src/tools/browser/registry";
 
 interface FakeBrowserOptions {
 	pid?: number;
 	close?: () => Promise<void>;
-	warmupDir?: string;
 }
 
 function makeHeadlessHandle(opts: FakeBrowserOptions = {}): { handle: BrowserHandle; close: ReturnType<typeof vi.fn> } {
@@ -26,9 +25,6 @@ function makeHeadlessHandle(opts: FakeBrowserOptions = {}): { handle: BrowserHan
 		refCount: 1,
 		stealth: { browserSession: null, override: null },
 	};
-	// Ownership is registry-internal, so tests take the same registration path the
-	// launch code does instead of setting a field on the handle.
-	if (opts.warmupDir) registerOwnedWarmupDirForTest(handle, opts.warmupDir);
 	return { handle, close };
 }
 
@@ -84,9 +80,9 @@ describe("browser registry headless teardown (#698)", () => {
 
 	it("removes the Chrome profile warm-up dir on release", async () => {
 		vi.spyOn(attach, "gracefulKillTreeOnce").mockResolvedValue(undefined);
-		const warmupDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-warmup-test-"));
+		const { handle } = makeHeadlessHandle({ pid: 4242 });
+		const warmupDir = createOwnedWarmupDirForTest(handle);
 		fs.writeFileSync(path.join(warmupDir, "Cookies"), "x");
-		const { handle } = makeHeadlessHandle({ pid: 4242, warmupDir });
 
 		await releaseBrowser(handle, { kill: false });
 
@@ -95,8 +91,8 @@ describe("browser registry headless teardown (#698)", () => {
 
 	it("removes the warm-up dir on a forced release too", async () => {
 		vi.spyOn(attach, "gracefulKillTreeOnce").mockResolvedValue(undefined);
-		const warmupDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-warmup-test-"));
-		const { handle } = makeHeadlessHandle({ pid: 4242, warmupDir });
+		const { handle } = makeHeadlessHandle({ pid: 4242 });
+		const warmupDir = createOwnedWarmupDirForTest(handle);
 
 		await releaseBrowser(handle, { kill: true });
 
@@ -105,8 +101,8 @@ describe("browser registry headless teardown (#698)", () => {
 
 	it("keeps the warm-up dir while refCount is still held", async () => {
 		vi.spyOn(attach, "gracefulKillTreeOnce").mockResolvedValue(undefined);
-		const warmupDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-warmup-test-"));
-		const { handle } = makeHeadlessHandle({ pid: 4242, warmupDir });
+		const { handle } = makeHeadlessHandle({ pid: 4242 });
+		const warmupDir = createOwnedWarmupDirForTest(handle);
 		handle.refCount = 2;
 
 		await releaseBrowser(handle, { kill: false });
@@ -118,9 +114,9 @@ describe("browser registry headless teardown (#698)", () => {
 
 	it("tolerates an already-deleted warm-up dir", async () => {
 		vi.spyOn(attach, "gracefulKillTreeOnce").mockResolvedValue(undefined);
-		const warmupDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-warmup-test-"));
+		const { handle, close } = makeHeadlessHandle({ pid: 4242 });
+		const warmupDir = createOwnedWarmupDirForTest(handle);
 		fs.rmSync(warmupDir, { recursive: true, force: true });
-		const { handle, close } = makeHeadlessHandle({ pid: 4242, warmupDir });
 
 		await releaseBrowser(handle, { kill: false });
 
@@ -148,8 +144,8 @@ describe("browser registry headless teardown (#698)", () => {
 
 	it("does not delete twice when disposal runs again", async () => {
 		vi.spyOn(attach, "gracefulKillTreeOnce").mockResolvedValue(undefined);
-		const warmupDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-warmup-test-"));
-		const { handle } = makeHeadlessHandle({ pid: 4242, warmupDir });
+		const { handle } = makeHeadlessHandle({ pid: 4242 });
+		const warmupDir = createOwnedWarmupDirForTest(handle);
 
 		await releaseBrowser(handle, { kill: false });
 		expect(fs.existsSync(warmupDir)).toBe(false);
@@ -162,5 +158,19 @@ describe("browser registry headless teardown (#698)", () => {
 
 		expect(fs.existsSync(warmupDir)).toBe(true);
 		fs.rmSync(warmupDir, { recursive: true, force: true });
+	});
+
+	it("cannot register a caller-selected directory as registry-owned", async () => {
+		vi.spyOn(attach, "gracefulKillTreeOnce").mockResolvedValue(undefined);
+		const foreign = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-profile-warmup-"));
+		fs.writeFileSync(path.join(foreign, "Local State"), "foreign");
+		const { handle } = makeHeadlessHandle({ pid: 4242 });
+		const owned = createOwnedWarmupDirForTest(handle);
+
+		await releaseBrowser(handle, { kill: false });
+
+		expect(fs.existsSync(owned)).toBe(false);
+		expect(fs.readFileSync(path.join(foreign, "Local State"), "utf-8")).toBe("foreign");
+		fs.rmSync(foreign, { recursive: true, force: true });
 	});
 });
