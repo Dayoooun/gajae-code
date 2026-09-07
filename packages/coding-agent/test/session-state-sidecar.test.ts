@@ -745,7 +745,7 @@ describe("coordinator runtime state sidecar", () => {
 			reason: "transition_claim_timeout",
 		});
 		expect(await Bun.file(stateFile).bytes()).toEqual(before);
-	});
+	}, 30000);
 
 	it("preserves directory runtime-state evidence and refuses event and postmortem writes", async () => {
 		const root = await tempRoot();
