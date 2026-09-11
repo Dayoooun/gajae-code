@@ -31,6 +31,7 @@ afterEach(async () => {
 	FileLockTestHooks.afterParentMkdir = undefined;
 	FileLockTestHooks.nativePublicationBindings = undefined;
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
+	FileLockTestHooks.nativeExactRemovalProbe = undefined;
 	for (const dir of tempDirs.splice(0)) {
 		await fs.rm(dir, { recursive: true, force: true });
 	}
@@ -886,6 +887,140 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		});
 		expect(snapshotCalls).toBeGreaterThan(0);
 		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
+	test("uses verified filesystem removal when native exact removal is unavailable", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		FileLockTestHooks.nativeExactRemovalProbe = () => false;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: (target, _snapshot, _parent, detachOnly) => {
+				if (detachOnly) {
+					renameSync(target, `${target}.removing`);
+					return { ok: false, code: "cleanup_pending", detachedPath: `${target}.removing` };
+				}
+				rmSync(target, { recursive: true, force: true });
+				return { ok: true };
+			},
+		});
+
+		await expect(withFileLock(lockedFile, async () => undefined)).resolves.toBeUndefined();
+
+		expect(await fs.exists(lockDir)).toBe(false);
+	});
+
+	test("does not report success while detached cleanup is pending", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		let detachedPath: string | undefined;
+		let cleanupCalls = 0;
+		let failFilesystemCleanup = true;
+		const realRm = fs.rm;
+		vi.spyOn(fs, "rm").mockImplementation((async (target, options) => {
+			if (process.platform !== "win32" && failFilesystemCleanup && detachedPath === String(target)) {
+				failFilesystemCleanup = false;
+				throw Object.assign(new Error("cleanup pending"), { code: "cleanup_pending" });
+			}
+			return realRm(target, options);
+		}) as typeof fs.rm);
+		FileLockTestHooks.nativeExactRemovalProbe = () => false;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: (target, _snapshot, _parent, detachOnly) => {
+				if (detachOnly) {
+					detachedPath = `${target}.removing`;
+					renameSync(target, detachedPath);
+					return { ok: true, detachedPath };
+				}
+				cleanupCalls++;
+				if (cleanupCalls === 1) return { ok: false, code: "cleanup_pending", detachedPath: target };
+				rmSync(target, { recursive: true, force: true });
+				return { ok: true };
+			},
+		});
+
+		await expect(withFileLock(lockedFile, async () => undefined)).rejects.toThrow();
+		expect(detachedPath).toBeDefined();
+		if (!detachedPath) throw new Error("Expected a detached lock path");
+		expect(await fs.exists(lockDir)).toBe(false);
+		expect(await fs.exists(detachedPath)).toBe(true);
+
+		let entered = false;
+		await withFileLock(lockedFile, async () => {
+			entered = true;
+		});
+
+		expect(entered).toBe(true);
+		expect(await fs.exists(detachedPath)).toBe(false);
+		expect(await fs.exists(lockDir)).toBe(false);
+	});
+
+	test("finishes a filter-hosted release with identity-checked disk cleanup", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		const detached = `${lockDir}.removing`;
+		const realPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+		let nativeReplayCalls = 0;
+		// A filter-hosted Windows host: the probe rejects the native exact-removal
+		// primitive, while the handle-bound detach-only quarantine still succeeds.
+		FileLockTestHooks.nativeExactRemovalProbe = () => false;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: (target, _snapshot, _parent, detachOnly) => {
+				if (detachOnly) {
+					renameSync(target, `${target}.removing`);
+					return { ok: true, detachedPath: `${target}.removing` };
+				}
+				nativeReplayCalls++;
+				return { ok: false, code: "sharing_violation" };
+			},
+		});
+		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+		try {
+			await expect(withFileLock(lockedFile, async () => undefined)).resolves.toBeUndefined();
+		} finally {
+			if (realPlatform) Object.defineProperty(process, "platform", realPlatform);
+		}
+		// The fallback must neither replay the rejected primitive nor leave the parked
+		// quarantine behind while reporting success.
+		expect(nativeReplayCalls).toBe(0);
+		expect(await fs.exists(lockDir)).toBe(false);
+		expect(await fs.exists(detached)).toBe(false);
+	});
+
+	test("keeps a successor after fallback validation races with replacement", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		await fs.mkdir(lockDir);
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 10_000 });
+		FileLockTestHooks.nativeExactRemovalProbe = () => false;
+		let replaced = false;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree(target) {
+				const result = snapshotDirectoryTree(target);
+				if (target === lockDir && !replaced && result.ok && result.snapshot) {
+					replaced = true;
+					rmSync(lockDir, { recursive: true, force: true });
+					mkdirSync(lockDir);
+					writeFileSync(path.join(lockDir, "info"), JSON.stringify({ pid: LIVE_PID, timestamp: Date.now() }));
+				}
+				return result;
+			},
+			exactRemoveDirectoryTree: () => {
+				return { ok: false, code: "identity_mismatch" };
+			},
+		});
+
+		const expected = await readFileLockObservationForGc(lockDir);
+		await removeFileLockDirForGc(lockDir, expected?.info ?? { pid: DEAD_PID, timestamp: Date.now() - 10_000 }).then(
+			result => expect(result).toBe("owner_changed"),
+		);
+		expect(await fs.readFile(path.join(lockDir, "info"), "utf8")).toContain(`"pid":${LIVE_PID}`);
 	});
 
 	test("retries transient Windows release denial before reporting success", async () => {
