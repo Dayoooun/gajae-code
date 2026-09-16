@@ -1,0 +1,3 @@
+### Fixed
+
+- Session transcript limit errors no longer advise `gjc export <session-file>`, which is not a subcommand: running it literally started a fresh agent that read `export` as a prompt while the unwritable session was left untouched, and the root `--export` flag only renders HTML. The near-limit append error, its tool-result copy, and the oversized-resume message now share one constant and name `/compact` plus `/new`, so an operator whose transcript already refuses appends is pointed at a route that starts a new transcript instead of one that cannot exist. A regression test resolves every command referenced by these messages against the CLI and builtin slash-command registries (#5621).

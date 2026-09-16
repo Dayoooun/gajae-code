@@ -2162,8 +2162,22 @@ export const RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
 export const BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES = 2 * 1024 * 1024 * 1024 + 1024 * 1024;
 const EAGER_RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
 
-export const SESSION_OVERSIZED_RECOVERY_MESSAGE =
-	"The selected session transcript is too large to resume safely. Use `gjc export <session-file>` to export its content into a new session, or remove/archive it after confirming its content is no longer needed.";
+/**
+ * Recovery actions offered when a transcript is at or past the managed per-file
+ * cap. Both routes must be reachable from that state: `/compact` can rewrite the
+ * live entries in place, and `/new` starts a fresh transcript when it cannot.
+ *
+ * Every command named here must exist — `gjc export <session-file>` was advised
+ * for both limits and is not a subcommand, so following it literally started a
+ * new agent that read "export" as a prompt while the session stayed unwritable.
+ * (The root `--export` flag renders HTML and exits; it yields no resumable
+ * session.) `session-recovery-guidance.test.ts` pins every reference to the CLI
+ * and builtin slash-command registries.
+ */
+export const SESSION_LIMIT_RECOVERY_ACTIONS =
+	"compact the session (`/compact`) or start a new one (`/new`), which keeps this transcript on disk";
+
+export const SESSION_OVERSIZED_RECOVERY_MESSAGE = `The selected session transcript is too large to resume safely. Resume a different session and ${SESSION_LIMIT_RECOVERY_ACTIONS}, or remove/archive this transcript after confirming its content is no longer needed.`;
 
 export class SessionAppendPersistenceError extends Error {
 	readonly phase: SessionAppendPersistenceFailurePhase;
@@ -2210,8 +2224,8 @@ export class SessionNearLimitAppendError extends Error {
 			[
 				`near_limit_append: entry (${details.entryBytes} B) plus live transcript (${details.liveBytes} B) exceeds the managed per-file limit (${details.capBytes} B).`,
 				details.entryRetained
-					? "The appended entry is retained in memory; its effect (including any committed source edit) is recorded and will persist on the next successful write. Compact the session (`/compact`) or export to a fresh session (`gjc export <session-file>`) before continuing."
-					: "The appended entry was rolled back from memory; re-issue it after compacting the session (`/compact`) or exporting to a fresh session (`gjc export <session-file>`).",
+					? `The appended entry is retained in memory; its effect (including any committed source edit) is recorded and will persist on the next successful write. To continue, ${SESSION_LIMIT_RECOVERY_ACTIONS}.`
+					: `The appended entry was rolled back from memory; ${SESSION_LIMIT_RECOVERY_ACTIONS}, then re-issue it.`,
 			].join(" "),
 		);
 		this.name = "SessionNearLimitAppendError";
