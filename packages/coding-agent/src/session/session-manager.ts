@@ -2163,21 +2163,41 @@ export const BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES = 2 * 1024 * 1024 * 1024 + 1024
 const EAGER_RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
 
 /**
- * Recovery actions offered when a transcript is at or past the managed per-file
- * cap. Both routes must be reachable from that state: `/compact` can rewrite the
- * live entries in place, and `/new` starts a fresh transcript when it cannot.
+ * Recovery actions offered when a live transcript is at or past the managed
+ * per-file cap.
  *
- * Every command named here must exist — `gjc export <session-file>` was advised
- * for both limits and is not a subcommand, so following it literally started a
- * new agent that read "export" as a prompt while the session stayed unwritable.
- * (The root `--export` flag renders HTML and exits; it yields no resumable
- * session.) `session-recovery-guidance.test.ts` pins every reference to the CLI
- * and builtin slash-command registries.
+ * Constrained three ways, and every command named here satisfies all three:
+ *
+ * 1. **It must exist.** `gjc export <session-file>` was advised for both limits
+ *    and is not a subcommand, so following it literally started a fresh agent
+ *    that read "export" as a prompt while the session stayed unwritable. (The
+ *    root `--export` flag renders HTML and exits; it yields no resumable
+ *    session.)
+ * 2. **It must be reachable on every surface that renders the message.** These
+ *    strings reach ACP/text consumers through `AgentSession`, and the ACP
+ *    registry is filtered to definitions carrying `handle`
+ *    (`slash-commands/acp-builtins.ts`), so a `handleTui`-only command such as
+ *    `/new` is a different dead end rather than a fix.
+ * 3. **It must not drop the retained near-limit entry.** The failed append is
+ *    kept in memory with a full rewrite armed, and the message promises it
+ *    persists on the next successful write. `/compact` and `/clear` keep the
+ *    manager — and therefore that pending debt — alive; a session switch closes
+ *    the writer without paying it.
+ *
+ * `session-recovery-guidance.test.ts` pins all three against the CLI, builtin,
+ * and ACP registries.
  */
 export const SESSION_LIMIT_RECOVERY_ACTIONS =
-	"compact the session (`/compact`) or start a new one (`/new`), which keeps this transcript on disk";
+	"compact the session (`/compact`), or clear its context (`/clear`) if compaction cannot reclaim enough";
 
-export const SESSION_OVERSIZED_RECOVERY_MESSAGE = `The selected session transcript is too large to resume safely. Resume a different session and ${SESSION_LIMIT_RECOVERY_ACTIONS}, or remove/archive this transcript after confirming its content is no longer needed.`;
+/**
+ * Oversized-resume guidance. This surface is reached *before* a session is
+ * opened, so it deliberately does not reuse {@link SESSION_LIMIT_RECOVERY_ACTIONS}:
+ * an in-session command there would act on whichever session the user resumes
+ * next, never on the transcript that was just rejected.
+ */
+export const SESSION_OVERSIZED_RECOVERY_MESSAGE =
+	"The selected session transcript is too large to resume safely. Resume a different session, or remove/archive this transcript after confirming its content is no longer needed.";
 
 export class SessionAppendPersistenceError extends Error {
 	readonly phase: SessionAppendPersistenceFailurePhase;

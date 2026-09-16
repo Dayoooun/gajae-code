@@ -585,9 +585,11 @@ describe("near-limit edit append after committed mutation (#4566)", () => {
 			expect(typed.entryBytes).toBeGreaterThan(0);
 			expect(typed.entryRetained).toBe(true);
 			expect(typed.message).toContain("compact");
-			// Recovery guidance must name commands that exist; `gjc export` never
-			// did. session-recovery-guidance.test.ts pins this against the registries.
-			expect(typed.message).toContain("/new");
+			// Recovery guidance must name commands that exist and are reachable on
+			// every surface that renders this message, without dropping the retained
+			// entry. session-recovery-guidance.test.ts pins that against the CLI,
+			// builtin, and ACP registries.
+			expect(typed.message).toContain("/clear");
 			expect(typed.message).not.toContain("gjc export");
 			// The committed edit is still in memory; the next successful persist
 			// (after compaction) records it — the effect/receipt gap is stated,
