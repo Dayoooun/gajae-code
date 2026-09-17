@@ -4,6 +4,7 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import type {
 	NativeDirectoryTreeSnapshot,
+	NativeExactFileIdentity,
 	NativeExactUnlinkResult,
 	NativeOwnerOnlySecurityResult,
 	RecoveryFsIdentity,
@@ -25,6 +26,7 @@ type NativeManagedSessionStorage = Pick<
 	| "exactRemoveDirectoryTree"
 	| "exactReplacePath"
 	| "exactUnlink"
+	| "exactUnlinkDirect"
 	| "linkNoReplacePath"
 	| "linkNoReplacePathAsync"
 	| "openRecoveryFsRoot"
@@ -569,6 +571,7 @@ const SCRUBBED_REMNANT_PREFIXES = [
 	".gjc-receipt-placeholder-remove-",
 	".gjc-replace-retry-",
 ] as const;
+const EMPTY_FILE_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /**
  * Replacement staging is named `.<destination-basename>.<uuid>.replacement` and
@@ -609,6 +612,30 @@ function reportScrubbedProtocolRemnantReap(reaped: number, failures: number): Sc
 	return { reaped, failures };
 }
 
+type ReplacementAliasObservation = {
+	destination: string;
+	staging: fs.BigIntStats;
+};
+
+function replacementStagingDestination(name: string): string | undefined {
+	return REPLACEMENT_STAGING_NAME.exec(name)?.groups?.destination;
+}
+
+function isRegularReaperFile(stat: fs.BigIntStats): boolean {
+	return stat.isFile() && !stat.isSymbolicLink();
+}
+
+function sameReaperFileIdentity(left: fs.BigIntStats, right: fs.BigIntStats): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.nlink === right.nlink &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs
+	);
+}
+
 /**
  * True when `name` is replacement staging whose inode is ALSO reachable under
  * its own published destination in the same directory. Publication exchanged
@@ -624,22 +651,143 @@ function reportScrubbedProtocolRemnantReap(reaped: number, failures: number): Sc
  * either an unpublished attempt or a retired predecessor, and both are
  * recovery evidence owned by receipt reconciliation.
  */
-function stagingAliasesPublishedDestination(directory: string, name: string): boolean {
-	const destination = REPLACEMENT_STAGING_NAME.exec(name)?.groups?.destination;
-	if (!destination) return false;
+function stagingAliasesPublishedDestinationSync(
+	directory: string,
+	name: string,
+): ReplacementAliasObservation | undefined {
+	const destination = replacementStagingDestination(name);
+	if (!destination) return undefined;
 	try {
 		const staging = fs.lstatSync(path.join(directory, name), { bigint: true });
-		if (!staging.isFile() || staging.isSymbolicLink()) return false;
+		if (!isRegularReaperFile(staging) || staging.nlink < 2n) return undefined;
 		const published = fs.lstatSync(path.join(directory, destination), { bigint: true });
-		return (
-			published.isFile() &&
-			!published.isSymbolicLink() &&
-			published.dev === staging.dev &&
-			published.ino === staging.ino
-		);
+		if (!isRegularReaperFile(published) || published.dev !== staging.dev || published.ino !== staging.ino)
+			return undefined;
+		return { destination, staging };
 	} catch {
-		return false;
+		return undefined;
 	}
+}
+
+async function stagingAliasesPublishedDestination(
+	directory: string,
+	name: string,
+): Promise<ReplacementAliasObservation | undefined> {
+	const destination = replacementStagingDestination(name);
+	if (!destination) return undefined;
+	try {
+		const staging = await fsp.lstat(path.join(directory, name), { bigint: true });
+		if (!isRegularReaperFile(staging) || staging.nlink < 2n) return undefined;
+		const published = await fsp.lstat(path.join(directory, destination), { bigint: true });
+		if (!isRegularReaperFile(published) || published.dev !== staging.dev || published.ino !== staging.ino)
+			return undefined;
+		return { destination, staging };
+	} catch {
+		return undefined;
+	}
+}
+
+function hashReaperFileSync(pathname: string, expected: fs.BigIntStats): string | undefined {
+	let descriptor: number | undefined;
+	try {
+		descriptor = fs.openSync(
+			pathname,
+			fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0) | (fs.constants.O_NOFOLLOW ?? 0),
+		);
+		const opened = fs.fstatSync(descriptor, { bigint: true });
+		if (!isRegularReaperFile(opened) || !sameReaperFileIdentity(opened, expected)) return undefined;
+		const digest = createHash("sha256");
+		const chunk = Buffer.alloc(64 * 1024);
+		for (;;) {
+			const count = fs.readSync(descriptor, chunk, 0, chunk.byteLength, null);
+			if (count === 0) break;
+			digest.update(chunk.subarray(0, count));
+		}
+		const after = fs.fstatSync(descriptor, { bigint: true });
+		return isRegularReaperFile(after) && sameReaperFileIdentity(after, expected) ? digest.digest("hex") : undefined;
+	} catch (error) {
+		if (isEnoent(error) || (error as NodeJS.ErrnoException).code === "ELOOP") return undefined;
+		throw error;
+	} finally {
+		if (descriptor !== undefined) fs.closeSync(descriptor);
+	}
+}
+
+async function hashReaperFile(pathname: string, expected: fs.BigIntStats): Promise<string | undefined> {
+	let handle: fsp.FileHandle | undefined;
+	try {
+		handle = await fsp.open(
+			pathname,
+			fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0) | (fs.constants.O_NOFOLLOW ?? 0),
+		);
+		const opened = await handle.stat({ bigint: true });
+		if (!isRegularReaperFile(opened) || !sameReaperFileIdentity(opened, expected)) return undefined;
+		const bytes = await handle.readFile();
+		const after = await handle.stat({ bigint: true });
+		return isRegularReaperFile(after) && sameReaperFileIdentity(after, expected)
+			? createHash("sha256").update(bytes).digest("hex")
+			: undefined;
+	} catch (error) {
+		if (isEnoent(error) || (error as NodeJS.ErrnoException).code === "ELOOP") return undefined;
+		throw error;
+	} finally {
+		await handle?.close();
+	}
+}
+
+function exactReaperUnlinkSync(
+	pathname: string,
+	stat: fs.BigIntStats,
+	sha256: string,
+	allowHardLink: boolean,
+): NativeExactUnlinkResult {
+	const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+	if (!parent.isDirectory() || parent.isSymbolicLink()) return { ok: false, code: "parent_mismatch" };
+	const identity: NativeExactFileIdentity = {
+		dev: stat.dev,
+		ino: stat.ino,
+		nlink: stat.nlink,
+		parentDev: parent.dev,
+		parentIno: parent.ino,
+		size: stat.size,
+		mtimeNs: stat.mtimeNs,
+		sha256,
+		quarantineName: `.gjc-remnant-reap-${randomUUID()}`,
+		...(allowHardLink ? { allowHardLink: true } : {}),
+	};
+	return nativeSessionStorage().exactUnlinkDirect(pathname, identity);
+}
+
+async function exactReaperUnlink(
+	pathname: string,
+	stat: fs.BigIntStats,
+	sha256: string,
+	allowHardLink: boolean,
+): Promise<NativeExactUnlinkResult> {
+	const parent = await fsp.lstat(path.dirname(pathname), { bigint: true });
+	if (!parent.isDirectory() || parent.isSymbolicLink()) return { ok: false, code: "parent_mismatch" };
+	const identity: NativeExactFileIdentity = {
+		dev: stat.dev,
+		ino: stat.ino,
+		nlink: stat.nlink,
+		parentDev: parent.dev,
+		parentIno: parent.ino,
+		size: stat.size,
+		mtimeNs: stat.mtimeNs,
+		sha256,
+		quarantineName: `.gjc-remnant-reap-${randomUUID()}`,
+		...(allowHardLink ? { allowHardLink: true } : {}),
+	};
+	return nativeSessionStorage().exactUnlinkDirect(pathname, identity);
+}
+
+function isBenignReaperRace(result: NativeExactUnlinkResult): boolean {
+	return (
+		result.code === "not_found" ||
+		result.code === "identity_mismatch" ||
+		result.code === "reparse_point" ||
+		result.code === "not_regular_file"
+	);
 }
 
 /**
@@ -672,15 +820,23 @@ export function reapScrubbedProtocolRemnantsSync(
 	let failures = 0;
 	for (const name of names) {
 		const terminalRemnant = SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix));
-		if (!terminalRemnant && !stagingAliasesPublishedDestination(directory, name)) continue;
+		const alias = terminalRemnant ? undefined : stagingAliasesPublishedDestinationSync(directory, name);
+		if (!terminalRemnant && !alias) continue;
 		const pathname = path.join(directory, name);
 		try {
-			const named = fs.lstatSync(pathname);
-			if (!named.isFile() || named.isSymbolicLink()) continue;
-			if (terminalRemnant && (named.nlink !== 1 || named.size !== 0)) continue;
+			// The alias probe already stat'ed the staging entry; reuse that exact
+			// observation rather than re-stating the pathname, which would only add
+			// another window. Identity is enforced at removal by the native
+			// primitive, not by how many times the name is looked up.
+			const named = terminalRemnant ? fs.lstatSync(pathname, { bigint: true }) : alias?.staging;
+			if (!named || !isRegularReaperFile(named)) continue;
+			if (terminalRemnant && (named.nlink !== 1n || named.size !== 0n)) continue;
 			if (named.mtimeMs > cutoff) continue;
-			fs.unlinkSync(pathname);
-			reaped += 1;
+			const sha256 = terminalRemnant ? EMPTY_FILE_SHA256 : hashReaperFileSync(pathname, named);
+			if (!sha256) continue;
+			const removed = exactReaperUnlinkSync(pathname, named, sha256, !terminalRemnant);
+			if (removed.ok) reaped += 1;
+			else if (!isBenignReaperRace(removed)) failures += 1;
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
 		}
@@ -716,16 +872,24 @@ export async function reapScrubbedProtocolRemnants(
 	let scanned = 0;
 	for (const name of names) {
 		const terminalRemnant = SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix));
-		if (!terminalRemnant && !stagingAliasesPublishedDestination(directory, name)) continue;
+		const replacementCandidate = REPLACEMENT_STAGING_NAME.test(name);
+		if (!terminalRemnant && !replacementCandidate) continue;
 		if (++scanned % SCRUBBED_REMNANT_REAP_BATCH_SIZE === 0) await Bun.sleep(0);
+		const alias = terminalRemnant ? undefined : await stagingAliasesPublishedDestination(directory, name);
+		if (!terminalRemnant && !alias) continue;
 		const pathname = path.join(directory, name);
 		try {
-			const named = await fsp.lstat(pathname);
-			if (!named.isFile() || named.isSymbolicLink()) continue;
-			if (terminalRemnant && (named.nlink !== 1 || named.size !== 0)) continue;
+			// Same reuse as the sync twin: one probe observation, one identity-bound
+			// removal.
+			const named = terminalRemnant ? await fsp.lstat(pathname, { bigint: true }) : alias?.staging;
+			if (!named || !isRegularReaperFile(named)) continue;
+			if (terminalRemnant && (named.nlink !== 1n || named.size !== 0n)) continue;
 			if (named.mtimeMs > cutoff) continue;
-			await fsp.unlink(pathname);
-			reaped += 1;
+			const sha256 = terminalRemnant ? EMPTY_FILE_SHA256 : await hashReaperFile(pathname, named);
+			if (!sha256) continue;
+			const removed = await exactReaperUnlink(pathname, named, sha256, !terminalRemnant);
+			if (removed.ok) reaped += 1;
+			else if (!isBenignReaperRace(removed)) failures += 1;
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
 		}
