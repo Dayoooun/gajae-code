@@ -242,13 +242,23 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 				);
 			}
 			const names = await fsp.readdir(dir);
-			const readdir = vi.spyOn(fsp, "readdir").mockResolvedValue(names);
+			// `fsp.readdir` and `fsp.lstat` are both overloaded. `vi.spyOn` resolves each
+			// to its last overload (`Dirent[]`, and the `Stats` form), while the code
+			// under test calls the plain `string[]` / default-options forms. Cast the
+			// mock to the declared function type so the spy keeps the real signature
+			// instead of forcing a `bigint` result the callers never ask for.
+			const readdir = vi
+				.spyOn(fsp, "readdir")
+				.mockResolvedValue(names as unknown as Awaited<ReturnType<typeof fsp.readdir>>);
 			const syncLstat = vi.spyOn(fs, "lstatSync");
 			const realLstat = fsp.lstat.bind(fsp);
-			const asyncLstat = vi.spyOn(fsp, "lstat").mockImplementation(async (pathname, options) => {
+			const asyncLstat = vi.spyOn(fsp, "lstat").mockImplementation((async (
+				pathname: Parameters<typeof fsp.lstat>[0],
+				options?: Parameters<typeof fsp.lstat>[1],
+			) => {
 				await new Promise<void>(resolve => setTimeout(resolve, 0));
-				return realLstat(pathname, options as { bigint: true });
-			});
+				return await realLstat(pathname, options);
+			}) as typeof fsp.lstat);
 			let timerFired = false;
 			const timer = setTimeout(() => {
 				timerFired = true;
