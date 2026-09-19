@@ -591,6 +591,8 @@ const EMPTY_FILE_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4959
  */
 const REPLACEMENT_STAGING_NAME =
 	/^\.(?<destination>.+)\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.replacement$/;
+const REAPER_QUARANTINE_NAME =
+	/^\.gjc-remnant-reap-(?<destination>[0-9a-f]+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** In-flight protocol steps complete in milliseconds; anything older is abandoned. */
 const SCRUBBED_REMNANT_MIN_AGE_MS = 15 * 60 * 1000;
@@ -619,6 +621,23 @@ type ReplacementAliasObservation = {
 
 function replacementStagingDestination(name: string): string | undefined {
 	return REPLACEMENT_STAGING_NAME.exec(name)?.groups?.destination;
+}
+
+function remnantReapDestination(name: string): string | undefined {
+	const encoded = REAPER_QUARANTINE_NAME.exec(name)?.groups?.destination;
+	if (!encoded || encoded.length % 2 !== 0) return undefined;
+	const destination = Buffer.from(encoded, "hex").toString("utf8");
+	return destination &&
+		Buffer.from(destination).toString("hex") === encoded &&
+		path.basename(destination) === destination
+		? destination
+		: undefined;
+}
+
+function remnantReapQuarantineName(pathname: string): string {
+	const basename = path.basename(pathname);
+	const destination = replacementStagingDestination(basename) ?? remnantReapDestination(basename) ?? basename;
+	return `.gjc-remnant-reap-${Buffer.from(destination).toString("hex")}-${randomUUID()}`;
 }
 
 function isRegularReaperFile(stat: fs.BigIntStats): boolean {
@@ -651,16 +670,48 @@ function sameReaperFileIdentity(left: fs.BigIntStats, right: fs.BigIntStats): bo
  * either an unpublished attempt or a retired predecessor, and both are
  * recovery evidence owned by receipt reconciliation.
  */
+function aliasesPublishedDestinationSync(
+	directory: string,
+	name: string,
+	destination: string,
+): ReplacementAliasObservation | undefined {
+	try {
+		const staging = fs.lstatSync(path.join(directory, name), { bigint: true });
+		if (!isRegularReaperFile(staging) || staging.nlink < 2n) return undefined;
+		const published = fs.lstatSync(path.join(directory, destination), { bigint: true });
+		if (!isRegularReaperFile(published) || published.dev !== staging.dev || published.ino !== staging.ino)
+			return undefined;
+		return { destination, staging };
+	} catch {
+		return undefined;
+	}
+}
+
 function stagingAliasesPublishedDestinationSync(
 	directory: string,
 	name: string,
 ): ReplacementAliasObservation | undefined {
 	const destination = replacementStagingDestination(name);
-	if (!destination) return undefined;
+	return destination ? aliasesPublishedDestinationSync(directory, name, destination) : undefined;
+}
+
+function remnantReapAliasesPublishedDestinationSync(
+	directory: string,
+	name: string,
+): ReplacementAliasObservation | undefined {
+	const destination = remnantReapDestination(name);
+	return destination ? aliasesPublishedDestinationSync(directory, name, destination) : undefined;
+}
+
+async function aliasesPublishedDestination(
+	directory: string,
+	name: string,
+	destination: string,
+): Promise<ReplacementAliasObservation | undefined> {
 	try {
-		const staging = fs.lstatSync(path.join(directory, name), { bigint: true });
+		const staging = await fsp.lstat(path.join(directory, name), { bigint: true });
 		if (!isRegularReaperFile(staging) || staging.nlink < 2n) return undefined;
-		const published = fs.lstatSync(path.join(directory, destination), { bigint: true });
+		const published = await fsp.lstat(path.join(directory, destination), { bigint: true });
 		if (!isRegularReaperFile(published) || published.dev !== staging.dev || published.ino !== staging.ino)
 			return undefined;
 		return { destination, staging };
@@ -674,17 +725,15 @@ async function stagingAliasesPublishedDestination(
 	name: string,
 ): Promise<ReplacementAliasObservation | undefined> {
 	const destination = replacementStagingDestination(name);
-	if (!destination) return undefined;
-	try {
-		const staging = await fsp.lstat(path.join(directory, name), { bigint: true });
-		if (!isRegularReaperFile(staging) || staging.nlink < 2n) return undefined;
-		const published = await fsp.lstat(path.join(directory, destination), { bigint: true });
-		if (!isRegularReaperFile(published) || published.dev !== staging.dev || published.ino !== staging.ino)
-			return undefined;
-		return { destination, staging };
-	} catch {
-		return undefined;
-	}
+	return destination ? aliasesPublishedDestination(directory, name, destination) : undefined;
+}
+
+async function remnantReapAliasesPublishedDestination(
+	directory: string,
+	name: string,
+): Promise<ReplacementAliasObservation | undefined> {
+	const destination = remnantReapDestination(name);
+	return destination ? aliasesPublishedDestination(directory, name, destination) : undefined;
 }
 
 function hashReaperFileSync(pathname: string, expected: fs.BigIntStats): string | undefined {
@@ -752,7 +801,7 @@ function exactReaperUnlinkSync(
 		size: stat.size,
 		mtimeNs: stat.mtimeNs,
 		sha256,
-		quarantineName: `.gjc-remnant-reap-${randomUUID()}`,
+		quarantineName: remnantReapQuarantineName(pathname),
 		...(allowHardLink ? { allowHardLink: true } : {}),
 	};
 	return nativeSessionStorage().exactUnlinkDirect(pathname, identity);
@@ -775,7 +824,7 @@ async function exactReaperUnlink(
 		size: stat.size,
 		mtimeNs: stat.mtimeNs,
 		sha256,
-		quarantineName: `.gjc-remnant-reap-${randomUUID()}`,
+		quarantineName: remnantReapQuarantineName(pathname),
 		...(allowHardLink ? { allowHardLink: true } : {}),
 	};
 	return nativeSessionStorage().exactUnlinkDirect(pathname, identity);
@@ -820,7 +869,14 @@ export function reapScrubbedProtocolRemnantsSync(
 	let failures = 0;
 	for (const name of names) {
 		const terminalRemnant = SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix));
-		const alias = terminalRemnant ? undefined : stagingAliasesPublishedDestinationSync(directory, name);
+		const replacementCandidate = REPLACEMENT_STAGING_NAME.test(name);
+		const quarantineCandidate = REAPER_QUARANTINE_NAME.test(name);
+		if (!terminalRemnant && !replacementCandidate && !quarantineCandidate) continue;
+		const alias = terminalRemnant
+			? undefined
+			: replacementCandidate
+				? stagingAliasesPublishedDestinationSync(directory, name)
+				: remnantReapAliasesPublishedDestinationSync(directory, name);
 		if (!terminalRemnant && !alias) continue;
 		const pathname = path.join(directory, name);
 		try {
@@ -873,9 +929,14 @@ export async function reapScrubbedProtocolRemnants(
 	for (const name of names) {
 		const terminalRemnant = SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix));
 		const replacementCandidate = REPLACEMENT_STAGING_NAME.test(name);
-		if (!terminalRemnant && !replacementCandidate) continue;
+		const quarantineCandidate = REAPER_QUARANTINE_NAME.test(name);
+		if (!terminalRemnant && !replacementCandidate && !quarantineCandidate) continue;
 		if (++scanned % SCRUBBED_REMNANT_REAP_BATCH_SIZE === 0) await Bun.sleep(0);
-		const alias = terminalRemnant ? undefined : await stagingAliasesPublishedDestination(directory, name);
+		const alias = terminalRemnant
+			? undefined
+			: replacementCandidate
+				? await stagingAliasesPublishedDestination(directory, name)
+				: await remnantReapAliasesPublishedDestination(directory, name);
 		if (!terminalRemnant && !alias) continue;
 		const pathname = path.join(directory, name);
 		try {

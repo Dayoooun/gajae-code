@@ -231,6 +231,87 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 		},
 	);
 
+	it.skipIf(process.platform === "win32")(
+		"does not delete the transcript's last link when the destination disappears after alias validation",
+		async () => {
+			for (const mode of ["sync", "async"] as const) {
+				await withTempDir(`gjc-remnant-alias-last-link-${mode}-`, async dir => {
+					const destination = path.join(dir, "session.jsonl");
+					const staging = path.join(dir, `.session.jsonl.00000000-0000-0000-0000-000000000001.replacement`);
+					const contents = "live transcript\n";
+					await fsp.writeFile(destination, contents);
+					await fsp.link(destination, staging);
+					const aged = new Date(Date.now() - 60 * 60 * 1000);
+					await fsp.utimes(staging, aged, aged);
+
+					const realExactUnlinkDirect = native.exactUnlinkDirect;
+					const exactUnlinkDirect = vi
+						.spyOn(native, "exactUnlinkDirect")
+						.mockImplementation((pathname, identity) => {
+							if (pathname === staging) fs.unlinkSync(destination);
+							return realExactUnlinkDirect(pathname, identity);
+						});
+					try {
+						const result =
+							mode === "sync"
+								? reapScrubbedProtocolRemnantsSync(dir, -60_000)
+								: await reapScrubbedProtocolRemnants(dir, -60_000);
+						expect(result).toEqual({ reaped: 0, failures: 0 });
+						expect(await fsp.readFile(staging, "utf8")).toBe(contents);
+						await expect(fsp.stat(destination)).rejects.toMatchObject({ code: "ENOENT" });
+					} finally {
+						exactUnlinkDirect.mockRestore();
+					}
+				});
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"reaps a replacement quarantine left behind immediately after its rename",
+		async () => {
+			for (const mode of ["sync", "async"] as const) {
+				await withTempDir(`gjc-remnant-reap-crash-${mode}-`, async dir => {
+					const destination = path.join(dir, "session.jsonl");
+					const staging = path.join(dir, `.session.jsonl.00000000-0000-0000-0000-000000000001.replacement`);
+					const contents = "live transcript\n";
+					await fsp.writeFile(destination, contents);
+					await fsp.link(destination, staging);
+					const aged = new Date(Date.now() - 60 * 60 * 1000);
+					await fsp.utimes(staging, aged, aged);
+
+					const realExactUnlinkDirect = native.exactUnlinkDirect;
+					const crashAfterRename = vi
+						.spyOn(native, "exactUnlinkDirect")
+						.mockImplementation((pathname, identity) => {
+							if (pathname === staging) {
+								fs.renameSync(pathname, path.join(dir, identity.quarantineName!));
+								return { ok: false, code: "simulated_process_exit" };
+							}
+							return realExactUnlinkDirect(pathname, identity);
+						});
+					try {
+						const firstPass =
+							mode === "sync"
+								? reapScrubbedProtocolRemnantsSync(dir, -60_000)
+								: await reapScrubbedProtocolRemnants(dir, -60_000);
+						expect(firstPass).toEqual({ reaped: 0, failures: 1 });
+					} finally {
+						crashAfterRename.mockRestore();
+					}
+
+					const secondPass =
+						mode === "sync"
+							? reapScrubbedProtocolRemnantsSync(dir, -60_000)
+							: await reapScrubbedProtocolRemnants(dir, -60_000);
+					expect(secondPass).toEqual({ reaped: 1, failures: 0 });
+					expect(await fsp.readFile(destination, "utf8")).toBe(contents);
+					await expect(fsp.stat(staging)).rejects.toMatchObject({ code: "ENOENT" });
+				});
+			}
+		},
+	);
+
 	it("keeps async alias scans off the event loop and yields between inspected candidates", async () => {
 		await withTempDir("gjc-remnant-alias-yield-", async dir => {
 			const count = 512;
