@@ -205,13 +205,15 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 					fs.linkSync(destination, staging);
 
 					const realExactUnlinkDirect = native.exactUnlinkDirect;
-					const exactUnlinkDirect = vi.spyOn(native, "exactUnlinkDirect").mockImplementation((pathname, identity) => {
-						if (pathname === staging) {
-							fs.renameSync(pathname, authorized);
-							fs.writeFileSync(pathname, "attacker replacement\n");
-						}
-						return realExactUnlinkDirect(pathname, identity);
-					});
+					const exactUnlinkDirect = vi
+						.spyOn(native, "exactUnlinkDirect")
+						.mockImplementation((pathname, identity) => {
+							if (pathname === staging) {
+								fs.renameSync(pathname, authorized);
+								fs.writeFileSync(pathname, "attacker replacement\n");
+							}
+							return realExactUnlinkDirect(pathname, identity);
+						});
 					try {
 						const result =
 							mode === "sync"
@@ -234,7 +236,10 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 			const count = 512;
 			for (let index = 0; index < count; index++) {
 				const suffix = index.toString(16).padStart(12, "0");
-				await fsp.writeFile(path.join(dir, `.missing.${`00000000-0000-0000-0000-${suffix}`}.replacement`), "staging");
+				await fsp.writeFile(
+					path.join(dir, `.missing.${`00000000-0000-0000-0000-${suffix}`}.replacement`),
+					"staging",
+				);
 			}
 			const names = await fsp.readdir(dir);
 			const readdir = vi.spyOn(fsp, "readdir").mockResolvedValue(names);
