@@ -5953,15 +5953,13 @@ pub(crate) mod platform {
 					opened.st_nlink >= 2
 				} else {
 					opened.st_nlink == 1 && identity.nlink.is_none_or(|nlink| nlink == 1)
-				}
-				&& if identity.allow_hard_link {
-					identity.nlink.is_none_or(|nlink| nlink >= 2)
-				} else {
-					identity
-						.nlink
-						.is_none_or(|nlink| nlink == opened.st_nlink as u64)
-				}
-				&& identity.sha256.as_ref() == Some(&digest)
+				} && if identity.allow_hard_link {
+				identity.nlink.is_none_or(|nlink| nlink >= 2)
+			} else {
+				identity
+					.nlink
+					.is_none_or(|nlink| nlink == opened.st_nlink as u64)
+			} && identity.sha256.as_ref() == Some(&digest)
 				&& named.st_mode & libc::S_IFMT == libc::S_IFREG
 				&& named.st_dev == opened.st_dev
 				&& named.st_ino == opened.st_ino)
