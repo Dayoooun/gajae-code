@@ -119,7 +119,7 @@ async function loadSshJsonFile(
 		warnings.push(`Failed to parse JSON in ${canonicalPath}`);
 		return { items, warnings };
 	}
-	const config = expandEnvVarsDeep(parsed);
+	const config = expandEnvVarsDeep(parsed, undefined, level === "project");
 	if (!config.hosts || typeof config.hosts !== "object") {
 		warnings.push(`Missing hosts in ${canonicalPath}`);
 		return { items, warnings };
