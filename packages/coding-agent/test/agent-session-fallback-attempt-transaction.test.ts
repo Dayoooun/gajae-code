@@ -469,6 +469,27 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		]);
 	});
 
+	it("falls back after a clean untyped zero-token empty stop", async () => {
+		const calls: string[] = [];
+		createSession((model, context, options) => {
+			calls.push(selector(model));
+			return calls.length === 1
+				? zeroTokenEmptyStopStream(model, false)
+				: createMockModel({ responses: [{ content: ["accepted"] }] }).stream(model, context, options);
+		}, 1);
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("recover from an untyped empty response");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual(["anthropic/claude-sonnet-4-5", "openai/gpt-4o-mini"]);
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(1);
+		expect(session!.messages.filter(message => message.role === "assistant")).toEqual([
+			expect.objectContaining({ content: [expect.objectContaining({ type: "text", text: "accepted" })] }),
+		]);
+	});
+
 	it("does not replay a typed empty response after a managed context handler participates", async () => {
 		const calls: string[] = [];
 		let handlerCalls = 0;
@@ -478,7 +499,12 @@ describe("AgentSession managed fallback attempt transaction", () => {
 				return zeroTokenEmptyStopStream(model);
 			},
 			3,
-			{ handler: "context", onHandler: () => handlerCalls++ },
+			{
+				handler: "context",
+				onHandler: () => {
+					handlerCalls++;
+				},
+			},
 		);
 
 		await session!.prompt("do not replay an extension-observable empty response");
@@ -498,7 +524,12 @@ describe("AgentSession managed fallback attempt transaction", () => {
 				return zeroTokenEmptyStopStream(model, false);
 			},
 			3,
-			{ handler: "context", onHandler: () => handlerCalls++ },
+			{
+				handler: "context",
+				onHandler: () => {
+					handlerCalls++;
+				},
+			},
 		);
 
 		await session!.prompt("do not replay an untyped extension-observable empty response");

@@ -24039,6 +24039,10 @@ export class AgentSession {
 		if (classification === "transient" || classification === "first_event_timeout") {
 			return { class: "server" };
 		}
+		// A locally promoted empty response is retryable only when the managed
+		// attempt stayed clean; authorize the configured fallback chain without
+		// fabricating provider transport facts for the runtime-owned failure.
+		if (classification === "empty_response") return { class: "server" };
 		if (classification === "unknown") return { class: "unknown" };
 		return undefined;
 	}
