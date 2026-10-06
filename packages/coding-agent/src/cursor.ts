@@ -23,6 +23,7 @@ import {
 	piTimeout,
 } from "@gajae-code/ai/providers/cursor/exec-modern";
 import { sanitizeText } from "@gajae-code/utils";
+import { assertDeleteInsideWorkspace } from "./cursor-delete-path";
 import { resolveToCwd } from "./tools/path-utils";
 
 /**
@@ -184,6 +185,7 @@ async function executeDelete(
 			throw new Error(`Path is not a file: ${pathArg}`);
 		}
 
+		await assertDeleteInsideWorkspace(options.cwd, absolutePath);
 		fs.rmSync(absolutePath);
 
 		const sizeText = fileStat.size ? ` (${fileStat.size} bytes)` : "";
