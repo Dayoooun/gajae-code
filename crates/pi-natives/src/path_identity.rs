@@ -29,8 +29,12 @@ const WINDOWS_BUILTIN_ADMINISTRATORS_SID: [u8; 16] =
 /// Windows may create a managed root while elevated, leaving it owned by the
 /// built-in Administrators group. The DACL is validated separately before use.
 #[cfg(any(windows, test))]
-fn is_trusted_windows_owner_sid(owner_sid: &[u8], current_user_sid: &[u8]) -> bool {
-	owner_sid == current_user_sid || owner_sid == WINDOWS_BUILTIN_ADMINISTRATORS_SID.as_slice()
+fn is_trusted_windows_owner_sid(
+	mut owner_matches_sid: impl FnMut(&[u8]) -> bool,
+	current_user_sid: &[u8],
+) -> bool {
+	owner_matches_sid(current_user_sid)
+		|| owner_matches_sid(WINDOWS_BUILTIN_ADMINISTRATORS_SID.as_slice())
 }
 
 #[cfg(test)]
@@ -42,11 +46,15 @@ mod windows_owner_sid_tests {
 	const UNTRUSTED_OWNER_SID: [u8; 12] =
 		[0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x16, 0x00, 0x00, 0x00];
 
+	fn is_trusted_owner(owner_sid: &[u8]) -> bool {
+		is_trusted_windows_owner_sid(|trusted_sid| trusted_sid == owner_sid, &CURRENT_USER_SID)
+	}
+
 	#[test]
 	fn accepts_current_user_and_builtin_administrators_but_rejects_other_owners() {
-		assert!(is_trusted_windows_owner_sid(&CURRENT_USER_SID, &CURRENT_USER_SID));
-		assert!(is_trusted_windows_owner_sid(&WINDOWS_BUILTIN_ADMINISTRATORS_SID, &CURRENT_USER_SID));
-		assert!(!is_trusted_windows_owner_sid(&UNTRUSTED_OWNER_SID, &CURRENT_USER_SID));
+		assert!(is_trusted_owner(&CURRENT_USER_SID));
+		assert!(is_trusted_owner(&WINDOWS_BUILTIN_ADMINISTRATORS_SID));
+		assert!(!is_trusted_owner(&UNTRUSTED_OWNER_SID));
 	}
 }
 
@@ -12417,16 +12425,15 @@ mod platform {
 		let result = if owner.is_null() {
 			Err("acl_unavailable")
 		} else {
-			// SAFETY: GetSecurityInfo returned owner within the live security
-			// descriptor, and GetLengthSid reads that API-provided SID's length.
-			let owner_length = usize::try_from(unsafe { GetLengthSid(owner) }).ok();
-			let owner_matches = owner_length.is_some_and(|owner_length| {
-				// SAFETY: `owner` remains inside the live descriptor and `GetLengthSid`
-				// supplies the exact bounded SID length.
-				let owner_sid = unsafe { std::slice::from_raw_parts(owner.cast::<u8>(), owner_length) };
-				valid_sid(owner_sid) == Some(owner_length)
-					&& super::is_trusted_windows_owner_sid(owner_sid, sid)
-			});
+			let owner_matches = super::is_trusted_windows_owner_sid(
+				|trusted_sid| {
+					// SAFETY: `owner` is returned by GetSecurityInfo within the live
+					// descriptor. `trusted_sid` is either the validated current-user SID or
+					// the fixed, well-formed BUILTIN Administrators SID.
+					unsafe { EqualSid(owner, trusted_sid.as_ptr().cast_mut().cast()) != 0 }
+				},
+				sid,
+			);
 			if !owner_matches {
 				Ok(OwnerOnlyAclState::OwnerMismatch)
 			} else {
