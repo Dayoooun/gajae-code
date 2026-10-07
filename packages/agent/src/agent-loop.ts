@@ -769,6 +769,11 @@ function managedTransportFailure(failure: unknown) {
 	return facts && typeof facts === "object" ? transportFailureFacts(facts) : undefined;
 }
 
+function managedAssistantMessageHasContent(failure: unknown): boolean {
+	const content = managedProperty(failure, "content");
+	return Array.isArray(content) && content.length > 0;
+}
+
 // AI owns provider-originated authority. The agent loop owns authority for
 // the rebuilt message objects it creates; this second WeakSet is deliberately
 // module-private so a public AI consumer cannot transfer authority to an
@@ -2944,6 +2949,27 @@ class ManagedAttemptTransaction {
 			}
 		}
 		return snapshot;
+	}
+
+	hasObservableAssistantOutput(): boolean {
+		return this.#batch.some(item => {
+			if (item.type === "assistant_event") {
+				const event = item.event;
+				if (
+					event.type === "text_delta" ||
+					event.type === "thinking_delta" ||
+					event.type === "reasoning_summary_delta" ||
+					event.type === "text_end" ||
+					event.type === "thinking_end" ||
+					event.type === "reasoning_summary_end"
+				) {
+					if (event.type === "text_end" || event.type === "thinking_end" || event.type === "reasoning_summary_end")
+						return event.content.length > 0;
+					return event.delta.length > 0;
+				}
+			}
+			return false;
+		});
 	}
 
 	discard(): void {
