@@ -23,8 +23,13 @@ use sha2::{Digest, Sha256};
 use crate::task;
 
 #[cfg(any(windows, test))]
-const WINDOWS_BUILTIN_ADMINISTRATORS_SID: [u8; 16] =
-	[0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x30, 0x02, 0x00, 0x00];
+#[repr(align(4))]
+struct WindowsSid([u8; 16]);
+
+#[cfg(any(windows, test))]
+const WINDOWS_BUILTIN_ADMINISTRATORS_SID: WindowsSid = WindowsSid([
+	0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x30, 0x02, 0x00, 0x00,
+]);
 
 /// Windows may create a managed root while elevated, leaving it owned by the
 /// built-in Administrators group. The DACL is validated separately before use.
@@ -34,7 +39,7 @@ fn is_trusted_windows_owner_sid(
 	current_user_sid: &[u8],
 ) -> bool {
 	owner_matches_sid(current_user_sid)
-		|| owner_matches_sid(WINDOWS_BUILTIN_ADMINISTRATORS_SID.as_slice())
+		|| owner_matches_sid(WINDOWS_BUILTIN_ADMINISTRATORS_SID.0.as_slice())
 }
 
 #[cfg(test)]
@@ -53,7 +58,7 @@ mod windows_owner_sid_tests {
 	#[test]
 	fn accepts_current_user_and_builtin_administrators_but_rejects_other_owners() {
 		assert!(is_trusted_owner(&CURRENT_USER_SID));
-		assert!(is_trusted_owner(&WINDOWS_BUILTIN_ADMINISTRATORS_SID));
+		assert!(is_trusted_owner(&WINDOWS_BUILTIN_ADMINISTRATORS_SID.0));
 		assert!(!is_trusted_owner(&UNTRUSTED_OWNER_SID));
 	}
 }
