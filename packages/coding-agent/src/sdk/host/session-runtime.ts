@@ -2743,6 +2743,11 @@ export function providerFailureFromAgentEnd(
 			return undefined;
 		}
 		if (errorKind === "local_snapshot_failure" || errorKind === "local_buffer_overflow") return undefined;
+		if (errorKind === "local_empty_response")
+			return {
+				code: "empty_response",
+				message: PROMPT_FAILURE_MESSAGE_SUBMISSION,
+			};
 		let errorMessage: unknown;
 		try {
 			errorMessage = assistant.errorMessage;
