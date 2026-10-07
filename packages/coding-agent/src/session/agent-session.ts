@@ -330,6 +330,7 @@ import {
 	buildSkillPromptMessage,
 	getSkillSlashCommandName,
 	isNamespacedSkillSlashCommandName,
+	type ParsedSkillInvocation,
 	parseSkillInvocations,
 	type Skill,
 	type SkillWarning,
@@ -13638,6 +13639,36 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * The loaded skill a prompt's text dispatches to, or undefined when `prompt`
+	 * would submit it as ordinary text (unknown or disabled `/skill:` names,
+	 * chains, or attached images). Single source for dispatch and for callers
+	 * that must mirror it, such as startup title seeding.
+	 */
+	resolvePromptSkillInvocation(text: string, images?: readonly unknown[]): ParsedSkillInvocation | undefined {
+		if (images?.length || !text.startsWith("/") || !isNamespacedSkillSlashCommandName(text.slice(1))) return;
+		const skillCommands = new Map(this.skills.map(skill => [getSkillSlashCommandName(skill), skill]));
+		const invocations = parseSkillInvocations(text, skillCommands);
+		return invocations.length === 1 ? invocations[0] : undefined;
+	}
+
+	/**
+	 * Whether `prompt` intercepts this slash text as an extension or custom/MCP
+	 * command. Used to keep command arguments away from the title model. Mirrors the
+	 * command lookup in `#tryExecuteExtensionCommand` / `#tryExecuteCustomCommand`
+	 * without executing anything.
+	 */
+	isLocallyHandledSlashCommand(text: string): boolean {
+		if (!text.startsWith("/")) return false;
+		const spaceIndex = text.indexOf(" ");
+		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+		return (
+			this.#extensionRunner?.getCommand(commandName) !== undefined ||
+			this.#customCommands.some(c => c.command.name === commandName) ||
+			this.#mcpPromptCommands.some(c => c.command.name === commandName)
+		);
+	}
+
 	async #promptInternal(
 		text: string,
 		options: PromptOptions | undefined,
@@ -13659,38 +13690,29 @@ export class AgentSession {
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 
-		if (
-			expandPromptTemplates &&
-			text.startsWith("/") &&
-			isNamespacedSkillSlashCommandName(text.slice(1)) &&
-			!options?.images?.length
-		) {
-			const skillCommands = new Map(this.skills.map(skill => [getSkillSlashCommandName(skill), skill]));
-			const invocations = parseSkillInvocations(text, skillCommands);
-			if (invocations.length === 1) {
-				const invocation = invocations[0];
-				if (invocation) {
-					await this.invokeSkill(
-						invocation.skill.name,
-						invocation.args,
-						options?.onPreflightAccepted ||
-							options?.onPreflightAcceptCommit ||
-							options?.preflightSignal ||
-							internalOptions?.sdkRunToken
-							? {
-									...(options?.onPreflightAccepted
-										? { onPreflightAccepted: options.onPreflightAccepted }
-										: {}),
-									...(options?.onPreflightAcceptCommit
-										? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
-										: {}),
-									...(options?.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
-									...(options?.sdkRunCapability ? { sdkRunCapability: options.sdkRunCapability } : {}),
-								}
-							: undefined,
-					);
-					return;
-				}
+		if (expandPromptTemplates) {
+			const invocation = this.resolvePromptSkillInvocation(text, options?.images);
+			if (invocation) {
+				await this.invokeSkill(
+					invocation.skill.name,
+					invocation.args,
+					options?.onPreflightAccepted ||
+						options?.onPreflightAcceptCommit ||
+						options?.preflightSignal ||
+						internalOptions?.sdkRunToken
+						? {
+								...(options?.onPreflightAccepted
+									? { onPreflightAccepted: options.onPreflightAccepted }
+									: {}),
+								...(options?.onPreflightAcceptCommit
+									? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
+									: {}),
+								...(options?.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
+								...(options?.sdkRunCapability ? { sdkRunCapability: options.sdkRunCapability } : {}),
+							}
+						: undefined,
+				);
+				return;
 			}
 		}
 
