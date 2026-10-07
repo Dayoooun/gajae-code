@@ -149,21 +149,52 @@ const initialTemporaryRoots = initialProcessEnvironment.then(async environment =
 	}
 	return [...roots];
 });
-const initialNodeAuthorities = initialProcessEnvironment.then(async environment => {
-	const authorities = new Map<string, string>();
+// Discover canonical node executable paths at startup, but defer hashing until actually needed.
+// Multiple symlinks to the same inode are deduplicated.
+const initialNodePaths = initialProcessEnvironment.then(async environment => {
+	const seen = new Set<string>();
+	const paths: string[] = [];
 	const temporaryRoots = await initialTemporaryRoots;
 	for (const pathEntry of (environment.get("PATH") ?? "").split(path.delimiter).filter(path.isAbsolute)) {
 		const lexical = path.join(pathEntry, process.platform === "win32" ? "node.exe" : "node");
 		try {
 			const real = await fs.realpath(lexical);
+			if (seen.has(real)) continue; // Deduplicate identical paths
 			if (temporaryRoots.some(root => isWithin(root, real))) continue;
-			authorities.set(real, await hashStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES));
+			seen.add(real);
+			paths.push(real);
 		} catch {
-			// Missing or unstable startup candidates do not become authority.
+			// Missing or unstable startup candidates are ignored.
 		}
 	}
-	return authorities;
+	return paths;
 });
+
+// Lazy cache for node executable hashes, keyed by canonical path.
+// Promises are cached to deduplicate concurrent hash computations on the same path.
+const nodeHashCache = new Map<string, Promise<string>>();
+
+// Compute node executable hash lazily and cache the promise to deduplicate concurrent requests.
+async function getNodeHash(realPath: string): Promise<string> {
+	let cached = nodeHashCache.get(realPath);
+	if (!cached) {
+		cached = hashStableFile(realPath, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES);
+		nodeHashCache.set(realPath, cached);
+	}
+	return cached;
+}
+
+// Check if a path is in the initial node authorities.
+async function isInitialNodePath(realPath: string): Promise<boolean> {
+	return (await initialNodePaths).includes(realPath);
+}
+
+// Get the hash of a node executable if it was discovered at startup.
+// Returns undefined if the path is not in the initial node authorities.
+async function getInitialNodeHash(realPath: string): Promise<string | undefined> {
+	if (!(await isInitialNodePath(realPath))) return undefined;
+	return getNodeHash(realPath);
+}
 
 async function snapshotExistingFile(filePath: string): Promise<FileSnapshot | null> {
 	try {
@@ -515,7 +546,7 @@ async function isInitialManagedNodeLauncherPath(
 	const real = await fs.realpath(executablePath);
 	if (untrustedRoots.some(root => isWithin(root, real))) return false;
 	if ((await initialTemporaryRoots).some(root => isWithin(root, real))) return false;
-	const expected = (await initialNodeAuthorities).get(real);
+	const expected = await getInitialNodeHash(real);
 	if (!expected) return false;
 	return (await hashStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES)) === expected;
 }
@@ -671,7 +702,7 @@ async function prepareVerifiedStdioLaunch(input: {
 		true,
 	);
 	const launcherReal = await fs.realpath(input.launcherPath);
-	const expectedLauncherHash = (await initialNodeAuthorities).get(launcherReal);
+	const expectedLauncherHash = await getInitialNodeHash(launcherReal);
 	if (!expectedLauncherHash || sha256(launcherBytes) !== expectedLauncherHash) {
 		throw new Error("Plugin MCP Node interpreter drifted from startup authority");
 	}
