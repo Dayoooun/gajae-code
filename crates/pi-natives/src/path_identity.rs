@@ -21,6 +21,35 @@ use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
 use crate::task;
+
+#[cfg(any(windows, test))]
+const WINDOWS_BUILTIN_ADMINISTRATORS_SID: [u8; 16] =
+	[0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x30, 0x02, 0x00, 0x00];
+
+/// Windows may create a managed root while elevated, leaving it owned by the
+/// built-in Administrators group. The DACL is validated separately before use.
+#[cfg(any(windows, test))]
+fn is_trusted_windows_owner_sid(owner_sid: &[u8], current_user_sid: &[u8]) -> bool {
+	owner_sid == current_user_sid || owner_sid == WINDOWS_BUILTIN_ADMINISTRATORS_SID.as_slice()
+}
+
+#[cfg(test)]
+mod windows_owner_sid_tests {
+	use super::{WINDOWS_BUILTIN_ADMINISTRATORS_SID, is_trusted_windows_owner_sid};
+
+	const CURRENT_USER_SID: [u8; 12] =
+		[0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0x00];
+	const UNTRUSTED_OWNER_SID: [u8; 12] =
+		[0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x16, 0x00, 0x00, 0x00];
+
+	#[test]
+	fn accepts_current_user_and_builtin_administrators_but_rejects_other_owners() {
+		assert!(is_trusted_windows_owner_sid(&CURRENT_USER_SID, &CURRENT_USER_SID));
+		assert!(is_trusted_windows_owner_sid(&WINDOWS_BUILTIN_ADMINISTRATORS_SID, &CURRENT_USER_SID));
+		assert!(!is_trusted_windows_owner_sid(&UNTRUSTED_OWNER_SID, &CURRENT_USER_SID));
+	}
+}
+
 /// Classification of a read-only retained-publication observation.
 #[napi(object)]
 pub struct NativeBrokerPublicationObservation {
@@ -12248,16 +12277,6 @@ mod platform {
 		}
 		Ok(sid_bytes[..sid_length].to_vec())
 	}
-	fn administrators_sid() -> Vec<u8> {
-		// BUILTIN\Administrators SID: S-1-5-32-544
-		vec![
-			0x01, // Revision
-			0x02, // SubAuthority count (2)
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // Authority (5 = NT_AUTHORITY)
-			0x20, 0x00, 0x00, 0x00, // SubAuthority 0 (32)
-			0x30, 0x02, 0x00, 0x00, // SubAuthority 1 (544)
-		]
-	}
 
 	const OBJECT_INHERIT_ACE: u8 = 0x01;
 	const CONTAINER_INHERIT_ACE: u8 = 0x02;
@@ -12399,19 +12418,15 @@ mod platform {
 			Err("acl_unavailable")
 		} else {
 			// SAFETY: GetSecurityInfo returned owner within the live security
-			// descriptor; `sid` is a validated current-user SID.
-			let owner_matches_user = unsafe { EqualSid(owner, sid.as_ptr().cast_mut().cast()) } != 0;
-
-			// On Windows, also accept Administrators as a trusted owner to support
-			// elevated installation paths (issue #6420)
-			let owner_matches_admin = if !owner_matches_user {
-				let admin_sid = administrators_sid();
-				(unsafe { EqualSid(owner, admin_sid.as_ptr().cast_mut().cast()) }) != 0
-			} else {
-				false
-			};
-
-			let owner_matches = owner_matches_user || owner_matches_admin;
+			// descriptor, and GetLengthSid reads that API-provided SID's length.
+			let owner_length = usize::try_from(unsafe { GetLengthSid(owner) }).ok();
+			let owner_matches = owner_length.is_some_and(|owner_length| {
+				// SAFETY: `owner` remains inside the live descriptor and `GetLengthSid`
+				// supplies the exact bounded SID length.
+				let owner_sid = unsafe { std::slice::from_raw_parts(owner.cast::<u8>(), owner_length) };
+				valid_sid(owner_sid) == Some(owner_length)
+					&& super::is_trusted_windows_owner_sid(owner_sid, sid)
+			});
 			if !owner_matches {
 				Ok(OwnerOnlyAclState::OwnerMismatch)
 			} else {
