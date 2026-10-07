@@ -231,6 +231,12 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal session-scoped profile lifecycle state behind the reviewed model.set seam, not an independent public SDK operation",
 	"agent_session:getUnavailableModelProfile":
 		"internal session-scoped profile lifecycle accessor behind the reviewed model.set seam, not an independent public SDK operation",
+	"agent_session:getUserModelSelectionRevision":
+		"internal session-scoped model selection revision tracking behind the reviewed model.set seam, not an independent public SDK operation",
+	"agent_session:getUserCanonicalVariantSelection":
+		"internal session-scoped model variant selection state behind the reviewed model.set seam, not an independent public SDK operation",
+	"agent_session:markUserModelSelection":
+		"internal session-scoped model selection revision marker behind the reviewed model.set seam, not an independent public SDK operation",
 	"agent_session:clearSessionOnlyModelProfileState":
 		"internal session-scoped profile lifecycle plumbing behind the reviewed model.set seam, not an independent public SDK operation",
 	"agent_session:noteProfileInstalledOverrides":
