@@ -164,8 +164,14 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		const root = await temporaryDirectory();
 		const source = path.join(root, "staged.exe");
 		const destination = path.join(root, "gjc.exe");
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
 		await fs.writeFile(source, "new-binary");
 		await fs.writeFile(destination, "old-binary");
+		// Exact replacement validates ownership as well as the DACL; pin the
+		// fixture owner instead of relying on the runner's temp-file default.
+		await runIcacls(source, "/setowner", user);
+		await runIcacls(destination, "/setowner", user);
 		expect(applyOwnerOnlyPathSecurity(source, "file")).toEqual({ ok: true });
 		expect(applyOwnerOnlyPathSecurity(destination, "file")).toEqual({ ok: true });
 		const parent = await parentIdentity(source);
