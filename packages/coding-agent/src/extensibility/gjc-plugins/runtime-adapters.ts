@@ -168,11 +168,14 @@ export interface StableFileIdentity {
 const initialNodeIdentities = initialProcessEnvironment.then(async environment => {
 	const identities = new Map<string, StableFileIdentity>();
 	const temporaryRoots = await initialTemporaryRoots;
+	const cwdReal = await fs.realpath(process.cwd()).catch(() => process.cwd());
 	for (const pathEntry of (environment.get("PATH") ?? "").split(path.delimiter).filter(path.isAbsolute)) {
 		const lexical = path.join(pathEntry, process.platform === "win32" ? "node.exe" : "node");
 		try {
 			const real = await fs.realpath(lexical);
-			if (temporaryRoots.some(root => isWithin(root, real))) continue;
+			// Skip temporary roots, unless the path is under the current working directory.
+			// Development environments might have worktrees in /tmp, so we should trust those.
+			if (!isWithin(cwdReal, real) && temporaryRoots.some(root => isWithin(root, real))) continue;
 			if (identities.has(real)) continue;
 			const stat = await fs.stat(real);
 			identities.set(real, {
@@ -202,15 +205,9 @@ export function getInitialNodeHash(realPath: string): Promise<string | undefined
 
 	const attempt = initialNodeIdentities.then(async identities => {
 		const identity = identities.get(realPath);
-		if (!identity) {
-			initialNodeHashes.set(realPath, Promise.resolve(undefined));
-			return undefined;
-		}
+		if (!identity) return undefined;
 		try {
-			const hash = await hashStableFile(realPath, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, identity);
-			// Memoize successful hashes so they are not re-read on every check.
-			initialNodeHashes.set(realPath, Promise.resolve(hash));
-			return hash;
+			return await hashStableFile(realPath, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, identity);
 		} catch {
 			// Do not memoize failed attempts to allow retries on transient errors
 			// (e.g., EMFILE on file open/read). Remove the pending entry so the next
