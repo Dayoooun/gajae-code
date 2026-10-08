@@ -438,19 +438,10 @@ export async function collectPullRequestFragmentViolations(
 		const violation = compareUnreleasedEdit(file, before, after, baseRef);
 		if (violation) errors.push(violation);
 	}
-	// Check for fragment deletions. A deleted fragment is only valid if it was
-	// consumed by the release process (i.e., it does not exist in the head commit
-	// being merged, only in the base). Fragments deleted on both sides or only on
-	// the base are still errors — they indicate an accidental deletion.
+	const consumed = await releaseConsumedFragments(base, head);
 	for (const file of (await gitDiffPaths(base, head, "D")).filter(isFragmentPath)) {
-		const existsInHead = (await gitShow(head, file)) !== undefined;
-		if (existsInHead) {
-			// Fragment exists in both base and head, so it's being deleted by this PR,
-			// not consumed by the release. This is an error.
-			errors.push({ file, message: "is deleted by this pull request. Only the release flow folds and consumes fragments (scripts/release.ts); deleting one here drops an unreleased note without shipping it." });
-		}
-		// Otherwise, fragment does not exist in head, so it was consumed by the
-		// release process. This is valid in a backmerge and we allow it.
+		if (consumed.has(file)) continue;
+		errors.push({ file, message: "is deleted by this pull request. Only the release flow folds and consumes fragments (scripts/release.ts); deleting one here drops an unreleased note without shipping it." });
 	}
 	const collected = await collectPackageFragments();
 	errors.push(...collected.errors);
@@ -462,6 +453,31 @@ export async function collectPullRequestFragmentViolations(
 		}
 	}
 	return errors;
+}
+
+const STABLE_RELEASE_TAG = /^v\d+\.\d+\.\d+$/;
+
+/**
+ * Fragments consumed by a release that this range brings in, keyed by path.
+ *
+ * Release provenance is the stable `vX.Y.Z` tag that `scripts/release.ts` places on
+ * its version-bump commit, and that commit is where the fragments are folded and
+ * deleted. A release backmerge merges a tag that is reachable from `head` but not from
+ * `base`, so the deletions that tagged commit made are legitimate in this range. Any
+ * other deletion, including one that is merely absent at `head`, has no release
+ * provenance and stays a violation.
+ */
+async function releaseConsumedFragments(base: string, head: string): Promise<Set<string>> {
+	const listed = await $`git tag --list ${"v*"} --merged ${head} --no-merged ${base}`.quiet().nothrow();
+	if (listed.exitCode !== 0) throw new Error(`git tag --merged ${head} failed: ${listed.stderr.toString().trim()}`);
+	const consumed = new Set<string>();
+	const tags = listed.text().split("\n").map(line => line.trim()).filter(tag => STABLE_RELEASE_TAG.test(tag));
+	for (const tag of tags) {
+		for (const file of await gitDiffPaths(`${tag}^1`, tag, "D")) {
+			if (isFragmentPath(file)) consumed.add(file);
+		}
+	}
+	return consumed;
 }
 
 export async function runGuard(baseFlag: string | undefined, headFlag: string | undefined): Promise<number> {
