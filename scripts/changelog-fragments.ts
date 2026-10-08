@@ -438,8 +438,19 @@ export async function collectPullRequestFragmentViolations(
 		const violation = compareUnreleasedEdit(file, before, after, baseRef);
 		if (violation) errors.push(violation);
 	}
+	// Check for fragment deletions. A deleted fragment is only valid if it was
+	// consumed by the release process (i.e., it does not exist in the head commit
+	// being merged, only in the base). Fragments deleted on both sides or only on
+	// the base are still errors — they indicate an accidental deletion.
 	for (const file of (await gitDiffPaths(base, head, "D")).filter(isFragmentPath)) {
-		errors.push({ file, message: "is deleted by this pull request. Only the release flow folds and consumes fragments (scripts/release.ts); deleting one here drops an unreleased note without shipping it." });
+		const existsInHead = (await gitShow(head, file)) !== undefined;
+		if (existsInHead) {
+			// Fragment exists in both base and head, so it's being deleted by this PR,
+			// not consumed by the release. This is an error.
+			errors.push({ file, message: "is deleted by this pull request. Only the release flow folds and consumes fragments (scripts/release.ts); deleting one here drops an unreleased note without shipping it." });
+		}
+		// Otherwise, fragment does not exist in head, so it was consumed by the
+		// release process. This is valid in a backmerge and we allow it.
 	}
 	const collected = await collectPackageFragments();
 	errors.push(...collected.errors);
