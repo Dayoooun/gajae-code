@@ -482,9 +482,6 @@ function admitEvents(events: SessionIndexEvent[]): Admission {
 }
 
 /** Pure rejection ledger derived from the event stream (C5 audit, idempotent by indexSeq). */
-/** `indexSeq` field of one serialized {@link SessionIndexAuditRecord} row. */
-const AUDIT_INDEX_SEQ = /"indexSeq":(\d+)[,}]/;
-
 function auditRecords(events: SessionIndexEvent[], ts: number): SessionIndexAuditRecord[] {
 	const { rejected } = admitEvents(events);
 	return rejected.map(rejection => ({
@@ -1345,11 +1342,13 @@ export class SessionIndex {
 			try {
 				const contents = await fs.readFile(auditFor(this.#agentDir), "utf8");
 				for (const line of contents.split("\n")) {
-					// Dedupe needs only `indexSeq`; matching the key avoids parsing every
-					// record. A torn row (no closing brace) is skipped, as before.
-					if (!line.endsWith("}")) continue;
-					const match = AUDIT_INDEX_SEQ.exec(line);
-					if (match) this.#auditedSeq.add(Number(match[1]));
+					if (!line) continue;
+					try {
+						const record = JSON.parse(line) as Partial<SessionIndexAuditRecord>;
+						if (typeof record.indexSeq === "number") this.#auditedSeq.add(record.indexSeq);
+					} catch {
+						// Best-effort dedupe seed; a corrupt audit row never blocks the index.
+					}
 				}
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;

@@ -1856,12 +1856,27 @@ describe("SDK session index", () => {
 		await (await new SessionIndex(dir).open()).refresh();
 		const first = await fs.readFile(auditPath, "utf8");
 		expect(first.trim().split("\n")).toHaveLength(1);
-		// A torn trailing row is not a dedupe record: its seq must not suppress the audit.
+		// A torn trailing row does not disturb dedupe of the valid rows.
 		await fs.writeFile(auditPath, `${first}{"indexSeq":2`);
 		await (await new SessionIndex(dir).open()).refresh();
 		await (await new SessionIndex(dir).open()).refresh();
 		const rows = (await fs.readFile(auditPath, "utf8")).split("\n").filter(line => line.includes('"indexSeq":1,'));
 		expect(rows).toHaveLength(1);
+		// A closed but invalid JSON row naming seq 1 is not a dedupe record either:
+		// the valid rejection record must still be written.
+		await fs.writeFile(auditPath, '{"indexSeq":1,broken}\n');
+		await (await new SessionIndex(dir).open()).refresh();
+		const valid = (await fs.readFile(auditPath, "utf8"))
+			.split("\n")
+			.flatMap(line => {
+				try {
+					return [JSON.parse(line) as { indexSeq?: number }];
+				} catch {
+					return [];
+				}
+			})
+			.filter(record => record.indexSeq === 1);
+		expect(valid).toHaveLength(1);
 	});
 	it("preserves closure before deletion but rejects delayed closure evidence", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-retirement-evidence-"));
