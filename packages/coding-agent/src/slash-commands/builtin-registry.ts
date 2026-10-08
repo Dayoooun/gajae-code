@@ -31,6 +31,8 @@ import {
 	type InteractiveModeContext,
 } from "../modes/types";
 import { parseUiLanguage, resolveUiLanguage, UI_LANGUAGE_LABELS, UI_LANGUAGES, uiString } from "../modes/ui-language";
+import { buildSessionProjectProgress } from "../progress/collect-project-progress";
+import { PROGRESS_COMMAND_ACP_DESCRIPTION } from "../progress/render-progress";
 // W1b/W5b: notification-service and daemon controllers stay off the static
 // import graph; the /notify handlers import them lazily at first use.
 import type { NotificationProvider } from "../sdk/bus/config";
@@ -63,6 +65,7 @@ import { switchSessionCredentialCommand } from "./helpers/credential-switch";
 import { buildFastStatusReport } from "./helpers/fast-status-report";
 import { formatDuration } from "./helpers/format";
 import { commandConsumed, errorMessage, parseSlashCommand, parseSubcommand, usage } from "./helpers/parse";
+import { renderProgressReportLines, renderProgressReportText } from "./helpers/progress-report";
 import { handleSshAcp } from "./helpers/ssh";
 import { buildUsageReportText, collectCachedUsageReports } from "./helpers/usage-report";
 import type {
@@ -1047,6 +1050,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						runtime,
 					);
 				}
+				if (targetIds.some(targetId => targetId !== "default")) runtime.session.markUserModelSelection();
 				// Preset shortcut: when the selector names a known model profile
 				// (optionally `gajae-code/`-prefixed) and the target is implicit,
 				// activate the profile immediately instead of treating the preset name
@@ -1059,14 +1063,17 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							const profileLabel = formatModelProfileDisplayLabel(
 								runtime.session.modelRegistry.getModelProfile(presetName) ?? { name: presetName },
 							);
-							await activateModelProfile(
-								{
-									session: runtime.session,
-									modelRegistry: runtime.session.modelRegistry,
-									settings: runtime.settings,
-									profileName: presetName,
-								},
-								{ persistDefault: false },
+							runtime.session.markUserModelSelection();
+							await runtime.session.withSdkControlMutation(() =>
+								activateModelProfile(
+									{
+										session: runtime.session,
+										modelRegistry: runtime.session.modelRegistry,
+										settings: runtime.settings,
+										profileName: presetName,
+									},
+									{ persistDefault: false },
+								),
 							);
 							await runtime.output(`Model profile: ${profileLabel}`);
 							await runtime.notifyTitleChanged?.();
@@ -1136,7 +1143,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							runtime.session.setThinkingLevel(existingDefaultThinkingLevel);
 						}
 					}
-
 					const materializedProfile = materializeActiveModelProfileAssignments({
 						session: runtime.session,
 						settings: runtime.settings,
@@ -1582,6 +1588,30 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handleTui: (_command, runtime) => {
 			runtime.ctx.handleContextCommand();
 			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "progress",
+		description:
+			"Show a read-only project progress overview from durable goal, todo, workflow, agent, and verification state",
+		// Production ACP advertises and dispatches `/progress` itself over the
+		// `session.progress` SDK query (modes/acp/acp-agent.ts) with the same copy.
+		acpDescription: PROGRESS_COMMAND_ACP_DESCRIPTION,
+		allowArgs: false,
+		handle: async (_command, runtime) => {
+			const report = await buildSessionProjectProgress(runtime.session, runtime.sessionManager);
+			await runtime.output(renderProgressReportText(report));
+			return commandConsumed();
+		},
+		handleTui: async (_command, runtime) => {
+			const ctx = runtime.ctx;
+			const report = await buildSessionProjectProgress(ctx.session, ctx.sessionManager);
+			ctx.chatContainer.addChild(new Spacer(1));
+			ctx.chatContainer.addChild(new DynamicBorder());
+			ctx.chatContainer.addChild(new Text(renderProgressReportLines(report, theme).join("\n"), 1, 0));
+			ctx.chatContainer.addChild(new DynamicBorder());
+			ctx.ui.requestRender();
+			ctx.editor.setText("");
 		},
 	},
 	{

@@ -22,6 +22,7 @@ import { type SlashCommand, slashCommandCapability } from "../capability/slash-c
 import { type SystemPrompt, systemPromptCapability } from "../capability/system-prompt";
 import { type CustomTool, toolCapability } from "../capability/tool";
 import type { LoadContext, LoadResult } from "../capability/types";
+import { resolveGlobalUserSkillLinkTrust } from "../config/skill-settings-defaults";
 import { expandTilde } from "../tools/path-utils";
 import {
 	buildRuleFromMarkdown,
@@ -220,6 +221,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 				cwd: serverConfig.cwd as string | undefined,
 				url: serverConfig.url as string | undefined,
 				headers: serverConfig.headers as Record<string, string> | undefined,
+				publicNetwork: serverConfig.publicNetwork === true ? true : undefined,
 				auth: serverConfig.auth as
 					| {
 							type: "oauth" | "apikey";
@@ -359,6 +361,14 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 			level: "user",
 			scope: "native",
 			requireDescription: true,
+			allowExternalUserSkillSymlinks:
+				ctx.allowExternalUserSkillSymlinks ??
+				(typeof ctx.settings?.getGlobal === "function"
+					? resolveGlobalUserSkillLinkTrust({
+							trustUserSkills: ctx.settings.getGlobal("skills.trustUserSkills"),
+							enablePiUser: ctx.settings.getGlobal("skills.enablePiUser"),
+						})
+					: true),
 		}),
 	);
 

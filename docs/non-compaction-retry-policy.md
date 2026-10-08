@@ -169,8 +169,10 @@ If abort hits while sleeping, catch path emits:
 
 On `auto_retry_start`, EventController:
 
-- swaps `Esc` handler to `session.abortRetry()`
-- renders loader text: `Retrying (attempt/maxAttempts) in Ns… (esc to cancel)`
+- installs a backoff interrupt handler: the first `Esc` calls `session.retryNow()`; a second interrupt while backoff remains active calls `session.abortRetry()`
+- renders a countdown with `(esc to retry now)`
+
+A focused ordinary menu receives interrupt/back first: dismissing it neither skips backoff nor primes retry cancellation. Once the menu closes, the next interrupt starts the retry gesture. Ctrl+C remains a global cancellation action. Hook workflow dialogs retain their separate workflow-interrupt policy; inline hook input handles Escape locally.
 
 On `auto_retry_end`, it restores prior `Esc` handler and clears loader state.
 
@@ -242,7 +244,7 @@ Retry stops and will not auto-continue when any of these occur:
 - error is not retry-classified
 - error is context overflow (delegated to compaction path)
 - max retries exceeded
-- user cancels retry through the session/SDK action or `Esc` during retry loader
+- user cancels retry through the session/SDK action, Ctrl+C, or the second interrupt while retry backoff is still active and no ordinary menu owns the key
 - global abort (`abort`) cancels retry first
 
 A new retry chain can still start later on a future retryable error after counters reset.

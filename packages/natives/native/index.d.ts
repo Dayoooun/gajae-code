@@ -51,7 +51,6 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
-
 /**
  * Incrementally ingests old/new text and computes an exact line diff on a
  * worker thread once both sides finish.
@@ -2911,6 +2910,12 @@ export declare function sliceWithWidth(line: string, startCol: number, length: n
  * changes are rejected rather than followed.
  */
 export declare function snapshotDirectoryTree(path: string): NativeDirectoryTreeResult
+
+/**
+ * Capture native root metadata only after proving a directory has no entries.
+ * Enumeration stops at the first non-dot child; no child is opened or read.
+ */
+export declare function snapshotEmptyDirectory(path: string): NativeDirectoryTreeResult
 
 /**
  * Unified-diff hunks with jsdiff

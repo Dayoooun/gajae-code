@@ -65,6 +65,7 @@ import {
 	resolveMissingSessionModelRecovery,
 } from "../config/model-profile-activation";
 import { resolveModelProfileName } from "../config/model-profile-contract";
+import type { ModelProfileOwnershipMarker } from "../config/model-profile-ownership";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
 import {
@@ -84,12 +85,15 @@ import { Settings, type SkillsSettings } from "../config/settings";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
 import { EditTool } from "../edit";
+import { disposeVmContextsByOwner } from "../eval/js/context-manager";
+import { disposeKernelSessionsByOwner } from "../eval/py/executor";
 import type { MasterModeContext } from "../master-mode/context";
 import { describeFoldReceipt } from "../session/fold-coordinator";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import { SearchTool } from "../tools/search";
 import "../discovery";
 import { resolveConfigValue } from "../config/resolve-config-value";
+import { resolveGlobalUserSkillLinkTrust } from "../config/skill-settings-defaults";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "../defaults/gjc-grok-cli";
 import { initializeWithSettings, releaseSettingsScope } from "../discovery";
@@ -183,7 +187,7 @@ import { AgentSession, type ForkContextSeed, isSessionDisposalIncompleteError } 
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { primaryControlSurfaceFor } from "../session/primary-control-surface";
-import { createReadonlySessionManager, SessionManager } from "../session/session-manager";
+import { createReadonlySessionManager, SessionManager, sessionArtifactCapability } from "../session/session-manager";
 import {
 	parsePersistedCredentialSelector,
 	resolveStartupAuthConfig,
@@ -490,6 +494,8 @@ export interface CreateAgentSessionOptions {
 	modelPattern?: string;
 	/** Active profile inherited by a nested SDK/subagent session. */
 	activeModelProfile?: string;
+	/** Model profile ownership marker for propagating parent profile ownership to subagent sessions. */
+	modelProfileOwnershipMarker?: ModelProfileOwnershipMarker;
 	/** Thinking selector. Default: from settings, else unset */
 	thinkingLevel?: ThinkingLevel;
 	/** Runtime substitution metadata for the initial model_change session event. */
@@ -588,6 +594,12 @@ export interface CreateAgentSessionOptions {
 	 * @internal lifecycle-only startup guard.
 	 */
 	deferOptionalModelRefresh?: boolean;
+
+	/**
+	 * Defer model profile activation until explicit model pin validation occurs.
+	 * @internal Lifecycle-only: prevents default profile activation before pin resolution.
+	 */
+	deferModelProfileActivation?: boolean;
 
 	/** Enable LSP integration (tool, formatting, diagnostics, warmup). Default: true */
 	enableLsp?: boolean;
@@ -2076,6 +2088,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const hasThinkingEntry = existingBranch.some(entry => entry.type === "thinking_level_change");
 		const hasServiceTierEntry = existingBranch.some(entry => entry.type === "service_tier_change");
 
+		// Apply inherited model profile ownership marker to subagent sessions when a parent provides one.
+		// This must occur after computing hasExistingSession to avoid marking a fresh session as resumed.
+		if (options.modelProfileOwnershipMarker !== undefined) {
+			sessionManager.appendModelProfileOwnershipMarker(options.modelProfileOwnershipMarker);
+		}
+
 		for (const entry of existingBranch) {
 			if (entry.type !== "custom" || entry.customType !== "auth-credential-pin") continue;
 			const data = entry.data;
@@ -2415,6 +2433,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				profileAuthority,
 				cwd,
 				disabledExtensions: settings.get("disabledExtensions"),
+				allowExternalUserSkillSymlinks: resolveGlobalUserSkillLinkTrust({
+					trustUserSkills: settings.getGlobal("skills.trustUserSkills"),
+					enablePiUser: settings.getGlobal("skills.enablePiUser"),
+				}),
 			});
 			skills = withEmbeddedDefaultGjcSkills(skillsResult.skills);
 			skillWarnings = skillsResult.warnings;
@@ -3193,9 +3215,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			getSessionAgentDir: () => session?.getSessionAgentDir() ?? options.agentDir ?? settings.getAgentDir(),
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
-			assertEvalExecutionAllowed: () => session?.assertEvalExecutionAllowed(),
-			trackEvalExecution: (execution, abortController) =>
-				session ? session.trackEvalExecution(execution, abortController) : execution,
+			assertEvalExecutionAllowed: () => {
+				if (!session) throw new Error("Eval execution is unavailable until session initialization completes");
+				session.assertEvalExecutionAllowed();
+			},
+			trackEvalExecution: (execution, abortController) => {
+				if (!session) {
+					abortController.abort(new Error("Eval execution is unavailable until session initialization completes"));
+					void execution.catch(() => {});
+					throw new Error("Eval execution is unavailable until session initialization completes");
+				}
+				return session.trackEvalExecution(execution, abortController);
+			},
 			getAsyncJobManager: () => asyncJobManager,
 			waitForUserSteering: signal => {
 				if (agent) return agent.waitForSteeringArrival(signal);
@@ -3278,19 +3309,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			peekQueueInvoker: () => session.peekQueueInvoker(),
 			peekStandingResolveHandler: () => session.peekStandingResolveHandler(),
 			setStandingResolveHandler: handler => session.setStandingResolveHandler(handler),
-			allocateOutputArtifact: async toolType => {
-				try {
-					return await sessionManager.allocateArtifactPath(toolType);
-				} catch {
-					return {};
-				}
+			allocateOutputArtifact: toolType => sessionManager.allocateArtifactPath(toolType),
+			captureArtifactPublication: () => {
+				const capability = sessionArtifactCapability(sessionManager);
+				if (!capability) throw new Error("Session artifact publication authority is unavailable.");
+				return capability.captureArtifactPublication();
 			},
 			getArtifactManager: () => sessionManager.getArtifactManager(),
 			isArtifactManagerAuthorized: manager => sessionManager.isArtifactManagerAuthorized(manager),
 			adoptArtifactManager: manager => sessionManager.adoptArtifactManager(manager),
 			releaseArtifactManager: manager => sessionManager.releaseArtifactManager(manager),
 			ensureArtifactManager: () => sessionManager.ensureArtifactManager(),
-			registerSessionCleanup: cleanup => session?.registerToolSessionTransitionCleanup(cleanup) ?? (() => {}),
+			registerSessionCleanup: cleanup => {
+				if (!session) throw new Error("Cannot register session cleanup before session initialization completes");
+				return session.registerToolSessionTransitionCleanup(cleanup);
+			},
 			mcpConfigPath: explicitMcpConfigPath,
 			settings,
 			authStorage,
@@ -4028,6 +4061,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// INTERNAL terminal-abort seams, threaded directly from the
 							// owning session (NOT on the public extension context).
 							terminalAbortSeams: {
+								getTerminalRunOwnerForEvent: event => {
+									if (!session) throw new Error("Terminal owner session is not initialized.");
+									return session.getTerminalRunOwnerForEvent(event);
+								},
+								getRunOwnerDomain: handle => {
+									if (!session) throw new Error("Terminal owner session is not initialized.");
+									return session.getRunOwnerDomain(handle);
+								},
 								getTerminalTurnEpoch: () => {
 									if (!session) throw new Error("Terminal abort session is not initialized.");
 									return session.getTerminalTurnEpoch();
@@ -4444,19 +4485,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// Re-resolve the allowed set: extension factories above may have
 			// registered providers/models that weren't visible at startup.
 			const allowedFallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
-			// A fresh provider discovery can disprove a bundled model while the
-			// general available catalog retains it for offline/profile compatibility.
-			// Exclude only those positively disproved bundled entries from the
-			// unconfigured startup path; explicit model/profile resolution above keeps
-			// its existing precedence and semantics.
-			const profileAvailableKeys = new Set(
-				modelRegistry
-					.getAvailableForProfileActivation()
-					.map(candidate => `${candidate.provider}\u0000${candidate.id}`),
-			);
-			const fallbackCandidates = allowedFallbackCandidates.filter(candidate =>
-				profileAvailableKeys.has(`${candidate.provider}\u0000${candidate.id}`),
-			);
 			// Candidate order is not a quality signal: catalogs sort retired models
 			// ahead of current ones whenever their IDs carry older date suffixes, so
 			// an unconfigured install would otherwise start on a model its provider
@@ -4464,7 +4492,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// first — the same table `findInitialModel` consults — and only then fall
 			// back to catalog order.
 			for (const candidate of orderByProviderDefaultFirst(
-				fallbackCandidates,
+				allowedFallbackCandidates,
 				modelRegistry.automaticProviderOrder(credentialSessionId),
 			)) {
 				if (await hasModelApiKey(candidate)) {
@@ -5386,6 +5414,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									profileAuthority,
 									cwd: reloadCwd,
 									disabledExtensions: settings.get("disabledExtensions"),
+									allowExternalUserSkillSymlinks: resolveGlobalUserSkillLinkTrust({
+										trustUserSkills: settings.getGlobal("skills.trustUserSkills"),
+										enablePiUser: settings.getGlobal("skills.enablePiUser"),
+									}),
 								});
 								return { skills: withEmbeddedDefaultGjcSkills(reloaded.skills), warnings: reloaded.warnings };
 							}
@@ -5452,7 +5484,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			forkContextSeed: options.forkContextSeed,
 			providerSessionState: options.providerSessionState,
 		});
-		session.setActiveModelProfile(startupActiveModelProfile);
+		// Defer profile activation until explicit model pin validation occurs (#5919).
+		if (!options.deferModelProfileActivation) {
+			session.setActiveModelProfile(startupActiveModelProfile);
+		}
 		if (retainedRecoveryBindingsAfterLateRestore) session.markStartupRecoveryBindingsRequired();
 		if (recoveredSessionDefault)
 			session.installRecoveredDefaultFallbackChain(
@@ -6021,6 +6056,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			gjcRuntimeSnapshot: gjcRuntimeStore,
 		};
 	} catch (error) {
+		// Capture pending owner work before asynchronous startup teardown can yield.
+		const startupPythonCleanup = disposeKernelSessionsByOwner(evalKernelOwnerId);
+		void startupPythonCleanup.catch(() => {});
 		let cleanupDiagnostic: unknown;
 		let ownedMcpCleanupFailed = false;
 		let ownedMcpCleanupError: unknown;
@@ -6058,6 +6096,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					await session.awaitDisposeCompletion();
 				}
 			});
+			await attemptCleanup(() => startupPythonCleanup);
 		} else {
 			if (hasRegistered)
 				await attemptCleanup(() => {
@@ -6082,18 +6121,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					ownedMcpCleanupFailed = true;
 					ownedMcpCleanupError = cleanupError;
 				});
-			const evalCleanup = Promise.all([import("../eval/py/executor"), import("../eval/js/context-manager")]);
-			let evalCleanupModules: Awaited<typeof evalCleanup> | undefined;
-			try {
-				evalCleanupModules = await evalCleanup;
-			} catch (cleanupError) {
-				recordCleanupFailure(cleanupError);
-			}
-			if (evalCleanupModules) {
-				const [kernelExecutor, contextManager] = evalCleanupModules;
-				await attemptCleanup(() => kernelExecutor.disposeKernelSessionsByOwner(evalKernelOwnerId));
-				await attemptCleanup(() => contextManager.disposeVmContextsByOwner(evalKernelOwnerId));
-			}
+			await attemptCleanup(() => startupPythonCleanup);
+			await attemptCleanup(() => disposeVmContextsByOwner(evalKernelOwnerId));
 			await attemptCleanup(closeOwnedSettings);
 		}
 		if (processCwdClaimed)

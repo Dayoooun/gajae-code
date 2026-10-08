@@ -7,7 +7,6 @@ import { getProjectDir, isEnoent, logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { AsyncJobManager, type FoldReason } from "../async";
 import { type BashArtifactSaveResult, type BashResult, executeBash } from "../exec/bash-executor";
-
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { buildGjcRuntimeSessionEnv } from "../gjc-runtime/goal-mode-request";
 import {
@@ -37,13 +36,13 @@ import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { highlightCode, type Theme } from "../modes/theme/theme";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
 import { renderSpawnTable, runSdkSpawn, type SdkSpawnArgs } from "../sdk/cli/master-cli";
-import type { ArtifactManager } from "../session/artifacts";
 import type {
 	ClientBridgeTerminalExitStatus,
 	ClientBridgeTerminalHandle,
 	ClientBridgeTerminalOutput,
 } from "../session/client-bridge";
 import type { FoldAdapter } from "../session/fold-coordinator";
+import type { SessionArtifactPublication } from "../session/session-manager";
 import {
 	DEFAULT_ARTIFACT_MAX_BYTES,
 	OutputSink,
@@ -60,7 +59,6 @@ import {
 	registerOwnedIfLineaged,
 	unregisterOwnedRegistration,
 } from "../session/terminal-abort";
-
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock, getOutputBlockContentWidth } from "../tui/output-block";
 import { truncateToWidth } from "../tui/utils";
@@ -84,6 +82,7 @@ import {
 } from "./output-meta";
 import { resolveToCwd } from "./path-utils";
 import { formatToolWorkingDirectory, replaceTabs } from "./render-utils";
+import { assertCwdInsideWorkspace } from "./restricted-cwd";
 import { steerFoldReasonLine, watchSteerForFold } from "./steer-fold";
 import { checkTmuxSelfInjection } from "./tmux-self-injection-guard";
 import { ToolAbortError, ToolError } from "./tool-errors";
@@ -378,6 +377,7 @@ interface PreparedClientTerminalOutput {
 async function prepareClientTerminalOutput(
 	session: ToolSession,
 	current: ClientBridgeTerminalOutput,
+	artifactPublication: SessionArtifactPublication | undefined,
 ): Promise<PreparedClientTerminalOutput> {
 	const { summary, locallyTruncated } = await boundClientTerminalOutput(
 		current.output,
@@ -386,7 +386,7 @@ async function prepareClientTerminalOutput(
 	);
 	let artifactSaveResult: BashOriginalArtifactSaveResult | undefined;
 	if (locallyTruncated && !current.truncated) {
-		artifactSaveResult = await saveBashOriginalArtifact(session, current.output);
+		artifactSaveResult = await saveBashOriginalArtifact(artifactPublication, current.output);
 		if (artifactSaveResult.status === "saved") appendRawArtifactFooter(summary, artifactSaveResult);
 	}
 	const artifactSaveNotice = artifactSaveResult
@@ -468,63 +468,26 @@ function appendArtifactDetails(text: string, result: BashResult | BashInteractiv
 }
 
 async function saveBashOriginalArtifact(
-	session: ToolSession,
+	artifactPublication: SessionArtifactPublication | undefined,
 	originalText: string,
 ): Promise<BashOriginalArtifactSaveResult> {
-	let manager: ArtifactManager | null | undefined;
+	if (!artifactPublication) return { status: "unavailable" };
 	try {
-		manager = session.getArtifactManager?.();
-	} catch (error) {
-		return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
-	}
-	if (manager) {
-		try {
-			const artifactId = await manager.save(originalText, "bash-original");
-			return artifactId
-				? summarizeOriginalArtifactSave(artifactId, originalText)
-				: { status: "failed", diagnostic: "storage returned no artifact id" };
-		} catch (error) {
-			return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
-		}
-	}
-
-	if (!session.allocateOutputArtifact) return { status: "unavailable" };
-	let alloc: { id?: string; path?: string } | undefined;
-	try {
-		alloc = await session.allocateOutputArtifact("bash-original");
-	} catch (error) {
-		return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
-	}
-	if (!alloc?.path || !alloc.id) return { status: "unavailable" };
-	try {
-		const saveResult = summarizeOriginalArtifactSave(alloc.id, originalText);
-		const payload = saveResult.complete
-			? originalText
-			: (() => {
-					const retained = truncateHeadBytes(originalText, DEFAULT_ARTIFACT_MAX_BYTES);
-					return `${retained.text}\n[artifact truncated after ${retained.bytes} bytes; omitted at least ${saveResult.omittedBytes} bytes]\n`;
-				})();
-		await Bun.write(alloc.path, payload);
-		return saveResult;
+		const artifactId = await artifactPublication(originalText, "bash-original");
+		return artifactId ? summarizeOriginalArtifactSave(artifactId, originalText) : { status: "unavailable" };
 	} catch (error) {
 		return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
 	}
 }
 
-function createBashArtifactPublisher(session: ToolSession): TerminalArtifactPublisher {
+function createBashArtifactPublisher(
+	artifactPublication: SessionArtifactPublication | undefined,
+): TerminalArtifactPublisher {
 	return async (content, _info): Promise<TerminalArtifactPublishResult> => {
-		let manager: ArtifactManager | null | undefined;
+		if (!artifactPublication) return { status: "unavailable" };
 		try {
-			manager = session.getArtifactManager?.();
-		} catch (error) {
-			return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
-		}
-		if (!manager) return { status: "unavailable" };
-		try {
-			const artifactId = await manager.save(content, "bash");
-			return artifactId
-				? { status: "published", artifactId }
-				: { status: "failed", diagnostic: "storage returned no artifact id" };
+			const artifactId = await artifactPublication(content, "bash");
+			return artifactId ? { status: "published", artifactId } : { status: "unavailable" };
 		} catch (error) {
 			return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
 		}
@@ -536,7 +499,8 @@ export async function saveBashOriginalArtifactForTests(
 	originalText: string,
 	onResult?: (result: BashOriginalArtifactSaveResult) => void,
 ): Promise<string | undefined> {
-	const result = await saveBashOriginalArtifact(session, originalText);
+	const artifactPublication = session.captureArtifactPublication?.();
+	const result = await saveBashOriginalArtifact(artifactPublication, originalText);
 	onResult?.(result);
 	return result.status === "saved" ? result.artifactId : undefined;
 }
@@ -1128,6 +1092,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		onCompletion?: () => void;
 		/** Immutable attempt-scoped tool call id, when executed via a tool call. */
 		toolCallId?: string;
+		artifactPublication: SessionArtifactPublication | undefined;
 		/** Accepted activity declaration, mirrored into job progress and result details. */
 		activity?: BashActivityDeclaration;
 	}): ManagedBashJobHandle {
@@ -1156,8 +1121,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			"bash",
 			label,
 			async ({ jobId, signal: runSignal, reportProgress }) => {
-				const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
-				const artifactPublisher = createBashArtifactPublisher(this.session);
+				const artifactPublisher = createBashArtifactPublisher(options.artifactPublication);
 				const spillThreshold = resolveBashOutputSinkTailBytes(this.session.settings);
 				const headBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
 				const tailBuffer = new TailBuffer(spillThreshold);
@@ -1180,8 +1144,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								signal: runSignal,
 								env: options.resolvedEnv,
 								unsetEnv: options.unsetEnv,
-								artifactPath,
-								artifactId,
 								artifactPublisher,
 								spillThreshold,
 								headBytes,
@@ -1194,7 +1156,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 									void reportProgress(latestText, runningDetails(jobId));
 								},
 								onRawChunk: chunk => manager.appendOutput(jobId, chunk),
-								onMinimizedSave: async originalText => saveBashOriginalArtifact(this.session, originalText),
+								onMinimizedSave: async originalText =>
+									saveBashOriginalArtifact(options.artifactPublication, originalText),
 							});
 					executionResult = result;
 					const finalResult = this.#buildCompletedResult(result, options.timeoutSec, {
@@ -1561,6 +1524,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (!cwdStat.isDirectory()) {
 			throw new ToolError(`Working directory is not a directory: ${commandCwd}`);
 		}
+		if (this.session.bashRestrictionProfile === "read-only" || (allowedPrefixes?.length ?? 0) > 0) {
+			await assertCwdInsideWorkspace(this.session.cwd, commandCwd);
+		}
 
 		const requestedTimeoutSec = input.timeout ?? 300;
 		const timeoutSec = clampTimeout("bash", requestedTimeoutSec);
@@ -1678,6 +1644,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (!manager.hasCapacity()) {
 			throw new ToolError("Background job limit reached. Wait for running jobs to finish or cancel one.");
 		}
+		const artifactPublication = this.session.captureArtifactPublication?.();
 		const prepared = await this.#prepareBashExecution(input, opts.ctx);
 		const label =
 			opts.label ?? (prepared.command.length > 120 ? `${prepared.command.slice(0, 117)}...` : prepared.command);
@@ -1725,8 +1692,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			"bash",
 			label,
 			async ({ jobId: id, signal, reportProgress }) => {
-				const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
-				const artifactPublisher = createBashArtifactPublisher(this.session);
+				const artifactPublisher = createBashArtifactPublisher(artifactPublication);
 				const spillThreshold = resolveBashOutputSinkTailBytes(this.session.settings);
 				const headBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
 				const tailBuffer = new TailBuffer(spillThreshold);
@@ -1740,8 +1706,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						signal,
 						env: prepared.resolvedEnv,
 						unsetEnv: prepared.unsetEnv,
-						artifactPath,
-						artifactId,
 						artifactPublisher,
 						spillThreshold,
 						headBytes,
@@ -1762,7 +1726,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							cursorOffset = slice.nextOffset;
 							dispatchLines(slice.text);
 						},
-						onMinimizedSave: async originalText => saveBashOriginalArtifact(this.session, originalText),
+						onMinimizedSave: async originalText => saveBashOriginalArtifact(artifactPublication, originalText),
 					});
 					flushTrailingLine();
 					const resultText = appendArtifactDetails(result.output || "(no output)", result);
@@ -1818,6 +1782,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			throw new ToolError("Background job limit reached. Wait for running jobs to finish or cancel one.");
 		}
 
+		const artifactPublication = this.session.captureArtifactPublication?.();
 		const prepared = await this.#prepareBashExecution(
 			{ command: rawCommand, env: rawEnv, timeout: rawTimeout, cwd },
 			ctx,
@@ -1871,6 +1836,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				onUpdate,
 				startBackgrounded: true,
 				toolCallId,
+				artifactPublication,
 				activity,
 			});
 			const jobGeneration = asyncManager.getJob(job.jobId)?.generation ?? job.jobId;
@@ -1927,6 +1893,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					managedForegroundSettled = true;
 				},
 				toolCallId,
+				artifactPublication,
 				activity,
 			});
 			const jobGeneration = ownedManager.getJob(job.jobId)?.generation ?? job.jobId;
@@ -2231,7 +2198,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							});
 						}
 						appendAcpSnapshot(current.output, current.truncated);
-						const prepared = await prepareClientTerminalOutput(this.session, current);
+						const prepared = await prepareClientTerminalOutput(this.session, current, artifactPublication);
 						throw new ToolAbortError(formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices));
 					}
 
@@ -2263,7 +2230,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								});
 							}
 							appendAcpSnapshot(current.output, current.truncated);
-							const prepared = await prepareClientTerminalOutput(this.session, current);
+							const prepared = await prepareClientTerminalOutput(this.session, current, artifactPublication);
 							throw new ToolAbortError(
 								formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices),
 							);
@@ -2284,7 +2251,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								});
 							}
 							appendAcpSnapshot(current.output, current.truncated);
-							const prepared = await prepareClientTerminalOutput(this.session, current);
+							const prepared = await prepareClientTerminalOutput(this.session, current, artifactPublication);
 							throw new ToolError(
 								formatClientTerminalWaitFailure(
 									prepared,
@@ -2314,7 +2281,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								});
 							}
 							appendAcpSnapshot(current.output, current.truncated);
-							const prepared = await prepareClientTerminalOutput(this.session, current);
+							const prepared = await prepareClientTerminalOutput(this.session, current, artifactPublication);
 							const timeoutNotices = [
 								...pendingNotices,
 								...(current.truncated || prepared.locallyTruncated ? ["(output truncated)"] : []),
@@ -2351,7 +2318,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							const diagnostic = boundArtifactSaveDiagnostic(error);
 							const recoveredOutput = retainedAcpOutput();
 							appendAcpSnapshot(recoveredOutput.output, recoveredOutput.truncated);
-							const prepared = await prepareClientTerminalOutput(this.session, recoveredOutput);
+							const prepared = await prepareClientTerminalOutput(
+								this.session,
+								recoveredOutput,
+								artifactPublication,
+							);
 							logger.warn("ACP terminal poll output read failed", {
 								terminalId: handle.terminalId,
 								error,
@@ -2384,7 +2355,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								await boundedKill();
 								const diagnostic = boundArtifactSaveDiagnostic(error);
 								const recoveredOutput = retainedAcpOutput();
-								const prepared = await prepareClientTerminalOutput(this.session, recoveredOutput);
+								const prepared = await prepareClientTerminalOutput(
+									this.session,
+									recoveredOutput,
+									artifactPublication,
+								);
 								throw new ToolError(formatClientTerminalReadFailure(prepared, diagnostic, pendingNotices));
 							}
 						}
@@ -2408,7 +2383,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						});
 					}
 					appendAcpSnapshot(current.output, current.truncated);
-					const prepared = await prepareClientTerminalOutput(this.session, current);
+					const prepared = await prepareClientTerminalOutput(this.session, current, artifactPublication);
 					throw new ToolAbortError(formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices));
 				}
 
@@ -2434,7 +2409,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				if (runSignal?.aborted) {
 					await boundedKill();
 					appendAcpSnapshot(finalOutput.output, finalOutput.truncated);
-					const prepared = await prepareClientTerminalOutput(this.session, finalOutput);
+					const prepared = await prepareClientTerminalOutput(this.session, finalOutput, artifactPublication);
 					throw new ToolAbortError(
 						formatClientTerminalAbortFailure(prepared, finalReadDiagnostic, pendingNotices),
 					);
@@ -2446,7 +2421,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					rawExitCode != null ? rawExitCode : exitStatus.signal ? 137 : undefined;
 
 				appendAcpSnapshot(finalOutput.output, finalOutput.truncated);
-				const prepared = await prepareClientTerminalOutput(this.session, finalOutput);
+				const prepared = await prepareClientTerminalOutput(this.session, finalOutput, artifactPublication);
 
 				const bridgeResult: BashResult = {
 					...prepared.summary,
@@ -2663,9 +2638,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// Track output for streaming updates (tail only)
 		const tailBuffer = new TailBuffer(spillThreshold);
 
-		// Allocate artifact for truncated output storage
-		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
-		const artifactPublisher = createBashArtifactPublisher(this.session);
+		const artifactPublisher = createBashArtifactPublisher(artifactPublication);
 
 		const interactiveUi =
 			this.session.bashRestrictionProfile === "read-only" || directMasterSpawn
@@ -2693,8 +2666,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					signal,
 					env: resolvedEnv,
 					unsetEnv,
-					artifactPath,
-					artifactId,
 					artifactPublisher,
 					spillThreshold,
 					headBytes,
@@ -2862,13 +2833,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					signal,
 					env: resolvedEnv,
 					unsetEnv,
-					artifactPath,
-					artifactId,
 					artifactPublisher,
 					spillThreshold,
 					headBytes,
 					onChunk: streamTailUpdates(tailBuffer, onUpdate),
-					onMinimizedSave: async originalText => saveBashOriginalArtifact(this.session, originalText),
+					onMinimizedSave: async originalText => saveBashOriginalArtifact(artifactPublication, originalText),
 					ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only" || directMasterSpawn,
 					disableShellSnapshot: this.session.bashRestrictionProfile === "read-only" || directMasterSpawn,
 				});

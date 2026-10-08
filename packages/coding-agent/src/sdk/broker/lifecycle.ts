@@ -13,7 +13,7 @@ function nativeLifecycle(): typeof import("@gajae-code/natives") {
 	return nativeLifecycleBindings;
 }
 
-import { $credentialEnv, logger, resolveEquivalentPath } from "@gajae-code/utils";
+import { $credentialEnv, getSessionsDir, logger, resolveEquivalentPath } from "@gajae-code/utils";
 import {
 	loadAcceptedModelPresetRegistry,
 	loadAcceptedModelPresetRegistryAsync,
@@ -43,7 +43,19 @@ import {
 	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
 	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 } from "../../gjc-runtime/session-state-sidecar";
+import {
+	type ManagedGcProtocolScopeInspector,
+	type ManagedScope,
+	managedGcProtocolScopeInspectorForScope,
+	resolveManagedGcScopeForRead,
+	taskArtifactOwnerStorageContextForScope,
+} from "../../session/internal/managed-session-scope";
 import { validateManagedArtifactTree } from "../../session/internal/managed-session-storage";
+import { captureTaskArtifactOwnerDeletionEvidence } from "../../session/internal/task-artifact-owner-access";
+import {
+	hasSiblingTaskArtifactOwnerTranscript,
+	taskArtifactOwnerLocatorFromTranscriptBytes,
+} from "../../session/internal/task-artifact-owner-transcript";
 import {
 	FileSessionStorage,
 	SessionDeleteVerificationError,
@@ -52,7 +64,18 @@ import {
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../../session/session-storage";
+import { parseFirstJsonlLine } from "../../session/session-transcript-header";
 import type { SessionWorkLease } from "../../session/session-work-lease";
+import type {
+	TaskArtifactOwnerDeletionEvidence,
+	TaskArtifactOwnerLocator,
+	TaskArtifactOwnerRetirementOutcome,
+	TaskArtifactOwnerStorageContext,
+} from "../../session/task-artifact-owner-codec";
+import {
+	retireTaskArtifactOwner,
+	verifyTaskArtifactOwnerPhysicalRetirement,
+} from "../../session/task-artifact-owner-retirement";
 import type { SessionLifecycleMcpServer } from "../acp/mcp";
 import { SdkClient, SdkClientError } from "../client/client";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
@@ -106,6 +129,12 @@ import {
 	readPreparationTimeouts,
 	startupQueueWaitMs,
 } from "./startup-budget";
+import {
+	type BrokerTaskArtifactOwnerCleanupValidation,
+	type BrokerTaskArtifactOwnerRetirementDisposition,
+	decodeBrokerTaskArtifactOwnerCleanupFields,
+	serializeBrokerTaskArtifactOwnerRetirementDisposition,
+} from "./task-artifact-owner-validation";
 import { worktreeOccupant } from "./worktree-occupancy";
 
 export {
@@ -961,6 +990,130 @@ function lifecycleLaunchKnownSecrets(launch: SessionLaunch): string[] {
 }
 
 type CleanupEvidence = BrokerCleanupEvidence;
+
+function brokerTaskArtifactOwnerCleanupFields(cleanup: CleanupEvidence): Record<string, unknown> {
+	const fields: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(cleanup)) {
+		if (key.startsWith("taskArtifactOwner")) fields[key] = value;
+	}
+	return fields;
+}
+
+function managedOwnerScopeFromInventory(scope: ManagedSessionScope): ManagedScope {
+	const resolved = resolveManagedGcScopeForRead({
+		cwd: scope.legacyLexicalCwd,
+		agentDir: scope.agentDir,
+		sessionsRoot: scope.sessionsRoot,
+	});
+	if (
+		resolved.kind !== "resolved" ||
+		resolved.scope.apiVersion !== scope.apiVersion ||
+		resolved.scope.layoutVersion !== scope.layoutVersion ||
+		resolved.scope.identityVersion !== scope.identityVersion ||
+		resolved.scope.agentDir !== scope.agentDir ||
+		resolved.scope.sessionsRoot !== scope.sessionsRoot ||
+		resolved.scope.canonicalCwd !== scope.canonicalCwd ||
+		resolved.scope.legacyLexicalCwd !== scope.legacyLexicalCwd ||
+		resolved.scope.directoryName !== scope.directoryName ||
+		resolved.scope.directoryPath !== scope.directoryPath
+	)
+		throw new Error("managed_task_artifact_owner_scope_changed");
+	return resolved.scope;
+}
+
+function taskArtifactOwnerTranscriptMatches(
+	storage: FileSessionStorage,
+	target: VerifiedSessionDeleteTarget,
+	evidence: TaskArtifactOwnerDeletionEvidence,
+): boolean {
+	const transcriptPath = target.detachedTranscriptPath ?? target.transcriptPath;
+	try {
+		const parent = fsSync.lstatSync(path.dirname(transcriptPath), { bigint: true });
+		if (
+			!parent.isDirectory() ||
+			parent.isSymbolicLink() ||
+			parent.dev !== target.transcriptParentIdentity?.dev ||
+			parent.ino !== target.transcriptParentIdentity?.ino
+		)
+			return false;
+		const snapshot = storage.readSnapshotSync(transcriptPath);
+		const digest = createHash("sha256").update(snapshot.bytes).digest("hex");
+		if (
+			!snapshot.stat.isFile ||
+			snapshot.stat.dev !== target.transcriptIdentity.dev ||
+			snapshot.stat.ino !== target.transcriptIdentity.ino ||
+			snapshot.stat.nlink !== target.transcriptIdentity.nlink ||
+			snapshot.stat.size !== target.transcriptIdentity.size ||
+			snapshot.stat.mtimeNs !== target.transcriptIdentity.mtimeNs ||
+			digest !== target.transcriptIdentity.sha256
+		)
+			return false;
+		const header = parseFirstJsonlLine(snapshot.bytes);
+		if (
+			!header ||
+			typeof header.cwd !== "string" ||
+			canonicalExistingPath(header.cwd) !== canonicalExistingPath(target.cwd)
+		)
+			return false;
+		const locator = taskArtifactOwnerLocatorFromTranscriptBytes(snapshot.bytes, target.sessionId);
+		return (
+			locator?.schemaVersion === evidence.locator.schemaVersion &&
+			locator.ownerId === evidence.locator.ownerId &&
+			locator.directoryDev === evidence.locator.directoryDev &&
+			locator.directoryIno === evidence.locator.directoryIno
+		);
+	} catch {
+		return false;
+	}
+}
+
+function taskArtifactOwnerFailureDiagnostic(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	return (
+		message.startsWith("task_artifact_owner_") ? message : `task_artifact_owner_cleanup_failed:${message}`
+	).slice(0, 4096);
+}
+
+function taskArtifactOwnerRetirementDisposition(
+	outcome: TaskArtifactOwnerRetirementOutcome,
+): BrokerTaskArtifactOwnerRetirementDisposition {
+	return serializeBrokerTaskArtifactOwnerRetirementDisposition(outcome);
+}
+
+function captureTaskArtifactOwnerEvidence(
+	storage: FileSessionStorage,
+	target: VerifiedSessionDeleteTarget,
+): { evidence?: TaskArtifactOwnerDeletionEvidence; error?: string } {
+	const transcriptPath = target.detachedTranscriptPath ?? target.transcriptPath;
+	let snapshot: SessionStorageSnapshot;
+	try {
+		snapshot = storage.readSnapshotSync(transcriptPath);
+	} catch {
+		return { error: "task_artifact_owner_transcript_unavailable" };
+	}
+	const digest = createHash("sha256").update(snapshot.bytes).digest("hex");
+	if (
+		!snapshot.stat.isFile ||
+		snapshot.stat.dev !== target.transcriptIdentity.dev ||
+		snapshot.stat.ino !== target.transcriptIdentity.ino ||
+		snapshot.stat.nlink !== target.transcriptIdentity.nlink ||
+		snapshot.stat.size !== target.transcriptIdentity.size ||
+		snapshot.stat.mtimeNs !== target.transcriptIdentity.mtimeNs ||
+		digest !== target.transcriptIdentity.sha256
+	)
+		return { error: "task_artifact_owner_transcript_identity_mismatch" };
+	try {
+		const locator = taskArtifactOwnerLocatorFromTranscriptBytes(snapshot.bytes, target.sessionId);
+		if (!locator) return {};
+		const context = target.taskArtifactOwnerStorageContext;
+		if (!context) return { error: "task_artifact_owner_context_missing" };
+		const evidence = captureTaskArtifactOwnerDeletionEvidence(context, target.sessionId, locator);
+		return evidence ? { evidence } : { error: "task_artifact_owner_evidence_missing" };
+	} catch (error) {
+		return { error: taskArtifactOwnerFailureDiagnostic(error) };
+	}
+}
+
 type CleanupIdentity = {
 	dev: bigint;
 	ino: bigint;
@@ -5965,6 +6118,8 @@ type ValidatedDelete = {
 	target: VerifiedSessionDeleteTarget;
 	metadataRoot: string;
 	transcriptParentIdentity: { dev: string; ino: string };
+	taskArtifactOwnerCaptureError?: string;
+	inspectProtocol?: ManagedGcProtocolScopeInspector;
 };
 function cleanupIdentity(
 	identity: BrokerCleanupEvidence["transcriptIdentity"],
@@ -6038,8 +6193,12 @@ function replayDeleteTarget(cleanup: CleanupEvidence): ValidatedDelete | BrokerR
 		(artifactsIdentity.dev !== artifactTreeIdentity.dev || artifactsIdentity.ino !== artifactTreeIdentity.ino)
 	)
 		return fail("terminal_uncertain", "Artifact cleanup tree does not match its ledger-bound root identity.");
-	if (cleanup.phase === "artifacts" && cleanup.artifactsRemoved === true)
-		return fail("terminal_uncertain", "Artifacts-phase cleanup receipt falsely claims artifact completion.");
+	if (
+		cleanup.phase === "artifacts" &&
+		cleanup.artifactsRemoved === true &&
+		cleanup.taskArtifactOwnerDeletionEvidence === undefined
+	)
+		return fail("terminal_uncertain", "Artifacts-phase cleanup receipt lacks immutable owner evidence.");
 	if (
 		cleanup.artifactsRemoved === true &&
 		cleanup.artifactTree &&
@@ -6243,7 +6402,126 @@ async function validateDeletePath(
 			canonicalExistingPath(replay.metadataRoot) !== canonicalRequestedRoot
 		)
 			return fail("invalid_input", "Cleanup receipt does not match the requested saved-session locator.");
-		return replay;
+		const ownerFields = brokerTaskArtifactOwnerCleanupFields(cleanup);
+		if (Object.keys(ownerFields).length === 0) {
+			const sessionsRoot = canonicalExistingPath(getSessionsDir(broker.settings.agentDir));
+			const relative = path.relative(sessionsRoot, replay.target.transcriptPath);
+			if (
+				path.resolve(replay.target.sessionsRoot) !== sessionsRoot ||
+				relative === "" ||
+				relative === ".." ||
+				relative.startsWith(`..${path.sep}`) ||
+				path.isAbsolute(relative)
+			)
+				return fail("terminal_uncertain", "Cleanup receipt does not match the configured session root.");
+			return replay;
+		}
+		const inventory = await managedCandidates(broker, cwd, "Saved");
+		if ("ok" in inventory) return inventory;
+		const transcriptRelative = path.relative(inventory.scope.sessionsRoot, replay.target.transcriptPath);
+		if (
+			path.resolve(replay.target.sessionsRoot) !== inventory.scope.sessionsRoot ||
+			transcriptRelative === "" ||
+			transcriptRelative === ".." ||
+			transcriptRelative.startsWith(`..${path.sep}`) ||
+			path.isAbsolute(transcriptRelative)
+		)
+			return fail("terminal_uncertain", "Cleanup receipt does not match the current managed session authority.");
+		replay.target.sessionsRoot = inventory.scope.sessionsRoot;
+		let ownerContext: TaskArtifactOwnerStorageContext;
+		let ownerScope: ManagedScope;
+		try {
+			ownerScope = managedOwnerScopeFromInventory(inventory.scope);
+			ownerContext = taskArtifactOwnerStorageContextForScope(ownerScope);
+		} catch {
+			return fail(
+				"terminal_uncertain",
+				"Managed task-artifact-owner authority could not be restored for cleanup replay.",
+			);
+		}
+		let owner: BrokerTaskArtifactOwnerCleanupValidation;
+		try {
+			owner = decodeBrokerTaskArtifactOwnerCleanupFields(
+				ownerFields,
+				ownerContext,
+				id,
+				cleanup.phase,
+				cleanup.artifactsRemoved,
+			);
+		} catch {
+			return fail("terminal_uncertain", "Cleanup receipt contains invalid task-artifact owner state.");
+		}
+		let captureError = owner.cleanupDiagnostic;
+		if (!owner.deletionEvidence && captureError === "task_artifact_owner_writer_not_quiescent") {
+			const retainedPaths = [
+				replay.target.detachedArtifactsPath,
+				replay.target.detachedTranscriptPath,
+				replay.target.retainedArtifactsSuccessorPath,
+				replay.target.retainedArtifactsPlaceholderPath,
+				replay.target.retainedArtifactsUnknownPath,
+				replay.target.retainedTranscriptSuccessorPath,
+				replay.target.retainedTranscriptPlaceholderPath,
+				replay.target.retainedTranscriptUnknownPath,
+			];
+			const plannedPaths = [
+				cleanup.plannedArtifactsPath,
+				cleanup.artifactTree?.plannedPath,
+				cleanup.plannedTranscriptPath,
+			];
+			const occupiedPlan = plannedPaths.some(planned => {
+				if (!planned) return false;
+				return [planned, `${planned}.removing`].some(candidate => {
+					try {
+						fsSync.lstatSync(candidate);
+						return true;
+					} catch (error) {
+						return (error as NodeJS.ErrnoException).code !== "ENOENT";
+					}
+				});
+			});
+			if (
+				cleanup.phase !== "artifacts" ||
+				cleanup.artifactsRemoved === true ||
+				Object.keys(ownerFields).some(key => key !== "taskArtifactOwnerCleanupError") ||
+				retainedPaths.some(candidate => candidate !== undefined) ||
+				occupiedPlan ||
+				transcriptParentStat.dev.toString() !== replay.transcriptParentIdentity.dev ||
+				transcriptParentStat.ino.toString() !== replay.transcriptParentIdentity.ino
+			)
+				return fail(
+					"terminal_uncertain",
+					"Initial task-artifact owner capture cannot be retried after unverified cleanup effects.",
+				);
+			replay.target.taskArtifactOwnerStorageContext = ownerContext;
+			const captured = captureTaskArtifactOwnerEvidence(replay.storage, replay.target);
+			if (!captured.evidence && !captured.error)
+				return fail(
+					"terminal_uncertain",
+					"The original task-artifact owner claim could not be restored for capture retry.",
+				);
+			if (captured.evidence) {
+				replay.target.taskArtifactOwnerDeletionEvidence = captured.evidence;
+				replay.target.deferTaskArtifactOwnerRetirement = true;
+			}
+			captureError = captured.error;
+		}
+		if (owner.deletionEvidence) {
+			replay.target.taskArtifactOwnerStorageContext = ownerContext;
+			replay.target.taskArtifactOwnerDeletionEvidence = owner.deletionEvidence;
+			replay.target.deferTaskArtifactOwnerRetirement = true;
+			if (owner.retirementContinuation)
+				replay.target.taskArtifactOwnerRetirementContinuation = owner.retirementContinuation;
+			if (owner.retirementOutcome) replay.target.taskArtifactOwnerRetirementOutcome = owner.retirementOutcome;
+			if (owner.retired) replay.target.taskArtifactOwnerRetired = true;
+			if (owner.payloadRetired) replay.target.taskArtifactOwnerPayloadRetired = true;
+			if (owner.namespaceRetained) replay.target.taskArtifactOwnerNamespaceRetained = true;
+			if (owner.transcriptDeleted) replay.target.taskArtifactOwnerTranscriptDeleted = true;
+		}
+		return {
+			...replay,
+			inspectProtocol: managedGcProtocolScopeInspectorForScope(ownerScope),
+			...(captureError && !owner.deletionEvidence ? { taskArtifactOwnerCaptureError: captureError } : {}),
+		};
 	}
 	const inventory = await managedCandidates(broker, cwd, "Saved");
 	if ("ok" in inventory) return inventory;
@@ -6255,7 +6533,6 @@ async function validateDeletePath(
 	const match = matches[0]!;
 	if (inventory.migrationPolicy === "disabled" && match.provenance === "legacy")
 		return fail("legacy_migration_disabled", "Saved legacy session migration is disabled for this workspace.");
-
 	const storage = new FileSessionStorage();
 	let snapshot: SessionStorageSnapshot;
 	try {
@@ -6284,28 +6561,56 @@ async function validateDeletePath(
 	} catch {
 		return fail("invalid_input", "session.delete transcript parent changed during authorization.");
 	}
+	let ownerContext: TaskArtifactOwnerStorageContext | undefined;
+	let ownerScope: ManagedScope | undefined;
+	let ownerCaptureError: string | undefined;
+	let ownerLocator: TaskArtifactOwnerLocator | undefined;
+	try {
+		ownerLocator = taskArtifactOwnerLocatorFromTranscriptBytes(snapshot.bytes, id);
+	} catch (error) {
+		ownerCaptureError = taskArtifactOwnerFailureDiagnostic(error);
+	}
+	if (ownerLocator) {
+		try {
+			ownerScope = managedOwnerScopeFromInventory(inventory.scope);
+			ownerContext = taskArtifactOwnerStorageContextForScope(ownerScope);
+		} catch {
+			return fail("invalid_input", "Managed task-artifact-owner authority could not be established for deletion.");
+		}
+	}
+	const target: VerifiedSessionDeleteTarget = {
+		sessionsRoot: canonicalExistingPath(inventory.scope.sessionsRoot),
+		transcriptPath: candidatePath,
+		sessionId: id,
+		cwd,
+		transcriptIdentity: {
+			dev: snapshot.stat.dev,
+			ino: snapshot.stat.ino,
+			nlink: snapshot.stat.nlink,
+			size: snapshot.stat.size,
+			mtimeNs: snapshot.stat.mtimeNs,
+			sha256: digest,
+		},
+		transcriptParentIdentity: { dev: transcriptParentStat.dev, ino: transcriptParentStat.ino },
+		...(ownerContext ? { taskArtifactOwnerStorageContext: ownerContext } : {}),
+	};
+	const capturedOwner: { evidence?: TaskArtifactOwnerDeletionEvidence; error?: string } = ownerCaptureError
+		? { error: ownerCaptureError }
+		: captureTaskArtifactOwnerEvidence(storage, target);
+	if (capturedOwner.evidence) {
+		target.taskArtifactOwnerDeletionEvidence = capturedOwner.evidence;
+		target.deferTaskArtifactOwnerRetirement = true;
+	}
 	return {
 		storage,
-		target: {
-			sessionsRoot: canonicalExistingPath(inventory.scope.sessionsRoot),
-			transcriptPath: candidatePath,
-			sessionId: id,
-			cwd,
-			transcriptIdentity: {
-				dev: snapshot.stat.dev,
-				ino: snapshot.stat.ino,
-				nlink: snapshot.stat.nlink,
-				size: snapshot.stat.size,
-				mtimeNs: snapshot.stat.mtimeNs,
-				sha256: digest,
-			},
-			transcriptParentIdentity: { dev: transcriptParentStat.dev, ino: transcriptParentStat.ino },
-		},
+		target,
 		metadataRoot: canonicalRequestedRoot,
+		...(ownerScope ? { inspectProtocol: managedGcProtocolScopeInspectorForScope(ownerScope) } : {}),
 		transcriptParentIdentity: {
 			dev: transcriptParentStat.dev.toString(),
 			ino: transcriptParentStat.ino.toString(),
 		},
+		...(capturedOwner.error ? { taskArtifactOwnerCaptureError: capturedOwner.error } : {}),
 	};
 }
 type CloseAuthority = { endpointGeneration: number; endpointIncarnation: string };
@@ -6448,7 +6753,13 @@ async function executeLifecycleResponse(
 	if (requestedSourceSessionId !== undefined && !isCanonicalSessionId(requestedSourceSessionId))
 		return fail("invalid_input", "sourceSessionId must be a canonical safe identifier.");
 	if (operation === "session.create" || operation === "session.fork" || operation === "session.resume") {
-		await broker.index.refresh();
+		// Creates without managed-worktree admission have no existing session
+		// authority to reconcile, so the change-stamp fast path avoids replaying
+		// the full index under its lock on every ACP spawn. Managed-worktree creates
+		// must serialize with registrations before checking checkout occupancy.
+		if (operation === "session.create" && lifecycleWorktreeTarget(input) === undefined)
+			await broker.index.refreshIfChanged();
+		else await broker.index.refresh();
 		if (operation === "session.create") {
 			// Creation has no existing session authority to reconcile. Keep the
 			// broker's periodic/startup heartbeat checkpoint as the reaping owner,
@@ -7483,15 +7794,45 @@ async function executeLifecycleResponse(
 		const transcriptParentIdentity = cleanup?.transcriptParentIdentity ?? validated.transcriptParentIdentity;
 		const durableArtifactsPlan =
 			cleanup?.artifactTree?.plannedPath ?? cleanup?.plannedArtifactsPath ?? cleanupTarget.plannedArtifactsPath;
+		let ownerRetirementOutcome = cleanupTarget.taskArtifactOwnerRetirementOutcome
+			? taskArtifactOwnerRetirementDisposition(cleanupTarget.taskArtifactOwnerRetirementOutcome)
+			: undefined;
+		let ownerTranscriptDeleted = cleanupTarget.taskArtifactOwnerTranscriptDeleted;
+		let freshPayloadRetirementForThisAttempt = false;
+		const ownerNamespacePending =
+			cleanupTarget.taskArtifactOwnerPayloadRetired === true &&
+			cleanupTarget.taskArtifactOwnerNamespaceRetained === true &&
+			cleanupTarget.taskArtifactOwnerRetired !== true;
 		const preauthorizedCleanup: CleanupEvidence = {
 			cleanupReceiptVersion: 1,
-			phase: cleanupTarget.artifactsRemoved ? "transcript" : "artifacts",
+			phase:
+				cleanupTarget.artifactsRemoved &&
+				!ownerNamespacePending &&
+				(cleanupTarget.taskArtifactOwnerRetired === true || !cleanupTarget.taskArtifactOwnerDeletionEvidence)
+					? "transcript"
+					: "artifacts",
 			sessionId: cleanupTarget.sessionId,
 			sessionsRoot: cleanupTarget.sessionsRoot,
 			transcriptPath: cleanupTarget.transcriptPath,
 			cwd: cleanupTarget.cwd,
 			...(cleanupTarget.artifactsRemoved ? { artifactsRemoved: true } : {}),
 			...(cleanupTarget.artifactsAbsentAtAuthorization ? { artifactsAbsentAtAuthorization: true as const } : {}),
+			...(cleanupTarget.taskArtifactOwnerDeletionEvidence
+				? { taskArtifactOwnerDeletionEvidence: cleanupTarget.taskArtifactOwnerDeletionEvidence }
+				: {}),
+			...(cleanupTarget.taskArtifactOwnerRetirementContinuation
+				? { taskArtifactOwnerRetirementContinuation: cleanupTarget.taskArtifactOwnerRetirementContinuation }
+				: {}),
+			...(ownerRetirementOutcome ? { taskArtifactOwnerRetirementOutcome: ownerRetirementOutcome } : {}),
+			...(cleanupTarget.taskArtifactOwnerPayloadRetired ? { taskArtifactOwnerPayloadRetired: true as const } : {}),
+			...(cleanupTarget.taskArtifactOwnerNamespaceRetained
+				? { taskArtifactOwnerNamespaceRetained: true as const }
+				: {}),
+			...(cleanupTarget.taskArtifactOwnerRetired ? { taskArtifactOwnerRetired: true as const } : {}),
+			...(ownerTranscriptDeleted ? { taskArtifactOwnerTranscriptDeleted: true as const } : {}),
+			...(validated.taskArtifactOwnerCaptureError
+				? { taskArtifactOwnerCleanupError: validated.taskArtifactOwnerCaptureError }
+				: {}),
 			metadataRoot: validated.metadataRoot,
 			transcriptIdentity: serializeCleanupIdentity(cleanupTarget.transcriptIdentity),
 			transcriptParentIdentity,
@@ -7591,6 +7932,145 @@ async function executeLifecycleResponse(
 			});
 			return pending;
 		};
+		const cleanupWithFreshOwnerPayload = (receipt: CleanupEvidence): CleanupEvidence => {
+			const current = { ...receipt };
+			delete current.taskArtifactOwnerDeletionEvidence;
+			delete current.taskArtifactOwnerRetirementContinuation;
+			delete current.taskArtifactOwnerRetirementOutcome;
+			delete current.taskArtifactOwnerPayloadRetired;
+			delete current.taskArtifactOwnerNamespaceRetained;
+			delete current.taskArtifactOwnerRetired;
+			delete current.taskArtifactOwnerTranscriptDeleted;
+			delete current.taskArtifactOwnerCleanupError;
+			return {
+				...current,
+				...(cleanupTarget.taskArtifactOwnerDeletionEvidence
+					? { taskArtifactOwnerDeletionEvidence: cleanupTarget.taskArtifactOwnerDeletionEvidence }
+					: {}),
+				...(cleanupTarget.taskArtifactOwnerRetirementContinuation
+					? { taskArtifactOwnerRetirementContinuation: cleanupTarget.taskArtifactOwnerRetirementContinuation }
+					: {}),
+				...(ownerRetirementOutcome ? { taskArtifactOwnerRetirementOutcome: ownerRetirementOutcome } : {}),
+				...(cleanupTarget.taskArtifactOwnerPayloadRetired
+					? { taskArtifactOwnerPayloadRetired: true as const }
+					: {}),
+				...(cleanupTarget.taskArtifactOwnerNamespaceRetained
+					? { taskArtifactOwnerNamespaceRetained: true as const }
+					: {}),
+				...(cleanupTarget.taskArtifactOwnerRetired ? { taskArtifactOwnerRetired: true as const } : {}),
+				...(ownerTranscriptDeleted ? { taskArtifactOwnerTranscriptDeleted: true as const } : {}),
+			};
+		};
+		const publishTaskArtifactOwnerPending = async (
+			error: unknown,
+			receipt: CleanupEvidence = preauthorizedCleanup,
+		): Promise<BrokerResponse> => {
+			const diagnostic = taskArtifactOwnerFailureDiagnostic(error);
+			const evidence = cleanupTarget.taskArtifactOwnerDeletionEvidence;
+			const ownerReceipt: CleanupEvidence = {
+				...cleanupWithFreshOwnerPayload(receipt),
+				phase: "artifacts",
+				artifactsRemoved: receipt.artifactsRemoved === true && evidence ? true : undefined,
+				artifactsAbsentAtAuthorization:
+					receipt.artifactsRemoved === true ? undefined : receipt.artifactsAbsentAtAuthorization,
+				taskArtifactOwnerCleanupError: diagnostic,
+			};
+			const pending = fail(
+				"cleanup_pending",
+				`Saved session cleanup is pending in artifacts: ${diagnostic}`,
+				ownerReceipt,
+			);
+			await broker.ledger.transition(identity, "effect_started", {
+				intendedSessionId: id,
+				response: pending,
+			});
+			return pending;
+		};
+		const persistFreshTaskArtifactOwnerRetirement = async (
+			receipt: CleanupEvidence,
+		): Promise<BrokerResponse | undefined> => {
+			const evidence = cleanupTarget.taskArtifactOwnerDeletionEvidence;
+			if (!evidence) return undefined;
+			const ownerContext = cleanupTarget.taskArtifactOwnerStorageContext;
+			if (!ownerContext)
+				return await publishTaskArtifactOwnerPending("task_artifact_owner_context_missing", receipt);
+			if (
+				ownerTranscriptDeleted === true
+					? !logicalTranscriptRetirementMatches()
+					: !taskArtifactOwnerTranscriptMatches(validated.storage, cleanupTarget, evidence)
+			)
+				return await publishTaskArtifactOwnerPending("task_artifact_owner_transcript_identity_mismatch", receipt);
+			let outcome: TaskArtifactOwnerRetirementOutcome;
+			try {
+				if (
+					await hasSiblingTaskArtifactOwnerTranscript(
+						validated.storage,
+						cleanupTarget.transcriptPath,
+						evidence.locator,
+						ownerContext,
+						validated.inspectProtocol,
+					)
+				)
+					return await publishTaskArtifactOwnerPending(
+						"task_artifact_owner_shared_with_sibling_transcript",
+						receipt,
+					);
+				outcome = retireTaskArtifactOwner(
+					ownerContext,
+					evidence,
+					cleanupTarget.taskArtifactOwnerRetirementContinuation,
+				);
+			} catch (error) {
+				freshPayloadRetirementForThisAttempt = false;
+				return await publishTaskArtifactOwnerPending(error, receipt);
+			}
+			freshPayloadRetirementForThisAttempt = outcome.kind === "payload_retired";
+			cleanupTarget.taskArtifactOwnerRetirementOutcome = outcome;
+			ownerRetirementOutcome = taskArtifactOwnerRetirementDisposition(outcome);
+			cleanupTarget.taskArtifactOwnerRetired = outcome.kind === "completed" ? true : undefined;
+			cleanupTarget.taskArtifactOwnerRetirementContinuation =
+				outcome.kind === "completed" ? undefined : outcome.continuation;
+			cleanupTarget.taskArtifactOwnerPayloadRetired = outcome.kind === "payload_retired" ? true : undefined;
+			cleanupTarget.taskArtifactOwnerNamespaceRetained = outcome.kind === "payload_retired" ? true : undefined;
+			if (outcome.kind === "completed") ownerTranscriptDeleted = undefined;
+			const ownerError =
+				outcome.kind === "uncertain"
+					? taskArtifactOwnerFailureDiagnostic(outcome.reason)
+					: outcome.kind === "cleanup_pending"
+						? taskArtifactOwnerFailureDiagnostic(
+								outcome.nativeOutcome?.code ?? "task_artifact_owner_cleanup_pending",
+							)
+						: undefined;
+			const ownerReceipt: CleanupEvidence = {
+				...cleanupWithFreshOwnerPayload(receipt),
+				phase: "artifacts",
+				artifactsRemoved: true,
+				artifactsAbsentAtAuthorization: undefined,
+				...(ownerError ? { taskArtifactOwnerCleanupError: ownerError } : {}),
+			};
+			const stateResponse = fail(
+				"cleanup_pending",
+				outcome.kind === "payload_retired"
+					? "Task-artifact payload is retired; its native namespace remains pending in artifacts."
+					: outcome.kind === "completed"
+						? "Task-artifact owner retirement is durably complete; transcript cleanup is preauthorized."
+						: `Task-artifact owner retirement remains ${outcome.kind} in artifacts.`,
+				ownerReceipt,
+			);
+			await broker.ledger.transition(identity, "effect_started", { intendedSessionId: id, response: stateResponse });
+			return outcome.kind === "completed" || outcome.kind === "payload_retired" ? undefined : stateResponse;
+		};
+		const storageOwnerFields = (): Partial<VerifiedSessionDeleteTarget> => {
+			const evidence = cleanupTarget.taskArtifactOwnerDeletionEvidence;
+			if (!evidence) return {};
+			if (!cleanupTarget.taskArtifactOwnerStorageContext) throw new Error("task_artifact_owner_context_missing");
+			return {
+				deferTaskArtifactOwnerRetirement: true,
+				...(cleanupTarget.taskArtifactOwnerRetirementOutcome
+					? { taskArtifactOwnerRetirementOutcome: cleanupTarget.taskArtifactOwnerRetirementOutcome }
+					: {}),
+			};
+		};
 		const canonicalArtifactsPath = cleanupTarget.transcriptPath.slice(0, -6);
 		const transcriptCleanupAuthorityIsAbsent = (): boolean =>
 			[
@@ -7646,6 +8126,11 @@ async function executeLifecycleResponse(
 				return false;
 			}
 		};
+		const logicalTranscriptRetirementMatches = (): boolean =>
+			transcriptParentMatchesPersistedIdentity() &&
+			pathIsAbsent(cleanupTarget.transcriptPath) &&
+			pathIsAbsent(cleanupTarget.retainedTranscriptSuccessorPath) &&
+			pathIsAbsent(cleanupTarget.retainedTranscriptUnknownPath);
 		const retainedTranscriptIdentityIsAbsentFromParent = (): boolean => {
 			const transcriptParent = path.dirname(cleanupTarget.transcriptPath);
 			const expectedParent = preauthorizedCleanup.transcriptParentIdentity;
@@ -7741,31 +8226,81 @@ async function executeLifecycleResponse(
 				preauthorizedCleanup,
 			),
 		});
-		let deleted: VerifiedSessionDeleteResult;
-		try {
-			const completedArtifactReplay = cleanup?.phase === "transcript" && cleanup.artifactsRemoved === true;
-			if (completedArtifactReplay && !pathIsAbsent(canonicalArtifactsPath))
+		if (validated.taskArtifactOwnerCaptureError)
+			return await publishTaskArtifactOwnerPending(validated.taskArtifactOwnerCaptureError);
+		if (
+			cleanup?.phase === "artifacts" &&
+			cleanupTarget.artifactsRemoved === true &&
+			cleanupTarget.taskArtifactOwnerDeletionEvidence &&
+			cleanupTarget.taskArtifactOwnerRetired !== true
+		) {
+			if (!pathIsAbsent(canonicalArtifactsPath))
 				return await publishCanonicalArtifactReappearance(preauthorizedCleanup);
-			if (
-				completedArtifactReplay &&
-				transcriptCleanupAuthorityIsAbsent() &&
-				retainedTranscriptIdentityIsAbsentFromParent()
-			)
-				return fail(
-					"cleanup_pending",
-					"Saved session cleanup remains pending because transcript authority disappeared without native deletion proof.",
+			const ownerPending = await persistFreshTaskArtifactOwnerRetirement(preauthorizedCleanup);
+			if (ownerPending) return ownerPending;
+		}
+		let deleted: VerifiedSessionDeleteResult | undefined;
+		if (cleanup?.taskArtifactOwnerTranscriptDeleted === true) {
+			if (!logicalTranscriptRetirementMatches())
+				return await publishTaskArtifactOwnerPending(
+					"task_artifact_owner_transcript_disposition_mismatch",
 					preauthorizedCleanup,
 				);
-			else {
+			if (cleanupTarget.taskArtifactOwnerPayloadRetired === true) {
+				const residual = fail(
+					"cleanup_pending",
+					"Transcript retirement is complete; the task-artifact owner namespace remains pending in artifacts.",
+					cleanupWithFreshOwnerPayload({ ...preauthorizedCleanup, phase: "artifacts", artifactsRemoved: true }),
+				);
+				await broker.ledger.transition(identity, "effect_started", { intendedSessionId: id, response: residual });
+				return residual;
+			}
+			if (cleanupTarget.taskArtifactOwnerRetired === true) {
+				const ownerEvidence = cleanupTarget.taskArtifactOwnerDeletionEvidence;
+				const ownerContext = cleanupTarget.taskArtifactOwnerStorageContext;
+				const ownerOutcome = cleanupTarget.taskArtifactOwnerRetirementOutcome;
+				if (!ownerEvidence || !ownerContext || !ownerOutcome)
+					return await publishTaskArtifactOwnerPending(
+						"task_artifact_owner_retired_evidence_missing",
+						preauthorizedCleanup,
+					);
+				try {
+					verifyTaskArtifactOwnerPhysicalRetirement(ownerContext, ownerEvidence, ownerOutcome);
+				} catch (error) {
+					return await publishTaskArtifactOwnerPending(error, preauthorizedCleanup);
+				}
+				deleted = { kind: "deleted" };
+			}
+		}
+		try {
+			if (deleted === undefined) {
+				const completedArtifactReplay = cleanup?.phase === "transcript" && cleanup.artifactsRemoved === true;
+				if (completedArtifactReplay && !pathIsAbsent(canonicalArtifactsPath))
+					return await publishCanonicalArtifactReappearance(preauthorizedCleanup);
+				if (
+					completedArtifactReplay &&
+					transcriptCleanupAuthorityIsAbsent() &&
+					retainedTranscriptIdentityIsAbsentFromParent()
+				)
+					return fail(
+						"cleanup_pending",
+						"Saved session cleanup remains pending because transcript authority disappeared without native deletion proof.",
+						preauthorizedCleanup,
+					);
 				if (!transcriptParentMatchesPersistedIdentity())
 					return fail(
 						"cleanup_pending",
 						"Saved session cleanup is pending because transcript parent identity changed before exact mutation.",
 						preauthorizedCleanup,
 					);
-				deleted = await validated.storage.deleteSessionVerified(cleanupTarget);
+				deleted = await validated.storage.deleteSessionVerified(
+					{ ...cleanupTarget, ...storageOwnerFields() },
+					validated.inspectProtocol,
+				);
 			}
 		} catch (error) {
+			if (error instanceof Error && error.message.startsWith("task_artifact_owner_"))
+				return await publishTaskArtifactOwnerPending(error);
 			if (error instanceof SessionDeleteVerificationError) {
 				if (cleanup?.phase === "artifacts")
 					return await publishChangedArtifactRoot(
@@ -7784,6 +8319,7 @@ async function executeLifecycleResponse(
 				`Unable to delete saved session artifacts: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
+		if (!deleted) return fail("unavailable", "Saved session deletion did not produce an outcome.");
 		if (
 			deleted.kind === "deleted" &&
 			cleanup?.phase === "transcript" &&
@@ -7807,10 +8343,22 @@ async function executeLifecycleResponse(
 					cleanupTarget.detachedArtifactsPath,
 					"Saved session cleanup is pending in artifacts: an authorized quarantine alias remains after exact removal.",
 				);
-			const transcriptPhaseCleanup: CleanupEvidence = {
-				...preauthorizedCleanup,
-				phase: "transcript",
+			const returnedOwnerEvidence = deleted.taskArtifactOwnerDeletionEvidence;
+			if (
+				cleanupTarget.taskArtifactOwnerDeletionEvidence &&
+				returnedOwnerEvidence &&
+				JSON.stringify(cleanupTarget.taskArtifactOwnerDeletionEvidence) !== JSON.stringify(returnedOwnerEvidence)
+			)
+				return await publishTaskArtifactOwnerPending("task_artifact_owner_evidence_changed_during_delete");
+			if (returnedOwnerEvidence && !cleanupTarget.taskArtifactOwnerDeletionEvidence)
+				return await publishTaskArtifactOwnerPending("task_artifact_owner_evidence_not_prepared_before_effect");
+			const ownerEvidence = cleanupTarget.taskArtifactOwnerDeletionEvidence;
+			const artifactCompletionCleanup: CleanupEvidence = {
+				...cleanupWithFreshOwnerPayload(preauthorizedCleanup),
+				phase: ownerEvidence ? "artifacts" : "transcript",
 				artifactsRemoved: true,
+				artifactsAbsentAtAuthorization: undefined,
+				...(ownerEvidence ? { taskArtifactOwnerDeletionEvidence: ownerEvidence } : {}),
 				detachedArtifactsPath: undefined,
 				retainedArtifactsSuccessorPath: undefined,
 				retainedArtifactsPlaceholderPath: undefined,
@@ -7826,12 +8374,41 @@ async function executeLifecycleResponse(
 						}
 					: {}),
 			};
-
 			await broker.ledger.transition(identity, "effect_started", {
 				intendedSessionId: id,
 				response: fail(
 					"cleanup_pending",
-					"Saved session artifacts were removed; transcript cleanup is preauthorized.",
+					"Saved session artifacts are removed; owner cleanup is durably preauthorized.",
+					artifactCompletionCleanup,
+				),
+			});
+			if (ownerEvidence && cleanupTarget.taskArtifactOwnerRetired !== true) {
+				const ownerPending = await persistFreshTaskArtifactOwnerRetirement(artifactCompletionCleanup);
+				if (ownerPending) return ownerPending;
+			}
+			const ownerNamespaceRetained =
+				cleanupTarget.taskArtifactOwnerPayloadRetired === true &&
+				cleanupTarget.taskArtifactOwnerNamespaceRetained === true;
+			const transcriptPhaseCleanup: CleanupEvidence = {
+				...cleanupWithFreshOwnerPayload(artifactCompletionCleanup),
+				phase: ownerNamespaceRetained ? "artifacts" : "transcript",
+				artifactsRemoved: true,
+				artifactsAbsentAtAuthorization: undefined,
+				...(artifactCompletionCleanup.artifactTree
+					? {
+							artifactTree: {
+								...artifactCompletionCleanup.artifactTree,
+								detachedPath: undefined,
+								completed: true as const,
+							},
+						}
+					: {}),
+			};
+			await broker.ledger.transition(identity, "effect_started", {
+				intendedSessionId: id,
+				response: fail(
+					"cleanup_pending",
+					"Saved session artifacts and owner cleanup are durably recorded; transcript cleanup is preauthorized.",
 					transcriptPhaseCleanup,
 				),
 			});
@@ -7843,33 +8420,39 @@ async function executeLifecycleResponse(
 					"Saved session cleanup remains pending because transcript authority disappeared without native deletion proof.",
 					transcriptPhaseCleanup,
 				);
-			else {
-				if (!transcriptParentMatchesPersistedIdentity())
-					return fail(
-						"cleanup_pending",
-						"Saved session cleanup is pending because transcript parent identity changed before exact mutation.",
-						transcriptPhaseCleanup,
-					);
-				try {
-					deleted = await validated.storage.deleteSessionVerified({
+			if (!transcriptParentMatchesPersistedIdentity())
+				return fail(
+					"cleanup_pending",
+					"Saved session cleanup is pending because transcript parent identity changed before exact mutation.",
+					transcriptPhaseCleanup,
+				);
+			try {
+				deleted = await validated.storage.deleteSessionVerified(
+					{
 						...cleanupTarget,
+						...storageOwnerFields(),
 						expectedArtifactsIdentity: undefined,
 						detachedArtifactsPath: undefined,
 						artifactsRemoved: true,
-					});
-				} catch (error) {
-					if (error instanceof SessionDeleteVerificationError && error.kind === "artifacts")
-						return await publishCanonicalArtifactReappearance(transcriptPhaseCleanup);
-					if (error instanceof SessionDeleteVerificationError)
-						return fail(
-							"invalid_input",
-							`Saved session deletion verification failed (${error.kind}): ${error.message}`,
-						);
+					},
+					validated.inspectProtocol,
+				);
+			} catch (error) {
+				if (error instanceof Error && error.message.startsWith("task_artifact_owner_"))
+					return await publishTaskArtifactOwnerPending(error, transcriptPhaseCleanup);
+				if (error instanceof SessionDeleteVerificationError && error.kind === "artifacts")
+					return await publishCanonicalArtifactReappearance(transcriptPhaseCleanup);
+				if (error instanceof SessionDeleteVerificationError)
 					return fail(
-						"unavailable",
-						`Unable to delete saved session transcript: ${error instanceof Error ? error.message : String(error)}`,
+						"invalid_input",
+						`Saved session deletion verification failed (${error.kind}): ${error.message}`,
 					);
-				}
+				if (freshPayloadRetirementForThisAttempt)
+					return await publishTaskArtifactOwnerPending(error, transcriptPhaseCleanup);
+				return fail(
+					"unavailable",
+					`Unable to delete saved session transcript: ${error instanceof Error ? error.message : String(error)}`,
+				);
 			}
 			if (deleted.kind === "deleted" && !pathIsAbsent(canonicalArtifactsPath))
 				return await publishCanonicalArtifactReappearance(transcriptPhaseCleanup);
@@ -7885,13 +8468,47 @@ async function executeLifecycleResponse(
 				"Saved session cleanup is pending in artifacts: a planned quarantine alias remains before terminal completion.",
 			);
 		const retainedRootArtifactsPlan = durableArtifactsPlan;
-		if (deleted.kind === "cleanup_pending")
-			return fail(
+		if (deleted.kind === "cleanup_pending") {
+			if (deleted.phase === "task_artifact_owner" && !deleted.artifactsRemoved)
+				return await publishTaskArtifactOwnerPending(deleted.error.message);
+			const ownerEvidence =
+				deleted.taskArtifactOwnerDeletionEvidence ?? cleanupTarget.taskArtifactOwnerDeletionEvidence;
+			const ownerRetired = deleted.taskArtifactOwnerRetired ?? cleanupTarget.taskArtifactOwnerRetired;
+			const ownerPayloadRetired =
+				deleted.taskArtifactOwnerPayloadRetired ?? cleanupTarget.taskArtifactOwnerPayloadRetired;
+			const ownerNamespaceRetained =
+				deleted.taskArtifactOwnerNamespaceRetained ?? cleanupTarget.taskArtifactOwnerNamespaceRetained;
+			const retainedOwnerNamespace = ownerPayloadRetired === true && ownerNamespaceRetained === true;
+			const ownerContinuation =
+				deleted.taskArtifactOwnerRetirementContinuation ?? cleanupTarget.taskArtifactOwnerRetirementContinuation;
+			const ownerOutcome = deleted.taskArtifactOwnerRetirementOutcome
+				? taskArtifactOwnerRetirementDisposition(deleted.taskArtifactOwnerRetirementOutcome)
+				: ownerRetirementOutcome;
+			const transcriptDeleted =
+				deleted.taskArtifactOwnerTranscriptDeleted === true || ownerTranscriptDeleted === true;
+			const ownerError =
+				deleted.phase === "task_artifact_owner" || deleted.error.message.startsWith("task_artifact_owner_")
+					? taskArtifactOwnerFailureDiagnostic(deleted.error)
+					: undefined;
+			const publicPhase =
+				retainedOwnerNamespace || deleted.phase === "task_artifact_owner" ? "artifacts" : deleted.phase;
+			const pending = fail(
 				"cleanup_pending",
-				`Saved session cleanup is pending in ${deleted.phase}: ${deleted.error.message}`,
+				`Saved session cleanup is pending in ${publicPhase}: ${deleted.error.message}`,
 				{
 					cleanupReceiptVersion: 1,
-					phase: deleted.phase,
+					phase: publicPhase,
+					...(ownerEvidence && (deleted.phase === "task_artifact_owner" || retainedOwnerNamespace)
+						? { artifactsRemoved: true }
+						: {}),
+					...(ownerEvidence ? { taskArtifactOwnerDeletionEvidence: ownerEvidence } : {}),
+					...(ownerContinuation ? { taskArtifactOwnerRetirementContinuation: ownerContinuation } : {}),
+					...(ownerOutcome ? { taskArtifactOwnerRetirementOutcome: ownerOutcome } : {}),
+					...(ownerPayloadRetired ? { taskArtifactOwnerPayloadRetired: true as const } : {}),
+					...(ownerNamespaceRetained ? { taskArtifactOwnerNamespaceRetained: true as const } : {}),
+					...(ownerRetired ? { taskArtifactOwnerRetired: true as const } : {}),
+					...(transcriptDeleted ? { taskArtifactOwnerTranscriptDeleted: true as const } : {}),
+					...(ownerError ? { taskArtifactOwnerCleanupError: ownerError } : {}),
 					sessionId: validated.target.sessionId,
 					sessionsRoot: validated.target.sessionsRoot,
 					transcriptPath: validated.target.transcriptPath,
@@ -7975,6 +8592,34 @@ async function executeLifecycleResponse(
 						: {}),
 				},
 			);
+			await broker.ledger.transition(identity, "effect_started", { intendedSessionId: id, response: pending });
+			return pending;
+		}
+		if (
+			deleted.kind === "deleted" &&
+			cleanupTarget.taskArtifactOwnerPayloadRetired === true &&
+			cleanupTarget.taskArtifactOwnerNamespaceRetained === true
+		) {
+			if (!logicalTranscriptRetirementMatches())
+				return await publishTaskArtifactOwnerPending(
+					"task_artifact_owner_transcript_disposition_mismatch",
+					preauthorizedCleanup,
+				);
+			if (record) await appendSessionDeletedEvidence(broker, record);
+			const residual = fail(
+				"cleanup_pending",
+				"Transcript retirement is complete; the task-artifact owner namespace remains pending in artifacts.",
+				{
+					...cleanupWithFreshOwnerPayload(preauthorizedCleanup),
+					phase: "artifacts",
+					artifactsRemoved: true,
+					artifactsAbsentAtAuthorization: undefined,
+					taskArtifactOwnerTranscriptDeleted: true,
+				},
+			);
+			await broker.ledger.transition(identity, "effect_started", { intendedSessionId: id, response: residual });
+			return residual;
+		}
 
 		const completion = { ok: true, result: { sessionId: id } } as const;
 		if (metadataCleanup.lifecycleFiles?.length) {

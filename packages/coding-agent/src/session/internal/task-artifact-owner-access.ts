@@ -26,7 +26,10 @@ export interface OwnerManifest extends TaskArtifactOwnerLocator {
 	readonly sessionId: string;
 }
 
-export function newSessionRootStore(context: TaskArtifactOwnerStorageContext): ManagedSessionDescendantStore {
+function sessionRootStore(
+	context: TaskArtifactOwnerStorageContext,
+	access: "read-only" | "read-write",
+): ManagedSessionDescendantStore {
 	assertSessionRoot(context);
 	if (path.resolve(context.profileAgentDir) !== context.profileAgentDir)
 		throw new Error("task_artifact_owner_profile_invalid");
@@ -45,7 +48,17 @@ export function newSessionRootStore(context: TaskArtifactOwnerStorageContext): M
 			dev: BigInt.asUintN(64, stat.dev),
 			ino: BigInt.asUintN(64, stat.ino),
 		},
+		access,
 	);
+}
+
+export function newSessionRootStore(context: TaskArtifactOwnerStorageContext): ManagedSessionDescendantStore {
+	return sessionRootStore(context, "read-write");
+}
+
+/** Path-backed reader with no retained or recovery-mutable native authority. */
+export function newSessionRootReaderStore(context: TaskArtifactOwnerStorageContext): ManagedSessionDescendantStore {
+	return sessionRootStore(context, "read-only");
 }
 
 function parseOwnerManifest(bytes: Uint8Array): OwnerManifest {
@@ -141,7 +154,8 @@ export function openOwnerStore(
 	);
 	try {
 		assertOwnerIdentity(ownerStore, locator);
-		readOwnerManifest(ownerStore, locator, OWNER_MANIFEST);
+		const finalManifest = readOwnerManifest(ownerStore, locator, OWNER_MANIFEST);
+		if (finalManifest.sessionId !== sessionId) throw new Error("task_artifact_owner_session_mismatch");
 		return ownerStore;
 	} catch (error) {
 		ownerStore.close();
@@ -211,7 +225,7 @@ export function captureTaskArtifactOwnerDeletionEvidence(
 ): TaskArtifactOwnerDeletionEvidence | undefined {
 	const locator = parseTaskArtifactOwnerLocator(locatorValue);
 	if (!locator) return undefined;
-	const rootStore = newSessionRootStore(context);
+	const rootStore = newSessionRootReaderStore(context);
 	try {
 		rootStore.verifyRootSecurity();
 		const parentIdentity: TaskArtifactOwnerParentIdentity = rootStore.captureDirectoryIdentity(OWNER_DIRECTORY);
@@ -219,6 +233,8 @@ export function captureTaskArtifactOwnerDeletionEvidence(
 		// This refuses to capture during publication; it does not revoke independent open descriptors.
 		if (ownerTreeHasPendingManagedPublication(treeSnapshot))
 			throw new Error("task_artifact_owner_writer_not_quiescent");
+		const finalManifest = readOwnerManifest(rootStore, locator);
+		if (finalManifest.sessionId !== sessionId) throw new Error("task_artifact_owner_session_mismatch");
 		const parentAfter = rootStore.captureDirectoryIdentity(OWNER_DIRECTORY);
 		if (!sameOwnerParentIdentity(parentIdentity, parentAfter))
 			throw new Error("task_artifact_owner_parent_changed_during_capture");

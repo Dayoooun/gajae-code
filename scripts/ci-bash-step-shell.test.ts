@@ -113,15 +113,16 @@ describe("cross-platform run steps declare their shell", () => {
 	it("leaves the Linux-only provenance step untouched", async () => {
 		const raw = await Bun.file(path.join(WORKFLOWS, "ci.yml")).text();
 		// The scope of this contribution is the cross-platform step; adding a Windows
-		// shell/comment to a Linux-only job would be an unrelated graph change.
+		// shell/comment to a Linux-only job would be an unrelated graph change. Main
+		// native consumers also verify transferred provenance on Linux-only runners.
 		expect(raw.split("# The binaries matrix includes a Windows runner").length - 1).toBe(1);
 		const document = parse(raw) as Workflow;
 		const linuxOnly = Object.values(document.jobs ?? {})
 			.filter(job => !canRunOnWindows(job))
 			.flatMap(job => job.steps ?? [])
 			.filter(step => typeof step.run === "string" && step.run.includes("verify-diagnostic-artifact-provenance.ts"));
-		expect(linuxOnly.length).toBe(1);
-		expect(linuxOnly[0]?.shell).toBeUndefined();
+		expect(linuxOnly.length).toBe(3);
+		expect(linuxOnly.filter(step => step.shell === undefined)).toHaveLength(1);
 	});
 
 	it("parses every workflow with the repository's own YAML checker", async () => {
