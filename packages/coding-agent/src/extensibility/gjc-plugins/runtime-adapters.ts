@@ -150,78 +150,67 @@ const initialTemporaryRoots = initialProcessEnvironment.then(async environment =
 	return [...roots];
 });
 
+/** Startup identity of a file: the object `hashStableFile` must still be reading. */
+export interface StableFileIdentity {
+	dev: number;
+	ino: number;
+	size: number;
+	mtimeMs: number;
+	ctimeMs: number;
+}
+
 /**
- * Snapshot stat identity (dev, ino, size, mtimeMs, ctimeMs) of node executables at startup.
- * This cheap snapshot detects binary replacement after startup.
- * Hashing is deferred to first use and cached.
- * Deduplicates identical realpaths (same inode).
+ * Startup identity of every canonical `node` on PATH, keyed by realpath. Only
+ * `stat` runs at startup; the digest is computed on first use from a descriptor
+ * whose identity must still match this snapshot, so a later replacement cannot
+ * become launch authority.
  */
-const initialNodeSnapshots = initialProcessEnvironment.then(async environment => {
-	const seen = new Map<number, FileSnapshot>(); // key: inode number
-	const snapshots = new Map<string, FileSnapshot>(); // key: canonical realpath
+const initialNodeIdentities = initialProcessEnvironment.then(async environment => {
+	const identities = new Map<string, StableFileIdentity>();
 	const temporaryRoots = await initialTemporaryRoots;
 	for (const pathEntry of (environment.get("PATH") ?? "").split(path.delimiter).filter(path.isAbsolute)) {
 		const lexical = path.join(pathEntry, process.platform === "win32" ? "node.exe" : "node");
 		try {
 			const real = await fs.realpath(lexical);
 			if (temporaryRoots.some(root => isWithin(root, real))) continue;
+			if (identities.has(real)) continue;
 			const stat = await fs.stat(real);
-			const snapshot: FileSnapshot = {
-				path: real,
+			identities.set(real, {
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size,
 				mtimeMs: stat.mtimeMs,
 				ctimeMs: stat.ctimeMs,
-				size: stat.size,
-				ino: stat.ino,
-			};
-			// Deduplicate: keep only the first inode occurrence
-			if (!seen.has(stat.ino)) {
-				seen.set(stat.ino, snapshot);
-				snapshots.set(real, snapshot);
-			}
+			});
 		} catch {
-			// Missing or unstable startup candidates are ignored.
+			// Missing startup candidates do not become authority.
 		}
 	}
-	return snapshots;
+	return identities;
 });
 
-// Lazy cache for node executable hashes, keyed by canonical path.
-// Promises are cached to deduplicate concurrent hash computations on the same path.
-const nodeHashCache = new Map<string, Promise<string>>();
+/** First-use digests of startup Node candidates, keyed by realpath; failures are cached as `undefined`. */
+const initialNodeHashes = new Map<string, Promise<string | undefined>>();
 
 /**
- * Get the hash of a node executable if it was discovered at startup and hasn't drifted.
- * Returns undefined if the path is not in the initial node authorities or has drifted.
- * Exported for testing.
+ * Digest of a `node` that was on PATH at startup, or `undefined` when the path
+ * was not a startup candidate or no longer is the startup file object.
  */
-export async function getInitialNodeHash(realPath: string): Promise<string | undefined> {
-	const snapshots = await initialNodeSnapshots;
-	const startupSnapshot = snapshots.get(realPath);
-	if (!startupSnapshot) return undefined; // Path not known at startup
-
-	// Detect drift: stat the file again and compare identity
-	try {
-		const currentStat = await fs.stat(realPath);
-		// Check if identity has changed (dev, ino, size, mtimeMs, ctimeMs)
-		if (
-			currentStat.ino !== startupSnapshot.ino ||
-			currentStat.mtimeMs !== startupSnapshot.mtimeMs ||
-			currentStat.ctimeMs !== startupSnapshot.ctimeMs ||
-			currentStat.size !== startupSnapshot.size
-		) {
-			return undefined; // Drift detected, reject
-		}
-	} catch {
-		return undefined; // Stat failed, treat as drift
+export function getInitialNodeHash(realPath: string): Promise<string | undefined> {
+	let digest = initialNodeHashes.get(realPath);
+	if (!digest) {
+		digest = initialNodeIdentities.then(async identities => {
+			const identity = identities.get(realPath);
+			if (!identity) return undefined;
+			try {
+				return await hashStableFile(realPath, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, identity);
+			} catch {
+				return undefined;
+			}
+		});
+		initialNodeHashes.set(realPath, digest);
 	}
-
-	// Identity matches: compute hash lazily and cache the promise
-	let cached = nodeHashCache.get(realPath);
-	if (!cached) {
-		cached = hashStableFile(realPath, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES);
-		nodeHashCache.set(realPath, cached);
-	}
-	return cached;
+	return digest;
 }
 
 async function snapshotExistingFile(filePath: string): Promise<FileSnapshot | null> {
@@ -475,11 +464,28 @@ const STABLE_HASH_CHUNK_BYTES = 1024 * 1024;
  * on PATH; buffering each interpreter (~120 MiB) held its full bytes in the
  * session process until exit.
  */
-export async function hashStableFile(filePath: string, label: string, maxBytes: number): Promise<string> {
+export async function hashStableFile(
+	filePath: string,
+	label: string,
+	maxBytes: number,
+	expected?: StableFileIdentity,
+): Promise<string> {
 	const handle = await fs.open(filePath, fs.constants.O_RDONLY);
 	try {
 		const before = await handle.stat();
 		if (!before.isFile()) throw new Error(`${label} is not a regular file`);
+		// Checked on the opened descriptor, so the digest belongs to the expected
+		// file object even if the path is swapped around the open.
+		if (
+			expected &&
+			(before.dev !== expected.dev ||
+				before.ino !== expected.ino ||
+				before.size !== expected.size ||
+				before.mtimeMs !== expected.mtimeMs ||
+				before.ctimeMs !== expected.ctimeMs)
+		) {
+			throw new Error(`${label} is not the expected file`);
+		}
 		if (before.size > maxBytes) throw new Error(`${label} exceeds its byte limit`);
 		const hash = createHash("sha256");
 		const chunk = Buffer.allocUnsafe(STABLE_HASH_CHUNK_BYTES);
