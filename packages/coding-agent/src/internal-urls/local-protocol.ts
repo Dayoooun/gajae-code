@@ -237,8 +237,8 @@ function assertManagedParentSync(localRoot: string): void {
 }
 
 /**
- * Rebind a pinned root only when this call created it because the path was
- * absent. An already-present directory must still be the pinned one.
+ * Keep a pinned root unless a changed inode is validated as a settled
+ * recreation. A root created by this call may be rebound after migration.
  */
 function acceptManagedRootForInit(
 	localRoot: string,
@@ -264,11 +264,12 @@ function acceptManagedRootForInit(
  * A pinned root whose inode changed is still ours when a gjc initializer
  * completed it: the temp sweeper (or `gjc gc`) removed the directory and
  * another process for the same session recreated it, writing a settled
- * migration marker. Only this user can create a 0700 directory it owns inside
- * the 0700 parent, so this does not admit another user's directory; a
- * replacement without a settled marker is still refused.
+ * migration marker. POSIX owner and write-bit checks on the root and parent
+ * protect this exception. Windows changed-inode adoption stays fail-closed
+ * until this path validates the replacement's identity and ACLs.
  */
 function isSettledRecreatedManagedRoot(localRoot: string, rootStat: DirectoryIdentityStat): boolean {
+	if (process.platform === "win32") return false;
 	try {
 		assertAdoptedManagedRoot(rootStat);
 		assertManagedParentSync(localRoot);
