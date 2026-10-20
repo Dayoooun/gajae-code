@@ -5851,7 +5851,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								mandatoryMCPToolNames: nextMandatoryMcpToolNames,
 								activateNewTools: false,
 							});
-							if (defaultMcpToolNamesToActivate.length > 0) {
+							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasExplicitActiveToolSelection()) {
 								await session.activateDiscoveredTools(defaultMcpToolNamesToActivate);
 							}
 						} catch (error) {
@@ -5946,11 +5946,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							snapshot,
 							classifiedTools.pluginMcpToolNames,
 						);
+						const defaultMcpToolNamesToActivate =
+							deferConventionalMcpAutoload && !existingSession.hasPersistedMCPToolSelection
+								? snapshot
+										.filter(
+											tool =>
+												tool.mcpServerName !== undefined &&
+												discoveryDefaultServerNames.has(tool.mcpServerName),
+										)
+										.map(tool => tool.name)
+								: [];
 						try {
 							await session.replaceNamedCustomTools(previousNames, snapshot, {
 								mandatoryMCPToolNames: mandatoryPluginToolNames,
 								activateNewTools: false,
 							});
+							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasExplicitActiveToolSelection()) {
+								await session.activateDiscoveredTools(defaultMcpToolNamesToActivate);
+							}
 						} catch (error) {
 							inheritedMcpManagerToolNames = [...new Set([...previousNames, ...nextNames])];
 							throw error;

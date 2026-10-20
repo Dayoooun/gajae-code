@@ -12220,6 +12220,11 @@ export class AgentSession {
 		if (this.getActiveToolNames().includes("edit")) await this.refreshBaseSystemPrompt();
 	}
 
+	/** Whether an explicit active-tool selection has been applied since construction. */
+	hasExplicitActiveToolSelection(): boolean {
+		return this.#explicitActiveToolSelectionGeneration > 0;
+	}
+
 	getSelectedMCPToolNames(): string[] {
 		if (!this.#mcpDiscoveryEnabled) {
 			return this.getActiveToolNames().filter(

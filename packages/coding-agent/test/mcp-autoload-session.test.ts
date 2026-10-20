@@ -69,7 +69,7 @@ rl.on('line', line => {
   if (msg.method === 'initialize') {
     setTimeout(() => {
       process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'slow-default', version: '1' } } }) + '\\n');
-    }, 6000);
+    }, 8000);
   } else if (msg.method === 'tools/list') {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'late_default', description: 'Late default demo tool', inputSchema: { type: 'object', properties: {} } }] } }) + '\\n');
   } else if (msg.id !== undefined) {
@@ -217,13 +217,13 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 45_000);
 
-	it("activates discovery-default tools published after deferred startup returns", async () => {
+	it("activates late defaults for inherited sessions unless tools were explicitly deselected", async () => {
 		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
 		const fastDefaultServerConfig = {
 			type: "stdio",
 			command: process.execPath,
 			args: ["-e", DEMO_MCP_SERVER_SCRIPT],
-			timeout: 10_000,
+			timeout: 15_000,
 		};
 		await fs.promises.writeFile(
 			path.join(projectDir, ".gjc", "mcp.json"),
@@ -234,7 +234,7 @@ describe("conventional MCP autoload in standalone sessions", () => {
 						type: "stdio",
 						command: process.execPath,
 						args: ["-e", LATE_DEFAULT_MCP_SERVER_SCRIPT],
-						timeout: 10_000,
+						timeout: 15_000,
 					},
 				},
 			}),
@@ -252,23 +252,66 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			}),
 			deferMcpConfigStartup: true,
 		});
+		let inheritedSession: AgentSession | undefined;
+		let explicitlyDeselectedSession: AgentSession | undefined;
 		try {
 			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			if (!mcpManager) throw new Error("Expected the deferred session-owned manager");
 			expect(mcpManager?.getConnectionStatus("slow-default")).toBe("connecting");
 			expect(session.getAllToolNames()).toContain("mcp__fast_default_hello");
 			expect(session.getActiveToolNames()).toContain("mcp__fast_default_hello");
 			expect(session.getAllToolNames()).not.toContain(lateToolName);
 			expect(session.getActiveToolNames()).not.toContain(lateToolName);
+			const inheritedSettings = () =>
+				Settings.isolated({
+					"mcp.discoveryMode": true,
+					"mcp.discoveryDeferAutoload": true,
+					"mcp.discoveryDefaultServers": ["fast-default", "slow-default"],
+					"mcp.enableProjectConfig": true,
+				});
+			inheritedSession = (
+				await createAgentSession({
+					...isolatedSessionOptions(),
+					toolNames: undefined,
+					settings: inheritedSettings(),
+					inheritedMcpManager: mcpManager,
+					parentTaskPrefix: "0-Inherited",
+				})
+			).session;
+			explicitlyDeselectedSession = (
+				await createAgentSession({
+					...isolatedSessionOptions(),
+					toolNames: undefined,
+					settings: inheritedSettings(),
+					inheritedMcpManager: mcpManager,
+					parentTaskPrefix: "1-Deselected",
+				})
+			).session;
+			expect(inheritedSession.getActiveToolNames()).toContain("mcp__fast_default_hello");
+			expect(explicitlyDeselectedSession.getActiveToolNames()).toContain("mcp__fast_default_hello");
+			await explicitlyDeselectedSession.setActiveToolsByName(["read"]);
+			expect(explicitlyDeselectedSession.getActiveToolNames()).not.toContain("mcp__fast_default_hello");
 
 			const activationDeadline = Date.now() + 15_000;
-			while (!session.getActiveToolNames().includes(lateToolName)) {
+			while (
+				!session.getActiveToolNames().includes(lateToolName) ||
+				!inheritedSession.getAllToolNames().includes(lateToolName) ||
+				!inheritedSession.getActiveToolNames().includes(lateToolName) ||
+				!explicitlyDeselectedSession.getAllToolNames().includes(lateToolName)
+			) {
 				if (Date.now() > activationDeadline) {
-					throw new Error(`Discovery-default MCP tool was never activated: ${lateToolName}`);
+					throw new Error(`Discovery-default MCP tool was not published and activated: ${lateToolName}`);
 				}
 				await Bun.sleep(20);
 			}
 			expect(session.getAllToolNames()).toContain(lateToolName);
+			expect(inheritedSession.getActiveToolNames()).toContain(lateToolName);
+			expect(explicitlyDeselectedSession.getActiveToolNames()).not.toContain("mcp__fast_default_hello");
+			expect(explicitlyDeselectedSession.getActiveToolNames()).not.toContain(lateToolName);
+			expect(explicitlyDeselectedSession.getSelectedMCPToolNames()).toEqual([]);
 		} finally {
+			await explicitlyDeselectedSession?.dispose();
+			await inheritedSession?.dispose();
 			await session.dispose();
 		}
 	}, 30_000);
