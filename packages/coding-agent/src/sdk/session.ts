@@ -4978,7 +4978,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const deferredMcpConnectPending = deferredExactMcpConfig !== undefined || deferredConventionalMcp !== undefined;
 		const requestedDeferredMCPToolNames =
 			deferredMcpConnectPending && hasExplicitToolNames
-				? options.toolNames!.map(name => name.toLowerCase()).filter(isMCPToolName)
+				? options
+						.toolNames!.map(name => name.toLowerCase())
+						.filter(name => isMCPToolName(name) && !toolRegistry.has(name))
 				: [];
 		const selectableExplicitMCPToolNames = [
 			...new Set([

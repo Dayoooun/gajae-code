@@ -13033,9 +13033,11 @@ export class AgentSession {
 		);
 		this.#pruneSelectedMCPToolNames();
 		const hasPersistedMCPToolSelection = this.buildDisplaySessionContext().hasPersistedMCPToolSelection;
+		const hasLiveMCPToolSelectionAuthority =
+			this.#mcpDiscoveryEnabled && this.hasMCPToolSelectionAuthority();
 		if (options.selectedMCPToolNames) {
 			this.#selectedMCPToolNames = new Set(this.#filterSelectableMCPToolNames(options.selectedMCPToolNames));
-		} else if (!hasPersistedMCPToolSelection) {
+		} else if (!hasPersistedMCPToolSelection && !hasLiveMCPToolSelectionAuthority) {
 			this.#selectedMCPToolNames = new Set(
 				this.#resolveConstructorMCPToolSelection() ?? this.#getConfiguredDefaultSelectedMCPToolNames(),
 			);

@@ -1635,6 +1635,62 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		}
 	});
 
+	it("does not treat a resolved inline tool as a deferred MCP selection", async () => {
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const configPath = path.join(tempDir, "deferred-local-mcp-name.json");
+		const discovery = Promise.withResolvers<MCPLoadResult>();
+		mockDeferredExactMcpLoad(discovery, { once: false });
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...createIsolatedSessionOptions(["mcp__local_inline_tool"]),
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDefaultServers": ["exact"],
+			}),
+			mcpConfigPath: configPath,
+			deferMcpConfigStartup: true,
+			customTools: [createLocalCustomTool("mcp__local_inline_tool")],
+		});
+		try {
+			const startup = startDeferredMcpConfig!();
+			discovery.resolve(createMcpLoadResult([createMcpCustomTool("mcp__exact_lookup", "exact", "lookup")]));
+			await expect(startup).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			expect(session.getActiveToolNames()).toContain("mcp__local_inline_tool");
+			expect(session.getActiveToolNames()).toContain("mcp__exact_lookup");
+			expect(session.getSelectedMCPToolNames()).toEqual(["mcp__exact_lookup"]);
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("honors live MCP selection authority during deferred catalog refresh", async () => {
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const configPath = path.join(tempDir, "deferred-live-selection.json");
+		const discovery = Promise.withResolvers<MCPLoadResult>();
+		mockDeferredExactMcpLoad(discovery, { once: false });
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...createIsolatedSessionOptions(null),
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDefaultServers": ["exact"],
+			}),
+			mcpConfigPath: configPath,
+			deferMcpConfigStartup: true,
+		});
+		try {
+			const startup = startDeferredMcpConfig!();
+			await session.setActiveToolsByName(["read"]);
+			expect(session.hasMCPToolSelectionAuthority()).toBe(true);
+			discovery.resolve(createMcpLoadResult([createMcpCustomTool("mcp__exact_lookup", "exact", "lookup")]));
+			await expect(startup).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			expect(session.getActiveToolNames()).not.toContain("mcp__exact_lookup");
+			expect(session.getSelectedMCPToolNames()).toEqual([]);
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("builds search_tool_bm25 descriptions from the loaded MCP catalog", async () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
