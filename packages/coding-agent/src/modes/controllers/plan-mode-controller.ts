@@ -135,7 +135,20 @@ export class PlanModeController {
 			: this.ctx.session.getToolByName("resolve")
 				? [...new Set([...previousTools, "resolve"])]
 				: previousTools;
-		await this.ctx.session.setActiveToolsByName(planTools, { explicit: false, persistMCPSelection: false });
+		try {
+			await this.ctx.session.setActiveToolsByName(planTools, {
+				explicit: false,
+				persistMCPSelection: false,
+				retryOnMcpCatalogChange: true,
+			});
+		} catch (error) {
+			this.#enabled = false;
+			this.#planFilePath = undefined;
+			this.#previousTools = undefined;
+			this.#previousMCPToolNames = undefined;
+			this.ctx.modeGate.exit("plan");
+			throw error;
+		}
 		this.ctx.session.setPlanModeState({
 			enabled: true,
 			planFilePath,

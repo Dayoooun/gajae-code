@@ -12918,11 +12918,12 @@ export class AgentSession {
 	 * Also rebuilds the system prompt to reflect the new tool set.
 	 * Changes take effect before the next model call.
 	 * Use `explicit: false` for internal filtering and `persistMCPSelection: false` when the live
-	 * selection must not be written to the session transcript.
+	 * selection must not be written to the session transcript. Internal mode transitions may set
+	 * `retryOnMcpCatalogChange` when a catalog publication must not leave their tool swap unapplied.
 	 */
 	async setActiveToolsByName(
 		toolNames: string[],
-		options?: { explicit?: boolean; persistMCPSelection?: boolean },
+		options?: { explicit?: boolean; persistMCPSelection?: boolean; retryOnMcpCatalogChange?: boolean },
 	): Promise<void> {
 		const isExplicit = options?.explicit !== false;
 		const explicitMCPToolNames = isExplicit ? this.#resolveExplicitMCPToolSelection(toolNames) : undefined;
@@ -12931,6 +12932,8 @@ export class AgentSession {
 			options?.persistMCPSelection !== false &&
 			(this.#mcpDiscoveryEnabled || this.#resolveEffectiveDiscoveryMode() === "all") &&
 			this.#selectedMCPToolNamesMatch(this.getSelectedMCPToolNames(), explicitMCPToolNames ?? []);
+		const initialMcpCatalogGeneration = this.#mcpCatalogGeneration;
+		const sessionTransitionGeneration = this.#sessionTransitionGeneration;
 		const explicitActiveToolSelectionGeneration = isExplicit
 			? ++this.#explicitActiveToolSelectionGeneration
 			: this.#explicitActiveToolSelectionGeneration;
@@ -12943,10 +12946,38 @@ export class AgentSession {
 			this.#explicitMCPToolSelectionPersistsForContext = options?.persistMCPSelection !== false;
 		}
 		try {
-			const appliedRevision = await this.#applyActiveToolsByName(toolNames, {
+			let appliedRevision = await this.#applyActiveToolsByName(toolNames, {
 				explicitActiveToolSelectionGeneration,
 				persistMCPSelection: options?.persistMCPSelection,
 			});
+			if (options?.retryOnMcpCatalogChange && appliedRevision === undefined) {
+				if (initialMcpCatalogGeneration === this.#mcpCatalogGeneration) {
+					throw new Error("Active tool selection was superseded before it could be applied");
+				}
+				const nonMCPToolNames = toolNames.filter(name => !isMCPToolName(name.toLowerCase()));
+				while (appliedRevision === undefined) {
+					await this.#waitForAdmittedBaseSystemPromptRebuilds();
+					if (
+						this.#isDisposed ||
+						this.#sessionTransitionGeneration !== sessionTransitionGeneration ||
+						this.#explicitActiveToolSelectionGeneration !== explicitActiveToolSelectionGeneration
+					) {
+						throw new Error("Active tool selection was superseded while the MCP catalog changed");
+					}
+					const retryMcpCatalogGeneration = this.#mcpCatalogGeneration;
+					const currentMCPToolNames = this.getSelectedMCPToolNames();
+					appliedRevision = await this.#applyActiveToolsByName(
+						[...new Set([...nonMCPToolNames, ...currentMCPToolNames])],
+						{
+							explicitActiveToolSelectionGeneration,
+							persistMCPSelection: options.persistMCPSelection,
+						},
+					);
+					if (appliedRevision === undefined && retryMcpCatalogGeneration === this.#mcpCatalogGeneration) {
+						throw new Error("Active tool selection was superseded while retrying after an MCP catalog change");
+					}
+				}
+			}
 			if (appliedRevision !== undefined && shouldPersistMCPSelectionIfUnchanged) {
 				const sessionContext = this.sessionManager.buildSessionContext();
 				const selectedMCPToolNames = this.getSelectedMCPToolNames();
