@@ -6528,7 +6528,7 @@ export class AgentSession {
 		if (next && MCPManager.instance() === undefined) MCPManager.setInstance(next);
 	}
 
-	/** Swap named custom tools and their optional mandatory MCP selection. */
+	/** Swap named custom tools and restore authoritative MCP selections as late tools arrive. */
 	async replaceNamedCustomTools(
 		previousNames: readonly string[],
 		nextTools: readonly CustomTool[],
@@ -6564,17 +6564,32 @@ export class AgentSession {
 				: retainedMandatory,
 		);
 		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
+		const authoritativeSelectedMCPToolNames = new Set(
+			(this.#getMCPToolSelectionAuthorityNames() ?? []).filter(name => {
+				const tool = this.#toolRegistry.get(name);
+				return tool !== undefined && isMCPBridgeTool(tool) && !this.#mandatoryMCPToolNames.has(name);
+			}),
+		);
 		await this.#applyActiveToolsByName(
 			[
 				...previousActive.filter(name => !previous.has(name)),
 				...added.filter(
 					name =>
 						previousActive.includes(name) ||
-						(options?.activateNewTools !== false && !previous.has(name) && !inactiveNewToolNames.has(name)),
+						(!inactiveNewToolNames.has(name) &&
+							(authoritativeSelectedMCPToolNames.has(name) ||
+								(options?.activateNewTools !== false && !previous.has(name)))),
 				),
 			],
 			{ previousSelectedMCPToolNames, persistMCPSelection: options?.persistMCPSelection },
 		);
+	}
+
+	#getMCPToolSelectionAuthorityNames(): string[] | undefined {
+		if (this.#hasExplicitActiveToolSelectionForContext) return [...this.#selectedMCPToolNames];
+		const sessionContext = this.buildDisplaySessionContext();
+		if (sessionContext.hasPersistedMCPToolSelection) return [...sessionContext.selectedMCPToolNames];
+		return this.#constructorMCPToolSelection === undefined ? undefined : [...this.#constructorMCPToolSelection];
 	}
 
 	/** Best-effort accessor for the active skill's `current_phase` field from
@@ -12272,6 +12287,13 @@ export class AgentSession {
 		);
 	}
 
+	getActiveMCPToolNames(): string[] {
+		const activeNames = new Set(this.getActiveToolNames());
+		return Array.from(this.#toolRegistry.values())
+			.filter(tool => activeNames.has(tool.name) && isMCPBridgeTool(tool))
+			.map(tool => tool.name);
+	}
+
 	getSelectedMCPToolNames(): string[] {
 		if (!this.#mcpDiscoveryEnabled) {
 			return this.getActiveToolNames().filter(
@@ -14045,7 +14067,7 @@ export class AgentSession {
 		const previousTools = this.getActiveToolNames();
 		const goalTools = [...new Set([...previousTools, "goal"])];
 		await this.#goalRuntime.createGoal({ objective: pendingGoal.objective, provenance: pendingGoal.provenance });
-		await this.setActiveToolsByName(goalTools);
+		await this.setActiveToolsByName(goalTools, { explicit: false, persistMCPSelection: false });
 		if (this.isStreaming) {
 			await this.sendGoalModeContext({ deliverAs: "steer" });
 		}

@@ -775,6 +775,13 @@ describe("conventional MCP autoload in standalone sessions", () => {
 
 		const { session, mcpManager, startDeferredMcpConfig } = await createAgentSession({
 			...isolatedSessionOptions(),
+			toolNames: ["mcp__demo_late_lookup"],
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.discoveryDefaultServers": [],
+				"mcp.enableProjectConfig": true,
+			}),
 			deferMcpConfigStartup: true,
 		});
 		try {
@@ -812,6 +819,9 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			await expect(startDeferredMcpConfig()).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
 			await lateToolReconciled.promise;
 			expect(session.getAllToolNames()).toContain(lateTool.name);
+			expect(session.getActiveToolNames()).toContain(lateTool.name);
+			expect(session.getSelectedMCPToolNames()).toEqual([lateTool.name]);
+			expect(session.buildDisplaySessionContext().selectedMCPToolNames).toEqual([lateTool.name]);
 		} finally {
 			await session.dispose();
 		}

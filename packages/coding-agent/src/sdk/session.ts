@@ -6084,7 +6084,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								throw new ExactMcpToolNameCollisionError(collidingToolNames);
 							}
 							if (!cancelled && !session.isDisposed) {
-								await session.refreshMCPTools(resultTools);
+								await session.refreshMCPTools(resultTools, { persistMCPSelection: false });
 								if (!session.isDisposed && (!mcpDiscoveryEnabled || !session.hasMCPToolSelectionAuthority())) {
 									await session.activateDiscoveredTools(toolNames);
 								}
@@ -6111,7 +6111,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								// only re-activates a swapped tool that was already active; running it
 								// before this registration would therefore drop a persisted conventional
 								// MCP selection and persist the empty set.
-								await session.refreshMCPTools(resultTools);
+								await session.refreshMCPTools(resultTools, { persistMCPSelection: false });
 								wireOwnedMcpToolSync(resultTools);
 								wireOwnedMcpManagerLifecycle();
 								const shouldActivateStartupMcpTools =

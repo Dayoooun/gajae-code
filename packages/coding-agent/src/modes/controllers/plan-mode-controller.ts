@@ -64,6 +64,7 @@ export class PlanModeController {
 	#paused = false;
 	#planFilePath: string | undefined;
 	#previousTools: string[] | undefined;
+	#previousMCPToolNames: string[] | undefined;
 	#previousModelState: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
 	#pendingModelSwitch: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
 	#providerSessionScope: TemporaryProviderSessionScope | undefined;
@@ -126,6 +127,7 @@ export class PlanModeController {
 		const planFilePath = options?.planFilePath ?? "local://PLAN.md";
 		const previousTools = this.ctx.session.getActiveToolNames();
 		this.#previousTools = previousTools;
+		this.#previousMCPToolNames = this.ctx.session.getActiveMCPToolNames();
 		this.#planFilePath = planFilePath;
 		this.#enabled = true;
 		const planTools = this.ctx.session.isExplicitEmptyToolSelection()
@@ -153,7 +155,7 @@ export class PlanModeController {
 		if (!this.#enabled) return;
 		await this.ctx.session.abort({ timeoutMs: ABORT_TIMEOUT_MS });
 		if (this.#previousTools !== undefined)
-			await this.ctx.session.setActiveToolsByName(this.#previousTools, {
+			await this.ctx.session.setActiveToolsByName(this.#restoreToolsWithCurrentMCPSelection(this.#previousTools), {
 				explicit: false,
 				persistMCPSelection: false,
 			});
@@ -180,11 +182,22 @@ export class PlanModeController {
 		this.#paused = options?.paused ?? false;
 		this.#planFilePath = undefined;
 		this.#previousTools = undefined;
+		this.#previousMCPToolNames = undefined;
 		this.#previousModelState = undefined;
 		if (!this.#paused) this.ctx.modeGate.exit("plan");
 		this.#updateStatus();
 		this.ctx.sessionManager.appendModeChange(this.#paused ? "plan_paused" : "none");
 		if (!options?.silent) this.ctx.showStatus(this.#paused ? "Plan mode paused." : "Plan mode disabled.");
+	}
+
+	#restoreToolsWithCurrentMCPSelection(previousTools: readonly string[]): string[] {
+		const previousMCPToolNames = new Set(this.#previousMCPToolNames ?? []);
+		return [
+			...new Set([
+				...previousTools.filter(name => !previousMCPToolNames.has(name)),
+				...this.ctx.session.getActiveMCPToolNames(),
+			]),
+		];
 	}
 
 	async flushPendingModelSwitch(): Promise<void> {
@@ -459,7 +472,9 @@ export class PlanModeController {
 		},
 	): Promise<void> {
 		await this.#finalizeApprovedPlan(planContent, options.planFilePath, options.finalPlanFilePath);
-		const previousTools = this.#previousTools ?? this.ctx.session.getActiveToolNames();
+		const previousTools = this.#restoreToolsWithCurrentMCPSelection(
+			this.#previousTools ?? this.ctx.session.getActiveToolNames(),
+		);
 		if (options.compactBeforeExecute) this.ctx.session.markPlanCompactAbortPending();
 		let sessionSwitchCompleted = true;
 		let compactOutcome: CompactionOutcome | undefined;

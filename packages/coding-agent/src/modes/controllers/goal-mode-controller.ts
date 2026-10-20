@@ -54,6 +54,7 @@ export class GoalModeController {
 	#enabled = false;
 	#paused = false;
 	#previousTools: string[] | undefined;
+	#previousMCPToolNames: string[] | undefined;
 	#continuationTimer: NodeJS.Timeout | undefined;
 	#turnHadToolCalls = false;
 	#continuationTurnInFlight = false;
@@ -264,6 +265,7 @@ export class GoalModeController {
 			if (this.#enabled || this.#paused) this.ctx.modeGate.enter("goal");
 			if (restored?.goal) {
 				this.#previousTools = this.ctx.session.getActiveToolNames();
+				this.#previousMCPToolNames = this.ctx.session.getActiveMCPToolNames();
 				if (!this.ctx.session.isExplicitEmptyToolSelection()) {
 					await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])], {
 						explicit: false,
@@ -320,6 +322,7 @@ export class GoalModeController {
 		if (this.#enabled) return;
 		if (!this.ctx.modeGate.enter("goal")) return this.ctx.showWarning("Exit plan mode first.");
 		this.#previousTools = this.ctx.session.getActiveToolNames();
+		this.#previousMCPToolNames = this.ctx.session.getActiveMCPToolNames();
 		this.#paused = false;
 		const state = options.resume
 			? await this.ctx.session.goalRuntime.resumeGoal()
@@ -351,7 +354,7 @@ export class GoalModeController {
 			options?.reason !== "dropped" &&
 			(this.#enabled || options?.reason === "completed" || options?.paused);
 		if (shouldRestoreTools && this.#previousTools)
-			await this.ctx.session.setActiveToolsByName(this.#previousTools, {
+			await this.ctx.session.setActiveToolsByName(this.#restoreToolsWithCurrentMCPSelection(this.#previousTools), {
 				explicit: false,
 				persistMCPSelection: false,
 			});
@@ -368,6 +371,7 @@ export class GoalModeController {
 		this.#enabled = false;
 		this.#paused = options?.paused ?? false;
 		this.#previousTools = undefined;
+		this.#previousMCPToolNames = undefined;
 		this.#continuationTurnInFlight = false;
 		this.#resetContinuationSuppression();
 		this.cancelContinuation();
@@ -383,6 +387,16 @@ export class GoalModeController {
 							? "Goal mode paused."
 							: "Goal mode disabled.",
 			);
+	}
+
+	#restoreToolsWithCurrentMCPSelection(previousTools: readonly string[]): string[] {
+		const previousMCPToolNames = new Set(this.#previousMCPToolNames ?? []);
+		return [
+			...new Set([
+				...previousTools.filter(name => !previousMCPToolNames.has(name)),
+				...this.ctx.session.getActiveMCPToolNames(),
+			]),
+		];
 	}
 
 	#getPausedState(): GoalModeState | undefined {
