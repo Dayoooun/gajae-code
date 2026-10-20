@@ -510,13 +510,11 @@ export class PlanModeController {
 		} finally {
 			this.ctx.session.clearPlanCompactAbortPending();
 		}
-		const restoredTools = [
-			...new Set([
-				...previousNonMCPToolNames,
-				...mcpToolNamesBeforeSessionSwitch,
-				...this.ctx.session.getActiveMCPToolNames(),
-			]),
-		];
+		const currentMCPToolNames = this.ctx.session.getActiveMCPToolNames();
+		const restoredMCPToolNames = this.ctx.session.hasMCPToolSelectionAuthority()
+			? currentMCPToolNames
+			: [...mcpToolNamesBeforeSessionSwitch, ...currentMCPToolNames];
+		const restoredTools = [...new Set([...previousNonMCPToolNames, ...restoredMCPToolNames])];
 		if (restoredTools.length)
 			await this.ctx.session.setActiveToolsByName(restoredTools, {
 				explicit: false,

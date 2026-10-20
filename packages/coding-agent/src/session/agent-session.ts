@@ -28709,6 +28709,8 @@ export class AgentSession {
 			const previousTools = [...this.agent.state.tools];
 			const previousBaseSystemPrompt = this.#baseSystemPrompt;
 			const previousSystemPrompt = this.agent.state.systemPrompt;
+			const previousLastAppliedToolSignature = this.#lastAppliedToolSignature;
+			const previousPendingAppliedToolSignature = this.#pendingAppliedToolSignature;
 			const previousAgentSteeringQueue = this.agent.snapshotSteering();
 			const previousAgentFollowUpQueue = this.agent.snapshotFollowUp();
 			const previousDeferredSdkFollowUps = [...this.#deferredSdkFollowUps];
@@ -29173,6 +29175,8 @@ export class AgentSession {
 				this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
 				this.#baseSystemPrompt = previousBaseSystemPrompt;
 				this.agent.setSystemPrompt(previousSystemPrompt);
+				this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
+				this.#pendingAppliedToolSignature = previousPendingAppliedToolSignature;
 				this.agent.replaceMessages(previousAgentMessages, {
 					historyRewrite: {
 						reason: switchingToDifferentSession ? "session-switch-rollback" : "conversation-reload-rollback",

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -1496,7 +1496,8 @@ describe("AgentSession MCP discovery", () => {
 		const targetSessionFile = targetSessionManager.getSessionFile();
 		expect(previousSessionFile).toBeString();
 		expect(targetSessionFile).toBeString();
-		let failNextMCPRebuild = true;
+		let targetMCPPromptRebuilt = false;
+		let failTargetEnsureOnDisk = true;
 		const session = new AgentSession({
 			agent: new Agent({
 				initialState: {
@@ -1516,14 +1517,24 @@ describe("AgentSession MCP discovery", () => {
 			initialSelectedMCPToolNames: ["mcp__docs_search"],
 			defaultSelectedMCPToolNames: ["mcp__docs_search"],
 			rebuildSystemPrompt: async toolNames => {
-				if (failNextMCPRebuild && toolNames.includes("mcp__docs_search")) {
-					failNextMCPRebuild = false;
-					throw new Error("injected MCP prompt rebuild failure");
-				}
+				if (sessionManager.getSessionFile() === targetSessionFile && toolNames.includes("mcp__docs_search"))
+					targetMCPPromptRebuilt = true;
 				return { systemPrompt: [`tools:${toolNames.join(",")}`] };
 			},
 		});
 		sessions.push(session);
+		const ensureOnDisk = sessionManager.ensureOnDisk.bind(sessionManager);
+		vi.spyOn(sessionManager, "ensureOnDisk").mockImplementation(async () => {
+			if (
+				failTargetEnsureOnDisk &&
+				targetMCPPromptRebuilt &&
+				sessionManager.getSessionFile() === targetSessionFile
+			) {
+				failTargetEnsureOnDisk = false;
+				throw new Error("injected post-tool session switch failure");
+			}
+			await ensureOnDisk();
+		});
 		const permissionRequests: string[] = [];
 		session.setSdkPermissionMode("prompt");
 		session.setClientBridge({
@@ -1539,7 +1550,9 @@ describe("AgentSession MCP discovery", () => {
 		expect(session.getSelectedMCPToolNames()).toEqual([]);
 		const preparedBash = session.agent.state.tools.find(tool => tool.name === "bash");
 		expect(preparedBash).toBeDefined();
-		await expect(session.switchSession(targetSessionFile!)).rejects.toThrow("injected MCP prompt rebuild failure");
+		await expect(session.switchSession(targetSessionFile!)).rejects.toThrow(
+			"injected post-tool session switch failure",
+		);
 
 		expect(session.sessionFile).toBe(previousSessionFile);
 		expect(session.hasMCPToolSelectionAuthority()).toBe(true);
@@ -1555,12 +1568,18 @@ describe("AgentSession MCP discovery", () => {
 			undefined as never,
 		);
 		expect(permissionRequests).toEqual(["rollback-permission-check"]);
+		await session.setActiveToolsByName(["read", "mcp__docs_search"], { persistMCPSelection: false });
+		expect(session.getActiveToolNames()).toEqual(["read", "mcp__docs_search"]);
+		expect(session.systemPrompt).toEqual(["tools:read,mcp__docs_search"]);
 		await session.refreshMCPTools([
 			createMcpCustomTool("mcp__docs_search", "docs", "search", "Search docs", ["query"]),
 		]);
 		expect(session.hasMCPToolSelectionAuthority()).toBe(true);
-		expect(session.getSelectedMCPToolNames()).toEqual([]);
-		expect(session.getActiveToolNames()).toEqual(["read", "bash"]);
+		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__docs_search"]);
+		expect(session.getActiveToolNames()).toEqual(["read", "mcp__docs_search"]);
+		await session.setActiveToolsByName(["read"], { persistMCPSelection: false });
+		expect(session.getActiveToolNames()).toEqual(["read"]);
+		expect(session.systemPrompt).toEqual(["tools:read"]);
 	});
 
 	it("fences in-flight search activation across new sessions and keeps tool context on committed tools", async () => {

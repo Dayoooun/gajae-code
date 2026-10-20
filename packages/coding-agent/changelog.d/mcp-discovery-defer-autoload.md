@@ -4,4 +4,5 @@
 
 ### Fixed
 
-- MCP selection authority now rolls back after failed tool updates and survives non-persisting catalog pruning; plan approval persists selected tools into fresh execution sessions, and failed session switches restore permission-guarded tools without stacking guards.
+- MCP selection authority now rolls back after failed tool updates and survives non-persisting catalog pruning; failed session-switch rollback restores matching tool signatures, prompts, and permission guards.
+- Plan approval preserves late default-server tools and transferred MCP selections without overriding successor-owned selections.
