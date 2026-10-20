@@ -12925,6 +12925,12 @@ export class AgentSession {
 		options?: { explicit?: boolean; persistMCPSelection?: boolean },
 	): Promise<void> {
 		const isExplicit = options?.explicit !== false;
+		const explicitMCPToolNames = isExplicit ? this.#resolveExplicitMCPToolSelection(toolNames) : undefined;
+		const shouldPersistMCPSelectionIfUnchanged =
+			isExplicit &&
+			options?.persistMCPSelection !== false &&
+			(this.#mcpDiscoveryEnabled || this.#resolveEffectiveDiscoveryMode() === "all") &&
+			this.#selectedMCPToolNamesMatch(this.getSelectedMCPToolNames(), explicitMCPToolNames ?? []);
 		const explicitActiveToolSelectionGeneration = isExplicit
 			? ++this.#explicitActiveToolSelectionGeneration
 			: this.#explicitActiveToolSelectionGeneration;
@@ -12933,14 +12939,24 @@ export class AgentSession {
 		const previousExplicitMCPToolSelectionPersistsForContext = this.#explicitMCPToolSelectionPersistsForContext;
 		if (isExplicit) {
 			this.#hasExplicitActiveToolSelectionForContext = true;
-			this.#explicitMCPToolSelectionForContext = this.#resolveExplicitMCPToolSelection(toolNames);
+			this.#explicitMCPToolSelectionForContext = explicitMCPToolNames;
 			this.#explicitMCPToolSelectionPersistsForContext = options?.persistMCPSelection !== false;
 		}
 		try {
-			await this.#applyActiveToolsByName(toolNames, {
+			const appliedRevision = await this.#applyActiveToolsByName(toolNames, {
 				explicitActiveToolSelectionGeneration,
 				persistMCPSelection: options?.persistMCPSelection,
 			});
+			if (appliedRevision !== undefined && shouldPersistMCPSelectionIfUnchanged) {
+				const sessionContext = this.sessionManager.buildSessionContext();
+				const selectedMCPToolNames = this.getSelectedMCPToolNames();
+				if (
+					!sessionContext.hasPersistedMCPToolSelection ||
+					!this.#selectedMCPToolNamesMatch(sessionContext.selectedMCPToolNames, selectedMCPToolNames)
+				) {
+					this.sessionManager.appendMCPToolSelection(selectedMCPToolNames);
+				}
+			}
 		} catch (error) {
 			if (isExplicit && explicitActiveToolSelectionGeneration === this.#explicitActiveToolSelectionGeneration) {
 				this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;

@@ -4,5 +4,6 @@
 
 ### Fixed
 
+- Explicit tool selections persist MCP authority even when the selectable catalog is empty or unchanged, so deselections survive resume instead of re-enabling configured defaults.
 - MCP selection authority now rolls back after failed tool updates and survives non-persisting catalog pruning; failed session-switch rollback restores matching tool signatures, prompts, and permission guards.
 - Plan approval preserves late default-server tools and transferred MCP selections without overriding successor-owned selections.

@@ -1885,6 +1885,69 @@ describe("AgentSession MCP discovery", () => {
 		expect(sessionManager.buildSessionContext().selectedMCPToolNames).toEqual([]);
 	});
 
+	it("persists an explicit empty MCP selection when tool application is a no-op", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agent-session-mcp-empty-selection-"));
+		tempDirs.push(tempDir);
+		const readTool = createBasicTool("read", "Read");
+		const docsSearchTool = createMcpCustomTool("mcp__docs_search", "docs", "search", "Search docs", ["query"]);
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		sessionManager.appendMessage({ role: "user", content: "original session", timestamp: Date.now() });
+		await sessionManager.flush();
+		const originalSessionFile = sessionManager.getSessionFile();
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: createModel(),
+					systemPrompt: ["initial"],
+					tools: [readTool],
+					messages: sessionManager.buildSessionContext().messages,
+				},
+			}),
+			sessionManager,
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
+			toolRegistry: new Map([[readTool.name, readTool]]),
+			mcpDiscoveryEnabled: true,
+			defaultSelectedMCPServerNames: ["docs"],
+			rebuildSystemPrompt: async toolNames => ({
+				systemPrompt: [`tools:${toolNames.join(",")}`],
+			}),
+		});
+		sessions.push(session);
+
+		await session.setActiveToolsByName(["read"]);
+		expect(sessionManager.buildSessionContext()).toMatchObject({
+			hasPersistedMCPToolSelection: true,
+			selectedMCPToolNames: [],
+		});
+
+		await sessionManager.flush();
+		await sessionManager.ensureOnDisk();
+		const targetSessionManager = SessionManager.create(tempDir, tempDir);
+		targetSessionManager.appendMessage({ role: "user", content: "target session", timestamp: Date.now() });
+		await targetSessionManager.flush();
+		await targetSessionManager.ensureOnDisk();
+		const targetSessionFile = targetSessionManager.getSessionFile();
+		await targetSessionManager.close();
+		expect(originalSessionFile).toBeString();
+		expect(targetSessionFile).toBeString();
+
+		await session.switchSession(targetSessionFile!);
+		await session.refreshMCPTools([docsSearchTool]);
+		expect(session.getActiveToolNames()).toEqual(["read", docsSearchTool.name]);
+
+		await session.switchSession(originalSessionFile!);
+		expect(session.sessionFile).toBe(originalSessionFile);
+		expect(session.buildDisplaySessionContext()).toMatchObject({
+			hasPersistedMCPToolSelection: true,
+			selectedMCPToolNames: [],
+		});
+		expect(session.getSelectedMCPToolNames()).toEqual([]);
+		expect(session.getActiveToolNames()).toEqual(["read"]);
+	});
+
 	it("removes newly mandatory MCP tools from persisted user selections during refresh", async () => {
 		const readTool = createBasicTool("read", "Read");
 		const docsSearchTool = createMcpTool("mcp__docs_search", "docs", "search", "Search internal docs", ["query"]);
