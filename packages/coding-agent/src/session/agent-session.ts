@@ -4135,6 +4135,8 @@ export class AgentSession {
 	#activeToolSelectionRevision = 0;
 	/** Explicit caller selections supersede any older pending discovery activation. */
 	#explicitActiveToolSelectionGeneration = 0;
+	/** Caller-authored active selections are authoritative only for the current session context. */
+	#hasExplicitActiveToolSelectionForContext = false;
 	#mcpCatalogGeneration = 0;
 	#baselineDiscoveredBuiltinToolNames = new Set<string>();
 	#discoverableToolAllowedNames: ReadonlySet<string> | undefined;
@@ -6108,7 +6110,9 @@ export class AgentSession {
 		);
 		this.#constructorMCPToolSelection =
 			config.initialMCPToolSelectionIsExplicit === true
-				? this.#filterSelectableMCPToolNames(config.initialPersistedMCPToolNames ?? [])
+				? config.preserveUnavailableInitialMCPToolSelection
+					? [...(config.initialPersistedMCPToolNames ?? [])]
+					: this.#filterSelectableMCPToolNames(config.initialPersistedMCPToolNames ?? [])
 				: undefined;
 		this.#constructorDiscoveredBuiltinToolSelection =
 			config.initialDiscoveredBuiltinToolSelectionIsExplicit === true
@@ -11682,6 +11686,7 @@ export class AgentSession {
 	#clearConstructorToolSelectionAuthority(): void {
 		this.#constructorMCPToolSelection = undefined;
 		this.#constructorDiscoveredBuiltinToolSelection = undefined;
+		this.#hasExplicitActiveToolSelectionForContext = false;
 	}
 
 	#getSelectedDiscoveredBuiltinToolNames(): string[] {
@@ -12220,9 +12225,13 @@ export class AgentSession {
 		if (this.getActiveToolNames().includes("edit")) await this.refreshBaseSystemPrompt();
 	}
 
-	/** Whether an explicit active-tool selection has been applied since construction. */
-	hasExplicitActiveToolSelection(): boolean {
-		return this.#explicitActiveToolSelectionGeneration > 0;
+	/** Whether the current context has persisted, constructor, or live caller MCP selection authority. */
+	hasMCPToolSelectionAuthority(): boolean {
+		return (
+			this.buildDisplaySessionContext().hasPersistedMCPToolSelection ||
+			this.#constructorMCPToolSelection !== undefined ||
+			this.#hasExplicitActiveToolSelectionForContext
+		);
 	}
 
 	getSelectedMCPToolNames(): string[] {
@@ -12812,13 +12821,26 @@ export class AgentSession {
 	 * Only tools in the registry can be enabled. Unknown tool names are ignored.
 	 * Also rebuilds the system prompt to reflect the new tool set.
 	 * Changes take effect before the next model call.
+	 * Use `explicit: false` for internal filtering and `persistMCPSelection: false` when it must not
+	 * create session selection authority.
 	 */
-	async setActiveToolsByName(toolNames: string[]): Promise<void> {
-		const explicitActiveToolSelectionGeneration = ++this.#explicitActiveToolSelectionGeneration;
-		await this.#applyActiveToolsByName(toolNames, { explicitActiveToolSelectionGeneration });
+	async setActiveToolsByName(
+		toolNames: string[],
+		options?: { explicit?: boolean; persistMCPSelection?: boolean },
+	): Promise<void> {
+		const isExplicit = options?.explicit !== false;
+		const explicitActiveToolSelectionGeneration = isExplicit
+			? ++this.#explicitActiveToolSelectionGeneration
+			: this.#explicitActiveToolSelectionGeneration;
+		if (isExplicit) this.#hasExplicitActiveToolSelectionForContext = true;
+		await this.#applyActiveToolsByName(toolNames, {
+			explicitActiveToolSelectionGeneration,
+			persistMCPSelection: options?.persistMCPSelection,
+		});
 	}
 
 	async #restoreMCPSelectionsForSessionContext(sessionContext: SessionContext): Promise<void> {
+		this.#hasExplicitActiveToolSelectionForContext = false;
 		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") {
 			await this.#attachAskToolIfWorkflowActive();
 			return;

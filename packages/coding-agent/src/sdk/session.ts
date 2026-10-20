@@ -4975,16 +4975,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			...retainPluginMcpMandatoryNames(customTools, pluginMcpToolNames),
 		);
 		const mandatoryMCPToolNameSet = new Set(pluginMcpToolNames);
-		const selectableExplicitMCPToolNames = explicitlyRequestedMCPToolNames.filter(
-			name => !mandatoryMCPToolNameSet.has(name),
-		);
+		const deferredMcpConnectPending = deferredExactMcpConfig !== undefined || deferredConventionalMcp !== undefined;
+		const requestedDeferredMCPToolNames =
+			deferredMcpConnectPending && hasExplicitToolNames
+				? options.toolNames!.map(name => name.toLowerCase()).filter(isMCPToolName)
+				: [];
+		const selectableExplicitMCPToolNames = [
+			...new Set([
+				...explicitlyRequestedMCPToolNames.filter(name => !mandatoryMCPToolNameSet.has(name)),
+				...requestedDeferredMCPToolNames.filter(name => !mandatoryMCPToolNameSet.has(name)),
+			]),
+		];
 		let initialToolNames = [...initialRequestedActiveToolNames];
 		if (mcpDiscoveryEnabled) {
 			// A pending deferred MCP connect (exact or conventional) registers its
 			// tools after construction, so persisted selections must be preserved
 			// verbatim instead of being trimmed to names the registry currently has.
-			const deferredMcpConnectPending =
-				deferredExactMcpConfig !== undefined || deferredConventionalMcp !== undefined;
 			const restoredSelectedMCPToolNames = deferredMcpConnectPending
 				? existingSession.selectedMCPToolNames.filter(name => !mandatoryMCPToolNameSet.has(name))
 				: existingSession.selectedMCPToolNames.filter(
@@ -5821,9 +5827,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							.filter(tool => tool.mcpServerName && conventionalServerNames.has(tool.mcpServerName))
 							.map(tool => tool.name);
 						const defaultMcpToolNamesToActivate =
-							deferConventionalMcpAutoload &&
-							!existingSession.hasPersistedMCPToolSelection &&
-							!hasExplicitMCPToolSelection
+							deferConventionalMcpAutoload && !session.hasMCPToolSelectionAuthority()
 								? nextTools
 										.filter(
 											tool =>
@@ -5860,7 +5864,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								mandatoryMCPToolNames: nextMandatoryMcpToolNames,
 								activateNewTools: false,
 							});
-							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasExplicitActiveToolSelection()) {
+							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasMCPToolSelectionAuthority()) {
 								await session.activateDiscoveredTools(defaultMcpToolNamesToActivate, {
 									persistMCPSelection: false,
 								});
@@ -5958,9 +5962,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							classifiedTools.pluginMcpToolNames,
 						);
 						const defaultMcpToolNamesToActivate =
-							deferConventionalMcpAutoload &&
-							!existingSession.hasPersistedMCPToolSelection &&
-							!hasExplicitMCPToolSelection
+							deferConventionalMcpAutoload && !session.hasMCPToolSelectionAuthority()
 								? snapshot
 										.filter(
 											tool =>
@@ -5974,7 +5976,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								mandatoryMCPToolNames: mandatoryPluginToolNames,
 								activateNewTools: false,
 							});
-							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasExplicitActiveToolSelection()) {
+							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasMCPToolSelectionAuthority()) {
 								await session.activateDiscoveredTools(defaultMcpToolNamesToActivate, {
 									persistMCPSelection: false,
 								});
@@ -6074,10 +6076,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							}
 							if (!cancelled && !session.isDisposed) {
 								await session.refreshMCPTools(resultTools);
-								if (
-									!session.isDisposed &&
-									(!mcpDiscoveryEnabled || !existingSession.hasPersistedMCPToolSelection)
-								) {
+								if (!session.isDisposed && (!mcpDiscoveryEnabled || !session.hasMCPToolSelectionAuthority())) {
 									await session.activateDiscoveredTools(toolNames);
 								}
 							}
@@ -6107,10 +6106,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								wireOwnedMcpToolSync(resultTools);
 								wireOwnedMcpManagerLifecycle();
 								const shouldActivateStartupMcpTools =
-									!mcpDiscoveryEnabled ||
-									(!existingSession.hasPersistedMCPToolSelection &&
-										(!deferConventionalMcpAutoload ||
-											(!hasExplicitMCPToolSelection && !session.hasExplicitActiveToolSelection())));
+									!mcpDiscoveryEnabled || !session.hasMCPToolSelectionAuthority();
 								if (!session.isDisposed && shouldActivateStartupMcpTools) {
 									await session.activateDiscoveredTools(
 										resultTools

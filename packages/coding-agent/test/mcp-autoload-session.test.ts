@@ -43,6 +43,25 @@ rl.on('line', line => {
 setInterval(() => {}, 1000);
 `;
 
+const MULTI_TOOL_DEMO_MCP_SERVER_SCRIPT = `
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'demo', version: '1' } } }) + '\\n');
+  } else if (msg.method === 'tools/list') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [
+      { name: 'hello', description: 'Demo hello tool', inputSchema: { type: 'object', properties: {} } },
+      { name: 'goodbye', description: 'Demo goodbye tool', inputSchema: { type: 'object', properties: {} } }
+    ] } }) + '\\n');
+  } else if (msg.id !== undefined) {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
+  }
+});
+setInterval(() => {}, 1000);
+`;
+
 const DELAYED_MCP_SERVER_SCRIPT = `
 const readline = require('node:readline');
 const rl = readline.createInterface({ input: process.stdin });
@@ -240,6 +259,45 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 45_000);
 
+	it("preserves an explicit deferred MCP subset when its default server connects", async () => {
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					demo: {
+						type: "stdio",
+						command: process.execPath,
+						args: ["-e", MULTI_TOOL_DEMO_MCP_SERVER_SCRIPT],
+						timeout: 5_000,
+					},
+				},
+			}),
+		);
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...isolatedSessionOptions(),
+			toolNames: ["mcp__demo_hello"],
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.discoveryDefaultServers": ["demo"],
+				"mcp.enableProjectConfig": true,
+			}),
+			deferMcpConfigStartup: true,
+		});
+		try {
+			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 2, hasErrors: false });
+			expect(session.getAllToolNames()).toContain("mcp__demo_hello");
+			expect(session.getAllToolNames()).toContain("mcp__demo_goodbye");
+			expect(session.getActiveToolNames()).toContain("mcp__demo_hello");
+			expect(session.getActiveToolNames()).not.toContain("mcp__demo_goodbye");
+			expect(session.getSelectedMCPToolNames()).toEqual(["mcp__demo_hello"]);
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(true);
+		} finally {
+			await session.dispose();
+		}
+	}, 45_000);
+
 	it("activates late defaults for inherited sessions unless tools were explicitly deselected", async () => {
 		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
 		const fastDefaultServerConfig = {
@@ -295,12 +353,19 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			inheritedSession = (
 				await createAgentSession({
 					...isolatedSessionOptions(),
-					toolNames: undefined,
+					toolNames: ["read", "todo_write"],
 					settings: inheritedSettings(),
 					inheritedMcpManager: mcpManager,
 					parentTaskPrefix: "0-Inherited",
 				})
 			).session;
+			expect(inheritedSession.getActiveToolNames()).toContain("todo_write");
+			await inheritedSession.setActiveToolsByName(
+				inheritedSession.getActiveToolNames().filter(name => name !== "todo_write"),
+				{ explicit: false, persistMCPSelection: false },
+			);
+			expect(inheritedSession.getActiveToolNames()).not.toContain("todo_write");
+			expect(inheritedSession.hasMCPToolSelectionAuthority()).toBe(false);
 			explicitlyDeselectedSession = (
 				await createAgentSession({
 					...isolatedSessionOptions(),
@@ -340,6 +405,57 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			await session.dispose();
 		}
 	}, 30_000);
+
+	it("reevaluates discovery-default authority after starting a new session", async () => {
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					"slow-default": {
+						type: "stdio",
+						command: process.execPath,
+						args: ["-e", LATE_DEFAULT_MCP_SERVER_SCRIPT],
+						timeout: 15_000,
+					},
+				},
+			}),
+		);
+		const sessionManager = SessionManager.inMemory(projectDir);
+		sessionManager.appendMCPToolSelection([]);
+		const lateToolName = "mcp__slow_default_late_default";
+		const { session, mcpManager, startDeferredMcpConfig } = await createAgentSession({
+			...isolatedSessionOptions(),
+			sessionManager,
+			toolNames: undefined,
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.discoveryDefaultServers": ["slow-default"],
+				"mcp.enableProjectConfig": true,
+			}),
+			deferMcpConfigStartup: true,
+		});
+		try {
+			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 0, hasErrors: false });
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(true);
+			expect(mcpManager?.getConnectionStatus("slow-default")).toBe("connecting");
+			await expect(session.newSession()).resolves.toBe(true);
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+
+			const activationDeadline = Date.now() + 15_000;
+			while (!session.getActiveToolNames().includes(lateToolName)) {
+				if (Date.now() > activationDeadline) {
+					throw new Error(`New session did not apply its configured MCP default: ${lateToolName}`);
+				}
+				await Bun.sleep(20);
+			}
+			expect(session.getAllToolNames()).toContain(lateToolName);
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	}, 45_000);
 
 	it("loads persisted cached conventional tools through the session-owned manager", async () => {
 		await runMCPCommand({
