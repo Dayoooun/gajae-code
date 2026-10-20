@@ -133,7 +133,7 @@ export class PlanModeController {
 			: this.ctx.session.getToolByName("resolve")
 				? [...new Set([...previousTools, "resolve"])]
 				: previousTools;
-		await this.ctx.session.setActiveToolsByName(planTools);
+		await this.ctx.session.setActiveToolsByName(planTools, { explicit: false, persistMCPSelection: false });
 		this.ctx.session.setPlanModeState({
 			enabled: true,
 			planFilePath,
@@ -152,7 +152,11 @@ export class PlanModeController {
 	async exit(options?: { silent?: boolean; paused?: boolean }): Promise<void> {
 		if (!this.#enabled) return;
 		await this.ctx.session.abort({ timeoutMs: ABORT_TIMEOUT_MS });
-		if (this.#previousTools !== undefined) await this.ctx.session.setActiveToolsByName(this.#previousTools);
+		if (this.#previousTools !== undefined)
+			await this.ctx.session.setActiveToolsByName(this.#previousTools, {
+				explicit: false,
+				persistMCPSelection: false,
+			});
 		if (this.#providerSessionScope && !this.ctx.session.isStreaming) {
 			if (await this.ctx.session.restoreTemporaryProviderSessionScope(this.#providerSessionScope))
 				this.#providerSessionScope = undefined;
@@ -488,7 +492,8 @@ export class PlanModeController {
 		} finally {
 			this.ctx.session.clearPlanCompactAbortPending();
 		}
-		if (previousTools.length) await this.ctx.session.setActiveToolsByName(previousTools);
+		if (previousTools.length)
+			await this.ctx.session.setActiveToolsByName(previousTools, { explicit: false, persistMCPSelection: false });
 		if (!sessionSwitchCompleted)
 			return this.ctx.showWarning(
 				"Plan approved, but the new session could not be created — execution was not dispatched.",

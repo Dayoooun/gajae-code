@@ -138,6 +138,20 @@ describe("InteractiveMode goal mode integration", () => {
 		);
 	});
 
+	it("keeps internal goal and plan tool swaps outside MCP selection authority", async () => {
+		expect(harness.session.hasMCPToolSelectionAuthority()).toBe(false);
+
+		await harness.mode.goalModeController.handleCommand("Ship the release");
+		expect(harness.session.hasMCPToolSelectionAuthority()).toBe(false);
+		await harness.mode.goalModeController.exit();
+		expect(harness.session.hasMCPToolSelectionAuthority()).toBe(false);
+
+		await harness.mode.planModeController.enter();
+		expect(harness.session.hasMCPToolSelectionAuthority()).toBe(false);
+		await harness.mode.planModeController.exit();
+		expect(harness.session.hasMCPToolSelectionAuthority()).toBe(false);
+	});
+
 	it("replaces the active goal via /goal set", async () => {
 		await harness.mode.goalModeController.handleCommand("Ship the release");
 		const originalGoal = harness.session.getGoalModeState()?.goal;

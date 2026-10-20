@@ -208,6 +208,56 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 30_000);
 
+	it("keeps automatic discovery-default selection non-persisting across catalog refreshes", async () => {
+		await addDemoServer();
+		let publishToolsChanged: Parameters<MCPManager["setOnToolsChanged"]>[0] | undefined;
+		const originalSetOnToolsChanged = MCPManager.prototype.setOnToolsChanged;
+		vi.spyOn(MCPManager.prototype, "setOnToolsChanged").mockImplementation(function (this: MCPManager, handler) {
+			publishToolsChanged = handler;
+			return originalSetOnToolsChanged.call(this, handler);
+		});
+
+		const { session, mcpManager } = await createAgentSession({
+			...isolatedSessionOptions(),
+			toolNames: undefined,
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.discoveryDefaultServers": ["demo"],
+				"mcp.enableProjectConfig": true,
+			}),
+		});
+		try {
+			if (!mcpManager) throw new Error("Expected the session-owned MCP manager");
+			const defaultToolName = "mcp__demo_hello";
+			const initialTools = mcpManager.getTools();
+			if (!publishToolsChanged) throw new Error("Expected the MCP catalog callback");
+			expect(session.getActiveToolNames()).toContain(defaultToolName);
+			expect(session.hasMCPToolSelectionAuthority()).toBe(false);
+
+			publishToolsChanged([]);
+			const removalDeadline = Date.now() + 5_000;
+			while (session.getAllToolNames().includes(defaultToolName)) {
+				if (Date.now() > removalDeadline) throw new Error(`MCP catalog tool was not removed: ${defaultToolName}`);
+				await Bun.sleep(20);
+			}
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+			expect(session.hasMCPToolSelectionAuthority()).toBe(false);
+
+			publishToolsChanged(initialTools);
+			const activationDeadline = Date.now() + 5_000;
+			while (!session.getActiveToolNames().includes(defaultToolName)) {
+				if (Date.now() > activationDeadline)
+					throw new Error(`Discovery-default MCP tool was not reactivated: ${defaultToolName}`);
+				await Bun.sleep(20);
+			}
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+			expect(session.hasMCPToolSelectionAuthority()).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
 	it("keeps deferred-startup autoload tools inactive unless their server is a discovery default", async () => {
 		await addDemoServer();
 		for (const [defaults, expectActive] of [

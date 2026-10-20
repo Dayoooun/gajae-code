@@ -265,7 +265,10 @@ export class GoalModeController {
 			if (restored?.goal) {
 				this.#previousTools = this.ctx.session.getActiveToolNames();
 				if (!this.ctx.session.isExplicitEmptyToolSelection()) {
-					await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])]);
+					await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])], {
+						explicit: false,
+						persistMCPSelection: false,
+					});
 				}
 			}
 			this.#updateStatus();
@@ -325,7 +328,10 @@ export class GoalModeController {
 					provenance: options.provenance,
 				});
 		if (!this.ctx.session.isExplicitEmptyToolSelection()) {
-			await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])]);
+			await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])], {
+				explicit: false,
+				persistMCPSelection: false,
+			});
 		}
 		this.ctx.session.setGoalModeState(state);
 		this.#enabled = true;
@@ -344,7 +350,11 @@ export class GoalModeController {
 			this.#previousTools &&
 			options?.reason !== "dropped" &&
 			(this.#enabled || options?.reason === "completed" || options?.paused);
-		if (shouldRestoreTools && this.#previousTools) await this.ctx.session.setActiveToolsByName(this.#previousTools);
+		if (shouldRestoreTools && this.#previousTools)
+			await this.ctx.session.setActiveToolsByName(this.#previousTools, {
+				explicit: false,
+				persistMCPSelection: false,
+			});
 		const currentState = this.ctx.session.getGoalModeState();
 		if (options?.reason === "completed") {
 			this.ctx.session.setGoalModeState(undefined);

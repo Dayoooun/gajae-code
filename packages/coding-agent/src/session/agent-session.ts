@@ -6499,6 +6499,7 @@ export class AgentSession {
 			mandatoryMCPToolNames?: readonly string[];
 			activateNewTools?: boolean;
 			inactiveNewToolNames?: readonly string[];
+			persistMCPSelection?: boolean;
 		},
 	): Promise<void> {
 		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
@@ -6535,7 +6536,7 @@ export class AgentSession {
 						(options?.activateNewTools !== false && !previous.has(name) && !inactiveNewToolNames.has(name)),
 				),
 			],
-			{ previousSelectedMCPToolNames },
+			{ previousSelectedMCPToolNames, persistMCPSelection: options?.persistMCPSelection },
 		);
 	}
 

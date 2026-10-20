@@ -1612,6 +1612,29 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		}
 	});
 
+	it("does not infer MCP selection from an explicitly requested inline local name", async () => {
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockResolvedValue(
+			createMcpLoadResult([createMcpCustomTool("mcp__exact_lookup", "exact", "lookup")]),
+		);
+		const { session } = await createAgentSession({
+			...createIsolatedSessionOptions(["mcp__local_inline_tool"]),
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDefaultServers": ["exact"],
+			}),
+			mcpConfigPath: path.join(tempDir, "explicit-mcp.json"),
+			customTools: [createLocalCustomTool("mcp__local_inline_tool")],
+		});
+		try {
+			expect(session.getActiveToolNames()).toContain("mcp__local_inline_tool");
+			expect(session.getActiveToolNames()).toContain("mcp__exact_lookup");
+			expect(session.getSelectedMCPToolNames()).toEqual(["mcp__exact_lookup"]);
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("builds search_tool_bm25 descriptions from the loaded MCP catalog", async () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,

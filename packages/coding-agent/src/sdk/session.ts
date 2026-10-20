@@ -5014,10 +5014,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				]),
 			];
 			hasExplicitMCPToolSelection =
-				hasExplicitToolNames &&
-				(options.toolNames!.length === 0 ||
-					selectableExplicitMCPToolNames.length > 0 ||
-					options.toolNames!.some(name => isMCPToolName(name.toLowerCase())));
+				hasExplicitToolNames && (options.toolNames!.length === 0 || selectableExplicitMCPToolNames.length > 0);
 			initialSelectedMCPToolNames = existingSession.hasPersistedMCPToolSelection
 				? restoredSelectedMCPToolNames
 				: hasExplicitMCPToolSelection
@@ -5863,6 +5860,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							await session.replaceNamedCustomTools(previousNames, nextTools, {
 								mandatoryMCPToolNames: nextMandatoryMcpToolNames,
 								activateNewTools: false,
+								persistMCPSelection: false,
 							});
 							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasMCPToolSelectionAuthority()) {
 								await session.activateDiscoveredTools(defaultMcpToolNamesToActivate, {
@@ -5975,6 +5973,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							await session.replaceNamedCustomTools(previousNames, snapshot, {
 								mandatoryMCPToolNames: mandatoryPluginToolNames,
 								activateNewTools: false,
+								persistMCPSelection: false,
 							});
 							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasMCPToolSelectionAuthority()) {
 								await session.activateDiscoveredTools(defaultMcpToolNamesToActivate, {
