@@ -1679,7 +1679,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		});
 		try {
 			const startup = startDeferredMcpConfig!();
-			await session.setActiveToolsByName(["read"]);
+			await session.setActiveToolsByName(["read"], { persistMCPSelection: false });
 			expect(session.hasMCPToolSelectionAuthority()).toBe(true);
 			discovery.resolve(createMcpLoadResult([createMcpCustomTool("mcp__exact_lookup", "exact", "lookup")]));
 			await expect(startup).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });

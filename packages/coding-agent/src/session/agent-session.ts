@@ -11782,9 +11782,10 @@ export class AgentSession {
 	#persistSelectedMCPToolNamesIfChanged(
 		previousSelectedMCPToolNames: string[],
 		previousSelectedDiscoveredBuiltinToolNames: string[],
+		nextPersistedMCPToolNames?: string[],
 	): void {
 		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") return;
-		const nextSelectedMCPToolNames = this.getSelectedMCPToolNames();
+		const nextSelectedMCPToolNames = nextPersistedMCPToolNames ?? this.getSelectedMCPToolNames();
 		const nextSelectedDiscoveredBuiltinToolNames = this.#getSelectedDiscoveredBuiltinToolNames();
 		const mcpSelectionChanged = !this.#selectedMCPToolNamesMatch(
 			previousSelectedMCPToolNames,
@@ -12445,6 +12446,7 @@ export class AgentSession {
 			const mcpCatalogGeneration = this.#mcpCatalogGeneration;
 			const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
 			const previousSelectedDiscoveredBuiltinToolNames = this.#getSelectedDiscoveredBuiltinToolNames();
+			const authoritativeMCPToolNames = this.#getMCPToolSelectionAuthorityNames() ?? [];
 			const nextActiveToolNames = this.getActiveToolNames();
 			const nextActiveNameSet = new Set(nextActiveToolNames);
 			const nextSelectedDiscoveredBuiltinToolNames = new Set(this.#selectedDiscoveredToolNames);
@@ -12468,11 +12470,19 @@ export class AgentSession {
 				}
 			}
 			const candidateToolEntries = nextActiveToolNames.map(name => this.#toolRegistry.get(name));
+			const activatedMCPToolNames = activated.filter(name => {
+				const tool = this.#toolRegistry.get(name);
+				return tool !== undefined && isMCPBridgeTool(tool);
+			});
 			if (activated.length > 0) {
 				const appliedRevision = await this.#applyActiveToolsByName(nextActiveToolNames, {
 					previousSelectedMCPToolNames,
 					previousSelectedDiscoveredBuiltinToolNames,
 					nextSelectedDiscoveredBuiltinToolNames: [...nextSelectedDiscoveredBuiltinToolNames],
+					persistedMCPToolNames:
+						activatedMCPToolNames.length > 0
+							? [...new Set([...previousSelectedMCPToolNames, ...authoritativeMCPToolNames, ...activatedMCPToolNames])]
+							: undefined,
 					persistMCPSelection,
 					sessionTransitionGeneration,
 					expectedActiveToolSelectionRevision: activeToolSelectionRevision,
@@ -12746,6 +12756,7 @@ export class AgentSession {
 			previousSelectedMCPToolNames?: string[];
 			previousSelectedDiscoveredBuiltinToolNames?: string[];
 			nextSelectedDiscoveredBuiltinToolNames?: string[];
+			persistedMCPToolNames?: string[];
 			sessionTransitionGeneration?: number;
 			expectedActiveToolSelectionRevision?: number;
 			explicitActiveToolSelectionGeneration?: number;
@@ -12870,6 +12881,7 @@ export class AgentSession {
 			this.#persistSelectedMCPToolNamesIfChanged(
 				previousSelectedMCPToolNames,
 				previousSelectedDiscoveredBuiltinToolNames,
+				options?.persistedMCPToolNames,
 			);
 		}
 		return this.#activeToolSelectionRevision;
