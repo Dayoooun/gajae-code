@@ -106,7 +106,7 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(session.peekStandingResolveHandler()).toBeUndefined();
 	});
 
-	it("retries plan tool activation after an MCP catalog changes during prompt rebuild", async () => {
+	it("retries plan activation after catalog changes without dropping local mcp-prefixed tools", async () => {
 		mode.stop();
 		await session.dispose();
 		const modelRegistry = new ModelRegistry(authStorage);
@@ -115,6 +115,7 @@ describe("InteractiveMode plan review rendering", () => {
 		const readTool = createTestTool("test_read");
 		const writeTool = createTestTool("test_write");
 		const resolveTool = createTestTool("resolve");
+		const localMcpNamedTool = createTestTool("mcp__local_custom");
 		const mcpTool: CustomTool = {
 			name: "mcp__docs_search",
 			label: "docs/search",
@@ -133,7 +134,7 @@ describe("InteractiveMode plan review rendering", () => {
 				initialState: {
 					model,
 					systemPrompt: ["Test"],
-					tools: [readTool, writeTool],
+					tools: [readTool, writeTool, localMcpNamedTool],
 					messages: [],
 				},
 			}),
@@ -144,6 +145,7 @@ describe("InteractiveMode plan review rendering", () => {
 				[readTool.name, readTool],
 				[writeTool.name, writeTool],
 				[resolveTool.name, resolveTool],
+				[localMcpNamedTool.name, localMcpNamedTool],
 			]),
 			mcpDiscoveryEnabled: true,
 			defaultSelectedMCPServerNames: ["docs"],
@@ -166,6 +168,7 @@ describe("InteractiveMode plan review rendering", () => {
 
 		expect(mode.planModeController.enabled).toBe(true);
 		expect(session.getActiveToolNames()).toContain(resolveTool.name);
+		expect(session.getActiveToolNames()).toContain(localMcpNamedTool.name);
 		expect(session.getActiveMCPToolNames()).toEqual([mcpTool.name]);
 		expect(session.peekStandingResolveHandler()).toBeDefined();
 		await mode.planModeController.exit({ silent: true });

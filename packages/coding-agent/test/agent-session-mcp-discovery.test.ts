@@ -1422,6 +1422,85 @@ describe("AgentSession MCP discovery", () => {
 		});
 	}
 
+	it("does not reactivate predecessor MCP tools from a catalog swap after /new", async () => {
+		const readTool = createBasicTool("read", "Read");
+		const docsSearchTool = createMcpTool("mcp__docs_search", "docs", "search", "Search docs", ["query"]);
+		const replacementDocsSearchTool = createMcpCustomTool(
+			"mcp__docs_search",
+			"docs",
+			"search",
+			"Updated search docs",
+			["query"],
+		);
+		const defaultTool = createMcpTool("mcp__default_lookup", "default", "lookup", "Lookup default data", ["query"]);
+		const replacementPromptStarted = Promise.withResolvers<void>();
+		const releaseReplacementPrompt = Promise.withResolvers<void>();
+		const beforeSwitchStarted = Promise.withResolvers<void>();
+		const releaseSwitchHook = Promise.withResolvers<void>();
+		let blockReplacementPrompt = false;
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "session_before_switch",
+			emit: async (event: { type: string }) => {
+				if (event.type === "session_before_switch") {
+					beforeSwitchStarted.resolve();
+					await releaseSwitchHook.promise;
+				}
+			},
+		} as never;
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: createModel(),
+					systemPrompt: ["initial"],
+					tools: [readTool, docsSearchTool],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
+			toolRegistry: new Map<string, AgentTool>([
+				[readTool.name, readTool],
+				[docsSearchTool.name, docsSearchTool],
+				[defaultTool.name, defaultTool],
+			]),
+			mcpDiscoveryEnabled: true,
+			defaultSelectedMCPServerNames: ["default"],
+			extensionRunner,
+			rebuildSystemPrompt: async toolNames => {
+				if (blockReplacementPrompt && toolNames.includes(docsSearchTool.name)) {
+					blockReplacementPrompt = false;
+					replacementPromptStarted.resolve();
+					await releaseReplacementPrompt.promise;
+				}
+				return { systemPrompt: [`tools:${toolNames.join(",")}`] };
+			},
+		});
+		sessions.push(session);
+
+		await session.setActiveToolsByName([readTool.name, docsSearchTool.name], { persistMCPSelection: false });
+		blockReplacementPrompt = true;
+		const replacement = session.replaceNamedCustomTools([docsSearchTool.name], [replacementDocsSearchTool], {
+			activateNewTools: false,
+			persistMCPSelection: false,
+		});
+		await replacementPromptStarted.promise;
+
+		const transition = session.newSession();
+		await beforeSwitchStarted.promise;
+		releaseSwitchHook.resolve();
+		expect(await transition).toBe(true);
+		expect(session.getActiveToolNames()).toContain(defaultTool.name);
+		expect(session.getActiveMCPToolNames()).not.toContain(docsSearchTool.name);
+
+		releaseReplacementPrompt.resolve();
+		await replacement;
+		expect(session.getActiveToolNames()).toContain(defaultTool.name);
+		expect(session.getActiveMCPToolNames()).not.toContain(docsSearchTool.name);
+	});
+
 	it("recomputes configured MCP defaults after a new-session catalog refresh", async () => {
 		const readTool = createBasicTool("read", "Read");
 		const docsSearchTool = createMcpCustomTool("mcp__docs_search", "docs", "search", "Search internal docs", [

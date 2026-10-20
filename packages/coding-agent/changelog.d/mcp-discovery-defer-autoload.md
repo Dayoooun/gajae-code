@@ -6,5 +6,7 @@
 
 - Explicit tool selections persist MCP authority even when the selectable catalog is empty or unchanged, so deselections survive resume instead of re-enabling configured defaults.
 - MCP selection authority now rolls back after failed tool updates and survives non-persisting catalog pruning; failed session-switch rollback restores matching tool signatures, prompts, and permission guards.
+- Reactive custom-tool replacements are fenced against session transitions, so a predecessor catalog update cannot reactivate non-default MCP tools after `/new`.
 - Plan mode retries its internal tool swap after an MCP catalog change, keeping `resolve` available alongside newly published tools.
+- Plan-mode retries preserve registered local tools whose names begin with `mcp__`.
 - Plan approval preserves late default-server tools and transferred MCP selections without overriding successor-owned selections.

@@ -6541,6 +6541,12 @@ export class AgentSession {
 			persistMCPSelection?: boolean;
 		},
 	): Promise<void> {
+		while (this.#sessionTransitionKind !== undefined) {
+			await this.#waitForSessionTransitionEnd(this.#disposeAbortController.signal);
+		}
+		if (this.#isDisposed) return;
+		const activeToolSelectionRevision = this.#activeToolSelectionRevision;
+		const sessionTransitionGeneration = this.#sessionTransitionGeneration;
 		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
 		const previous = new Set(previousNames);
 		const inactiveNewToolNames = new Set(options?.inactiveNewToolNames ?? []);
@@ -6584,6 +6590,8 @@ export class AgentSession {
 			],
 			{
 				previousSelectedMCPToolNames,
+				sessionTransitionGeneration,
+				expectedActiveToolSelectionRevision: activeToolSelectionRevision,
 				persistMCPSelection:
 					options?.persistMCPSelection ??
 					(this.#hasExplicitActiveToolSelectionForContext
@@ -12954,7 +12962,10 @@ export class AgentSession {
 				if (initialMcpCatalogGeneration === this.#mcpCatalogGeneration) {
 					throw new Error("Active tool selection was superseded before it could be applied");
 				}
-				const nonMCPToolNames = toolNames.filter(name => !isMCPToolName(name.toLowerCase()));
+				const nonMCPToolNames = toolNames.filter(name => {
+					const tool = this.#toolRegistry.get(name.toLowerCase());
+					return tool === undefined || !isMCPBridgeTool(tool);
+				});
 				while (appliedRevision === undefined) {
 					await this.#waitForAdmittedBaseSystemPromptRebuilds();
 					if (
