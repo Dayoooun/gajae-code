@@ -139,6 +139,66 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 30_000);
 
+	async function addDemoServer(): Promise<void> {
+		vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		await runMCPCommand({
+			action: "add",
+			name: "demo",
+			commandArgs: [process.execPath, "-e", DEMO_MCP_SERVER_SCRIPT],
+			flags: { project: true, timeout: 5_000 },
+			cwd: projectDir,
+		});
+	}
+
+	it("keeps autoloaded MCP tools discoverable but inactive when mcp.discoveryDeferAutoload is set", async () => {
+		await addDemoServer();
+		const { session } = await createAgentSession({
+			...isolatedSessionOptions(),
+			toolNames: undefined,
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.enableProjectConfig": true,
+			}),
+		});
+		try {
+			expect(session.getAllToolNames()).toContain("mcp__demo_hello");
+			expect(session.getActiveToolNames()).not.toContain("mcp__demo_hello");
+			await session.activateDiscoveredTools(["mcp__demo_hello"]);
+			expect(session.getActiveToolNames()).toContain("mcp__demo_hello");
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("keeps deferred-startup autoload tools inactive unless their server is a discovery default", async () => {
+		await addDemoServer();
+		for (const [defaults, expectActive] of [
+			[[], false],
+			[["demo"], true],
+		] as const) {
+			MCPManager.resetForTests();
+			const { session, startDeferredMcpConfig } = await createAgentSession({
+				...isolatedSessionOptions(),
+				toolNames: undefined,
+				settings: Settings.isolated({
+					"mcp.discoveryMode": true,
+					"mcp.discoveryDeferAutoload": true,
+					"mcp.discoveryDefaultServers": [...defaults],
+					"mcp.enableProjectConfig": true,
+				}),
+				deferMcpConfigStartup: true,
+			});
+			try {
+				await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+				expect(session.getAllToolNames()).toContain("mcp__demo_hello");
+				expect(session.getActiveToolNames().includes("mcp__demo_hello")).toBe(expectActive);
+			} finally {
+				await session.dispose();
+			}
+		}
+	}, 45_000);
+
 	it("loads persisted cached conventional tools through the session-owned manager", async () => {
 		await runMCPCommand({
 			action: "add",

@@ -4994,8 +4994,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					...discoveryDefaultServerToolNames,
 					...(explicitMcpConfigPath !== undefined ? exactMcpToolNames : []),
 					// Conventional autoload servers are selected by default so their
-					// tools are exposed in sessions that enable MCP discovery mode.
-					...conventionalMcpToolNames,
+					// tools are exposed in sessions that enable MCP discovery mode,
+					// unless `mcp.discoveryDeferAutoload` keeps them behind tool search.
+					...(settings.get("mcp.discoveryDeferAutoload") ? [] : conventionalMcpToolNames),
 				]),
 			];
 			hasExplicitMCPToolSelection =
@@ -6064,7 +6065,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									!session.isDisposed &&
 									(!mcpDiscoveryEnabled || !existingSession.hasPersistedMCPToolSelection)
 								) {
-									await session.activateDiscoveredTools(resultTools.map(tool => tool.name));
+									const deferAutoload = mcpDiscoveryEnabled && settings.get("mcp.discoveryDeferAutoload");
+									const defaultServers = new Set(settings.get("mcp.discoveryDefaultServers") ?? []);
+									await session.activateDiscoveredTools(
+										resultTools
+											.filter(
+												tool =>
+													!deferAutoload ||
+													(tool.mcpServerName !== undefined && defaultServers.has(tool.mcpServerName)),
+											)
+											.map(tool => tool.name),
+									);
 								}
 							}
 							loadedToolCount = resultTools.length;
