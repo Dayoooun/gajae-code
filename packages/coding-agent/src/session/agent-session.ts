@@ -4171,6 +4171,7 @@ export class AgentSession {
 	/** Caller-authored active selections are authoritative only for the current session context. */
 	#hasExplicitActiveToolSelectionForContext = false;
 	#explicitMCPToolSelectionForContext: string[] | undefined;
+	#explicitMCPToolSelectionPersistsForContext = true;
 	#mcpCatalogGeneration = 0;
 	#baselineDiscoveredBuiltinToolNames = new Set<string>();
 	#discoverableToolAllowedNames: ReadonlySet<string> | undefined;
@@ -6581,7 +6582,14 @@ export class AgentSession {
 						(!inactiveNewToolNames.has(name) && options?.activateNewTools !== false && !previous.has(name)),
 				),
 			],
-			{ previousSelectedMCPToolNames, persistMCPSelection: options?.persistMCPSelection },
+			{
+				previousSelectedMCPToolNames,
+				persistMCPSelection:
+					options?.persistMCPSelection ??
+					(this.#hasExplicitActiveToolSelectionForContext
+						? this.#explicitMCPToolSelectionPersistsForContext
+						: undefined),
+			},
 		);
 	}
 
@@ -11754,6 +11762,7 @@ export class AgentSession {
 		this.#constructorDiscoveredBuiltinToolSelection = undefined;
 		this.#hasExplicitActiveToolSelectionForContext = false;
 		this.#explicitMCPToolSelectionForContext = undefined;
+		this.#explicitMCPToolSelectionPersistsForContext = true;
 	}
 
 	#getSelectedDiscoveredBuiltinToolNames(): string[] {
@@ -12396,9 +12405,12 @@ export class AgentSession {
 					const tool = this.#toolRegistry.get(name);
 					return tool !== undefined && isMCPBridgeTool(tool);
 				});
-				this.#explicitMCPToolSelectionForContext = [
-					...new Set([...(this.#explicitMCPToolSelectionForContext ?? []), ...activatedMCPToolNames]),
-				];
+				if (activatedMCPToolNames.length > 0) {
+					this.#explicitMCPToolSelectionForContext = [
+						...new Set([...(this.#explicitMCPToolSelectionForContext ?? []), ...activatedMCPToolNames]),
+					];
+					this.#explicitMCPToolSelectionPersistsForContext = options?.persistMCPSelection !== false;
+				}
 			}
 			return activated;
 		});
@@ -12905,8 +12917,8 @@ export class AgentSession {
 	 * Only tools in the registry can be enabled. Unknown tool names are ignored.
 	 * Also rebuilds the system prompt to reflect the new tool set.
 	 * Changes take effect before the next model call.
-	 * Use `explicit: false` for internal filtering and `persistMCPSelection: false` when it must not
-	 * create session selection authority.
+	 * Use `explicit: false` for internal filtering and `persistMCPSelection: false` when the live
+	 * selection must not be written to the session transcript.
 	 */
 	async setActiveToolsByName(
 		toolNames: string[],
@@ -12916,19 +12928,33 @@ export class AgentSession {
 		const explicitActiveToolSelectionGeneration = isExplicit
 			? ++this.#explicitActiveToolSelectionGeneration
 			: this.#explicitActiveToolSelectionGeneration;
+		const previousHasExplicitActiveToolSelectionForContext = this.#hasExplicitActiveToolSelectionForContext;
+		const previousExplicitMCPToolSelectionForContext = this.#explicitMCPToolSelectionForContext;
+		const previousExplicitMCPToolSelectionPersistsForContext = this.#explicitMCPToolSelectionPersistsForContext;
 		if (isExplicit) {
 			this.#hasExplicitActiveToolSelectionForContext = true;
 			this.#explicitMCPToolSelectionForContext = this.#resolveExplicitMCPToolSelection(toolNames);
+			this.#explicitMCPToolSelectionPersistsForContext = options?.persistMCPSelection !== false;
 		}
-		await this.#applyActiveToolsByName(toolNames, {
-			explicitActiveToolSelectionGeneration,
-			persistMCPSelection: options?.persistMCPSelection,
-		});
+		try {
+			await this.#applyActiveToolsByName(toolNames, {
+				explicitActiveToolSelectionGeneration,
+				persistMCPSelection: options?.persistMCPSelection,
+			});
+		} catch (error) {
+			if (isExplicit && explicitActiveToolSelectionGeneration === this.#explicitActiveToolSelectionGeneration) {
+				this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
+				this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
+				this.#explicitMCPToolSelectionPersistsForContext = previousExplicitMCPToolSelectionPersistsForContext;
+			}
+			throw error;
+		}
 	}
 
 	async #restoreMCPSelectionsForSessionContext(sessionContext: SessionContext): Promise<void> {
 		this.#hasExplicitActiveToolSelectionForContext = false;
 		this.#explicitMCPToolSelectionForContext = undefined;
+		this.#explicitMCPToolSelectionPersistsForContext = true;
 		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") {
 			await this.#attachAskToolIfWorkflowActive();
 			return;
@@ -13138,7 +13164,11 @@ export class AgentSession {
 		];
 		await this.#applyActiveToolsByName(nextActive, {
 			previousSelectedMCPToolNames,
-			persistMCPSelection: options.persistMCPSelection ?? hasPersistedMCPToolSelection,
+			persistMCPSelection:
+				options.persistMCPSelection ??
+				(this.#hasExplicitActiveToolSelectionForContext
+					? this.#explicitMCPToolSelectionPersistsForContext
+					: hasPersistedMCPToolSelection),
 		});
 	}
 
@@ -28675,6 +28705,7 @@ export class AgentSession {
 			const previousExplicitMCPToolSelectionForContext = this.#explicitMCPToolSelectionForContext
 				? [...this.#explicitMCPToolSelectionForContext]
 				: undefined;
+			const previousExplicitMCPToolSelectionPersistsForContext = this.#explicitMCPToolSelectionPersistsForContext;
 			const previousTools = [...this.agent.state.tools];
 			const previousBaseSystemPrompt = this.#baseSystemPrompt;
 			const previousSystemPrompt = this.agent.state.systemPrompt;
@@ -29135,8 +29166,11 @@ export class AgentSession {
 				}
 				this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
 				this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
+				this.#explicitMCPToolSelectionPersistsForContext = previousExplicitMCPToolSelectionPersistsForContext;
 				this.#selectedMCPToolNames = new Set(previousSelectedMCPToolNames);
-				this.#setGuardedAgentTools(previousTools);
+				this.#activeToolSelectionRevision++;
+				this.agent.setTools(previousTools);
+				this.#onToolNamesChanged?.(previousTools.map(tool => tool.name));
 				this.#baseSystemPrompt = previousBaseSystemPrompt;
 				this.agent.setSystemPrompt(previousSystemPrompt);
 				this.agent.replaceMessages(previousAgentMessages, {

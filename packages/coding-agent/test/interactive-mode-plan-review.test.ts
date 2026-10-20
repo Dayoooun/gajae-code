@@ -573,6 +573,102 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 	});
 
+	it("persists MCP tools transferred into the fresh plan-execution session for resume", async () => {
+		mode.stop();
+		await session.dispose();
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
+		const readTool = createTestTool("test_read");
+		const writeTool = createTestTool("test_write");
+		const resolveTool = createTestTool("resolve");
+		const mcpTool = {
+			name: "mcp__docs_search",
+			label: "docs/search",
+			description: "Search docs",
+			parameters: z.object({}),
+			strict: true,
+			mcpServerName: "docs",
+			mcpToolName: "search",
+			async execute() {
+				return { content: [{ type: "text" as const, text: "found" }] };
+			},
+		} as AgentTool;
+		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["Test"],
+					tools: [readTool, writeTool],
+					messages: [],
+				},
+			}),
+			sessionManager,
+			settings: Settings.isolated({ "mcp.discoveryMode": true, "plan.enabled": true }),
+			modelRegistry,
+			toolRegistry: new Map([
+				[readTool.name, readTool],
+				[writeTool.name, writeTool],
+				[resolveTool.name, resolveTool],
+				[mcpTool.name, mcpTool],
+			]),
+			mcpDiscoveryEnabled: true,
+			rebuildSystemPrompt: async toolNames => ({ systemPrompt: [`tools:${toolNames.join(",")}`] }),
+		});
+		mode = new InteractiveMode(session, "test");
+		await session.setActiveToolsByName([readTool.name, mcpTool.name]);
+		const predecessorSessionFile = session.sessionFile;
+
+		const planFilePath = "local://PLAN.md";
+		const finalPlanFilePath = "local://APPROVED.md";
+		const plan = "# Plan\n\nUse the selected MCP tool.";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, plan);
+		const planHash = planSnapshotHash(plan);
+		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
+			action: "Approve and execute",
+			comments: [],
+			notes: "",
+			snapshotHash: planHash,
+		});
+		const clear = vi.spyOn(mode, "handleClearCommand").mockImplementation(async () => await session.newSession());
+		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+		await mode.planModeController.enter();
+		await mode.planModeController.handleApproval({
+			planFilePath,
+			planExists: true,
+			title: "PLAN",
+			finalPlanFilePath,
+		});
+
+		expect(clear).toHaveBeenCalledTimes(1);
+		expect(session.getActiveMCPToolNames()).toEqual([mcpTool.name]);
+		expect(sessionManager.buildSessionContext()).toMatchObject({
+			hasPersistedMCPToolSelection: true,
+			selectedMCPToolNames: [mcpTool.name],
+		});
+		await session.sessionManager.ensureOnDisk();
+		await session.sessionManager.flush();
+		const executionSessionFile = session.sessionFile;
+		if (!executionSessionFile) throw new Error("Expected the plan-execution session to be on disk");
+		expect(executionSessionFile).not.toBe(predecessorSessionFile);
+		expect(await fs.readFile(executionSessionFile, "utf8")).toContain('"type":"mcp_tool_selection"');
+		const resumedSessionManager = await SessionManager.open(executionSessionFile, tempDir.path());
+		try {
+			expect(resumedSessionManager.buildSessionContext()).toMatchObject({
+				hasPersistedMCPToolSelection: true,
+				selectedMCPToolNames: [mcpTool.name],
+			});
+		} finally {
+			await resumedSessionManager.close();
+		}
+	});
+
 	it("does not dispatch an approved plan when fresh-session creation is refused", async () => {
 		const planFilePath = "local://PLAN.md";
 		const finalPlanFilePath = "local://APPROVED.md";

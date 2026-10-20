@@ -508,7 +508,10 @@ export class PlanModeController {
 			this.ctx.session.clearPlanCompactAbortPending();
 		}
 		if (previousTools.length)
-			await this.ctx.session.setActiveToolsByName(previousTools, { explicit: false, persistMCPSelection: false });
+			await this.ctx.session.setActiveToolsByName(previousTools, {
+				explicit: false,
+				persistMCPSelection: !options.preserveContext && sessionSwitchCompleted,
+			});
 		if (!sessionSwitchCompleted)
 			return this.ctx.showWarning(
 				"Plan approved, but the new session could not be created — execution was not dispatched.",

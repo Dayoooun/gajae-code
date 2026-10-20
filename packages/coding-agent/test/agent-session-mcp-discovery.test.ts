@@ -327,6 +327,98 @@ describe("AgentSession MCP discovery", () => {
 		expect(session.getActiveToolNames()).toEqual(["read", "mcp__docs_search"]);
 	});
 
+	it("keeps configured MCP defaults after explicit tool application fails", async () => {
+		const readTool = createBasicTool("read", "Read");
+		const docsSearchTool = createMcpCustomTool("mcp__docs_search", "docs", "search", "Search docs", ["query"]);
+		let failDeselection = false;
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: createModel(),
+					systemPrompt: ["initial"],
+					tools: [readTool],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
+			toolRegistry: new Map([[readTool.name, readTool]]),
+			mcpDiscoveryEnabled: true,
+			defaultSelectedMCPServerNames: ["docs"],
+			rebuildSystemPrompt: async toolNames => {
+				if (failDeselection && !toolNames.includes(docsSearchTool.name)) {
+					throw new Error("injected tool application failure");
+				}
+				return { systemPrompt: [`tools:${toolNames.join(",")}`] };
+			},
+		});
+		sessions.push(session);
+
+		await session.refreshMCPTools([docsSearchTool]);
+		expect(session.getActiveToolNames()).toEqual(["read", docsSearchTool.name]);
+		expect(session.hasMCPToolSelectionAuthority()).toBe(false);
+
+		failDeselection = true;
+		await expect(session.setActiveToolsByName(["read"])).rejects.toThrow("injected tool application failure");
+		expect(session.getActiveToolNames()).toEqual(["read", docsSearchTool.name]);
+		expect(session.hasMCPToolSelectionAuthority()).toBe(false);
+
+		failDeselection = false;
+		await session.refreshMCPTools([docsSearchTool]);
+		expect(session.getSelectedMCPToolNames()).toEqual([docsSearchTool.name]);
+		expect(session.getActiveToolNames()).toEqual(["read", docsSearchTool.name]);
+		expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+	});
+
+	it("does not persist catalog pruning of a non-persisting live MCP selection", async () => {
+		const readTool = createBasicTool("read", "Read");
+		const persistedTool = createMcpCustomTool("mcp__docs_search", "docs", "search", "Search docs", ["query"]);
+		const liveTool = createMcpCustomTool("mcp__pager_list", "pager", "list", "List alerts", ["service"]);
+		const sessionManager = SessionManager.inMemory();
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: createModel(),
+					systemPrompt: ["initial"],
+					tools: [readTool],
+					messages: [],
+				},
+			}),
+			sessionManager,
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
+			toolRegistry: new Map([[readTool.name, readTool]]),
+			mcpDiscoveryEnabled: true,
+			rebuildSystemPrompt: async toolNames => ({ systemPrompt: [`tools:${toolNames.join(",")}`] }),
+		});
+		sessions.push(session);
+
+		await session.refreshMCPTools([persistedTool, liveTool]);
+		await session.setActiveToolsByName(["read", persistedTool.name]);
+		expect(sessionManager.buildSessionContext()).toMatchObject({
+			hasPersistedMCPToolSelection: true,
+			selectedMCPToolNames: [persistedTool.name],
+		});
+
+		await session.setActiveToolsByName(["read", liveTool.name], { persistMCPSelection: false });
+		expect(session.getSelectedMCPToolNames()).toEqual([liveTool.name]);
+		expect(sessionManager.buildSessionContext().selectedMCPToolNames).toEqual([persistedTool.name]);
+
+		await session.refreshMCPTools([persistedTool]);
+
+		expect(session.getSelectedMCPToolNames()).toEqual([]);
+		expect(session.getActiveToolNames()).toEqual(["read"]);
+		expect(sessionManager.buildSessionContext()).toMatchObject({
+			hasPersistedMCPToolSelection: true,
+			selectedMCPToolNames: [persistedTool.name],
+		});
+	});
+
 	it("preserves active local mcp__-prefixed tools when MCP bridge tools refresh", async () => {
 		const readTool = createBasicTool("read", "Read");
 		const localTool = createBasicTool("mcp__local_inline_tool", "Local");
@@ -1388,9 +1480,11 @@ describe("AgentSession MCP discovery", () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agent-session-mcp-rollback-"));
 		tempDirs.push(tempDir);
 		const readTool = createBasicTool("read", "Read");
+		const bashTool = createBasicTool("bash", "Bash");
 		const docsSearchTool = createMcpTool("mcp__docs_search", "docs", "search", "Search internal docs", ["query"]);
 		const toolRegistry = new Map([
 			[readTool.name, readTool],
+			[bashTool.name, bashTool],
 			[docsSearchTool.name, docsSearchTool],
 		]);
 		const sessionManager = SessionManager.create(tempDir, tempDir);
@@ -1408,7 +1502,7 @@ describe("AgentSession MCP discovery", () => {
 				initialState: {
 					model: createModel(),
 					systemPrompt: ["initial"],
-					tools: [readTool, docsSearchTool],
+					tools: [readTool, bashTool, docsSearchTool],
 					messages: [],
 				},
 			}),
@@ -1430,22 +1524,43 @@ describe("AgentSession MCP discovery", () => {
 			},
 		});
 		sessions.push(session);
+		const permissionRequests: string[] = [];
+		session.setSdkPermissionMode("prompt");
+		session.setClientBridge({
+			capabilities: { requestPermission: true },
+			async requestPermission(toolCall: { toolCallId: string }) {
+				permissionRequests.push(toolCall.toolCallId);
+				return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+			},
+		} as never);
 
-		await session.setActiveToolsByName(["read"], { persistMCPSelection: false });
+		await session.setActiveToolsByName(["read", "bash"], { persistMCPSelection: false });
 		expect(session.hasMCPToolSelectionAuthority()).toBe(true);
 		expect(session.getSelectedMCPToolNames()).toEqual([]);
+		const preparedBash = session.agent.state.tools.find(tool => tool.name === "bash");
+		expect(preparedBash).toBeDefined();
 		await expect(session.switchSession(targetSessionFile!)).rejects.toThrow("injected MCP prompt rebuild failure");
 
 		expect(session.sessionFile).toBe(previousSessionFile);
 		expect(session.hasMCPToolSelectionAuthority()).toBe(true);
 		expect(session.getSelectedMCPToolNames()).toEqual([]);
-		expect(session.getActiveToolNames()).toEqual(["read"]);
+		expect(session.getActiveToolNames()).toEqual(["read", "bash"]);
+		const restoredBash = session.agent.state.tools.find(tool => tool.name === "bash");
+		expect(restoredBash).toBe(preparedBash);
+		await restoredBash!.execute(
+			"rollback-permission-check",
+			{ command: "echo safe" },
+			undefined,
+			undefined as never,
+			undefined as never,
+		);
+		expect(permissionRequests).toEqual(["rollback-permission-check"]);
 		await session.refreshMCPTools([
 			createMcpCustomTool("mcp__docs_search", "docs", "search", "Search docs", ["query"]),
 		]);
 		expect(session.hasMCPToolSelectionAuthority()).toBe(true);
 		expect(session.getSelectedMCPToolNames()).toEqual([]);
-		expect(session.getActiveToolNames()).toEqual(["read"]);
+		expect(session.getActiveToolNames()).toEqual(["read", "bash"]);
 	});
 
 	it("fences in-flight search activation across new sessions and keeps tool context on committed tools", async () => {
