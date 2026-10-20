@@ -5833,16 +5833,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						const nextConventionalToolNames = nextTools
 							.filter(tool => tool.mcpServerName && conventionalServerNames.has(tool.mcpServerName))
 							.map(tool => tool.name);
-						const defaultMcpToolNamesToActivate =
-							deferConventionalMcpAutoload && !session.hasMCPToolSelectionAuthority()
-								? nextTools
-										.filter(
-											tool =>
-												tool.mcpServerName !== undefined &&
-												discoveryDefaultServerNames.has(tool.mcpServerName),
-										)
-										.map(tool => tool.name)
-								: [];
 						const nextMandatoryMcpToolNames = [
 							...retainPluginMcpMandatoryNames(nextTools, pluginMcpToolNames).filter(
 								name => !previousSet.has(name),
@@ -5872,6 +5862,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								activateNewTools: false,
 								persistMCPSelection: false,
 							});
+							const defaultMcpToolNamesToActivate =
+								deferConventionalMcpAutoload && !session.hasMCPToolSelectionAuthority()
+									? nextTools
+											.filter(
+												tool =>
+													tool.mcpServerName !== undefined &&
+													discoveryDefaultServerNames.has(tool.mcpServerName),
+											)
+											.map(tool => tool.name)
+									: [];
 							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasMCPToolSelectionAuthority()) {
 								await session.activateDiscoveredTools(defaultMcpToolNamesToActivate, {
 									persistMCPSelection: false,
@@ -5969,22 +5969,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							snapshot,
 							classifiedTools.pluginMcpToolNames,
 						);
-						const defaultMcpToolNamesToActivate =
-							deferConventionalMcpAutoload && !session.hasMCPToolSelectionAuthority()
-								? snapshot
-										.filter(
-											tool =>
-												tool.mcpServerName !== undefined &&
-												discoveryDefaultServerNames.has(tool.mcpServerName),
-										)
-										.map(tool => tool.name)
-								: [];
 						try {
 							await session.replaceNamedCustomTools(previousNames, snapshot, {
 								mandatoryMCPToolNames: mandatoryPluginToolNames,
 								activateNewTools: false,
 								persistMCPSelection: false,
 							});
+							const defaultMcpToolNamesToActivate =
+								deferConventionalMcpAutoload && !session.hasMCPToolSelectionAuthority()
+									? snapshot
+											.filter(
+												tool =>
+													tool.mcpServerName !== undefined &&
+													discoveryDefaultServerNames.has(tool.mcpServerName),
+											)
+											.map(tool => tool.name)
+									: [];
 							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasMCPToolSelectionAuthority()) {
 								await session.activateDiscoveredTools(defaultMcpToolNamesToActivate, {
 									persistMCPSelection: false,

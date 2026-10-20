@@ -12409,18 +12409,6 @@ export class AgentSession {
 				explicitActiveToolSelectionGeneration,
 				options?.persistMCPSelection,
 			);
-			if (this.#hasExplicitActiveToolSelectionForContext && activated.length > 0) {
-				const activatedMCPToolNames = activated.filter(name => {
-					const tool = this.#toolRegistry.get(name);
-					return tool !== undefined && isMCPBridgeTool(tool);
-				});
-				if (activatedMCPToolNames.length > 0) {
-					this.#explicitMCPToolSelectionForContext = [
-						...new Set([...(this.#explicitMCPToolSelectionForContext ?? []), ...activatedMCPToolNames]),
-					];
-					this.#explicitMCPToolSelectionPersistsForContext = options?.persistMCPSelection !== false;
-				}
-			}
 			return activated;
 		});
 		this.#discoveredToolActivationChain = activation.then(
@@ -12488,6 +12476,18 @@ export class AgentSession {
 					expectedActiveToolSelectionRevision: activeToolSelectionRevision,
 					explicitActiveToolSelectionGeneration,
 				});
+				if (
+					appliedRevision !== undefined &&
+					this.#hasExplicitActiveToolSelectionForContext &&
+					activatedMCPToolNames.length > 0 &&
+					sessionTransitionGeneration === this.#sessionTransitionGeneration &&
+					explicitActiveToolSelectionGeneration === this.#explicitActiveToolSelectionGeneration
+				) {
+					this.#explicitMCPToolSelectionForContext = [
+						...new Set([...(this.#explicitMCPToolSelectionForContext ?? []), ...activatedMCPToolNames]),
+					];
+					this.#explicitMCPToolSelectionPersistsForContext = persistMCPSelection !== false;
+				}
 				if (appliedRevision === undefined || appliedRevision !== this.#activeToolSelectionRevision) {
 					if (
 						sessionTransitionGeneration !== this.#sessionTransitionGeneration ||

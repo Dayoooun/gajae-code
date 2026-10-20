@@ -327,6 +327,67 @@ describe("AgentSession MCP discovery", () => {
 		expect(session.getActiveToolNames()).toEqual(["read", "mcp__docs_search"]);
 	});
 
+	it("retains a committed MCP activation in live authority across a catalog retry", async () => {
+		const readTool = createBasicTool("read", "Read");
+		const docsSearchTool = createMcpTool("mcp__docs_search", "docs", "search", "Search docs", ["query"]);
+		const slackSendTool = createMcpTool("mcp__slack_send_message", "slack", "send_message", "Send a message", [
+			"channel",
+			"text",
+		]);
+		const docsSearchCustomTool = createMcpCustomTool("mcp__docs_search", "docs", "search", "Search docs", ["query"]);
+		const slackSendCustomTool = createMcpCustomTool(
+			"mcp__slack_send_message",
+			"slack",
+			"send_message",
+			"Send a message",
+			["channel", "text"],
+		);
+		let session: AgentSession;
+		let removeAfterActivation = false;
+		let catalogRemoval: Promise<void> | undefined;
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: createModel(),
+					systemPrompt: ["initial"],
+					tools: [readTool, docsSearchTool],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
+			toolRegistry: new Map([
+				[readTool.name, readTool],
+				[docsSearchTool.name, docsSearchTool],
+				[slackSendTool.name, slackSendTool],
+			]),
+			mcpDiscoveryEnabled: true,
+			onToolNamesChanged: names => {
+				if (removeAfterActivation && names.includes(slackSendTool.name)) {
+					removeAfterActivation = false;
+					catalogRemoval = session.refreshMCPTools([docsSearchCustomTool], { persistMCPSelection: false });
+				}
+			},
+			rebuildSystemPrompt: async toolNames => ({
+				systemPrompt: [`tools:${toolNames.join(",")}`],
+			}),
+		});
+		sessions.push(session);
+
+		await session.setActiveToolsByName([readTool.name, docsSearchTool.name]);
+		removeAfterActivation = true;
+		await session.activateDiscoveredTools([slackSendTool.name]);
+		if (!catalogRemoval) throw new Error("Expected activation to trigger the catalog removal");
+		await catalogRemoval;
+		expect(session.getActiveMCPToolNames()).toEqual([docsSearchTool.name]);
+
+		await session.refreshMCPTools([docsSearchCustomTool, slackSendCustomTool], { persistMCPSelection: false });
+		expect(session.getActiveMCPToolNames()).toEqual([docsSearchTool.name, slackSendTool.name]);
+	});
+
 	it("keeps configured MCP defaults after explicit tool application fails", async () => {
 		const readTool = createBasicTool("read", "Read");
 		const docsSearchTool = createMcpCustomTool("mcp__docs_search", "docs", "search", "Search docs", ["query"]);

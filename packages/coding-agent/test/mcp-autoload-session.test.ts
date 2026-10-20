@@ -258,6 +258,96 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 30_000);
 
+	it("re-evaluates discovery defaults after a catalog callback resumes from /new", async () => {
+		await addDemoServer();
+		const [defaultTool] = MCPTool.fromTools({ name: "demo" } as unknown as Parameters<typeof MCPTool.fromTools>[0], [
+			{
+				name: "late_default",
+				description: "Late default tool",
+				inputSchema: { type: "object", properties: {} },
+			},
+		]);
+		if (!defaultTool) throw new Error("Default MCP regression tool was not created");
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockResolvedValue({
+			tools: [],
+			errors: new Map(),
+			connectedServers: ["demo"],
+			exaApiKeys: [],
+		});
+		let publishToolsChanged: Parameters<MCPManager["setOnToolsChanged"]>[0] | undefined;
+		const originalSetOnToolsChanged = MCPManager.prototype.setOnToolsChanged;
+		vi.spyOn(MCPManager.prototype, "setOnToolsChanged").mockImplementation(function (this: MCPManager, handler) {
+			publishToolsChanged = handler;
+			return originalSetOnToolsChanged.call(this, handler);
+		});
+		const beforeSwitchStarted = Promise.withResolvers<void>();
+		const releaseSwitchHook = Promise.withResolvers<void>();
+		const replacementStarted = Promise.withResolvers<void>();
+		let session: AgentSession | undefined;
+		const originalReplaceNamedCustomTools = AgentSession.prototype.replaceNamedCustomTools;
+		vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
+			this: AgentSession,
+			previousNames,
+			nextTools,
+			options,
+		) {
+			if (this === session && nextTools.some(tool => tool.name === defaultTool.name)) {
+				replacementStarted.resolve();
+			}
+			await originalReplaceNamedCustomTools.call(this, previousNames, nextTools, options);
+		});
+
+		const created = await createAgentSession({
+			...isolatedSessionOptions(),
+			toolNames: undefined,
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.discoveryDefaultServers": ["demo"],
+				"mcp.enableProjectConfig": true,
+			}),
+			extensions: [
+				api => {
+					api.on("session_before_switch", async () => {
+						beforeSwitchStarted.resolve();
+						await releaseSwitchHook.promise;
+					});
+				},
+			],
+		});
+		session = created.session;
+		try {
+			if (!created.mcpManager) throw new Error("Expected the session-owned MCP manager");
+			if (!publishToolsChanged) throw new Error("Expected the MCP catalog callback");
+			expect(session.getAllToolNames()).not.toContain(defaultTool.name);
+			await session.setActiveToolsByName(["read"], { persistMCPSelection: false });
+			expect(session.hasMCPToolSelectionAuthority()).toBe(true);
+
+			const transition = session.newSession();
+			await beforeSwitchStarted.promise;
+			publishToolsChanged([defaultTool]);
+			await Promise.race([
+				replacementStarted.promise,
+				Bun.sleep(5_000).then(() => {
+					throw new Error("Catalog replacement did not start during the session transition");
+				}),
+			]);
+			releaseSwitchHook.resolve();
+			expect(await transition).toBe(true);
+
+			const activationDeadline = Date.now() + 5_000;
+			while (!session.getActiveToolNames().includes(defaultTool.name)) {
+				if (Date.now() > activationDeadline)
+					throw new Error(`Discovery-default MCP tool was not activated: ${defaultTool.name}`);
+				await Bun.sleep(20);
+			}
+			expect(session.hasMCPToolSelectionAuthority()).toBe(false);
+		} finally {
+			releaseSwitchHook.resolve();
+			await session.dispose();
+		}
+	}, 30_000);
+
 	it("keeps deferred-startup autoload tools inactive unless their server is a discovery default", async () => {
 		await addDemoServer();
 		for (const [defaults, expectActive] of [
