@@ -331,10 +331,13 @@ export class GoalModeController {
 					provenance: options.provenance,
 				});
 		if (!this.ctx.session.isExplicitEmptyToolSelection()) {
-			await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])], {
-				explicit: false,
-				persistMCPSelection: false,
-			});
+			await this.ctx.session.setActiveToolsByName(
+				[...new Set([...this.#restoreToolsWithCurrentMCPSelection(this.#previousTools), "goal"])],
+				{
+					explicit: false,
+					persistMCPSelection: false,
+				},
+			);
 		}
 		this.ctx.session.setGoalModeState(state);
 		this.#enabled = true;

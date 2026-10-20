@@ -205,7 +205,66 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.session.buildDisplaySessionContext().selectedMCPToolNames).toEqual([initialMcpTool, addedMcpTool]);
 	});
 
+	it("retains live MCP selections through a temporary catalog removal", async () => {
+		await harness.cleanup();
+		harness = await createGoalHarness({ mcpDiscoveryEnabled: true });
+		const selectedTool = "mcp__demo_selected";
+		const tool = createMCPTool(selectedTool, "selected");
+		await harness.session.replaceNamedCustomTools([], [tool], { activateNewTools: false });
+		await harness.session.setActiveToolsByName(["read", selectedTool], { persistMCPSelection: false });
+		expect(harness.session.hasMCPToolSelectionAuthority()).toBe(true);
+		expect(harness.session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+
+		await harness.session.replaceNamedCustomTools([selectedTool], [], { persistMCPSelection: false });
+		expect(harness.session.getActiveMCPToolNames()).toEqual([]);
+		expect(harness.session.hasMCPToolSelectionAuthority()).toBe(true);
+
+		await harness.session.replaceNamedCustomTools([], [tool], {
+			activateNewTools: false,
+			persistMCPSelection: false,
+		});
+		expect(harness.session.getActiveMCPToolNames()).toEqual([selectedTool]);
+		expect(harness.session.getSelectedMCPToolNames()).toEqual([selectedTool]);
+		expect(harness.session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+	});
+
+	it("keeps late default MCP tools active when goal creation is pending", async () => {
+		await harness.cleanup();
+		harness = await createGoalHarness({ mcpDiscoveryEnabled: true });
+		const defaultTool = "mcp__demo_default";
+		await harness.session.replaceNamedCustomTools([], [createMCPTool(defaultTool, "default")], {
+			activateNewTools: false,
+		});
+		const createGoalStarted = Promise.withResolvers<void>();
+		const finishGoalCreation = Promise.withResolvers<void>();
+		const originalCreateGoal = harness.session.goalRuntime.createGoal.bind(harness.session.goalRuntime);
+		vi.spyOn(harness.session.goalRuntime, "createGoal").mockImplementation(async (...args) => {
+			const state = await originalCreateGoal(...args);
+			createGoalStarted.resolve();
+			await finishGoalCreation.promise;
+			return state;
+		});
+
+		const entering = harness.mode.goalModeController.handleCommand("Ship the release");
+		await createGoalStarted.promise;
+		await harness.session.activateDiscoveredTools([defaultTool], { persistMCPSelection: false });
+		finishGoalCreation.resolve();
+		await entering;
+
+		expect(harness.session.getActiveMCPToolNames()).toEqual([defaultTool]);
+		expect(harness.session.hasMCPToolSelectionAuthority()).toBe(false);
+		expect(harness.session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+		await harness.mode.goalModeController.exit();
+		expect(harness.session.getActiveMCPToolNames()).toEqual([defaultTool]);
+	});
+
 	it("keeps pending goal activation outside MCP selection authority", async () => {
+		await harness.cleanup();
+		harness = await createGoalHarness({ mcpDiscoveryEnabled: true });
+		const defaultTool = "mcp__demo_default";
+		await harness.session.replaceNamedCustomTools([], [createMCPTool(defaultTool, "default")], {
+			activateNewTools: false,
+		});
 		const sessionManager = harness.session.sessionManager;
 		await writePendingGoalModeRequest({
 			cwd: sessionManager.getCwd(),
@@ -214,6 +273,15 @@ describe("InteractiveMode goal mode integration", () => {
 			sessionId: sessionManager.getSessionId(),
 		});
 		const setActiveToolsByName = vi.spyOn(harness.session, "setActiveToolsByName");
+		const createGoalStarted = Promise.withResolvers<void>();
+		const finishGoalCreation = Promise.withResolvers<void>();
+		const originalCreateGoal = harness.session.goalRuntime.createGoal.bind(harness.session.goalRuntime);
+		vi.spyOn(harness.session.goalRuntime, "createGoal").mockImplementation(async (...args) => {
+			const state = await originalCreateGoal(...args);
+			createGoalStarted.resolve();
+			await finishGoalCreation.promise;
+			return state;
+		});
 		harness.session.agent.emitExternalEvent({
 			type: "tool_execution_end",
 			toolCallId: "call-bash-success",
@@ -221,6 +289,9 @@ describe("InteractiveMode goal mode integration", () => {
 			isError: false,
 			result: { content: [] },
 		} as never);
+		await createGoalStarted.promise;
+		await harness.session.activateDiscoveredTools([defaultTool], { persistMCPSelection: false });
+		finishGoalCreation.resolve();
 		const deadline = Date.now() + 5_000;
 		while (setActiveToolsByName.mock.calls.length === 0) {
 			if (Date.now() >= deadline) throw new Error("pending goal activation did not finish");
@@ -232,6 +303,8 @@ describe("InteractiveMode goal mode integration", () => {
 			persistMCPSelection: false,
 		});
 		expect(harness.session.hasMCPToolSelectionAuthority()).toBe(false);
+		expect(harness.session.getActiveMCPToolNames()).toEqual([defaultTool]);
+		expect(harness.session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
 	});
 
 	it("replaces the active goal via /goal set", async () => {

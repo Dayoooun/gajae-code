@@ -4170,6 +4170,7 @@ export class AgentSession {
 	#explicitActiveToolSelectionGeneration = 0;
 	/** Caller-authored active selections are authoritative only for the current session context. */
 	#hasExplicitActiveToolSelectionForContext = false;
+	#explicitMCPToolSelectionForContext: string[] | undefined;
 	#mcpCatalogGeneration = 0;
 	#baselineDiscoveredBuiltinToolNames = new Set<string>();
 	#discoverableToolAllowedNames: ReadonlySet<string> | undefined;
@@ -6586,10 +6587,23 @@ export class AgentSession {
 	}
 
 	#getMCPToolSelectionAuthorityNames(): string[] | undefined {
-		if (this.#hasExplicitActiveToolSelectionForContext) return [...this.#selectedMCPToolNames];
+		if (this.#hasExplicitActiveToolSelectionForContext)
+			return [...(this.#explicitMCPToolSelectionForContext ?? [])];
 		const sessionContext = this.buildDisplaySessionContext();
 		if (sessionContext.hasPersistedMCPToolSelection) return [...sessionContext.selectedMCPToolNames];
 		return this.#constructorMCPToolSelection === undefined ? undefined : [...this.#constructorMCPToolSelection];
+	}
+
+	#resolveExplicitMCPToolSelection(toolNames: readonly string[]): string[] {
+		const selectedNames = new Set<string>();
+		for (const requestedName of toolNames) {
+			const name = requestedName.toLowerCase();
+			if (!isMCPToolName(name) || this.#mandatoryMCPToolNames.has(name)) continue;
+			const tool = this.#toolRegistry.get(name);
+			if (tool !== undefined && !isMCPBridgeTool(tool)) continue;
+			selectedNames.add(name);
+		}
+		return [...selectedNames];
 	}
 
 	/** Best-effort accessor for the active skill's `current_phase` field from
@@ -11740,6 +11754,7 @@ export class AgentSession {
 		this.#constructorMCPToolSelection = undefined;
 		this.#constructorDiscoveredBuiltinToolSelection = undefined;
 		this.#hasExplicitActiveToolSelectionForContext = false;
+		this.#explicitMCPToolSelectionForContext = undefined;
 	}
 
 	#getSelectedDiscoveredBuiltinToolNames(): string[] {
@@ -12892,7 +12907,10 @@ export class AgentSession {
 		const explicitActiveToolSelectionGeneration = isExplicit
 			? ++this.#explicitActiveToolSelectionGeneration
 			: this.#explicitActiveToolSelectionGeneration;
-		if (isExplicit) this.#hasExplicitActiveToolSelectionForContext = true;
+		if (isExplicit) {
+			this.#hasExplicitActiveToolSelectionForContext = true;
+			this.#explicitMCPToolSelectionForContext = this.#resolveExplicitMCPToolSelection(toolNames);
+		}
 		await this.#applyActiveToolsByName(toolNames, {
 			explicitActiveToolSelectionGeneration,
 			persistMCPSelection: options?.persistMCPSelection,
@@ -12901,6 +12919,7 @@ export class AgentSession {
 
 	async #restoreMCPSelectionsForSessionContext(sessionContext: SessionContext): Promise<void> {
 		this.#hasExplicitActiveToolSelectionForContext = false;
+		this.#explicitMCPToolSelectionForContext = undefined;
 		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") {
 			await this.#attachAskToolIfWorkflowActive();
 			return;
@@ -14065,9 +14084,18 @@ export class AgentSession {
 		}
 
 		const previousTools = this.getActiveToolNames();
-		const goalTools = [...new Set([...previousTools, "goal"])];
+		const previousMCPToolNames = new Set(this.getActiveMCPToolNames());
 		await this.#goalRuntime.createGoal({ objective: pendingGoal.objective, provenance: pendingGoal.provenance });
-		await this.setActiveToolsByName(goalTools, { explicit: false, persistMCPSelection: false });
+		await this.setActiveToolsByName(
+			[
+				...new Set([
+					...previousTools.filter(name => !previousMCPToolNames.has(name)),
+					...this.getActiveMCPToolNames(),
+					"goal",
+				]),
+			],
+			{ explicit: false, persistMCPSelection: false },
+		);
 		if (this.isStreaming) {
 			await this.sendGoalModeContext({ deliverAs: "steer" });
 		}
