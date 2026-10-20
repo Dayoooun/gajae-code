@@ -217,6 +217,29 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 45_000);
 
+	it("preserves an explicit empty MCP selection during deferred startup", async () => {
+		await addDemoServer();
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...isolatedSessionOptions(),
+			toolNames: [],
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.discoveryDefaultServers": ["demo"],
+				"mcp.enableProjectConfig": true,
+			}),
+			deferMcpConfigStartup: true,
+		});
+		try {
+			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			expect(session.getAllToolNames()).toContain("mcp__demo_hello");
+			expect(session.getActiveToolNames()).not.toContain("mcp__demo_hello");
+			expect(session.getSelectedMCPToolNames()).not.toContain("mcp__demo_hello");
+		} finally {
+			await session.dispose();
+		}
+	}, 45_000);
+
 	it("activates late defaults for inherited sessions unless tools were explicitly deselected", async () => {
 		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
 		const fastDefaultServerConfig = {
@@ -305,7 +328,9 @@ describe("conventional MCP autoload in standalone sessions", () => {
 				await Bun.sleep(20);
 			}
 			expect(session.getAllToolNames()).toContain(lateToolName);
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
 			expect(inheritedSession.getActiveToolNames()).toContain(lateToolName);
+			expect(inheritedSession.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
 			expect(explicitlyDeselectedSession.getActiveToolNames()).not.toContain("mcp__fast_default_hello");
 			expect(explicitlyDeselectedSession.getActiveToolNames()).not.toContain(lateToolName);
 			expect(explicitlyDeselectedSession.getSelectedMCPToolNames()).toEqual([]);

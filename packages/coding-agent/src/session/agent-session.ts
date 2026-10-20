@@ -12286,7 +12286,10 @@ export class AgentSession {
 		return [...new Set([...mcpSelected, ...this.#getSelectedDiscoveredBuiltinToolNames()])];
 	}
 
-	activateDiscoveredTools(toolNames: string[]): Promise<string[]> {
+	activateDiscoveredTools(
+		toolNames: string[],
+		options?: { persistMCPSelection?: boolean },
+	): Promise<string[]> {
 		const requestedToolNames = [...toolNames];
 		const sessionTransitionGeneration = this.#sessionTransitionGeneration;
 		const explicitActiveToolSelectionGeneration = this.#explicitActiveToolSelectionGeneration;
@@ -12303,6 +12306,7 @@ export class AgentSession {
 				requestedToolNames,
 				sessionTransitionGeneration,
 				explicitActiveToolSelectionGeneration,
+				options?.persistMCPSelection,
 			);
 		});
 		this.#discoveredToolActivationChain = activation.then(
@@ -12316,6 +12320,7 @@ export class AgentSession {
 		toolNames: string[],
 		sessionTransitionGeneration: number,
 		explicitActiveToolSelectionGeneration: number,
+		persistMCPSelection?: boolean,
 	): Promise<string[]> {
 		while (true) {
 			if (
@@ -12355,6 +12360,7 @@ export class AgentSession {
 					previousSelectedMCPToolNames,
 					previousSelectedDiscoveredBuiltinToolNames,
 					nextSelectedDiscoveredBuiltinToolNames: [...nextSelectedDiscoveredBuiltinToolNames],
+					persistMCPSelection,
 					sessionTransitionGeneration,
 					expectedActiveToolSelectionRevision: activeToolSelectionRevision,
 					explicitActiveToolSelectionGeneration,
