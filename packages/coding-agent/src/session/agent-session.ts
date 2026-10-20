@@ -13122,9 +13122,12 @@ export class AgentSession {
 		const hasPersistedMCPToolSelection = this.buildDisplaySessionContext().hasPersistedMCPToolSelection;
 		const hasLiveMCPToolSelectionAuthority =
 			this.#mcpDiscoveryEnabled && this.hasMCPToolSelectionAuthority();
+		const authoritativeMCPToolNames = this.#getMCPToolSelectionAuthorityNames();
 		if (options.selectedMCPToolNames) {
 			this.#selectedMCPToolNames = new Set(this.#filterSelectableMCPToolNames(options.selectedMCPToolNames));
-		} else if (!hasPersistedMCPToolSelection && !hasLiveMCPToolSelectionAuthority) {
+		} else if (hasPersistedMCPToolSelection || hasLiveMCPToolSelectionAuthority) {
+			this.#selectedMCPToolNames = new Set(this.#filterSelectableMCPToolNames(authoritativeMCPToolNames ?? []));
+		} else {
 			this.#selectedMCPToolNames = new Set(
 				this.#resolveConstructorMCPToolSelection() ?? this.#getConfiguredDefaultSelectedMCPToolNames(),
 			);
