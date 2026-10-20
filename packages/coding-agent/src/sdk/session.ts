@@ -2864,7 +2864,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			await session.replaceNamedCustomTools(
 				previousCwdCapturing.filter(name => !nextCustomTools.some(tool => tool.name === name)),
 				nextCustomTools,
-				{ mandatoryMCPToolNames: pluginMcpToolNames },
+				{
+					mandatoryMCPToolNames: pluginMcpToolNames,
+					inactiveNewToolNames: deferConventionalMcpAutoload ? conventionalMcpToolNames : undefined,
+				},
 			);
 			wireOwnedMcpToolSync();
 		};
@@ -4928,6 +4931,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const requestedToolNameSet = new Set(normalizedRequested);
 		const effectiveDiscoveryMode = resolveEffectiveDiscoveryMode(settings, explicitMcpConfigPath);
 		const mcpDiscoveryEnabled = effectiveDiscoveryMode !== "off";
+		const discoveryDefaultServerNames = new Set(settings.get("mcp.discoveryDefaultServers") ?? []);
+		const deferConventionalMcpAutoload = mcpDiscoveryEnabled && settings.get("mcp.discoveryDeferAutoload");
 		const defaultInactiveToolNames = new Set(
 			registeredTools.filter(tool => tool.definition.defaultInactive).map(tool => tool.definition.name),
 		);
@@ -4946,7 +4951,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let hasExplicitDiscoveredBuiltinToolSelection = false;
 		let explicitlyRequestedDiscoveredBuiltinToolNames: string[] = [];
 		if (mcpDiscoveryEnabled) {
-			const defaultServerNames = new Set(settings.get("mcp.discoveryDefaultServers") ?? []);
 			for (const tool of toolRegistry.values()) {
 				if (!isMCPBridgeTool(tool)) continue;
 				discoverableMCPToolNames.add(tool.name);
@@ -4954,7 +4958,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					explicitlyRequestedMCPToolNames.push(tool.name);
 				}
 				const serverName = (tool as AgentTool & { mcpServerName?: string }).mcpServerName;
-				if (serverName && defaultServerNames.has(serverName)) {
+				if (serverName && discoveryDefaultServerNames.has(serverName)) {
 					discoveryDefaultServerToolNames.push(tool.name);
 				}
 			}
@@ -4996,7 +5000,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					// Conventional autoload servers are selected by default so their
 					// tools are exposed in sessions that enable MCP discovery mode,
 					// unless `mcp.discoveryDeferAutoload` keeps them behind tool search.
-					...(settings.get("mcp.discoveryDeferAutoload") ? [] : conventionalMcpToolNames),
+					...(deferConventionalMcpAutoload ? [] : conventionalMcpToolNames),
 				]),
 			];
 			hasExplicitMCPToolSelection =
@@ -5809,6 +5813,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						const nextConventionalToolNames = nextTools
 							.filter(tool => tool.mcpServerName && conventionalServerNames.has(tool.mcpServerName))
 							.map(tool => tool.name);
+						const defaultMcpToolNamesToActivate =
+							deferConventionalMcpAutoload && !existingSession.hasPersistedMCPToolSelection
+								? nextTools
+										.filter(
+											tool =>
+												tool.mcpServerName !== undefined &&
+												discoveryDefaultServerNames.has(tool.mcpServerName),
+										)
+										.map(tool => tool.name)
+								: [];
 						const nextMandatoryMcpToolNames = [
 							...retainPluginMcpMandatoryNames(nextTools, pluginMcpToolNames).filter(
 								name => !previousSet.has(name),
@@ -5837,6 +5851,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								mandatoryMCPToolNames: nextMandatoryMcpToolNames,
 								activateNewTools: false,
 							});
+							if (defaultMcpToolNamesToActivate.length > 0) {
+								await session.activateDiscoveredTools(defaultMcpToolNamesToActivate);
+							}
 						} catch (error) {
 							ownedMcpManagerToolNames = [...new Set([...previousNames, ...nextToolNames])];
 							throw error;
@@ -6065,14 +6082,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									!session.isDisposed &&
 									(!mcpDiscoveryEnabled || !existingSession.hasPersistedMCPToolSelection)
 								) {
-									const deferAutoload = mcpDiscoveryEnabled && settings.get("mcp.discoveryDeferAutoload");
-									const defaultServers = new Set(settings.get("mcp.discoveryDefaultServers") ?? []);
 									await session.activateDiscoveredTools(
 										resultTools
 											.filter(
 												tool =>
-													!deferAutoload ||
-													(tool.mcpServerName !== undefined && defaultServers.has(tool.mcpServerName)),
+													!deferConventionalMcpAutoload ||
+													(tool.mcpServerName !== undefined &&
+														discoveryDefaultServerNames.has(tool.mcpServerName)),
 											)
 											.map(tool => tool.name),
 									);

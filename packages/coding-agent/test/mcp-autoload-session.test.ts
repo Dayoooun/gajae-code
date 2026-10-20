@@ -61,6 +61,24 @@ rl.on('line', line => {
 setInterval(() => {}, 1000);
 `;
 
+const LATE_DEFAULT_MCP_SERVER_SCRIPT = `
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'slow-default', version: '1' } } }) + '\\n');
+    }, 6000);
+  } else if (msg.method === 'tools/list') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'late_default', description: 'Late default demo tool', inputSchema: { type: 'object', properties: {} } }] } }) + '\\n');
+  } else if (msg.id !== undefined) {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
+  }
+});
+setInterval(() => {}, 1000);
+`;
+
 const originalAgentDir = getAgentDir();
 
 describe("conventional MCP autoload in standalone sessions", () => {
@@ -199,6 +217,62 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 45_000);
 
+	it("activates discovery-default tools published after deferred startup returns", async () => {
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		const fastDefaultServerConfig = {
+			type: "stdio",
+			command: process.execPath,
+			args: ["-e", DEMO_MCP_SERVER_SCRIPT],
+			timeout: 10_000,
+		};
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					"fast-default": fastDefaultServerConfig,
+					"slow-default": {
+						type: "stdio",
+						command: process.execPath,
+						args: ["-e", LATE_DEFAULT_MCP_SERVER_SCRIPT],
+						timeout: 10_000,
+					},
+				},
+			}),
+		);
+
+		const lateToolName = "mcp__slow_default_late_default";
+		const { session, mcpManager, startDeferredMcpConfig } = await createAgentSession({
+			...isolatedSessionOptions(),
+			toolNames: undefined,
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.discoveryDefaultServers": ["fast-default", "slow-default"],
+				"mcp.enableProjectConfig": true,
+			}),
+			deferMcpConfigStartup: true,
+		});
+		try {
+			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			expect(mcpManager?.getConnectionStatus("slow-default")).toBe("connecting");
+			expect(session.getAllToolNames()).toContain("mcp__fast_default_hello");
+			expect(session.getActiveToolNames()).toContain("mcp__fast_default_hello");
+			expect(session.getAllToolNames()).not.toContain(lateToolName);
+			expect(session.getActiveToolNames()).not.toContain(lateToolName);
+
+			const activationDeadline = Date.now() + 15_000;
+			while (!session.getActiveToolNames().includes(lateToolName)) {
+				if (Date.now() > activationDeadline) {
+					throw new Error(`Discovery-default MCP tool was never activated: ${lateToolName}`);
+				}
+				await Bun.sleep(20);
+			}
+			expect(session.getAllToolNames()).toContain(lateToolName);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
 	it("loads persisted cached conventional tools through the session-owned manager", async () => {
 		await runMCPCommand({
 			action: "add",
@@ -290,6 +364,47 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			}
 		} finally {
 			storage.close();
+		}
+	}, 30_000);
+
+	it("keeps conventional autoload tools deferred when rebuilding MCP authority after a cwd move", async () => {
+		const sourceCwd = path.join(projectDir, "move-source");
+		const targetCwd = path.join(sourceCwd, "move-target");
+		await fs.promises.mkdir(path.join(targetCwd, ".gjc"), { recursive: true });
+		const serverConfig = {
+			type: "stdio",
+			command: process.execPath,
+			args: ["-e", DEMO_MCP_SERVER_SCRIPT],
+			timeout: 5_000,
+		};
+		await fs.promises.writeFile(
+			path.join(targetCwd, ".gjc", "mcp.json"),
+			JSON.stringify({ mcpServers: { autoload: serverConfig, default: serverConfig } }),
+		);
+
+		const originalProcessCwd = process.cwd();
+		const sessionManager = SessionManager.create(sourceCwd, SessionManager.managedDestination(sourceCwd, projectDir));
+		const { session } = await createAgentSession({
+			...isolatedSessionOptions(),
+			cwd: sourceCwd,
+			sessionManager,
+			toolNames: ["move_session"],
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": true,
+				"mcp.discoveryDefaultServers": ["default"],
+				"mcp.enableProjectConfig": true,
+			}),
+		});
+		try {
+			await session.getToolByName("move_session")!.execute("move-with-deferred-autoload", { path: "move-target" });
+			expect(session.getAllToolNames()).toContain("mcp__autoload_hello");
+			expect(session.getAllToolNames()).toContain("mcp__default_hello");
+			expect(session.getActiveToolNames()).toContain("mcp__default_hello");
+			expect(session.getActiveToolNames()).not.toContain("mcp__autoload_hello");
+		} finally {
+			await session.dispose();
+			process.chdir(originalProcessCwd);
 		}
 	}, 30_000);
 
@@ -466,7 +581,7 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 30_000);
 
 	it("holds the first prompt until deferred conventional startup completes", async () => {
 		// The gated prompt passes model-credential preflight once the barrier

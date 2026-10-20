@@ -6491,10 +6491,15 @@ export class AgentSession {
 	async replaceNamedCustomTools(
 		previousNames: readonly string[],
 		nextTools: readonly CustomTool[],
-		options?: { mandatoryMCPToolNames?: readonly string[]; activateNewTools?: boolean },
+		options?: {
+			mandatoryMCPToolNames?: readonly string[];
+			activateNewTools?: boolean;
+			inactiveNewToolNames?: readonly string[];
+		},
 	): Promise<void> {
 		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
 		const previous = new Set(previousNames);
+		const inactiveNewToolNames = new Set(options?.inactiveNewToolNames ?? []);
 		const previousActive = this.getActiveToolNames();
 		for (const name of previous) this.#toolRegistry.delete(name);
 		const getCustomToolContext = () => this.#getCustomToolContext();
@@ -6521,7 +6526,9 @@ export class AgentSession {
 			[
 				...previousActive.filter(name => !previous.has(name)),
 				...added.filter(
-					name => previousActive.includes(name) || (options?.activateNewTools !== false && !previous.has(name)),
+					name =>
+						previousActive.includes(name) ||
+						(options?.activateNewTools !== false && !previous.has(name) && !inactiveNewToolNames.has(name)),
 				),
 			],
 			{ previousSelectedMCPToolNames },
