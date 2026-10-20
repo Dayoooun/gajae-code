@@ -18528,13 +18528,10 @@ export class AgentSession {
 				name => !this.#baselineDiscoveredBuiltinToolNames.has(name),
 			),
 		);
-		const nextDiscoverySessionToolNames = this.#mcpDiscoveryEnabled
-			? [
-					...this.#getActiveNonMCPToolNames().filter(
-						name => name !== "ask" && !selectionOnlyDiscoveredBuiltinToolNames.has(name),
-					),
-					...this.#getConfiguredDefaultSelectedMCPToolNames(),
-				]
+		const nextDiscoverySessionNonMCPToolNames = this.#mcpDiscoveryEnabled
+			? this.#getActiveNonMCPToolNames().filter(
+					name => name !== "ask" && !selectionOnlyDiscoveredBuiltinToolNames.has(name),
+				)
 			: undefined;
 
 		// Emit session_before_switch event with reason "new" (can be cancelled)
@@ -18609,7 +18606,7 @@ export class AgentSession {
 			this.#followUpMessages = [];
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
-			await this.#initializeNewSessionState(nextDiscoverySessionToolNames, previousSessionFile);
+			await this.#initializeNewSessionState(nextDiscoverySessionNonMCPToolNames, previousSessionFile);
 			if (options?.drop && previousSessionFile) {
 				try {
 					await this.sessionManager.dropSession(previousSessionFile);
@@ -18698,7 +18695,7 @@ export class AgentSession {
 			this.#followUpMessages = [];
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
-			await this.#initializeNewSessionState(nextDiscoverySessionToolNames, previousSessionFile);
+			await this.#initializeNewSessionState(nextDiscoverySessionNonMCPToolNames, previousSessionFile);
 			if (options?.drop && previousSessionFile) {
 				try {
 					await this.sessionManager.dropSession(previousSessionFile);
@@ -18719,7 +18716,7 @@ export class AgentSession {
 	}
 
 	async #initializeNewSessionState(
-		nextDiscoverySessionToolNames: string[] | undefined,
+		nextDiscoverySessionNonMCPToolNames: string[] | undefined,
 		previousSessionFile: string | undefined,
 	): Promise<void> {
 		// The successor session must not inherit the predecessor's profile marker
@@ -18743,6 +18740,9 @@ export class AgentSession {
 			}
 		}
 		this.#clearConstructorToolSelectionAuthority();
+		const nextDiscoverySessionToolNames = nextDiscoverySessionNonMCPToolNames
+			? [...nextDiscoverySessionNonMCPToolNames, ...this.#getConfiguredDefaultSelectedMCPToolNames()]
+			: undefined;
 		const configuredDefaultProfile = this.settings.get("modelProfile.default");
 		const configuredDefaultProfileIdentity = configuredDefaultProfile
 			? resolveModelProfileName(
@@ -28671,6 +28671,10 @@ export class AgentSession {
 			const previousPreProfileModel = this.#preProfileModel;
 			const previousServiceTier = this.agent.serviceTier;
 			const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
+			const previousHasExplicitActiveToolSelectionForContext = this.#hasExplicitActiveToolSelectionForContext;
+			const previousExplicitMCPToolSelectionForContext = this.#explicitMCPToolSelectionForContext
+				? [...this.#explicitMCPToolSelectionForContext]
+				: undefined;
 			const previousTools = [...this.agent.state.tools];
 			const previousBaseSystemPrompt = this.#baseSystemPrompt;
 			const previousSystemPrompt = this.agent.state.systemPrompt;
@@ -29128,11 +29132,11 @@ export class AgentSession {
 						targetSessionFile: sessionPath,
 						error: String(mcpError),
 					});
-					this.#selectedMCPToolNames = new Set(previousSelectedMCPToolNames);
-					this.#setGuardedAgentTools(previousTools);
-					this.#baseSystemPrompt = previousBaseSystemPrompt;
-					this.agent.setSystemPrompt(previousSystemPrompt);
 				}
+				this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
+				this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
+				this.#selectedMCPToolNames = new Set(previousSelectedMCPToolNames);
+				this.#setGuardedAgentTools(previousTools);
 				this.#baseSystemPrompt = previousBaseSystemPrompt;
 				this.agent.setSystemPrompt(previousSystemPrompt);
 				this.agent.replaceMessages(previousAgentMessages, {

@@ -1330,6 +1330,124 @@ describe("AgentSession MCP discovery", () => {
 		});
 	}
 
+	it("recomputes configured MCP defaults after a new-session catalog refresh", async () => {
+		const readTool = createBasicTool("read", "Read");
+		const docsSearchTool = createMcpCustomTool("mcp__docs_search", "docs", "search", "Search internal docs", [
+			"query",
+		]);
+		const beforeSwitchStarted = Promise.withResolvers<void>();
+		const releaseSwitchHook = Promise.withResolvers<void>();
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "session_before_switch",
+			emit: async (event: { type: string }) => {
+				if (event.type === "session_before_switch") {
+					beforeSwitchStarted.resolve();
+					await releaseSwitchHook.promise;
+				}
+			},
+		} as never;
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: createModel(),
+					systemPrompt: ["initial"],
+					tools: [readTool],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
+			toolRegistry: new Map([[readTool.name, readTool]]),
+			mcpDiscoveryEnabled: true,
+			defaultSelectedMCPServerNames: ["docs"],
+			extensionRunner,
+			rebuildSystemPrompt: async toolNames => ({
+				systemPrompt: [`tools:${toolNames.join(",")}`],
+			}),
+		});
+		sessions.push(session);
+
+		await session.setActiveToolsByName(["read"], { persistMCPSelection: false });
+		const transition = session.newSession();
+		await beforeSwitchStarted.promise;
+		await session.refreshMCPTools([docsSearchTool]);
+		expect(session.getActiveToolNames()).toEqual(["read"]);
+		expect(session.getSelectedMCPToolNames()).toEqual([]);
+
+		releaseSwitchHook.resolve();
+		expect(await transition).toBe(true);
+		expect(session.getActiveToolNames()).toEqual(["read", "mcp__docs_search"]);
+		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__docs_search"]);
+		expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+	});
+
+	it("restores live MCP selection authority and active tools after a failed session switch", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agent-session-mcp-rollback-"));
+		tempDirs.push(tempDir);
+		const readTool = createBasicTool("read", "Read");
+		const docsSearchTool = createMcpTool("mcp__docs_search", "docs", "search", "Search internal docs", ["query"]);
+		const toolRegistry = new Map([
+			[readTool.name, readTool],
+			[docsSearchTool.name, docsSearchTool],
+		]);
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		await sessionManager.flush();
+		const previousSessionFile = sessionManager.getSessionFile();
+		const targetSessionManager = SessionManager.create(tempDir, tempDir);
+		targetSessionManager.appendMessage({ role: "user", content: "target session", timestamp: Date.now() });
+		await targetSessionManager.flush();
+		const targetSessionFile = targetSessionManager.getSessionFile();
+		expect(previousSessionFile).toBeString();
+		expect(targetSessionFile).toBeString();
+		let failNextMCPRebuild = true;
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: createModel(),
+					systemPrompt: ["initial"],
+					tools: [readTool, docsSearchTool],
+					messages: [],
+				},
+			}),
+			sessionManager,
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
+			toolRegistry,
+			mcpDiscoveryEnabled: true,
+			initialSelectedMCPToolNames: ["mcp__docs_search"],
+			defaultSelectedMCPToolNames: ["mcp__docs_search"],
+			rebuildSystemPrompt: async toolNames => {
+				if (failNextMCPRebuild && toolNames.includes("mcp__docs_search")) {
+					failNextMCPRebuild = false;
+					throw new Error("injected MCP prompt rebuild failure");
+				}
+				return { systemPrompt: [`tools:${toolNames.join(",")}`] };
+			},
+		});
+		sessions.push(session);
+
+		await session.setActiveToolsByName(["read"], { persistMCPSelection: false });
+		expect(session.hasMCPToolSelectionAuthority()).toBe(true);
+		expect(session.getSelectedMCPToolNames()).toEqual([]);
+		await expect(session.switchSession(targetSessionFile!)).rejects.toThrow("injected MCP prompt rebuild failure");
+
+		expect(session.sessionFile).toBe(previousSessionFile);
+		expect(session.hasMCPToolSelectionAuthority()).toBe(true);
+		expect(session.getSelectedMCPToolNames()).toEqual([]);
+		expect(session.getActiveToolNames()).toEqual(["read"]);
+		await session.refreshMCPTools([
+			createMcpCustomTool("mcp__docs_search", "docs", "search", "Search docs", ["query"]),
+		]);
+		expect(session.hasMCPToolSelectionAuthority()).toBe(true);
+		expect(session.getSelectedMCPToolNames()).toEqual([]);
+		expect(session.getActiveToolNames()).toEqual(["read"]);
+	});
+
 	it("fences in-flight search activation across new sessions and keeps tool context on committed tools", async () => {
 		const readTool = createBasicTool("read", "Read");
 		const docsSearchTool = createMcpTool("mcp__docs_search", "docs", "search", "Search internal docs", ["query"]);
