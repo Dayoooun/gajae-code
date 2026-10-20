@@ -472,14 +472,17 @@ export class PlanModeController {
 		},
 	): Promise<void> {
 		await this.#finalizeApprovedPlan(planContent, options.planFilePath, options.finalPlanFilePath);
-		const previousTools = this.#restoreToolsWithCurrentMCPSelection(
-			this.#previousTools ?? this.ctx.session.getActiveToolNames(),
+		const previousMCPToolNames = new Set(this.#previousMCPToolNames ?? this.ctx.session.getActiveMCPToolNames());
+		const previousNonMCPToolNames = (this.#previousTools ?? this.ctx.session.getActiveToolNames()).filter(
+			name => !previousMCPToolNames.has(name),
 		);
 		if (options.compactBeforeExecute) this.ctx.session.markPlanCompactAbortPending();
 		let sessionSwitchCompleted = true;
 		let compactOutcome: CompactionOutcome | undefined;
+		let mcpToolNamesBeforeSessionSwitch: string[] = [];
 		try {
 			await this.exit({ silent: true });
+			mcpToolNamesBeforeSessionSwitch = this.ctx.session.getActiveMCPToolNames();
 			if (!options.preserveContext) {
 				sessionSwitchCompleted = await this.ctx.handleClearCommand();
 				if (sessionSwitchCompleted)
@@ -507,8 +510,15 @@ export class PlanModeController {
 		} finally {
 			this.ctx.session.clearPlanCompactAbortPending();
 		}
-		if (previousTools.length)
-			await this.ctx.session.setActiveToolsByName(previousTools, {
+		const restoredTools = [
+			...new Set([
+				...previousNonMCPToolNames,
+				...mcpToolNamesBeforeSessionSwitch,
+				...this.ctx.session.getActiveMCPToolNames(),
+			]),
+		];
+		if (restoredTools.length)
+			await this.ctx.session.setActiveToolsByName(restoredTools, {
 				explicit: false,
 				persistMCPSelection: !options.preserveContext && sessionSwitchCompleted,
 			});

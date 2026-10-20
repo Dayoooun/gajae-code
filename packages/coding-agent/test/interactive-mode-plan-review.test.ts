@@ -13,6 +13,7 @@ import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { formatKeyHints } from "../src/config/keybindings";
 import { ModelRegistry } from "../src/config/model-registry";
+import type { CustomTool } from "../src/extensibility/custom-tools/types";
 import { planSnapshotHash } from "../src/modes/components/plan-preview-overlay";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 import { InteractiveMode } from "../src/modes/interactive-mode";
@@ -573,7 +574,7 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 	});
 
-	it("persists MCP tools transferred into the fresh plan-execution session for resume", async () => {
+	it("persists transferred MCP tools and late defaults into the fresh execution session", async () => {
 		mode.stop();
 		await session.dispose();
 		const modelRegistry = new ModelRegistry(authStorage);
@@ -593,7 +594,19 @@ describe("InteractiveMode plan review rendering", () => {
 			async execute() {
 				return { content: [{ type: "text" as const, text: "found" }] };
 			},
-		} as AgentTool;
+		} as CustomTool;
+		const lateDefaultTool = {
+			name: "mcp__default_lookup",
+			label: "default/lookup",
+			description: "Look up default data",
+			parameters: z.object({}),
+			strict: true,
+			mcpServerName: "default",
+			mcpToolName: "lookup",
+			async execute() {
+				return { content: [{ type: "text" as const, text: "found default" }] };
+			},
+		} as CustomTool;
 		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		session = new AgentSession({
 			agent: new Agent({
@@ -611,12 +624,13 @@ describe("InteractiveMode plan review rendering", () => {
 				[readTool.name, readTool],
 				[writeTool.name, writeTool],
 				[resolveTool.name, resolveTool],
-				[mcpTool.name, mcpTool],
 			]),
 			mcpDiscoveryEnabled: true,
+			defaultSelectedMCPServerNames: ["default"],
 			rebuildSystemPrompt: async toolNames => ({ systemPrompt: [`tools:${toolNames.join(",")}`] }),
 		});
 		mode = new InteractiveMode(session, "test");
+		await session.refreshMCPTools([mcpTool]);
 		await session.setActiveToolsByName([readTool.name, mcpTool.name]);
 		const predecessorSessionFile = session.sessionFile;
 
@@ -635,7 +649,12 @@ describe("InteractiveMode plan review rendering", () => {
 			notes: "",
 			snapshotHash: planHash,
 		});
-		const clear = vi.spyOn(mode, "handleClearCommand").mockImplementation(async () => await session.newSession());
+		const clear = vi.spyOn(mode, "handleClearCommand").mockImplementation(async () => {
+			const switched = await session.newSession();
+			if (!switched) return false;
+			await session.refreshMCPTools([mcpTool, lateDefaultTool]);
+			return true;
+		});
 		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
 		await mode.planModeController.enter();
@@ -647,10 +666,10 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 
 		expect(clear).toHaveBeenCalledTimes(1);
-		expect(session.getActiveMCPToolNames()).toEqual([mcpTool.name]);
+		expect(session.getActiveMCPToolNames()).toEqual([mcpTool.name, lateDefaultTool.name]);
 		expect(sessionManager.buildSessionContext()).toMatchObject({
 			hasPersistedMCPToolSelection: true,
-			selectedMCPToolNames: [mcpTool.name],
+			selectedMCPToolNames: [mcpTool.name, lateDefaultTool.name],
 		});
 		await session.sessionManager.ensureOnDisk();
 		await session.sessionManager.flush();
@@ -662,7 +681,7 @@ describe("InteractiveMode plan review rendering", () => {
 		try {
 			expect(resumedSessionManager.buildSessionContext()).toMatchObject({
 				hasPersistedMCPToolSelection: true,
-				selectedMCPToolNames: [mcpTool.name],
+				selectedMCPToolNames: [mcpTool.name, lateDefaultTool.name],
 			});
 		} finally {
 			await resumedSessionManager.close();
