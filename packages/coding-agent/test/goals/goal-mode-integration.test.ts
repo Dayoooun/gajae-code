@@ -209,23 +209,32 @@ describe("InteractiveMode goal mode integration", () => {
 		await harness.cleanup();
 		harness = await createGoalHarness({ mcpDiscoveryEnabled: true });
 		const selectedTool = "mcp__demo_selected";
-		const tool = createMCPTool(selectedTool, "selected");
-		await harness.session.replaceNamedCustomTools([], [tool], { activateNewTools: false });
+		const discoveredTool = "mcp__demo_discovered";
+		const selectedCustomTool = createMCPTool(selectedTool, "selected");
+		const discoveredCustomTool = createMCPTool(discoveredTool, "discovered");
+		await harness.session.replaceNamedCustomTools([], [selectedCustomTool, discoveredCustomTool], {
+			activateNewTools: false,
+		});
 		await harness.session.setActiveToolsByName(["read", selectedTool], { persistMCPSelection: false });
 		expect(harness.session.hasMCPToolSelectionAuthority()).toBe(true);
 		expect(harness.session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+		await harness.session.activateDiscoveredTools([discoveredTool]);
+		expect(harness.session.getSelectedMCPToolNames()).toEqual([selectedTool, discoveredTool]);
 
-		await harness.session.replaceNamedCustomTools([selectedTool], [], { persistMCPSelection: false });
-		expect(harness.session.getActiveMCPToolNames()).toEqual([]);
-		expect(harness.session.hasMCPToolSelectionAuthority()).toBe(true);
-
-		await harness.session.replaceNamedCustomTools([], [tool], {
-			activateNewTools: false,
+		await harness.session.replaceNamedCustomTools([discoveredTool], [selectedCustomTool], {
 			persistMCPSelection: false,
 		});
 		expect(harness.session.getActiveMCPToolNames()).toEqual([selectedTool]);
-		expect(harness.session.getSelectedMCPToolNames()).toEqual([selectedTool]);
-		expect(harness.session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+		expect(harness.session.hasMCPToolSelectionAuthority()).toBe(true);
+
+		await harness.session.replaceNamedCustomTools([selectedTool], [selectedCustomTool, discoveredCustomTool], {
+			activateNewTools: false,
+			inactiveNewToolNames: [discoveredTool],
+			persistMCPSelection: false,
+		});
+		expect(harness.session.getActiveMCPToolNames()).toEqual([selectedTool, discoveredTool]);
+		expect(harness.session.getSelectedMCPToolNames()).toEqual([selectedTool, discoveredTool]);
+		expect(harness.session.buildDisplaySessionContext().selectedMCPToolNames).toEqual([selectedTool, discoveredTool]);
 	});
 
 	it("keeps late default MCP tools active when goal creation is pending", async () => {

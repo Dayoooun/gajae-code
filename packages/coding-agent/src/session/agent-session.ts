@@ -6577,9 +6577,8 @@ export class AgentSession {
 				...added.filter(
 					name =>
 						previousActive.includes(name) ||
-						(!inactiveNewToolNames.has(name) &&
-							(authoritativeSelectedMCPToolNames.has(name) ||
-								(options?.activateNewTools !== false && !previous.has(name)))),
+						authoritativeSelectedMCPToolNames.has(name) ||
+						(!inactiveNewToolNames.has(name) && options?.activateNewTools !== false && !previous.has(name)),
 				),
 			],
 			{ previousSelectedMCPToolNames, persistMCPSelection: options?.persistMCPSelection },
@@ -12386,12 +12385,22 @@ export class AgentSession {
 				explicitActiveToolSelectionGeneration !== this.#explicitActiveToolSelectionGeneration
 			)
 				return [];
-			return this.#activateDiscoveredTools(
+			const activated = await this.#activateDiscoveredTools(
 				requestedToolNames,
 				sessionTransitionGeneration,
 				explicitActiveToolSelectionGeneration,
 				options?.persistMCPSelection,
 			);
+			if (this.#hasExplicitActiveToolSelectionForContext && activated.length > 0) {
+				const activatedMCPToolNames = activated.filter(name => {
+					const tool = this.#toolRegistry.get(name);
+					return tool !== undefined && isMCPBridgeTool(tool);
+				});
+				this.#explicitMCPToolSelectionForContext = [
+					...new Set([...(this.#explicitMCPToolSelectionForContext ?? []), ...activatedMCPToolNames]),
+				];
+			}
+			return activated;
 		});
 		this.#discoveredToolActivationChain = activation.then(
 			() => undefined,
