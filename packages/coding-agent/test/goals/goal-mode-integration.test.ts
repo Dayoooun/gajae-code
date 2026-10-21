@@ -305,6 +305,56 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
 	});
 
+	it("drops a newly created goal and releases the mode gate when tool activation fails", async () => {
+		await harness.cleanup();
+		harness = await createGoalHarness({ mcpDiscoveryEnabled: true });
+		const originalSetActiveToolsByName = harness.session.setActiveToolsByName.bind(harness.session);
+		const setActiveToolsByName = vi.spyOn(harness.session, "setActiveToolsByName");
+		setActiveToolsByName.mockImplementation(async (toolNames, options) => {
+			if (toolNames.includes("goal")) throw new Error("goal selection failed");
+			await originalSetActiveToolsByName(toolNames, options);
+		});
+
+		await expect(harness.mode.goalModeController.enter({ objective: "Ship the release" })).rejects.toThrow(
+			"goal selection failed",
+		);
+		setActiveToolsByName.mockRestore();
+
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		expect(harness.mode.goalModeController.enabled).toBe(false);
+		expect(harness.mode.goalModeController.paused).toBe(false);
+		await harness.mode.planModeController.enter();
+		expect(harness.mode.planModeController.enabled).toBe(true);
+	});
+
+	it("restores a paused goal when resume tool activation fails", async () => {
+		await harness.cleanup();
+		harness = await createGoalHarness({ mcpDiscoveryEnabled: true });
+		const originalState = await harness.session.goalRuntime.createGoal({ objective: "Ship the release" });
+		await harness.session.goalRuntime.pauseGoal();
+		const originalSetActiveToolsByName = harness.session.setActiveToolsByName.bind(harness.session);
+		const setActiveToolsByName = vi.spyOn(harness.session, "setActiveToolsByName");
+		setActiveToolsByName.mockImplementation(async (toolNames, options) => {
+			if (toolNames.includes("goal")) throw new Error("goal selection failed");
+			await originalSetActiveToolsByName(toolNames, options);
+		});
+
+		await expect(harness.mode.goalModeController.enter({ resume: true })).rejects.toThrow("goal selection failed");
+		setActiveToolsByName.mockRestore();
+
+		expect(harness.session.getGoalModeState()).toMatchObject({
+			enabled: false,
+			goal: { id: originalState.goal.id, status: "paused" },
+		});
+		expect(harness.mode.goalModeController.enabled).toBe(false);
+		expect(harness.mode.goalModeController.paused).toBe(true);
+		await harness.session.goalRuntime.dropGoal();
+		await harness.mode.goalModeController.exit({ reason: "dropped" });
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		await harness.mode.planModeController.enter();
+		expect(harness.mode.planModeController.enabled).toBe(true);
+	});
+
 	it("keeps pending goal activation outside MCP selection authority", async () => {
 		await harness.cleanup();
 		harness = await createGoalHarness({ mcpDiscoveryEnabled: true });
