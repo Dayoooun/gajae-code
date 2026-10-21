@@ -1607,6 +1607,11 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			expect(session.getDiscoverableTools({ source: "mcp" }).map(tool => tool.name)).toEqual([
 				"mcp__github_create_issue",
 			]);
+
+			await session.newSession();
+			expect(session.getActiveToolNames()).toContain("mcp__local_inline_tool");
+			expect(session.getActiveToolNames()).not.toContain("mcp__github_create_issue");
+			expect(session.getSelectedMCPToolNames()).toEqual([]);
 		} finally {
 			await session.dispose();
 		}
