@@ -14236,17 +14236,39 @@ export class AgentSession {
 
 		const previousTools = this.getActiveToolNames();
 		const previousMCPToolNames = new Set(this.getActiveMCPToolNames());
-		await this.#goalRuntime.createGoal({ objective: pendingGoal.objective, provenance: pendingGoal.provenance });
-		await this.setActiveToolsByName(
-			[
-				...new Set([
-					...previousTools.filter(name => !previousMCPToolNames.has(name)),
-					...this.getActiveMCPToolNames(),
-					"goal",
-				]),
-			],
-			{ explicit: false, persistMCPSelection: false, retryOnMcpCatalogChange: true },
-		);
+		const createdState = await this.#goalRuntime.createGoal({
+			objective: pendingGoal.objective,
+			provenance: pendingGoal.provenance,
+		});
+		try {
+			await this.setActiveToolsByName(
+				[
+					...new Set([
+						...previousTools.filter(name => !previousMCPToolNames.has(name)),
+						...this.getActiveMCPToolNames(),
+						"goal",
+					]),
+				],
+				{ explicit: false, persistMCPSelection: false, retryOnMcpCatalogChange: true },
+			);
+		} catch (error) {
+			const currentState = this.getGoalModeState();
+			const createdGoalIsStillActive =
+				currentState?.enabled === true &&
+				currentState.goal.status === "active" &&
+				currentState.goal.id === createdState.goal.id;
+			if (createdGoalIsStillActive) {
+				try {
+					await this.#goalRuntime.dropGoal();
+				} catch (rollbackError) {
+					throw new AggregateError(
+						[error, rollbackError],
+						"Pending goal activation failed and goal state rollback also failed",
+					);
+				}
+			}
+			throw error;
+		}
 		if (this.isStreaming) {
 			await this.sendGoalModeContext({ deliverAs: "steer" });
 		}

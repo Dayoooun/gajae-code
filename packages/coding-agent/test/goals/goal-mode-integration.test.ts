@@ -405,6 +405,74 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
 	});
 
+	it("drops a pending goal and releases the mode gate when tool selection supersedes activation", async () => {
+		await harness.cleanup();
+		const goalRebuildStarted = Promise.withResolvers<void>();
+		const releaseGoalRebuild = Promise.withResolvers<void>();
+		let blockGoalRebuild = true;
+		harness = await createGoalHarness({
+			rebuildSystemPrompt: async toolNames => {
+				if (blockGoalRebuild && toolNames.includes("goal")) {
+					blockGoalRebuild = false;
+					goalRebuildStarted.resolve();
+					await releaseGoalRebuild.promise;
+				}
+				return { systemPrompt: [`tools:${toolNames.join(",")}`] };
+			},
+		});
+		const sessionManager = harness.session.sessionManager;
+		await writePendingGoalModeRequest({
+			cwd: sessionManager.getCwd(),
+			objective: "Ship the release",
+			goalsPath: "goals.json",
+			sessionId: sessionManager.getSessionId(),
+		});
+		const activationFailure = Promise.withResolvers<unknown>();
+		const originalSetActiveToolsByName = harness.session.setActiveToolsByName.bind(harness.session);
+		const setActiveToolsByName = vi.spyOn(harness.session, "setActiveToolsByName");
+		setActiveToolsByName.mockImplementation(async (toolNames, options) => {
+			try {
+				await originalSetActiveToolsByName(toolNames, options);
+			} catch (error) {
+				if (toolNames.includes("goal")) activationFailure.resolve(error);
+				throw error;
+			}
+		});
+		const goalDropFinished = Promise.withResolvers<void>();
+		const originalDropGoal = harness.session.goalRuntime.dropGoal.bind(harness.session.goalRuntime);
+		vi.spyOn(harness.session.goalRuntime, "dropGoal").mockImplementation(async () => {
+			const state = await originalDropGoal();
+			goalDropFinished.resolve();
+			return state;
+		});
+
+		harness.session.agent.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: "call-bash-success",
+			toolName: "bash",
+			isError: false,
+			result: { content: [] },
+		} as never);
+		try {
+			await goalRebuildStarted.promise;
+			// Re-selecting the current tool list still fences the pending implicit swap.
+			const explicitSelection = harness.session.setActiveToolsByName(["read"]);
+			releaseGoalRebuild.resolve();
+			await explicitSelection;
+			expect(await activationFailure.promise).toBeInstanceOf(Error);
+			await goalDropFinished.promise;
+		} finally {
+			releaseGoalRebuild.resolve();
+		}
+
+		setActiveToolsByName.mockRestore();
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		expect(harness.mode.goalModeController.enabled).toBe(false);
+		expect(harness.session.getActiveToolNames()).toEqual(["read"]);
+		await harness.mode.planModeController.enter();
+		expect(harness.mode.planModeController.enabled).toBe(true);
+	});
+
 	it("retries pending goal activation after an MCP catalog change during its prompt rebuild", async () => {
 		await harness.cleanup();
 		const goalRebuildStarted = Promise.withResolvers<void>();
