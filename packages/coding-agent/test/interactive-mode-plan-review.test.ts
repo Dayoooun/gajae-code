@@ -174,6 +174,80 @@ describe("InteractiveMode plan review rendering", () => {
 		await mode.planModeController.exit({ silent: true });
 	});
 
+	it("retries plan exit after a concurrent MCP catalog change", async () => {
+		mode.stop();
+		await session.dispose();
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
+		const readTool = createTestTool("test_read");
+		const writeTool = createTestTool("test_write");
+		const resolveTool = createTestTool("resolve");
+		const docsTool: CustomTool = {
+			name: "mcp__docs_search",
+			label: "docs/search",
+			description: "Search docs",
+			parameters: z.object({}),
+			mcpServerName: "docs",
+			mcpToolName: "search",
+			async execute() {
+				return { content: [{ type: "text", text: "found" }] };
+			},
+		};
+		const refreshedDocsTool: CustomTool = { ...docsTool, description: "Search docs with refreshed metadata" };
+		const exitRebuildStarted = Promise.withResolvers<void>();
+		const releaseExitRebuild = Promise.withResolvers<void>();
+		let blockExitRebuild = false;
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["Test"],
+					tools: [readTool, writeTool],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings: Settings.isolated({ "mcp.discoveryMode": true, "plan.enabled": true }),
+			modelRegistry,
+			toolRegistry: new Map([
+				[readTool.name, readTool],
+				[writeTool.name, writeTool],
+				[resolveTool.name, resolveTool],
+			]),
+			mcpDiscoveryEnabled: true,
+			defaultSelectedMCPServerNames: ["docs"],
+			rebuildSystemPrompt: async toolNames => {
+				if (blockExitRebuild && !toolNames.includes(resolveTool.name) && toolNames.includes(docsTool.name)) {
+					blockExitRebuild = false;
+					exitRebuildStarted.resolve();
+					await releaseExitRebuild.promise;
+				}
+				return { systemPrompt: [`tools:${toolNames.join(",")}`] };
+			},
+		});
+		mode = new InteractiveMode(session, "test");
+
+		await session.refreshMCPTools([docsTool], { persistMCPSelection: false });
+		await mode.planModeController.enter();
+		expect(session.getActiveToolNames()).toContain("resolve");
+		blockExitRebuild = true;
+		const exitingPlan = mode.planModeController.exit({ silent: true });
+		try {
+			await exitRebuildStarted.promise;
+			const refreshingMcp = session.refreshMCPTools([refreshedDocsTool], { persistMCPSelection: false });
+			releaseExitRebuild.resolve();
+			await Promise.all([exitingPlan, refreshingMcp]);
+		} finally {
+			releaseExitRebuild.resolve();
+		}
+
+		expect(mode.planModeController.enabled).toBe(false);
+		expect(session.getActiveToolNames()).toEqual([readTool.name, writeTool.name, docsTool.name]);
+		expect(session.getActiveToolNames()).not.toContain(resolveTool.name);
+		expect(session.peekStandingResolveHandler()).toBeUndefined();
+	});
+
 	it("fails SDK plan toggles closed when the interactive lifecycle refuses them", async () => {
 		mode.goalModeController.setEnabledForCompatibility(true);
 		await expect(session.setSdkPlanMode(true)).rejects.toMatchObject({ code: "conflict" });

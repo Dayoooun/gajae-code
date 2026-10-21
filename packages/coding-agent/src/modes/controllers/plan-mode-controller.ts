@@ -171,6 +171,7 @@ export class PlanModeController {
 			await this.ctx.session.setActiveToolsByName(this.#restoreToolsWithCurrentMCPSelection(this.#previousTools), {
 				explicit: false,
 				persistMCPSelection: false,
+				retryOnMcpCatalogChange: true,
 			});
 		if (this.#providerSessionScope && !this.ctx.session.isStreaming) {
 			if (await this.ctx.session.restoreTemporaryProviderSessionScope(this.#providerSessionScope))

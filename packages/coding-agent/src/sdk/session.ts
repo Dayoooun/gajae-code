@@ -5868,7 +5868,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								persistMCPSelection: false,
 							});
 							const defaultMcpToolNamesToActivate =
-								deferConventionalMcpAutoload && !session.hasMCPToolSelectionAuthority()
+								deferConventionalMcpAutoload && !session.hasCommittedMCPToolSelectionAuthority()
 									? nextTools
 											.filter(
 												tool =>
@@ -5877,7 +5877,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 											)
 											.map(tool => tool.name)
 									: [];
-							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasMCPToolSelectionAuthority()) {
+							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasCommittedMCPToolSelectionAuthority()) {
 								await session.activateDiscoveredTools(defaultMcpToolNamesToActivate, {
 									persistMCPSelection: false,
 								});
@@ -5981,7 +5981,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								persistMCPSelection: false,
 							});
 							const defaultMcpToolNamesToActivate =
-								deferConventionalMcpAutoload && !session.hasMCPToolSelectionAuthority()
+								deferConventionalMcpAutoload && !session.hasCommittedMCPToolSelectionAuthority()
 									? snapshot
 											.filter(
 												tool =>
@@ -5990,7 +5990,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 											)
 											.map(tool => tool.name)
 									: [];
-							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasMCPToolSelectionAuthority()) {
+							if (defaultMcpToolNamesToActivate.length > 0 && !session.hasCommittedMCPToolSelectionAuthority()) {
 								await session.activateDiscoveredTools(defaultMcpToolNamesToActivate, {
 									persistMCPSelection: false,
 								});

@@ -4170,6 +4170,7 @@ export class AgentSession {
 	#activeToolSelectionRevision = 0;
 	/** Explicit caller selections supersede any older pending discovery activation. */
 	#explicitActiveToolSelectionGeneration = 0;
+	#committedExplicitActiveToolSelectionGeneration = 0;
 	/** Caller-authored active selections are authoritative only for the current session context. */
 	#hasExplicitActiveToolSelectionForContext = false;
 	#explicitMCPToolSelectionForContext: string[] | undefined;
@@ -11794,6 +11795,7 @@ export class AgentSession {
 			? [...this.#explicitMCPToolSelectionForContext]
 			: undefined;
 		this.#committedExplicitMCPToolSelectionPersistsForContext = this.#explicitMCPToolSelectionPersistsForContext;
+		this.#committedExplicitActiveToolSelectionGeneration = this.#explicitActiveToolSelectionGeneration;
 	}
 
 	#restoreCommittedExplicitMCPToolSelectionAuthority(): void {
@@ -11802,6 +11804,7 @@ export class AgentSession {
 			? [...this.#committedExplicitMCPToolSelectionForContext]
 			: undefined;
 		this.#explicitMCPToolSelectionPersistsForContext = this.#committedExplicitMCPToolSelectionPersistsForContext;
+		this.#committedExplicitActiveToolSelectionGeneration = this.#explicitActiveToolSelectionGeneration;
 	}
 
 	#resetExplicitMCPToolSelectionAuthority(): void {
@@ -12348,13 +12351,18 @@ export class AgentSession {
 		if (this.getActiveToolNames().includes("edit")) await this.refreshBaseSystemPrompt();
 	}
 
-	/** Whether the current context has persisted, constructor, or live caller MCP selection authority. */
-	hasMCPToolSelectionAuthority(): boolean {
+	/** Whether the current context has committed persisted, constructor, or caller MCP selection authority. */
+	hasCommittedMCPToolSelectionAuthority(): boolean {
 		return (
 			this.buildDisplaySessionContext().hasPersistedMCPToolSelection ||
 			this.#constructorMCPToolSelection !== undefined ||
-			this.#hasExplicitActiveToolSelectionForContext
+			this.#committedHasExplicitActiveToolSelectionForContext
 		);
+	}
+
+	/** Whether the current context has committed or pending caller MCP selection authority. */
+	hasMCPToolSelectionAuthority(): boolean {
+		return this.hasCommittedMCPToolSelectionAuthority() || this.#hasExplicitActiveToolSelectionForContext;
 	}
 
 	getActiveMCPToolNames(): string[] {
@@ -12519,13 +12527,24 @@ export class AgentSession {
 					this.#hasExplicitActiveToolSelectionForContext &&
 					activatedMCPToolNames.length > 0 &&
 					sessionTransitionGeneration === this.#sessionTransitionGeneration &&
-					explicitActiveToolSelectionGeneration === this.#explicitActiveToolSelectionGeneration
+					this.#explicitActiveToolSelectionGeneration === explicitActiveToolSelectionGeneration
 				) {
-					this.#explicitMCPToolSelectionForContext = [
-						...new Set([...(this.#explicitMCPToolSelectionForContext ?? []), ...activatedMCPToolNames]),
-					];
-					this.#explicitMCPToolSelectionPersistsForContext = persistMCPSelection !== false;
-					this.#commitExplicitMCPToolSelectionAuthority();
+					const explicitMCPSelectionIsPending =
+						this.#explicitActiveToolSelectionGeneration !==
+						this.#committedExplicitActiveToolSelectionGeneration;
+					if (explicitMCPSelectionIsPending && persistMCPSelection !== false) {
+						this.#committedHasExplicitActiveToolSelectionForContext = true;
+						this.#committedExplicitMCPToolSelectionForContext = [
+							...new Set([...previousSelectedMCPToolNames, ...authoritativeMCPToolNames, ...activatedMCPToolNames]),
+						];
+						this.#committedExplicitMCPToolSelectionPersistsForContext = true;
+					} else if (!explicitMCPSelectionIsPending) {
+						this.#explicitMCPToolSelectionForContext = [
+							...new Set([...(this.#explicitMCPToolSelectionForContext ?? []), ...activatedMCPToolNames]),
+						];
+						this.#explicitMCPToolSelectionPersistsForContext = persistMCPSelection !== false;
+						this.#commitExplicitMCPToolSelectionAuthority();
+					}
 				}
 				if (appliedRevision === undefined || appliedRevision !== this.#activeToolSelectionRevision) {
 					if (

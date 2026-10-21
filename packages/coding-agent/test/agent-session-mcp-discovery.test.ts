@@ -451,6 +451,67 @@ describe("AgentSession MCP discovery", () => {
 		expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
 	});
 
+	it("keeps a pending explicit MCP selection out of a concurrent discovery activation", async () => {
+		const readTool = createBasicTool("read", "Read");
+		const tentativeTool = createMcpCustomTool("mcp__tentative_search", "docs", "tentative", "Tentative", ["query"]);
+		const activatedTool = createMcpCustomTool("mcp__activated_search", "docs", "activated", "Activated", ["query"]);
+		const tentativeRebuildStarted = Promise.withResolvers<void>();
+		const releaseTentativeRebuild = Promise.withResolvers<void>();
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: createModel(),
+					systemPrompt: ["initial"],
+					tools: [readTool],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
+			toolRegistry: new Map([[readTool.name, readTool]]),
+			mcpDiscoveryEnabled: true,
+			rebuildSystemPrompt: async toolNames => {
+				if (toolNames.includes(tentativeTool.name)) {
+					tentativeRebuildStarted.resolve();
+					await releaseTentativeRebuild.promise;
+					throw new Error("tentative selection rebuild failed");
+				}
+				return { systemPrompt: [`tools:${toolNames.join(",")}`] };
+			},
+		});
+		sessions.push(session);
+
+		await session.refreshMCPTools([tentativeTool, activatedTool], { persistMCPSelection: false });
+		const pendingSelection = session.setActiveToolsByName([readTool.name, tentativeTool.name]);
+		try {
+			await tentativeRebuildStarted.promise;
+			expect(session.hasMCPToolSelectionAuthority()).toBe(true);
+			expect(session.hasCommittedMCPToolSelectionAuthority()).toBe(false);
+
+			expect(await session.activateDiscoveredTools([activatedTool.name])).toEqual([activatedTool.name]);
+			expect(session.getActiveMCPToolNames()).toEqual([activatedTool.name]);
+			expect(session.getSelectedMCPToolNames()).toEqual([activatedTool.name]);
+			expect(session.hasCommittedMCPToolSelectionAuthority()).toBe(true);
+
+			releaseTentativeRebuild.resolve();
+			await expect(pendingSelection).rejects.toThrow("tentative selection rebuild failed");
+		} finally {
+			releaseTentativeRebuild.resolve();
+		}
+
+		expect(session.getSelectedMCPToolNames()).toEqual([activatedTool.name]);
+		expect(session.buildDisplaySessionContext()).toMatchObject({
+			hasPersistedMCPToolSelection: true,
+			selectedMCPToolNames: [activatedTool.name],
+		});
+		await session.refreshMCPTools([tentativeTool, activatedTool], { persistMCPSelection: false });
+		expect(session.getActiveMCPToolNames()).toEqual([activatedTool.name]);
+		expect(session.getActiveToolNames()).not.toContain(tentativeTool.name);
+	});
+
 	it("keeps configured MCP defaults after explicit tool application fails", async () => {
 		const readTool = createBasicTool("read", "Read");
 		const docsSearchTool = createMcpCustomTool("mcp__docs_search", "docs", "search", "Search docs", ["query"]);

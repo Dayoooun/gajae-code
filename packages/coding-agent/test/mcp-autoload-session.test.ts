@@ -244,6 +244,8 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
 			expect(session.hasMCPToolSelectionAuthority()).toBe(false);
 
+			const pendingAuthority = vi.spyOn(session, "hasMCPToolSelectionAuthority").mockReturnValue(true);
+			const committedAuthority = vi.spyOn(session, "hasCommittedMCPToolSelectionAuthority").mockReturnValue(false);
 			publishToolsChanged(initialTools);
 			const activationDeadline = Date.now() + 5_000;
 			while (!session.getActiveToolNames().includes(defaultToolName)) {
@@ -251,6 +253,9 @@ describe("conventional MCP autoload in standalone sessions", () => {
 					throw new Error(`Discovery-default MCP tool was not reactivated: ${defaultToolName}`);
 				await Bun.sleep(20);
 			}
+			expect(committedAuthority).toHaveBeenCalled();
+			pendingAuthority.mockRestore();
+			committedAuthority.mockRestore();
 			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
 			expect(session.hasMCPToolSelectionAuthority()).toBe(false);
 		} finally {
@@ -462,6 +467,15 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		);
 
 		const lateToolName = "mcp__slow_default_late_default";
+		const inheritedToolChangeHandlers: Parameters<MCPManager["subscribeToToolsChanged"]>[0][] = [];
+		const originalSubscribeToToolsChanged = MCPManager.prototype.subscribeToToolsChanged;
+		vi.spyOn(MCPManager.prototype, "subscribeToToolsChanged").mockImplementation(function (
+			this: MCPManager,
+			handler,
+		) {
+			inheritedToolChangeHandlers.push(handler);
+			return originalSubscribeToToolsChanged.call(this, handler);
+		});
 		const { session, mcpManager, startDeferredMcpConfig } = await createAgentSession({
 			...isolatedSessionOptions(),
 			toolNames: undefined,
@@ -520,6 +534,14 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			await explicitlyDeselectedSession.setActiveToolsByName(["read"]);
 			expect(explicitlyDeselectedSession.getActiveToolNames()).not.toContain("mcp__fast_default_hello");
 
+			const pendingAuthority = vi.spyOn(inheritedSession, "hasMCPToolSelectionAuthority").mockReturnValue(true);
+			const committedAuthority = vi
+				.spyOn(inheritedSession, "hasCommittedMCPToolSelectionAuthority")
+				.mockReturnValue(false);
+			if (inheritedToolChangeHandlers.length === 0) {
+				throw new Error("Expected an inherited MCP catalog callback");
+			}
+			for (const handler of inheritedToolChangeHandlers) handler(mcpManager.getTools());
 			const activationDeadline = Date.now() + 15_000;
 			while (
 				!session.getActiveToolNames().includes(lateToolName) ||
@@ -532,6 +554,9 @@ describe("conventional MCP autoload in standalone sessions", () => {
 				}
 				await Bun.sleep(20);
 			}
+			expect(committedAuthority).toHaveBeenCalled();
+			pendingAuthority.mockRestore();
+			committedAuthority.mockRestore();
 			expect(session.getAllToolNames()).toContain(lateToolName);
 			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
 			expect(inheritedSession.getActiveToolNames()).toContain(lateToolName);
