@@ -1086,6 +1086,8 @@ export interface AgentSessionConfig {
 	defaultSelectedMCPServerNames?: string[];
 	/** MCP tool names that should seed brand-new sessions created from this AgentSession. */
 	defaultSelectedMCPToolNames?: string[];
+	/** Conventional autoload MCP names for the current catalog when autoload is not deferred. */
+	defaultSelectedConventionalMCPToolNames?: string[];
 	/** MCP capabilities that are always active and never part of persisted user selection. */
 	mandatoryMCPToolNames?: string[];
 	/** TTSR manager for time-traveling stream rules */
@@ -4182,6 +4184,7 @@ export class AgentSession {
 	#gjcSubskillToolSignature: string | undefined;
 	#defaultSelectedMCPServerNames = new Set<string>();
 	#defaultSelectedMCPToolNames = new Set<string>();
+	#defaultSelectedConventionalMCPToolNames = new Set<string>();
 	#mandatoryMCPToolNames = new Set<string>();
 	/** Constructor authority applies only while this AgentSession instance remains alive. */
 	#constructorMCPToolSelection: string[] | undefined;
@@ -6141,6 +6144,7 @@ export class AgentSession {
 		);
 		this.#defaultSelectedMCPServerNames = new Set(config.defaultSelectedMCPServerNames ?? []);
 		this.#defaultSelectedMCPToolNames = new Set(config.defaultSelectedMCPToolNames ?? []);
+		this.#defaultSelectedConventionalMCPToolNames = new Set(config.defaultSelectedConventionalMCPToolNames ?? []);
 		this.#mandatoryMCPToolNames = new Set(
 			(config.mandatoryMCPToolNames ?? [])
 				.map(name => name.toLowerCase())
@@ -6539,6 +6543,7 @@ export class AgentSession {
 		nextTools: readonly CustomTool[],
 		options?: {
 			mandatoryMCPToolNames?: readonly string[];
+			defaultSelectedConventionalMCPToolNames?: readonly string[];
 			activateNewTools?: boolean;
 			inactiveNewToolNames?: readonly string[];
 			persistMCPSelection?: boolean;
@@ -6574,6 +6579,9 @@ export class AgentSession {
 				? retainedMandatory.filter(name => this.#toolRegistry.has(name))
 				: retainedMandatory,
 		);
+		if (options?.defaultSelectedConventionalMCPToolNames !== undefined) {
+			this.#defaultSelectedConventionalMCPToolNames = new Set(options.defaultSelectedConventionalMCPToolNames);
+		}
 		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
 		const authoritativeSelectedMCPToolNames = new Set(
 			(this.#getMCPToolSelectionAuthorityNames() ?? []).filter(name => {
@@ -11730,21 +11738,17 @@ export class AgentSession {
 	}
 
 	#getConfiguredDefaultSelectedMCPToolNames(): string[] {
-		const defaultToolNames = [
+		const defaultToolNames = new Set([
 			...this.#defaultSelectedMCPToolNames,
 			...selectDiscoverableToolNamesByServer(
 				this.#discoverableMCPTools.values(),
 				this.#defaultSelectedMCPServerNames,
 			),
-		];
-		if (this.#mcpDiscoveryEnabled && !this.settings.get("mcp.discoveryDeferAutoload")) {
-			for (const name of this.#discoverableMCPTools.keys()) {
-				if (!this.#mandatoryMCPToolNames.has(name)) defaultToolNames.push(name);
-			}
-		}
-		return this.#filterSelectableMCPToolNames([
-			...defaultToolNames,
 		]);
+		if (this.#mcpDiscoveryEnabled && !this.settings.get("mcp.discoveryDeferAutoload")) {
+			for (const name of this.#defaultSelectedConventionalMCPToolNames) defaultToolNames.add(name);
+		}
+		return this.#filterSelectableMCPToolNames(defaultToolNames);
 	}
 
 	#pruneSelectedMCPToolNames(): void {

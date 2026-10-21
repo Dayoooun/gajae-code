@@ -2870,6 +2870,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				nextCustomTools,
 				{
 					mandatoryMCPToolNames: pluginMcpToolNames,
+					defaultSelectedConventionalMCPToolNames: deferConventionalMcpAutoload ? [] : conventionalMcpToolNames,
 					inactiveNewToolNames: deferConventionalMcpAutoload ? conventionalMcpToolNames : undefined,
 				},
 			);
@@ -5534,6 +5535,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			initialSelectedDiscoveredBuiltinToolNames,
 			initialBaselineDiscoveredBuiltinToolNames,
 			defaultSelectedMCPToolNames,
+			defaultSelectedConventionalMCPToolNames: deferConventionalMcpAutoload ? [] : conventionalMcpToolNames,
 			mandatoryMCPToolNames: pluginMcpToolNames,
 			persistInitialMCPToolSelection: !hasExistingSession && hasExplicitMCPToolSelection,
 			persistInitialDiscoveredBuiltinToolSelection: !hasExistingSession && hasExplicitDiscoveredBuiltinToolSelection,
@@ -5859,6 +5861,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						try {
 							await session.replaceNamedCustomTools(previousNames, nextTools, {
 								mandatoryMCPToolNames: nextMandatoryMcpToolNames,
+								defaultSelectedConventionalMCPToolNames: deferConventionalMcpAutoload
+									? []
+									: nextConventionalToolNames,
 								activateNewTools: false,
 								persistMCPSelection: false,
 							});
