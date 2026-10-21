@@ -11730,12 +11730,20 @@ export class AgentSession {
 	}
 
 	#getConfiguredDefaultSelectedMCPToolNames(): string[] {
-		return this.#filterSelectableMCPToolNames([
+		const defaultToolNames = [
 			...this.#defaultSelectedMCPToolNames,
 			...selectDiscoverableToolNamesByServer(
 				this.#discoverableMCPTools.values(),
 				this.#defaultSelectedMCPServerNames,
 			),
+		];
+		if (this.#mcpDiscoveryEnabled && !this.settings.get("mcp.discoveryDeferAutoload")) {
+			for (const name of this.#discoverableMCPTools.keys()) {
+				if (!this.#mandatoryMCPToolNames.has(name)) defaultToolNames.push(name);
+			}
+		}
+		return this.#filterSelectableMCPToolNames([
+			...defaultToolNames,
 		]);
 	}
 

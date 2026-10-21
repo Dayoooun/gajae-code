@@ -732,6 +732,49 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 30_000);
 
+	it("reselects the current conventional catalog on /new after a cwd move", async () => {
+		const sourceCwd = path.join(projectDir, "move-source");
+		const targetCwd = path.join(sourceCwd, "move-target");
+		await fs.promises.mkdir(path.join(targetCwd, ".gjc"), { recursive: true });
+		const serverConfig = {
+			type: "stdio",
+			command: process.execPath,
+			args: ["-e", DEMO_MCP_SERVER_SCRIPT],
+			timeout: 5_000,
+		};
+		await fs.promises.writeFile(
+			path.join(targetCwd, ".gjc", "mcp.json"),
+			JSON.stringify({ mcpServers: { autoload: serverConfig } }),
+		);
+
+		const originalProcessCwd = process.cwd();
+		const sessionManager = SessionManager.create(sourceCwd, SessionManager.managedDestination(sourceCwd, projectDir));
+		const { session } = await createAgentSession({
+			...isolatedSessionOptions(),
+			cwd: sourceCwd,
+			sessionManager,
+			toolNames: ["move_session"],
+			settings: Settings.isolated({
+				"mcp.discoveryMode": true,
+				"mcp.discoveryDeferAutoload": false,
+				"mcp.enableProjectConfig": true,
+			}),
+		});
+		try {
+			await session.getToolByName("move_session")!.execute("move-with-autoload", { path: "move-target" });
+			expect(session.getActiveToolNames()).toContain("mcp__autoload_hello");
+
+			await expect(session.newSession()).resolves.toBe(true);
+
+			expect(session.getAllToolNames()).toContain("mcp__autoload_hello");
+			expect(session.getActiveToolNames()).toContain("mcp__autoload_hello");
+			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+		} finally {
+			await session.dispose();
+			process.chdir(originalProcessCwd);
+		}
+	}, 30_000);
+
 	it("retains a declared-timeout MCP manager and publishes tools after background connection", async () => {
 		await runMCPCommand({
 			action: "add",
