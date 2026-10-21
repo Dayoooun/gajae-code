@@ -52,7 +52,11 @@ function createMCPTool(name: string, mcpToolName: string): CustomTool {
 }
 
 async function createGoalHarness(
-	options: { extensionRunner?: ExtensionRunner; mcpDiscoveryEnabled?: boolean } = {},
+	options: {
+		extensionRunner?: ExtensionRunner;
+		mcpDiscoveryEnabled?: boolean;
+		rebuildSystemPrompt?: (toolNames: string[]) => Promise<{ systemPrompt: string[] }>;
+	} = {},
 ): Promise<GoalHarness> {
 	resetSettingsForTest();
 	const tempDir = TempDir.createSync("@pi-goal-mode-");
@@ -88,7 +92,7 @@ async function createGoalHarness(
 		modelRegistry,
 		toolRegistry,
 		...(options.mcpDiscoveryEnabled === true ? { mcpDiscoveryEnabled: true } : {}),
-		rebuildSystemPrompt: async () => ({ systemPrompt: ["Test"] }),
+		rebuildSystemPrompt: options.rebuildSystemPrompt ?? (async () => ({ systemPrompt: ["Test"] })),
 		extensionRunner: options.extensionRunner,
 	});
 	const mode = new InteractiveMode(session, "test");
@@ -267,6 +271,40 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.session.getActiveMCPToolNames()).toEqual([defaultTool]);
 	});
 
+	it("retries goal entry after an MCP catalog change during its prompt rebuild", async () => {
+		await harness.cleanup();
+		const goalRebuildStarted = Promise.withResolvers<void>();
+		const releaseGoalRebuild = Promise.withResolvers<void>();
+		let blockGoalRebuild = true;
+		harness = await createGoalHarness({
+			mcpDiscoveryEnabled: true,
+			rebuildSystemPrompt: async toolNames => {
+				if (blockGoalRebuild && toolNames.includes("goal")) {
+					blockGoalRebuild = false;
+					goalRebuildStarted.resolve();
+					await releaseGoalRebuild.promise;
+				}
+				return { systemPrompt: [`tools:${toolNames.join(",")}`] };
+			},
+		});
+
+		const entering = harness.mode.goalModeController.handleCommand("Ship the release");
+		await goalRebuildStarted.promise;
+		const defaultTool = "mcp__demo_default";
+		await harness.session.replaceNamedCustomTools([], [createMCPTool(defaultTool, "default")], {
+			activateNewTools: false,
+		});
+		await harness.session.activateDiscoveredTools([defaultTool], { persistMCPSelection: false });
+		releaseGoalRebuild.resolve();
+		await entering;
+
+		expect(harness.mode.goalModeController.enabled).toBe(true);
+		expect(harness.session.getActiveToolNames()).toContain("goal");
+		expect(harness.session.getActiveMCPToolNames()).toEqual([defaultTool]);
+		expect(harness.session.hasMCPToolSelectionAuthority()).toBe(false);
+		expect(harness.session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+	});
+
 	it("keeps pending goal activation outside MCP selection authority", async () => {
 		await harness.cleanup();
 		harness = await createGoalHarness({ mcpDiscoveryEnabled: true });
@@ -310,9 +348,68 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(setActiveToolsByName).toHaveBeenCalledWith(expect.arrayContaining(["goal"]), {
 			explicit: false,
 			persistMCPSelection: false,
+			retryOnMcpCatalogChange: true,
 		});
 		expect(harness.session.hasMCPToolSelectionAuthority()).toBe(false);
 		expect(harness.session.getActiveMCPToolNames()).toEqual([defaultTool]);
+		expect(harness.session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+	});
+
+	it("retries pending goal activation after an MCP catalog change during its prompt rebuild", async () => {
+		await harness.cleanup();
+		const goalRebuildStarted = Promise.withResolvers<void>();
+		const releaseGoalRebuild = Promise.withResolvers<void>();
+		let blockGoalRebuild = true;
+		harness = await createGoalHarness({
+			mcpDiscoveryEnabled: true,
+			rebuildSystemPrompt: async toolNames => {
+				if (blockGoalRebuild && toolNames.includes("goal")) {
+					blockGoalRebuild = false;
+					goalRebuildStarted.resolve();
+					await releaseGoalRebuild.promise;
+				}
+				return { systemPrompt: [`tools:${toolNames.join(",")}`] };
+			},
+		});
+		const sessionManager = harness.session.sessionManager;
+		await writePendingGoalModeRequest({
+			cwd: sessionManager.getCwd(),
+			objective: "Ship the release",
+			goalsPath: "goals.json",
+			sessionId: sessionManager.getSessionId(),
+		});
+		const goalActivationFinished = Promise.withResolvers<void>();
+		const originalSetActiveToolsByName = harness.session.setActiveToolsByName.bind(harness.session);
+		const setActiveToolsByName = vi.spyOn(harness.session, "setActiveToolsByName");
+		setActiveToolsByName.mockImplementation(async (toolNames, options) => {
+			await originalSetActiveToolsByName(toolNames, options);
+			if (toolNames.includes("goal")) goalActivationFinished.resolve();
+		});
+
+		harness.session.agent.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: "call-bash-success",
+			toolName: "bash",
+			isError: false,
+			result: { content: [] },
+		} as never);
+		await goalRebuildStarted.promise;
+		const defaultTool = "mcp__demo_default";
+		await harness.session.replaceNamedCustomTools([], [createMCPTool(defaultTool, "default")], {
+			activateNewTools: false,
+		});
+		await harness.session.activateDiscoveredTools([defaultTool], { persistMCPSelection: false });
+		releaseGoalRebuild.resolve();
+		await goalActivationFinished.promise;
+
+		expect(setActiveToolsByName).toHaveBeenCalledWith(expect.arrayContaining(["goal"]), {
+			explicit: false,
+			persistMCPSelection: false,
+			retryOnMcpCatalogChange: true,
+		});
+		expect(harness.session.getActiveToolNames()).toContain("goal");
+		expect(harness.session.getActiveMCPToolNames()).toEqual([defaultTool]);
+		expect(harness.session.hasMCPToolSelectionAuthority()).toBe(false);
 		expect(harness.session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
 	});
 

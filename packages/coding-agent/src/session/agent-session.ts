@@ -14236,7 +14236,7 @@ export class AgentSession {
 					"goal",
 				]),
 			],
-			{ explicit: false, persistMCPSelection: false },
+			{ explicit: false, persistMCPSelection: false, retryOnMcpCatalogChange: true },
 		);
 		if (this.isStreaming) {
 			await this.sendGoalModeContext({ deliverAs: "steer" });

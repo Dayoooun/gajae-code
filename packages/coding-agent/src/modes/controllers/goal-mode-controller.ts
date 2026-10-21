@@ -270,6 +270,7 @@ export class GoalModeController {
 					await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])], {
 						explicit: false,
 						persistMCPSelection: false,
+						retryOnMcpCatalogChange: true,
 					});
 				}
 			}
@@ -336,6 +337,7 @@ export class GoalModeController {
 				{
 					explicit: false,
 					persistMCPSelection: false,
+					retryOnMcpCatalogChange: true,
 				},
 			);
 		}
@@ -360,6 +362,7 @@ export class GoalModeController {
 			await this.ctx.session.setActiveToolsByName(this.#restoreToolsWithCurrentMCPSelection(this.#previousTools), {
 				explicit: false,
 				persistMCPSelection: false,
+				retryOnMcpCatalogChange: true,
 			});
 		const currentState = this.ctx.session.getGoalModeState();
 		if (options?.reason === "completed") {
