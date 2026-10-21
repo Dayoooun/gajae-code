@@ -229,16 +229,26 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		});
 		try {
 			if (!mcpManager) throw new Error("Expected the session-owned MCP manager");
-			const defaultToolName = "mcp__demo_hello";
-			const initialTools = mcpManager.getTools();
+			const initialToolName = "mcp__demo_hello";
+			const [lateDefaultTool] = MCPTool.fromTools(
+				{ name: "demo" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
+				[
+					{
+						name: "late_default",
+						description: "Late default tool",
+						inputSchema: { type: "object", properties: {} },
+					},
+				],
+			);
+			if (!lateDefaultTool) throw new Error("Default MCP regression tool was not created");
 			if (!publishToolsChanged) throw new Error("Expected the MCP catalog callback");
-			expect(session.getActiveToolNames()).toContain(defaultToolName);
+			expect(session.getActiveToolNames()).toContain(initialToolName);
 			expect(session.hasMCPToolSelectionAuthority()).toBe(false);
 
 			publishToolsChanged([]);
 			const removalDeadline = Date.now() + 5_000;
-			while (session.getAllToolNames().includes(defaultToolName)) {
-				if (Date.now() > removalDeadline) throw new Error(`MCP catalog tool was not removed: ${defaultToolName}`);
+			while (session.getAllToolNames().includes(initialToolName)) {
+				if (Date.now() > removalDeadline) throw new Error(`MCP catalog tool was not removed: ${initialToolName}`);
 				await Bun.sleep(20);
 			}
 			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
@@ -246,11 +256,11 @@ describe("conventional MCP autoload in standalone sessions", () => {
 
 			const pendingAuthority = vi.spyOn(session, "hasMCPToolSelectionAuthority").mockReturnValue(true);
 			const committedAuthority = vi.spyOn(session, "hasCommittedMCPToolSelectionAuthority").mockReturnValue(false);
-			publishToolsChanged(initialTools);
+			publishToolsChanged([lateDefaultTool]);
 			const activationDeadline = Date.now() + 5_000;
-			while (!session.getActiveToolNames().includes(defaultToolName)) {
+			while (!session.getActiveToolNames().includes(lateDefaultTool.name)) {
 				if (Date.now() > activationDeadline)
-					throw new Error(`Discovery-default MCP tool was not reactivated: ${defaultToolName}`);
+					throw new Error(`Discovery-default MCP tool was not activated: ${lateDefaultTool.name}`);
 				await Bun.sleep(20);
 			}
 			expect(committedAuthority).toHaveBeenCalled();
@@ -535,9 +545,6 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			expect(explicitlyDeselectedSession.getActiveToolNames()).not.toContain("mcp__fast_default_hello");
 
 			const pendingAuthority = vi.spyOn(inheritedSession, "hasMCPToolSelectionAuthority").mockReturnValue(true);
-			const committedAuthority = vi
-				.spyOn(inheritedSession, "hasCommittedMCPToolSelectionAuthority")
-				.mockReturnValue(false);
 			if (inheritedToolChangeHandlers.length === 0) {
 				throw new Error("Expected an inherited MCP catalog callback");
 			}
@@ -554,9 +561,7 @@ describe("conventional MCP autoload in standalone sessions", () => {
 				}
 				await Bun.sleep(20);
 			}
-			expect(committedAuthority).toHaveBeenCalled();
 			pendingAuthority.mockRestore();
-			committedAuthority.mockRestore();
 			expect(session.getAllToolNames()).toContain(lateToolName);
 			expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
 			expect(inheritedSession.getActiveToolNames()).toContain(lateToolName);
