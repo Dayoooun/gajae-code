@@ -496,6 +496,66 @@ describe("AgentSession MCP discovery", () => {
 		expect(session.getActiveToolNames()).not.toContain(lateTool.name);
 	});
 
+	it("does not apply a catalog retry after a new session commits", async () => {
+		const readTool = createBasicTool("read", "Read");
+		const findTool = createBasicTool("find", "Find");
+		const firstRebuildStarted = Promise.withResolvers<void>();
+		const releaseFirstRebuild = Promise.withResolvers<void>();
+		const retryRebuildStarted = Promise.withResolvers<void>();
+		const releaseRetryRebuild = Promise.withResolvers<void>();
+		let findRebuildCount = 0;
+		const lateTool = createMcpCustomTool("mcp__late_search", "docs", "search", "Search docs", ["query"]);
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: createModel(),
+					systemPrompt: ["initial"],
+					tools: [readTool],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
+			toolRegistry: new Map([
+				[readTool.name, readTool],
+				[findTool.name, findTool],
+			]),
+			mcpDiscoveryEnabled: true,
+			rebuildSystemPrompt: async toolNames => {
+				if (toolNames.includes(findTool.name)) {
+					findRebuildCount += 1;
+					if (findRebuildCount === 1) {
+						firstRebuildStarted.resolve();
+						await releaseFirstRebuild.promise;
+					} else {
+						retryRebuildStarted.resolve();
+						await releaseRetryRebuild.promise;
+					}
+				}
+				return { systemPrompt: [`tools:${toolNames.join(",")}`] };
+			},
+		});
+		sessions.push(session);
+
+		const pendingSelection = session.setActiveToolsByName(["read", "find"], {
+			explicit: false,
+			persistMCPSelection: false,
+			retryOnMcpCatalogChange: true,
+		});
+		await firstRebuildStarted.promise;
+		await session.refreshMCPTools([lateTool], { persistMCPSelection: false });
+		releaseFirstRebuild.resolve();
+		await retryRebuildStarted.promise;
+
+		await expect(session.newSession()).resolves.toBe(true);
+		releaseRetryRebuild.resolve();
+		await expect(pendingSelection).rejects.toThrow(/superseded/);
+		expect(session.getActiveToolNames()).toEqual(["read"]);
+	});
+
 	it("does not persist catalog pruning of a non-persisting live MCP selection", async () => {
 		const readTool = createBasicTool("read", "Read");
 		const persistedTool = createMcpCustomTool("mcp__docs_search", "docs", "search", "Search docs", ["query"]);

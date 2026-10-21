@@ -13001,10 +13001,14 @@ export class AgentSession {
 		}
 		try {
 			let appliedRevision = await this.#applyActiveToolsByName(toolNames, {
+				sessionTransitionGeneration,
 				explicitActiveToolSelectionGeneration,
 				persistMCPSelection: options?.persistMCPSelection,
 			});
 			if (options?.retryOnMcpCatalogChange && appliedRevision === undefined) {
+				if (sessionTransitionGeneration !== this.#sessionTransitionGeneration) {
+					throw new Error("Active tool selection was superseded by a session transition");
+				}
 				if (initialMcpCatalogGeneration === this.#mcpCatalogGeneration) {
 					throw new Error("Active tool selection was superseded before it could be applied");
 				}
@@ -13026,6 +13030,7 @@ export class AgentSession {
 					appliedRevision = await this.#applyActiveToolsByName(
 						[...new Set([...nonMCPToolNames, ...currentMCPToolNames])],
 						{
+							sessionTransitionGeneration,
 							explicitActiveToolSelectionGeneration,
 							persistMCPSelection: options.persistMCPSelection,
 						},
