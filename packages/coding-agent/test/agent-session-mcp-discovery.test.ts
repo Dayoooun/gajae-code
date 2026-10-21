@@ -434,6 +434,68 @@ describe("AgentSession MCP discovery", () => {
 		expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
 	});
 
+	it("does not restore an uncommitted MCP selection after overlapping explicit requests fail", async () => {
+		const readTool = createBasicTool("read", "Read");
+		const findTool = createBasicTool("find", "Find");
+		const searchTool = createBasicTool("search", "Search");
+		const firstRebuildStarted = Promise.withResolvers<void>();
+		const releaseFirstRebuild = Promise.withResolvers<void>();
+		const secondRebuildStarted = Promise.withResolvers<void>();
+		const releaseSecondRebuild = Promise.withResolvers<void>();
+		const lateTool = createMcpCustomTool("mcp__late_search", "docs", "search", "Search docs", ["query"]);
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: createModel(),
+					systemPrompt: ["initial"],
+					tools: [readTool],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
+			toolRegistry: new Map([
+				[readTool.name, readTool],
+				[findTool.name, findTool],
+				[searchTool.name, searchTool],
+			]),
+			mcpDiscoveryEnabled: true,
+			rebuildSystemPrompt: async toolNames => {
+				if (toolNames.includes(findTool.name)) {
+					firstRebuildStarted.resolve();
+					await releaseFirstRebuild.promise;
+					throw new Error("first rebuild failed");
+				}
+				if (toolNames.includes(searchTool.name)) {
+					secondRebuildStarted.resolve();
+					await releaseSecondRebuild.promise;
+					throw new Error("second rebuild failed");
+				}
+				return { systemPrompt: [`tools:${toolNames.join(",")}`] };
+			},
+		});
+		sessions.push(session);
+
+		const firstSelection = session.setActiveToolsByName(["read", "find", "mcp__late_search"]);
+		await firstRebuildStarted.promise;
+		const secondSelection = session.setActiveToolsByName(["read", "search", "mcp__other_late"]);
+		await secondRebuildStarted.promise;
+
+		releaseSecondRebuild.resolve();
+		await expect(secondSelection).rejects.toThrow("second rebuild failed");
+		releaseFirstRebuild.resolve();
+		await expect(firstSelection).rejects.toThrow("first rebuild failed");
+
+		expect(session.hasMCPToolSelectionAuthority()).toBe(false);
+		expect(session.getSelectedMCPToolNames()).toEqual([]);
+		await session.refreshMCPTools([lateTool], { persistMCPSelection: false });
+		expect(session.getActiveToolNames()).toEqual(["read"]);
+		expect(session.getActiveToolNames()).not.toContain(lateTool.name);
+	});
+
 	it("does not persist catalog pruning of a non-persisting live MCP selection", async () => {
 		const readTool = createBasicTool("read", "Read");
 		const persistedTool = createMcpCustomTool("mcp__docs_search", "docs", "search", "Search docs", ["query"]);

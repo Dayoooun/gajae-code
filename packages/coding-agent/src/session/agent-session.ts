@@ -4172,6 +4172,9 @@ export class AgentSession {
 	#hasExplicitActiveToolSelectionForContext = false;
 	#explicitMCPToolSelectionForContext: string[] | undefined;
 	#explicitMCPToolSelectionPersistsForContext = true;
+	#committedHasExplicitActiveToolSelectionForContext = false;
+	#committedExplicitMCPToolSelectionForContext: string[] | undefined;
+	#committedExplicitMCPToolSelectionPersistsForContext = true;
 	#mcpCatalogGeneration = 0;
 	#baselineDiscoveredBuiltinToolNames = new Set<string>();
 	#discoverableToolAllowedNames: ReadonlySet<string> | undefined;
@@ -11768,9 +11771,30 @@ export class AgentSession {
 	#clearConstructorToolSelectionAuthority(): void {
 		this.#constructorMCPToolSelection = undefined;
 		this.#constructorDiscoveredBuiltinToolSelection = undefined;
+		this.#resetExplicitMCPToolSelectionAuthority();
+	}
+
+	#commitExplicitMCPToolSelectionAuthority(): void {
+		this.#committedHasExplicitActiveToolSelectionForContext = this.#hasExplicitActiveToolSelectionForContext;
+		this.#committedExplicitMCPToolSelectionForContext = this.#explicitMCPToolSelectionForContext
+			? [...this.#explicitMCPToolSelectionForContext]
+			: undefined;
+		this.#committedExplicitMCPToolSelectionPersistsForContext = this.#explicitMCPToolSelectionPersistsForContext;
+	}
+
+	#restoreCommittedExplicitMCPToolSelectionAuthority(): void {
+		this.#hasExplicitActiveToolSelectionForContext = this.#committedHasExplicitActiveToolSelectionForContext;
+		this.#explicitMCPToolSelectionForContext = this.#committedExplicitMCPToolSelectionForContext
+			? [...this.#committedExplicitMCPToolSelectionForContext]
+			: undefined;
+		this.#explicitMCPToolSelectionPersistsForContext = this.#committedExplicitMCPToolSelectionPersistsForContext;
+	}
+
+	#resetExplicitMCPToolSelectionAuthority(): void {
 		this.#hasExplicitActiveToolSelectionForContext = false;
 		this.#explicitMCPToolSelectionForContext = undefined;
 		this.#explicitMCPToolSelectionPersistsForContext = true;
+		this.#commitExplicitMCPToolSelectionAuthority();
 	}
 
 	#getSelectedDiscoveredBuiltinToolNames(): string[] {
@@ -12487,6 +12511,7 @@ export class AgentSession {
 						...new Set([...(this.#explicitMCPToolSelectionForContext ?? []), ...activatedMCPToolNames]),
 					];
 					this.#explicitMCPToolSelectionPersistsForContext = persistMCPSelection !== false;
+					this.#commitExplicitMCPToolSelectionAuthority();
 				}
 				if (appliedRevision === undefined || appliedRevision !== this.#activeToolSelectionRevision) {
 					if (
@@ -12957,9 +12982,6 @@ export class AgentSession {
 		const explicitActiveToolSelectionGeneration = isExplicit
 			? ++this.#explicitActiveToolSelectionGeneration
 			: this.#explicitActiveToolSelectionGeneration;
-		const previousHasExplicitActiveToolSelectionForContext = this.#hasExplicitActiveToolSelectionForContext;
-		const previousExplicitMCPToolSelectionForContext = this.#explicitMCPToolSelectionForContext;
-		const previousExplicitMCPToolSelectionPersistsForContext = this.#explicitMCPToolSelectionPersistsForContext;
 		if (isExplicit) {
 			this.#hasExplicitActiveToolSelectionForContext = true;
 			this.#explicitMCPToolSelectionForContext = explicitMCPToolNames;
@@ -13011,20 +13033,20 @@ export class AgentSession {
 					this.sessionManager.appendMCPToolSelection(selectedMCPToolNames);
 				}
 			}
+			if (isExplicit && explicitActiveToolSelectionGeneration === this.#explicitActiveToolSelectionGeneration) {
+				if (appliedRevision !== undefined) this.#commitExplicitMCPToolSelectionAuthority();
+				else this.#restoreCommittedExplicitMCPToolSelectionAuthority();
+			}
 		} catch (error) {
 			if (isExplicit && explicitActiveToolSelectionGeneration === this.#explicitActiveToolSelectionGeneration) {
-				this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
-				this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
-				this.#explicitMCPToolSelectionPersistsForContext = previousExplicitMCPToolSelectionPersistsForContext;
+				this.#restoreCommittedExplicitMCPToolSelectionAuthority();
 			}
 			throw error;
 		}
 	}
 
 	async #restoreMCPSelectionsForSessionContext(sessionContext: SessionContext): Promise<void> {
-		this.#hasExplicitActiveToolSelectionForContext = false;
-		this.#explicitMCPToolSelectionForContext = undefined;
-		this.#explicitMCPToolSelectionPersistsForContext = true;
+		this.#resetExplicitMCPToolSelectionAuthority();
 		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") {
 			await this.#attachAskToolIfWorkflowActive();
 			return;
@@ -28771,11 +28793,13 @@ export class AgentSession {
 			const previousPreProfileModel = this.#preProfileModel;
 			const previousServiceTier = this.agent.serviceTier;
 			const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
-			const previousHasExplicitActiveToolSelectionForContext = this.#hasExplicitActiveToolSelectionForContext;
-			const previousExplicitMCPToolSelectionForContext = this.#explicitMCPToolSelectionForContext
-				? [...this.#explicitMCPToolSelectionForContext]
+			const previousHasExplicitActiveToolSelectionForContext =
+				this.#committedHasExplicitActiveToolSelectionForContext;
+			const previousExplicitMCPToolSelectionForContext = this.#committedExplicitMCPToolSelectionForContext
+				? [...this.#committedExplicitMCPToolSelectionForContext]
 				: undefined;
-			const previousExplicitMCPToolSelectionPersistsForContext = this.#explicitMCPToolSelectionPersistsForContext;
+			const previousExplicitMCPToolSelectionPersistsForContext =
+				this.#committedExplicitMCPToolSelectionPersistsForContext;
 			const previousTools = [...this.agent.state.tools];
 			const previousBaseSystemPrompt = this.#baseSystemPrompt;
 			const previousSystemPrompt = this.agent.state.systemPrompt;
@@ -29239,6 +29263,7 @@ export class AgentSession {
 				this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
 				this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
 				this.#explicitMCPToolSelectionPersistsForContext = previousExplicitMCPToolSelectionPersistsForContext;
+				this.#commitExplicitMCPToolSelectionAuthority();
 				this.#selectedMCPToolNames = new Set(previousSelectedMCPToolNames);
 				this.#activeToolSelectionRevision++;
 				this.agent.setTools(previousTools);
