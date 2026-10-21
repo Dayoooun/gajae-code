@@ -388,6 +388,69 @@ describe("AgentSession MCP discovery", () => {
 		expect(session.getActiveMCPToolNames()).toEqual([docsSearchTool.name, slackSendTool.name]);
 	});
 
+	it("does not adopt a pending MCP selection during catalog replacement", async () => {
+		const readTool = createBasicTool("read", "Read");
+		const docsSearchToolName = "mcp__docs_search";
+		const docsSearchCustomTool = createMcpCustomTool(docsSearchToolName, "docs", "search", "Search docs", ["query"]);
+		const replacementDocsSearchTool = createMcpCustomTool(
+			docsSearchToolName,
+			"docs",
+			"search",
+			"Search docs with refreshed metadata",
+			["query"],
+		);
+		const explicitRebuildStarted = Promise.withResolvers<void>();
+		const releaseExplicitRebuild = Promise.withResolvers<void>();
+		let blockExplicitRebuild = true;
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: createModel(),
+					systemPrompt: ["initial"],
+					tools: [readTool],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
+			toolRegistry: new Map([[readTool.name, readTool]]),
+			mcpDiscoveryEnabled: true,
+			rebuildSystemPrompt: async toolNames => {
+				if (blockExplicitRebuild && toolNames.includes(docsSearchToolName)) {
+					blockExplicitRebuild = false;
+					explicitRebuildStarted.resolve();
+					await releaseExplicitRebuild.promise;
+				}
+				return { systemPrompt: [`tools:${toolNames.join(",")}`] };
+			},
+		});
+		sessions.push(session);
+
+		await session.refreshMCPTools([docsSearchCustomTool], { persistMCPSelection: false });
+		const explicitSelection = session.setActiveToolsByName([readTool.name, docsSearchToolName], {
+			persistMCPSelection: false,
+		});
+		try {
+			await explicitRebuildStarted.promise;
+			const replacement = session.replaceNamedCustomTools([docsSearchToolName], [replacementDocsSearchTool], {
+				activateNewTools: false,
+				persistMCPSelection: false,
+			});
+			releaseExplicitRebuild.resolve();
+			await Promise.all([explicitSelection, replacement]);
+		} finally {
+			releaseExplicitRebuild.resolve();
+		}
+
+		expect(session.getActiveToolNames()).toEqual([readTool.name]);
+		expect(session.getSelectedMCPToolNames()).toEqual([]);
+		expect(session.hasMCPToolSelectionAuthority()).toBe(false);
+		expect(session.buildDisplaySessionContext().hasPersistedMCPToolSelection).toBe(false);
+	});
+
 	it("keeps configured MCP defaults after explicit tool application fails", async () => {
 		const readTool = createBasicTool("read", "Read");
 		const docsSearchTool = createMcpCustomTool("mcp__docs_search", "docs", "search", "Search docs", ["query"]);

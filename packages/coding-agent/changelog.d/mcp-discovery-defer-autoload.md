@@ -14,3 +14,4 @@
 - Plan-mode retries preserve registered local tools whose names begin with `mcp__`.
 - Plan approval preserves late default-server tools and transferred MCP selections without overriding successor-owned selections.
 - Pending goal activation drops its new goal when a concurrent explicit tool selection supersedes the goal-tool swap, releasing the mode gate.
+- Catalog refreshes use committed MCP selection authority so an in-flight tool request cannot leak into a replacement catalog.

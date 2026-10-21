@@ -6605,16 +6605,18 @@ export class AgentSession {
 				expectedActiveToolSelectionRevision: activeToolSelectionRevision,
 				persistMCPSelection:
 					options?.persistMCPSelection ??
-					(this.#hasExplicitActiveToolSelectionForContext
-						? this.#explicitMCPToolSelectionPersistsForContext
+					(this.#committedHasExplicitActiveToolSelectionForContext
+						? this.#committedExplicitMCPToolSelectionPersistsForContext
 						: undefined),
 			},
 		);
 	}
 
 	#getMCPToolSelectionAuthorityNames(): string[] | undefined {
-		if (this.#hasExplicitActiveToolSelectionForContext)
-			return [...(this.#explicitMCPToolSelectionForContext ?? [])];
+		// Catalog reconciliation must observe committed selection state, not an explicit
+		// request whose prompt rebuild may still fail or be superseded by this update.
+		if (this.#committedHasExplicitActiveToolSelectionForContext)
+			return [...(this.#committedExplicitMCPToolSelectionForContext ?? [])];
 		const sessionContext = this.buildDisplaySessionContext();
 		if (sessionContext.hasPersistedMCPToolSelection) return [...sessionContext.selectedMCPToolNames];
 		return this.#constructorMCPToolSelection === undefined ? undefined : [...this.#constructorMCPToolSelection];
@@ -13256,7 +13258,8 @@ export class AgentSession {
 		this.#pruneSelectedMCPToolNames();
 		const hasPersistedMCPToolSelection = this.buildDisplaySessionContext().hasPersistedMCPToolSelection;
 		const hasLiveMCPToolSelectionAuthority =
-			this.#mcpDiscoveryEnabled && this.hasMCPToolSelectionAuthority();
+			this.#mcpDiscoveryEnabled &&
+			(this.#constructorMCPToolSelection !== undefined || this.#committedHasExplicitActiveToolSelectionForContext);
 		const authoritativeMCPToolNames = this.#getMCPToolSelectionAuthorityNames();
 		if (options.selectedMCPToolNames) {
 			this.#selectedMCPToolNames = new Set(this.#filterSelectableMCPToolNames(options.selectedMCPToolNames));
@@ -13275,8 +13278,8 @@ export class AgentSession {
 			previousSelectedMCPToolNames,
 			persistMCPSelection:
 				options.persistMCPSelection ??
-				(this.#hasExplicitActiveToolSelectionForContext
-					? this.#explicitMCPToolSelectionPersistsForContext
+				(this.#committedHasExplicitActiveToolSelectionForContext
+					? this.#committedExplicitMCPToolSelectionPersistsForContext
 					: hasPersistedMCPToolSelection),
 		});
 	}
