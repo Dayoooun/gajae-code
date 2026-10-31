@@ -5811,14 +5811,14 @@ function materializeProviderVisibleEntrySync(entry: SessionEntry, stores: Reside
 const COLD_SPILL_NOTICE = "[Compacted history content evicted to durable cold storage]";
 const COLD_SPILL_ARGUMENTS_SENTINEL_KEY = "__gjcColdSpillArguments";
 const COLD_SPILL_MIN_CHARS = 1024;
-const COLD_SPILL_PATH_SEGMENT_SEPARATOR = "\0"; // Null byte: cannot appear in JSON keys
-
 /**
- * Join path segments with a separator that cannot collide with key names.
- * This prevents collisions like `message.details['a.b']` vs `message.details.a.b`.
+ * Append one segment to a cold-spill payload path. Segments are dot-joined so paths written by
+ * earlier releases (`message.content.0.text`) keep resolving; `\\` and `.` inside a key are
+ * backslash-escaped so `details["a.b"]` and `details.a.b` cannot collide.
  */
 function coldSpillPathJoin(base: string, segment: string | number): string {
-	return `${base}${COLD_SPILL_PATH_SEGMENT_SEPARATOR}${segment}`;
+	const escaped = typeof segment === "number" ? String(segment) : segment.replace(/[\\.]/g, "\\$&");
+	return `${base}.${escaped}`;
 }
 
 type ColdSpillWrite = {
@@ -6115,7 +6115,7 @@ function rehydrateColdSpillValue(
 	value: unknown,
 	marker: EvictedContentMarker | undefined,
 	blobStore: BlobStore,
-	basePath: string = "root",
+	basePath: string,
 	residentStores?: ResidentBlobStores,
 ): unknown {
 	const directRef = marker?.payloads[basePath];

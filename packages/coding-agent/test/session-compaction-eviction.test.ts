@@ -26,14 +26,6 @@ const BASE = 200_000;
 const EXPLICIT_SMALL_BOUND = 100_000;
 const CHUNK_CHARS = 500;
 const CHUNKS_PER_TURN = Math.ceil(TURN_PAYLOAD_CHARS / CHUNK_CHARS);
-const COLD_SPILL_PATH_SEPARATOR = "\0"; // Matches the separator in session-manager.ts
-
-/** Convert dot-separated paths to null-byte-separated paths for test assertions */
-function toNewPathFormat(dotPath: string): string {
-	// Split by dots, but preserve numeric array indices and quoted keys
-	const segments = dotPath.split(".");
-	return segments.join(COLD_SPILL_PATH_SEPARATOR);
-}
 
 function chunkedText(prefix: string): Array<{ type: "text"; text: string }> {
 	return Array.from({ length: CHUNKS_PER_TURN }, (_, index) => ({
@@ -640,7 +632,7 @@ describe("SessionManager compacted cold-spill eviction", () => {
 		expect(result.residentImageReadCount).toBe(0);
 		const canonicalAfter = session.getCanonicalEntryForTests(oldAssistantEntryId) as SessionMessageEntry;
 		const sentinel = coldSpillArgumentsSentinel(toolCallArguments(canonicalAfter));
-		expect(sentinel.refPath).toBe(toNewPathFormat("message.content.0.arguments"));
+		expect(sentinel.refPath).toBe("message.content.0.arguments");
 		expect(sentinel.notice).toBe("[Compacted history content evicted to durable cold storage]");
 
 		expectToolArgumentArrayPayload(
@@ -658,7 +650,7 @@ describe("SessionManager compacted cold-spill eviction", () => {
 		expect(exportEntry).toBeDefined();
 		expectToolArgumentArrayPayload(exportEntry as SessionMessageEntry, argumentPayload);
 		const hot = session.getCanonicalEntryForTests(oldAssistantEntryId) as SessionMessageEntry;
-		const aggregatePayloadRef = hot.evictedContent?.payloads[toNewPathFormat("message.content.0.arguments")];
+		const aggregatePayloadRef = hot.evictedContent?.payloads["message.content.0.arguments"];
 		expect(aggregatePayloadRef).toBeDefined();
 		expectNoResidentSentinel(session.getEntryForFidelity(oldAssistantEntryId));
 	});
@@ -722,7 +714,7 @@ describe("SessionManager compacted cold-spill eviction", () => {
 		const hotContent = "content" in hotMessage && Array.isArray(hotMessage.content) ? hotMessage.content : [];
 		const textBlock = hotContent.find((block): block is TextContent => block.type === "text");
 		expect(textBlock?.text).toBe("[Compacted history content evicted to durable cold storage]");
-		expect(hot.evictedContent?.payloads[toNewPathFormat("message.content.0.text")]).toBeDefined();
+		expect(hot.evictedContent?.payloads["message.content.0.text"]).toBeDefined();
 
 		const fidelity = session.getEntryForFidelity(oldEntryId) as SessionMessageEntry;
 		expect(messageContentText(fidelity)).toContain(oldNeedle);
@@ -744,7 +736,7 @@ describe("SessionManager compacted cold-spill eviction", () => {
 		expect(result.residentTextReadCount).toBe(1);
 
 		const hot = session.getCanonicalEntryForTests(oldEntryId) as SessionMessageEntry;
-		const ref = hot.evictedContent?.payloads[toNewPathFormat("message.content.0.text")];
+		const ref = hot.evictedContent?.payloads["message.content.0.text"];
 		expect(ref).toBeDefined();
 		// originalChars must be the UTF-8 BYTE length, proving eviction did not call
 		// data.toString("utf8") (which would yield the smaller JS string length).
@@ -768,9 +760,7 @@ describe("SessionManager compacted cold-spill eviction", () => {
 		const canonicalAfter = session.getCanonicalEntryForTests(oldAssistantEntryId) as SessionMessageEntry;
 		const afterArgs = toolCallArguments(canonicalAfter) as { payload?: unknown };
 		expect(afterArgs.payload).toBe("[Compacted history content evicted to durable cold storage]");
-		expect(
-			canonicalAfter.evictedContent?.payloads[toNewPathFormat("message.content.0.arguments.payload")],
-		).toBeDefined();
+		expect(canonicalAfter.evictedContent?.payloads["message.content.0.arguments.payload"]).toBeDefined();
 
 		expectToolArgumentPayload(session.getEntryForFidelity(oldAssistantEntryId) as SessionMessageEntry, largeArgument);
 		const branchEntry = session
@@ -816,13 +806,11 @@ describe("SessionManager compacted cold-spill eviction", () => {
 			aggregate?: unknown;
 		};
 		expect(afterArgs.resident?.nested).toBe("[Compacted history content evicted to durable cold storage]");
-		const residentRef =
-			canonicalAfter.evictedContent?.payloads[toNewPathFormat("message.content.0.arguments.resident.nested")];
+		const residentRef = canonicalAfter.evictedContent?.payloads["message.content.0.arguments.resident.nested"];
 		expect(residentRef).toBeDefined();
 		const aggregateSentinel = coldSpillArgumentsSentinel(afterArgs.aggregate);
-		expect(aggregateSentinel.refPath).toBe(toNewPathFormat("message.content.0.arguments.aggregate"));
-		const aggregateRef =
-			canonicalAfter.evictedContent?.payloads[toNewPathFormat("message.content.0.arguments.aggregate")];
+		expect(aggregateSentinel.refPath).toBe("message.content.0.arguments.aggregate");
+		const aggregateRef = canonicalAfter.evictedContent?.payloads["message.content.0.arguments.aggregate"];
 		expect(aggregateRef).toBeDefined();
 
 		const fidelity = session.getEntryForFidelity(oldAssistantEntryId) as SessionMessageEntry;
@@ -889,9 +877,7 @@ describe("SessionManager compacted cold-spill eviction", () => {
 			const residentHot = session.getCanonicalEntryForTests(residentEntryId) as SessionMessageEntry;
 			const residentHotArgs = toolCallArguments(residentHot) as { payload?: unknown };
 			expect(residentHotArgs.payload).toBe("[Compacted history content evicted to durable cold storage]");
-			expect(
-				residentHot.evictedContent?.payloads[toNewPathFormat("message.content.0.arguments.payload")],
-			).toBeDefined();
+			expect(residentHot.evictedContent?.payloads["message.content.0.arguments.payload"]).toBeDefined();
 			await session.ensureOnDisk();
 			await session.rewriteEntries();
 			await session.flush();
@@ -977,12 +963,10 @@ describe("SessionManager compacted cold-spill eviction", () => {
 			expect(session.hotRetainedMessageCharsForTests()).toBeLessThan(ONE_MIB_CHARS);
 			expect(session.hotRetainedMessageCharsForTests()).toBeLessThan(before * 0.05);
 			const canonicalAfter = session.getCanonicalEntryForTests(oldAssistantEntryId) as SessionMessageEntry;
-			const aggregateRef =
-				canonicalAfter.evictedContent?.payloads[toNewPathFormat("message.content.0.arguments.aggregate")];
+			const aggregateRef = canonicalAfter.evictedContent?.payloads["message.content.0.arguments.aggregate"];
 			expect(aggregateRef).toBeDefined();
 			expectColdBlobSentinelFree(aggregateRef as ColdSpillRef, aggregatePayload);
-			const residentRef =
-				canonicalAfter.evictedContent?.payloads[toNewPathFormat("message.content.0.arguments.resident.nested")];
+			const residentRef = canonicalAfter.evictedContent?.payloads["message.content.0.arguments.resident.nested"];
 			expect(residentRef).toBeDefined();
 
 			await session.ensureOnDisk();
@@ -1148,9 +1132,7 @@ describe("SessionManager compacted cold-spill eviction", () => {
 			const hotResult = session.getCanonicalEntryForTests(resultId) as SessionMessageEntry;
 			expect(JSON.stringify(hotResult)).not.toContain(screenshot);
 			expect(
-				Object.keys(hotResult.evictedContent?.payloads ?? {}).some(key =>
-					key.startsWith(toNewPathFormat("message.details")),
-				),
+				Object.keys(hotResult.evictedContent?.payloads ?? {}).some(key => key.startsWith("message.details")),
 			).toBe(true);
 			const hotAssistant = session.getCanonicalEntryForTests(assistantId) as SessionMessageEntry;
 			expect(JSON.stringify(hotAssistant)).not.toContain(signature);
@@ -1198,12 +1180,7 @@ describe("SessionManager compacted cold-spill eviction", () => {
 			session.evictCompactedContent(firstKeptEntryId, compactionEntryId);
 
 			const evicted = session.getCanonicalEntryForTests(toolEntryId) as SessionMessageEntry;
-			const payloadsMap = evicted.evictedContent?.payloads ?? {};
-			const payloadKeys = Object.keys(payloadsMap);
-			// The arguments might be spilled as a whole or recursively depending on content
-			// For this test, we just need to verify that something was evicted
-			expect(payloadKeys.length).toBeGreaterThan(0);
-			const ref = payloadKeys.length > 0 ? (payloadsMap[payloadKeys[0]] as ColdSpillRef) : undefined;
+			const ref = evicted.evictedContent?.payloads["message.content.0.arguments"] as ColdSpillRef;
 			expect(ref).toBeDefined();
 
 			await session.ensureOnDisk();
@@ -1367,19 +1344,13 @@ describe("SessionManager compacted cold-spill eviction", () => {
 		let reopened: SessionManager | undefined;
 		try {
 			const session = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, root));
-			// Create a tool result with details containing both a dotted key and nested keys
-			// The details object will be cold-spilled recursively
+			// `field` holds a sentinel-shaped value, so cold-spill descends into it and spills `field.a`
+			// on its own. Its path must not collide with the sibling top-level key "field.a".
 			const detailsWithCollision = {
-				"field.a": Array.from({ length: 1000 }, (_, i) => ({ index: i, data: `collision-${i}` })), // Dotted key
+				"field.a": Array.from({ length: 1000 }, (_, i) => ({ index: i, data: `collision-${i}` })),
 				field: {
-					a: Array.from({ length: 1000 }, (_, i) => ({ index: i, data: `nested-${i}` })), // Nested key: field.a
-				},
-				// Add extra large payloads to trigger nested cold-spilling
-				nested: {
-					"x.y": Array.from({ length: 1000 }, (_, i) => ({ index: i, data: `xy-${i}` })),
-					x: {
-						y: Array.from({ length: 1000 }, (_, i) => ({ index: i, data: `xy-nested-${i}` })),
-					},
+					a: Array.from({ length: 1000 }, (_, i) => ({ index: i, data: `nested-${i}` })),
+					raw: { __gjcResidentBlob: true, kind: "text" as const, ref: `blob:sha256:${"e".repeat(64)}` },
 				},
 			};
 			const resultId = session.appendMessage({
@@ -1416,11 +1387,6 @@ describe("SessionManager compacted cold-spill eviction", () => {
 				| undefined;
 			expect(restoredDetails?.["field.a"]).toEqual(detailsWithCollision["field.a"]);
 			expect((restoredDetails?.field as Record<string, unknown>)?.a).toEqual(detailsWithCollision.field.a);
-			expect((restoredDetails?.nested as Record<string, unknown>)?.["x.y"]).toEqual(
-				detailsWithCollision.nested["x.y"],
-			);
-			const nestedX = (restoredDetails?.nested as Record<string, unknown>)?.x as Record<string, unknown> | undefined;
-			expect(nestedX?.y).toEqual(detailsWithCollision.nested.x.y);
 		} finally {
 			await reopened?.close();
 			await fs.promises.rm(root, { recursive: true, force: true });
