@@ -664,15 +664,16 @@ pub struct NativeExactUnlinkResult {
 	/// namespace mutation.
 	pub windows_error_code: Option<String>,
 	/// ACL failure details: offending principal (account name or SID string).
-	/// Present only when code is "acl_present" on Windows exact-replace
+	/// Present only when code is `acl_present` on Windows exact-replace
 	/// pre-mutation failures.
 	pub acl_failure_principal: Option<String>,
 	/// ACL failure detail: whether the offending ACE is inherited from a parent
-	/// directory. Present only when code is "acl_present" on Windows
+	/// directory. Present only when code is `acl_present` on Windows
 	/// exact-replace pre-mutation failures.
 	pub acl_failure_inherited: Option<bool>,
-	/// ACL failure detail: identifies which path failed ACL validation ("source" or "destination").
-	/// Present only when code is "acl_present" on Windows exact-replace pre-mutation failures.
+	/// ACL failure detail: identifies which path failed ACL validation
+	/// (`source` or `destination`). Present only when code is `acl_present` on
+	/// Windows exact-replace pre-mutation failures.
 	pub acl_failure_side: Option<String>,
 }
 
@@ -13339,7 +13340,9 @@ mod platform {
 		if source_information.nNumberOfLinks != 1 {
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
 		}
-		if let Err(failure) = verify_executable_ownership_no_shared_write(source.target, Some("source")) {
+		if let Err(failure) =
+			verify_executable_ownership_no_shared_write(source.target, Some("source"))
+		{
 			return failure;
 		}
 		let Some(parent_handle) = source.parent() else {
@@ -13408,7 +13411,9 @@ mod platform {
 		if information.nNumberOfLinks != 1 {
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
 		}
-		if let Err(failure) = verify_executable_ownership_no_shared_write(destination.target, Some("destination")) {
+		if let Err(failure) =
+			verify_executable_ownership_no_shared_write(destination.target, Some("destination"))
+		{
 			return failure;
 		}
 		match handles_same_object_checked(source.target, destination.target) {
@@ -13512,6 +13517,7 @@ mod platform {
 						windows_error_code: None,
 						acl_failure_principal: None,
 						acl_failure_inherited: None,
+						acl_failure_side: None,
 					}
 				}
 			},
@@ -13741,6 +13747,7 @@ mod platform {
 					windows_error_code: None,
 					acl_failure_principal: None,
 					acl_failure_inherited: None,
+					acl_failure_side: None,
 				};
 			},
 		};
@@ -13960,6 +13967,7 @@ mod platform {
 					windows_error_code: None,
 					acl_failure_principal: None,
 					acl_failure_inherited: None,
+					acl_failure_side: None,
 				};
 			},
 		};
@@ -15500,6 +15508,7 @@ mod platform {
 							windows_error_code: None,
 							acl_failure_principal: None,
 							acl_failure_inherited: None,
+							acl_failure_side: None,
 						};
 					},
 				}
@@ -15516,6 +15525,7 @@ mod platform {
 					windows_error_code: None,
 					acl_failure_principal: None,
 					acl_failure_inherited: None,
+					acl_failure_side: None,
 				};
 			},
 		};
