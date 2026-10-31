@@ -5939,9 +5939,19 @@ function coldSpillContentBlock(
 		return { ...block, text: coldSpillTextValue(text, `${basePath}.text`, writes) };
 	}
 	if (block.type === "thinking") {
-		const thinking = block.thinking;
-		if (typeof thinking !== "string" || thinking.length < COLD_SPILL_MIN_CHARS) return block;
-		return { ...block, thinking: coldSpillTextValue(thinking, `${basePath}.thinking`, writes) };
+		// Encrypted signatures are often far larger than the visible thinking (empty
+		// thinking with a multi-KB signature is common); spill both fields
+		// independently, including resident-blob sentinels, so compacted history does
+		// not keep them in the transcript forever.
+		const thinking = coldSpillSubtreeValue(block.thinking, `${basePath}.thinking`, writes, promotion);
+		const thinkingSignature = coldSpillSubtreeValue(
+			block.thinkingSignature,
+			`${basePath}.thinkingSignature`,
+			writes,
+			promotion,
+		);
+		if (thinking === block.thinking && thinkingSignature === block.thinkingSignature) return block;
+		return { ...block, thinking, thinkingSignature };
 	}
 	if (block.type === "redactedThinking") {
 		const data = block.data;
@@ -19957,14 +19967,28 @@ export class SessionManager {
 
 	#coldSpillClone(entry: SessionEntry, writes: ColdSpillWrite[]): SessionEntry {
 		if (entry.type === "message") {
-			const content = "content" in entry.message ? entry.message.content : undefined;
-			if (!Array.isArray(content)) return entry;
-			const nextContent = coldSpillContentBlocks(content, "message.content", writes, {
-				stores: this.#residentBlobStoresForColdRehydrate(),
-			});
-			return nextContent === content
-				? entry
-				: { ...entry, message: { ...entry.message, content: nextContent } as AgentMessage };
+			const message = entry.message;
+			const content = "content" in message ? message.content : undefined;
+			const promotion = { stores: this.#residentBlobStoresForColdRehydrate() };
+			const nextContent = Array.isArray(content)
+				? coldSpillContentBlocks(content, "message.content", writes, promotion)
+				: content;
+			// Tool-result `details` carry renderer-only payloads (e.g. an MCP tool's full
+			// raw response, base64 screenshots included) that are never replayed to the
+			// model. Left resident, they make compacted history the bulk of the file and
+			// long-lived sessions hit the managed per-file cap.
+			const details = "details" in message ? message.details : undefined;
+			const nextDetails =
+				details === undefined ? details : coldSpillSubtreeValue(details, "message.details", writes, promotion);
+			if (nextContent === content && nextDetails === details) return entry;
+			return {
+				...entry,
+				message: {
+					...message,
+					...(nextContent === content ? {} : { content: nextContent }),
+					...(nextDetails === details ? {} : { details: nextDetails }),
+				} as AgentMessage,
+			};
 		}
 		if (entry.type === "custom_message") {
 			const content = coldSpillCustomMessageContent(entry.content, writes, {
