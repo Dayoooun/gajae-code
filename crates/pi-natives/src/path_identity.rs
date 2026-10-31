@@ -14784,7 +14784,8 @@ mod platform {
 
 		#[test]
 		fn sid_to_principal_resolves_local_system_account() {
-			let principal = resolve_sid_to_principal(&super::super::WINDOWS_LOCAL_SYSTEM_SID);
+			let principal =
+				resolve_sid_to_principal(super::super::WINDOWS_LOCAL_SYSTEM_SID.0.as_slice());
 			// Account names are localized, but the resolved domain/name shape is stable.
 			let (domain, name) = principal.split_once('\\').expect("resolved DOMAIN\\name");
 			assert!(!domain.is_empty());
