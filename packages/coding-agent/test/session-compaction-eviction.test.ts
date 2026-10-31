@@ -1392,4 +1392,224 @@ describe("SessionManager compacted cold-spill eviction", () => {
 			await fs.promises.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	it("[P2-1] preserves legacy cold-spill paths with v0 encoding (raw dot-join lookups)", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-legacy-paths-"));
+		let reopened: SessionManager | undefined;
+		try {
+			const session = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, root));
+
+			// Create a tool result with details containing dotted keys that should remain compatible
+			const dotted_payload = Array.from({ length: 500 }, (_, i) => ({
+				index: i,
+				data: `legacy-dotted-${i}`,
+			}));
+			const legacyDetails = {
+				"a.b": dotted_payload, // Dotted key
+				"a\\b": Array.from({ length: 500 }, (_, i) => ({
+					index: i,
+					data: `legacy-escaped-${i}`,
+				})), // Backslash key
+				regular: { nested: dotted_payload },
+			};
+
+			const toolId = session.appendMessage({
+				role: "toolResult",
+				toolCallId: "legacy-call",
+				toolName: "legacy_tool",
+				content: [{ type: "text", text: "legacy ok" }],
+				details: legacyDetails,
+				isError: false,
+				timestamp: Date.now(),
+			});
+
+			const firstKeptEntryId = session.appendMessage({
+				role: "user",
+				content: "kept",
+				timestamp: Date.now(),
+			});
+			const compactionEntryId = session.appendCompaction("summary", "short", firstKeptEntryId, 123);
+
+			// Evict and manually inject v0 marker (no pathEncoding field)
+			session.evictCompactedContent(firstKeptEntryId, compactionEntryId);
+			const evicted = session.getCanonicalEntryForTests(toolId) as SessionMessageEntry;
+			if (evicted.evictedContent) {
+				// Downgrade to v0 by removing pathEncoding field
+				const v0Marker = { ...evicted.evictedContent };
+				delete (v0Marker as any).pathEncoding;
+				evicted.evictedContent = v0Marker;
+			}
+
+			await session.ensureOnDisk();
+			await session.rewriteEntries();
+			await session.flush();
+			const sessionFile = session.getSessionFile();
+			if (!sessionFile) throw new Error("Expected persisted session file");
+			await session.close();
+
+			// Reopen and verify legacy paths are still recovered
+			reopened = await SessionManager.open(sessionFile);
+			const restored = reopened.getEntryForFidelity(toolId) as SessionMessageEntry;
+			const restoredDetails = (restored.message as { details?: unknown }).details as
+				| Record<string, unknown>
+				| undefined;
+
+			// Verify the dotted and escaped keys are recovered correctly
+			expect(restoredDetails?.["a.b"]).toEqual(legacyDetails["a.b"]);
+			expect(restoredDetails?.["a\\b"]).toEqual(legacyDetails["a\\b"]);
+			expect((restoredDetails?.regular as Record<string, unknown>)?.nested).toEqual(legacyDetails.regular.nested);
+		} finally {
+			await reopened?.close();
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("[P2-2] safely handles cold-spill refs with dangerous refPath values (constructor, __proto__)", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-dangerous-refs-"));
+		let reopened: SessionManager | undefined;
+		try {
+			const session = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, root));
+
+			// Create large content that will trigger eviction
+			const largeContent = Array.from({ length: 500 }, (_, i) => ({
+				index: i,
+				data: `large-${i}-${"".padStart(100, "x")}`,
+			}));
+
+			// Create a message with MCP tool with large payload
+			session.appendMessage({
+				...assistantMessage("mcp"),
+				content: [
+					{
+						type: "toolCall",
+						id: "mcp-call",
+						name: "mcp__aside_repl",
+						arguments: { code: "1", largeData: largeContent },
+					},
+				],
+			});
+
+			const resultId = session.appendMessage({
+				role: "toolResult",
+				toolCallId: "mcp-call",
+				toolName: "mcp__aside_repl",
+				content: [{ type: "text", text: "result" }],
+				// Simulate untrusted details with a marker-shaped object but dangerous refPath
+				details: {
+					__gjcColdSpillArguments: true,
+					refPath: "constructor", // Dangerous - could access Object.constructor
+					payloads: {},
+					largeMcpResponse: largeContent, // Add large data to trigger eviction
+				},
+				isError: false,
+				timestamp: Date.now(),
+			});
+
+			const firstKeptEntryId = session.appendMessage({
+				role: "user",
+				content: "kept",
+				timestamp: Date.now(),
+			});
+			const compactionEntryId = session.appendCompaction("summary", "short", firstKeptEntryId, 123);
+
+			// This should not throw even with dangerous refPath values
+			const result = session.evictCompactedContent(firstKeptEntryId, compactionEntryId);
+			expect(result.evictedEntries).toBeGreaterThan(0);
+
+			await session.ensureOnDisk();
+			await session.rewriteEntries();
+			await session.flush();
+			const sessionFile = session.getSessionFile();
+			if (!sessionFile) throw new Error("Expected persisted session file");
+			await session.close();
+
+			// Reopen and verify no exceptions are thrown during rehydration
+			reopened = await SessionManager.open(sessionFile);
+			const restoredResult = reopened.getEntryForFidelity(resultId) as SessionMessageEntry;
+
+			// The dangerous marker-shaped object should remain unchanged (not dereferenced)
+			const restoredDetails = (restoredResult.message as { details?: unknown }).details;
+			expect(restoredDetails).toBeDefined();
+			// Should not have thrown and should return the sentinel unchanged
+			expect(restoredDetails).toHaveProperty("__gjcColdSpillArguments", true);
+		} finally {
+			await reopened?.close();
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("[P3] applies details.usage exception only to task tool results", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-usage-exception-"));
+		let reopened: SessionManager | undefined;
+		try {
+			const session = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, root));
+
+			const largePayload = Array.from({ length: 500 }, (_, i) => ({
+				index: i,
+				data: `large-${i}-${"".padStart(100, "x")}`,
+			}));
+
+			// Non-task tool: usage follows normal cold-spill rules
+			session.appendMessage({
+				role: "toolResult",
+				toolCallId: "mcp-call",
+				toolName: "mcp__aside_repl",
+				content: [{ type: "text", text: "result" }],
+				details: {
+					serverName: "aside",
+					rawContent: largePayload,
+				},
+				isError: false,
+				timestamp: Date.now(),
+			});
+
+			// Task tool: usage is explicitly preserved inline
+			const taskToolId = session.appendMessage({
+				role: "toolResult",
+				toolCallId: "task-call",
+				toolName: "task",
+				content: [{ type: "text", text: "task result" }],
+				details: {
+					raw: largePayload,
+					usage: { input: 5000, output: 10000 },
+				},
+				isError: false,
+				timestamp: Date.now(),
+			});
+
+			const firstKeptEntryId = session.appendMessage({
+				role: "user",
+				content: "kept",
+				timestamp: Date.now(),
+			});
+			const compactionEntryId = session.appendCompaction("summary", "short", firstKeptEntryId, 123);
+			session.evictCompactedContent(firstKeptEntryId, compactionEntryId);
+
+			// Task tool: usage must be preserved inline in the message
+			const taskEntry = session.getCanonicalEntryForTests(taskToolId) as SessionMessageEntry;
+			const taskDetails = (taskEntry.message as { details?: unknown }).details as
+				| Record<string, unknown>
+				| undefined;
+			expect(taskDetails?.usage).toEqual({ input: 5000, output: 10000 }); // Usage preserved inline
+
+			await session.ensureOnDisk();
+			await session.rewriteEntries();
+			await session.flush();
+			const sessionFile = session.getSessionFile();
+			if (!sessionFile) throw new Error("Expected persisted session file");
+			await session.close();
+
+			// Reopen and verify usage preservation behavior persists
+			reopened = await SessionManager.open(sessionFile);
+
+			const restoredTaskEntry = reopened.getEntryForFidelity(taskToolId) as SessionMessageEntry;
+			const restoredTaskDetails = (restoredTaskEntry.message as { details?: unknown }).details as
+				| Record<string, unknown>
+				| undefined;
+			expect(restoredTaskDetails?.usage).toEqual({ input: 5000, output: 10000 }); // Usage still preserved
+		} finally {
+			await reopened?.close();
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+	});
 });

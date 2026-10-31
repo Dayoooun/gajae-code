@@ -632,6 +632,8 @@ export interface EvictedContentMarker {
 	compactionEntryId: string;
 	firstKeptEntryId: string;
 	payloads: Record<string, ColdSpillRef>;
+	/** Path encoding version. v0 (omitted/undefined) uses legacy raw dot-join; v1 uses escaped paths. */
+	pathEncoding?: "v0" | "v1";
 }
 
 export interface EvictCompactedContentResult {
@@ -6091,6 +6093,19 @@ function preserveTaskUsageWhenColdSpilling(
 	return changed || hasUsage ? Object.fromEntries(entries) : details;
 }
 
+function isColdSpillRef(value: unknown): value is ColdSpillRef {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const obj = value as Record<string, unknown>;
+	return (
+		obj.kind === "cold_spill" &&
+		typeof obj.ref === "string" &&
+		(obj.encoding === "utf8" || obj.encoding === "json") &&
+		typeof obj.originalChars === "number" &&
+		typeof obj.sha256 === "string" &&
+		typeof obj.bytes === "number"
+	);
+}
+
 function coldSpillUnavailable(ref: ColdSpillRef): string {
 	return `[Cold-spill blob unavailable: ${ref.ref}; original ${ref.originalChars} chars unavailable]`;
 }
@@ -6118,11 +6133,40 @@ function rehydrateColdSpillValue(
 	basePath: string,
 	residentStores?: ResidentBlobStores,
 ): unknown {
-	const directRef = marker?.payloads[basePath];
-	if (directRef) return rehydrateColdSpillRef(directRef, blobStore, residentStores);
+	// Try v1 encoding (escaped paths) first
+	let directRef: unknown;
+	if (marker && Object.hasOwn(marker.payloads, basePath)) {
+		directRef = marker.payloads[basePath];
+	}
+	// Fall back to v0 encoding (legacy raw dot-join) if marker lacks pathEncoding
+	if (!directRef && !marker?.pathEncoding && marker?.payloads) {
+		for (const [key, ref] of Object.entries(marker.payloads)) {
+			if (key === basePath) {
+				directRef = ref;
+				break;
+			}
+		}
+	}
+	if (isColdSpillRef(directRef)) return rehydrateColdSpillRef(directRef, blobStore, residentStores);
+
 	if (isColdSpillArgumentsSentinel(value) && typeof value.refPath === "string") {
-		const ref = marker?.payloads[value.refPath];
-		return ref ? rehydrateColdSpillRef(ref, blobStore, residentStores) : value;
+		// Safely look up the refPath without accessing inherited properties or prototype
+		let ref: unknown;
+		if (marker && Object.hasOwn(marker.payloads, value.refPath)) {
+			ref = marker.payloads[value.refPath];
+		}
+		// Fall back to v0 encoding if needed
+		if (!ref && !marker?.pathEncoding && marker?.payloads) {
+			for (const [key, refValue] of Object.entries(marker.payloads)) {
+				if (key === value.refPath) {
+					ref = refValue;
+					break;
+				}
+			}
+		}
+		if (isColdSpillRef(ref)) return rehydrateColdSpillRef(ref, blobStore, residentStores);
+		// Invalid ref or not found; return the sentinel unchanged
+		return value;
 	}
 	if (Array.isArray(value))
 		return value.map((item, index) =>
@@ -19984,6 +20028,7 @@ export class SessionManager {
 					compactionEntryId,
 					firstKeptEntryId,
 					payloads,
+					pathEncoding: "v1",
 				};
 				// Store the marker at the ENTRY level (session metadata), not on the
 				// strict message type, so message shapes stay type-clean.
@@ -20034,10 +20079,18 @@ export class SessionManager {
 			// HOWEVER: preserve details.usage (task tool only) which is read during session
 			// reopen to reconstruct usage statistics. Never cold-spill task tool usage.
 			const details = "details" in message ? message.details : undefined;
+			const isTaskTool = (message as any).role === "toolResult" && (message as any).toolName === "task";
 			const nextDetails =
 				details === undefined
 					? details
-					: preserveTaskUsageWhenColdSpilling(details, coldSpillPathJoin("message", "details"), writes, promotion);
+					: isTaskTool
+						? preserveTaskUsageWhenColdSpilling(
+								details,
+								coldSpillPathJoin("message", "details"),
+								writes,
+								promotion,
+							)
+						: coldSpillSubtreeValue(details, coldSpillPathJoin("message", "details"), writes, promotion);
 			if (nextContent === content && nextDetails === details) return entry;
 			return {
 				...entry,
