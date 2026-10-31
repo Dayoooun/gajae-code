@@ -808,11 +808,7 @@ function formatUnsupportedTargetMessage(reason: string, platform: NodeJS.Platfor
  * When principal and inherited details are available, includes exact icacls remedy.
  * Falls back to bare error code when diagnostic fields are absent.
  */
-export function formatAclPresentError(
-	path: string,
-	principal?: string,
-	inherited?: boolean,
-): string {
+export function formatAclPresentError(path: string, principal?: string, inherited?: boolean): string {
 	if (!principal) {
 		return "acl_present";
 	}

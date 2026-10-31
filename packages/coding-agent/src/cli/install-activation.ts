@@ -34,11 +34,22 @@ export class InstallationAclPresentError extends Error {
 		const principal = detail.aclFailurePrincipal;
 		const inherited = detail.aclFailureInherited;
 		const parent = path.win32.isAbsolute(targetPath) ? path.win32.dirname(targetPath) : path.dirname(targetPath);
-		super(
-			principal && typeof inherited === "boolean"
-				? `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is ${inherited ? "inherited from a parent directory" : "explicitly set"}. Run: icacls "${parent}" /inheritance:d && icacls "${parent}" /remove "${principal}" && gjc update`
-				: "acl_present",
-		);
+
+		let message = "acl_present";
+		if (principal && typeof inherited === "boolean") {
+			// Format principal for icacls: numeric SIDs need '*' prefix
+			const icaclsPrincipal = principal.startsWith("S-1-") ? `*${principal}` : `"${principal}"`;
+
+			if (inherited) {
+				// ACE inherited from parent: disable inheritance and remove from parent
+				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is inherited from a parent directory. Run: icacls "${parent}" /inheritance:d && icacls "${parent}" /remove ${icaclsPrincipal} && gjc update`;
+			} else {
+				// ACE explicitly set on file: remove from the file itself
+				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is explicitly set. Run: icacls "${targetPath}" /remove ${icaclsPrincipal} && gjc update`;
+			}
+		}
+
+		super(message);
 		this.name = "InstallationAclPresentError";
 	}
 }

@@ -123,8 +123,8 @@ export class ManagedReplaceError extends Error {
 		this.retainedPlaceholderPath = result.retainedPlaceholderPath;
 		this.retainedUnknownPath = result.retainedUnknownPath;
 		this.windowsErrorCode = result.windowsErrorCode;
-		this.aclFailurePrincipal = result.acl_failure_principal;
-		this.aclFailureInherited = result.acl_failure_inherited;
+		this.aclFailurePrincipal = result.aclFailurePrincipal;
+		this.aclFailureInherited = result.aclFailureInherited;
 		this.replacementCause = replacementCause;
 	}
 }

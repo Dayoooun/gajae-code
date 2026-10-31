@@ -21,7 +21,7 @@ describe("InstallationAclPresentError", () => {
 		});
 
 		expect(error.message).toBe(
-			String.raw`acl_present during exact replacement of C:\Tools\gjc.exe: ACE for "S-1-5-32-545" is explicitly set. Run: icacls "C:\Tools" /inheritance:d && icacls "C:\Tools" /remove "S-1-5-32-545" && gjc update`,
+			String.raw`acl_present during exact replacement of C:\Tools\gjc.exe: ACE for "S-1-5-32-545" is explicitly set. Run: icacls "C:\Tools\gjc.exe" /remove *S-1-5-32-545 && gjc update`,
 		);
 	});
 
@@ -65,7 +65,40 @@ describe("InstallationAclPresentError", () => {
 		});
 
 		expect(error.message).toBe(
-			String.raw`acl_present during exact replacement of \\server\share\GJC Tools\gjc-custom.exe: ACE for "Everyone" is explicitly set. Run: icacls "\\server\share\GJC Tools" /inheritance:d && icacls "\\server\share\GJC Tools" /remove "Everyone" && gjc update`,
+			String.raw`acl_present during exact replacement of \\server\share\GJC Tools\gjc-custom.exe: ACE for "Everyone" is explicitly set. Run: icacls "\\server\share\GJC Tools\gjc-custom.exe" /remove "Everyone" && gjc update`,
+		);
+	});
+
+	it("targets the file for explicit ACE removal and uses SID syntax with asterisk prefix", () => {
+		const error = new InstallationAclPresentError(String.raw`C:\Program Files\GJC\gjc.exe`, {
+			aclFailurePrincipal: "S-1-5-21-123456-123456-123456-1001",
+			aclFailureInherited: false,
+		});
+
+		expect(error.message).toBe(
+			String.raw`acl_present during exact replacement of C:\Program Files\GJC\gjc.exe: ACE for "S-1-5-21-123456-123456-123456-1001" is explicitly set. Run: icacls "C:\Program Files\GJC\gjc.exe" /remove *S-1-5-21-123456-123456-123456-1001 && gjc update`,
+		);
+	});
+
+	it("handles inherited numeric SID with correct syntax", () => {
+		const error = new InstallationAclPresentError(String.raw`C:\Tools\gjc.exe`, {
+			aclFailurePrincipal: "S-1-5-32-544",
+			aclFailureInherited: true,
+		});
+
+		expect(error.message).toBe(
+			String.raw`acl_present during exact replacement of C:\Tools\gjc.exe: ACE for "S-1-5-32-544" is inherited from a parent directory. Run: icacls "C:\Tools" /inheritance:d && icacls "C:\Tools" /remove *S-1-5-32-544 && gjc update`,
+		);
+	});
+
+	it("targets the file for explicit ACE with account name and spaces", () => {
+		const error = new InstallationAclPresentError(String.raw`C:\Program Files\GJC\gjc.exe`, {
+			aclFailurePrincipal: String.raw`CONTOSO\Domain Users`,
+			aclFailureInherited: false,
+		});
+
+		expect(error.message).toBe(
+			String.raw`acl_present during exact replacement of C:\Program Files\GJC\gjc.exe: ACE for "CONTOSO\Domain Users" is explicitly set. Run: icacls "C:\Program Files\GJC\gjc.exe" /remove "CONTOSO\Domain Users" && gjc update`,
 		);
 	});
 });

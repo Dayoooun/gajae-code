@@ -333,7 +333,7 @@ export async function repairStandaloneBinary(
 					? repointError.reasonCode
 					: error instanceof Error && /^[a-z][a-z0-9_]{0,63}$/.test(error.message)
 						? error.message
-						: aclError?.code ?? "installation_execution_unverified";
+						: (aclError?.code ?? "installation_execution_unverified");
 		if (aclError) logger.warn(aclError.message, { targetPath, code: aclError.code });
 		if (accessDeniedError)
 			logger.warn("Doctor standalone binary restore failed with access denied", {
