@@ -21,7 +21,27 @@ import {
 	exactReplaceRetained,
 	exactRestore,
 	type NativeExactFileIdentity,
+	type NativeExactUnlinkResult,
 } from "@gajae-code/natives";
+
+export class InstallationAclPresentError extends Error {
+	readonly code = "acl_present";
+
+	constructor(
+		readonly targetPath: string,
+		detail: Pick<NativeExactUnlinkResult, "aclFailurePrincipal" | "aclFailureInherited">,
+	) {
+		const principal = detail.aclFailurePrincipal;
+		const inherited = detail.aclFailureInherited;
+		const parent = path.win32.isAbsolute(targetPath) ? path.win32.dirname(targetPath) : path.dirname(targetPath);
+		super(
+			principal && typeof inherited === "boolean"
+				? `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is ${inherited ? "inherited from a parent directory" : "explicitly set"}. Run: icacls "${parent}" /inheritance:d && icacls "${parent}" /remove "${principal}" && gjc update`
+				: "acl_present",
+		);
+		this.name = "InstallationAclPresentError";
+	}
+}
 
 export type ActivationPhase = "staged" | "published" | "verified" | "pending_activation" | "rolled_back" | "uncertain";
 
@@ -484,7 +504,10 @@ export async function updateActivationRecordFile(
 		toNativeIdentity(source.identity),
 		toNativeIdentity(expectedIdentity),
 	);
-	if (!replaced.ok) throw new Error("activation_record_compare_and_swap_failed");
+	if (!replaced.ok) {
+		if (replaced.code === "acl_present") throw new InstallationAclPresentError(recordPath, replaced);
+		throw new Error("activation_record_compare_and_swap_failed");
+	}
 	return source.identity;
 }
 
@@ -506,6 +529,8 @@ export interface ReconcileResult {
 	readonly reason?: string;
 	/** Present only for a pre-mutation Windows exact-replacement failure. */
 	readonly windowsErrorCode?: string;
+	readonly aclFailurePrincipal?: string;
+	readonly aclFailureInherited?: boolean;
 	readonly detachedPath?: string;
 	readonly retainedSuccessorPath?: string;
 	readonly retainedPlaceholderPath?: string;
@@ -676,6 +701,9 @@ export async function reconcileActivationRecord(
 				status: "conflict",
 				record,
 				reason: result.code ?? "activation_promotion_failed",
+				...(result.code === "acl_present"
+					? { aclFailurePrincipal: result.aclFailurePrincipal, aclFailureInherited: result.aclFailureInherited }
+					: {}),
 				...(result.windowsErrorCode ? { windowsErrorCode: result.windowsErrorCode } : {}),
 				...(result.detachedPath !== undefined ? { detachedPath: result.detachedPath } : {}),
 				...(result.retainedSuccessorPath !== undefined

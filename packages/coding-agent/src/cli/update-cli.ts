@@ -38,6 +38,7 @@ import {
 	createActivationRecordFile,
 	type DirectoryIdentity,
 	type FileIdentity,
+	InstallationAclPresentError,
 	type ReconcileResult,
 	readActivationRecord,
 	reconcileActivationRecord,
@@ -802,6 +803,28 @@ function formatUnsupportedTargetMessage(reason: string, platform: NodeJS.Platfor
 	return `${reason}.\n${formatManualUpdateInstructions(platform)}`;
 }
 
+/**
+ * Format an actionable error message for Windows ACL failures.
+ * When principal and inherited details are available, includes exact icacls remedy.
+ * Falls back to bare error code when diagnostic fields are absent.
+ */
+export function formatAclPresentError(
+	path: string,
+	principal?: string,
+	inherited?: boolean,
+): string {
+	if (!principal) {
+		return "acl_present";
+	}
+	const parentDir = require("node:path").dirname(require("node:path").resolve(path));
+	const inheritanceStatus = inherited ? "inherited from a parent directory" : "explicitly set";
+	const icaclsRemedy = `icacls "${parentDir}" /inheritance:d && icacls "${parentDir}" /remove "${principal}" && gjc update`;
+	return [
+		`ACL contains a write-capable permission for ${principal} (${inheritanceStatus}).`,
+		`To fix: ${icaclsRemedy}`,
+	].join(" ");
+}
+
 function buildReleaseBinaryUrl(
 	version: string,
 	platform: NodeJS.Platform = process.platform,
@@ -1166,6 +1189,7 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 				reason: promoted.reason ?? promoted.status,
 				warning: stagingCleanupWarning,
 			});
+		if (promoted.reason === "acl_present") throw new InstallationAclPresentError(targetPath, promoted);
 		throw new Error(promoted.reason ?? "installation_publication_unverified");
 	}
 	record = promoted.record;
@@ -1214,6 +1238,8 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 					toNativeIdentity(record.targetIdentity),
 				);
 				const observed = await snapshotRegularFile(targetPath);
+				if (!restored.ok && restored.code === "acl_present")
+					throw new InstallationAclPresentError(targetPath, restored);
 				if (!restored.ok || !observed || !sameFileIdentity(record.backupIdentity, observed.identity))
 					throw new Error("rollback_unverified");
 				await updateActivationRecordFile(

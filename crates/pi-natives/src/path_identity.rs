@@ -1096,6 +1096,20 @@ impl NativeExactUnlinkResult {
 		self.windows_error_code = Some(windows_error_code);
 		self
 	}
+
+	#[cfg(windows)]
+	/// Attach the offending ACL principal (DOMAIN\name or SID string) when code is "acl_present".
+	fn with_acl_failure_principal(mut self, principal: String) -> Self {
+		self.acl_failure_principal = Some(principal);
+		self
+	}
+
+	#[cfg(windows)]
+	/// Attach the inherited flag (true if ACE is inherited from parent) when code is "acl_present".
+	fn with_acl_failure_inherited(mut self, inherited: bool) -> Self {
+		self.acl_failure_inherited = Some(inherited);
+		self
+	}
 }
 
 #[cfg(any(windows, test))]
@@ -11858,9 +11872,10 @@ mod platform {
 		Security::{
 			ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
 			AclSizeInformation, AddAccessAllowedAceEx,
-			Authorization::{GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo},
+			Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo},
 			DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
-			GetTokenInformation, InitializeAcl, IsValidSid, OWNER_SECURITY_INFORMATION,
+			GetTokenInformation, INHERITED_ACE, InitializeAcl, IsValidSid, LookupAccountSidW,
+			OWNER_SECURITY_INFORMATION,
 			PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
 		},
 		Storage::FileSystem::{
@@ -12979,6 +12994,59 @@ mod platform {
 		}
 	}
 
+	fn resolve_sid_to_principal(ace_sid: &[u8]) -> String {
+		if valid_sid(ace_sid).is_none() {
+			return String::new();
+		}
+		let sid = ace_sid.as_ptr().cast_mut().cast();
+		let mut name_length = 0;
+		let mut domain_length = 0;
+		let mut sid_use = 0;
+		// SAFETY: sid is validated and live; null buffers request the required sizes.
+		unsafe {
+			LookupAccountSidW(
+				null(), sid, null_mut(), &mut name_length, null_mut(), &mut domain_length,
+				&mut sid_use,
+			);
+		}
+		if name_length > 0 {
+			let mut name = vec![0u16; name_length as usize];
+			let mut domain = vec![0u16; domain_length as usize];
+			// SAFETY: both writable buffers have the capacities supplied to the API.
+			if unsafe {
+				LookupAccountSidW(
+					null(), sid, name.as_mut_ptr(), &mut name_length, domain.as_mut_ptr(),
+					&mut domain_length, &mut sid_use,
+				)
+			} != 0
+			{
+				let name = String::from_utf16_lossy(&name[..name_length as usize]);
+				let domain = String::from_utf16_lossy(&domain[..domain_length as usize]);
+				return if domain.is_empty() { name } else { format!("{domain}\\{name}") };
+			}
+		}
+		let mut string_sid = null_mut();
+		// SAFETY: sid is validated and string_sid is writable output storage.
+		if unsafe { ConvertSidToStringSidW(sid, &mut string_sid) } == 0 {
+			return String::new();
+		}
+		// SAFETY: successful conversion returns a NUL-terminated LocalAlloc string,
+		// owned here until it is released after copying into the Rust String.
+		unsafe {
+			let mut length = 0;
+			while *string_sid.add(length) != 0 {
+				length += 1;
+			}
+			let principal = String::from_utf16_lossy(std::slice::from_raw_parts(string_sid, length));
+			LocalFree(string_sid.cast());
+			principal
+		}
+	}
+
+	fn ace_header_has_inherited_flag(header: ACE_HEADER) -> bool {
+		u32::from(header.AceFlags) & INHERITED_ACE != 0
+	}
+
 	/// Owner/no-shared-write ACL check for an executable-file candidate.
 	/// Unlike the owner-only DACL this module applies to config files (a single
 	/// protected ACE granting the owner exactly
@@ -12987,10 +13055,10 @@ mod platform {
 	/// mismatch, or any ACCESS_ALLOWED ACE that grants a write-capable right to
 	/// a principal other than the verified owner. Read/execute-only ACEs for
 	/// other principals are accepted.
-	fn verify_executable_ownership_no_shared_write(handle: HANDLE) -> Result<(), &'static str> {
+	fn verify_executable_ownership_no_shared_write(handle: HANDLE) -> Result<(), NativeExactUnlinkResult> {
 		let sid = match current_user_sid() {
 			Ok(sid) => sid,
-			Err(()) => return Err("acl_unavailable"),
+			Err(()) => return Err(NativeExactUnlinkResult::failure("acl_unavailable")),
 		};
 		let mut owner = null_mut();
 		let mut dacl = null_mut();
@@ -13015,8 +13083,9 @@ mod platform {
 				// by this function on the error path.
 				unsafe { LocalFree(descriptor) };
 			}
-			return Err("acl_unavailable");
+			return Err(NativeExactUnlinkResult::failure("acl_unavailable"));
 		}
+		let mut acl_failure = None;
 		let result = (|| {
 			if owner.is_null() {
 				return Err("acl_unavailable");
@@ -13111,6 +13180,7 @@ mod platform {
 					&sid,
 				);
 				if !safe {
+					acl_failure = Some((resolve_sid_to_principal(ace_sid), ace_header_has_inherited_flag(header)));
 					return Err("acl_present");
 				}
 			}
@@ -13119,7 +13189,15 @@ mod platform {
 		// SAFETY: GetSecurityInfo allocated descriptor with LocalAlloc and it is
 		// released exactly once after all reads have completed.
 		unsafe { LocalFree(descriptor) };
-		result
+		result.map_err(|code| {
+			let failure = NativeExactUnlinkResult::failure(code);
+			match acl_failure {
+				Some((principal, inherited)) if !principal.is_empty() => failure
+					.with_acl_failure_principal(principal)
+					.with_acl_failure_inherited(inherited),
+				_ => failure,
+			}
+		})
 	}
 
 	/// D4-safe in-place replacement mirroring [`exact_replace_path`]'s validated
@@ -13208,8 +13286,8 @@ mod platform {
 		if source_information.nNumberOfLinks != 1 {
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
 		}
-		if let Err(code) = verify_executable_ownership_no_shared_write(source.target) {
-			return NativeExactUnlinkResult::failure(code);
+		if let Err(failure) = verify_executable_ownership_no_shared_write(source.target) {
+			return failure;
 		}
 		let Some(parent_handle) = source.parent() else {
 			return NativeExactUnlinkResult::failure("io_error");
@@ -13277,8 +13355,8 @@ mod platform {
 		if information.nNumberOfLinks != 1 {
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
 		}
-		if let Err(code) = verify_executable_ownership_no_shared_write(destination.target) {
-			return NativeExactUnlinkResult::failure(code);
+		if let Err(failure) = verify_executable_ownership_no_shared_write(destination.target) {
+			return failure;
 		}
 		match handles_same_object_checked(source.target, destination.target) {
 			Ok(true) => return NativeExactUnlinkResult::failure("identity_mismatch"),
@@ -14636,11 +14714,52 @@ mod platform {
 		};
 
 		use super::{
-			FILE_ALL_ACCESS, FILE_READ_DATA, GENERIC_ALL, exact_remove_directory_tree_with_mode,
-			owner_only_ace_mask_is_safe, snapshot_directory_tree,
+			ACE_HEADER, FILE_ALL_ACCESS, FILE_READ_DATA, GENERIC_ALL, INHERITED_ACE,
+			ace_header_has_inherited_flag, exact_remove_directory_tree_with_mode,
+			owner_only_ace_mask_is_safe, resolve_sid_to_principal, snapshot_directory_tree,
 		};
 
 		static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+		#[test]
+		fn sid_to_principal_resolves_local_system_account() {
+			let principal = resolve_sid_to_principal(&super::super::WINDOWS_LOCAL_SYSTEM_SID);
+			// Account names are localized, but the resolved domain/name shape is stable.
+			let (domain, name) = principal.split_once('\\').expect("resolved DOMAIN\\name");
+			assert!(!domain.is_empty());
+			assert!(!name.is_empty());
+			assert!(!principal.starts_with("S-1-"));
+		}
+
+		#[test]
+		fn sid_to_principal_falls_back_to_unmapped_sid_string() {
+			let mut sid = vec![1, 5, 0, 0, 0, 0, 0, 5];
+			for sub_authority in [21u32, u32::MAX, u32::MAX, u32::MAX, u32::MAX - 1] {
+				sid.extend_from_slice(&sub_authority.to_le_bytes());
+			}
+			assert_eq!(
+				resolve_sid_to_principal(&sid),
+				"S-1-5-21-4294967295-4294967295-4294967295-4294967294"
+			);
+		}
+
+		#[test]
+		fn sid_to_principal_rejects_truncated_sid_without_calling_windows() {
+			assert!(resolve_sid_to_principal(&[]).is_empty());
+			assert!(resolve_sid_to_principal(&[1, 1, 0, 0, 0, 0, 0, 5]).is_empty());
+		}
+
+		#[test]
+		fn inherited_flag_distinguishes_inheritance_from_audit_and_propagation_flags() {
+			for (flags, expected) in [(0, false), (0x0f, false), (0x80, false), (0x10, true), (0x9f, true)] {
+				assert_eq!(
+					ace_header_has_inherited_flag(ACE_HEADER { AceType: 0, AceFlags: flags, AceSize: 4 }),
+					expected,
+					"ACE flags {flags:#x}"
+				);
+			}
+			assert_eq!(INHERITED_ACE, 0x10);
+		}
 
 		struct TempDir(PathBuf);
 
