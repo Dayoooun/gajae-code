@@ -2304,20 +2304,19 @@ export interface NativeExactUnlinkResult {
   windowsErrorCode?: string
   /**
    * ACL failure details: offending principal (account name or SID string).
-   * Present only when code is `acl_present` on Windows exact-replace
+   * Present only when code is "acl_present" on Windows exact-replace
    * pre-mutation failures.
    */
   aclFailurePrincipal?: string
   /**
    * ACL failure detail: whether the offending ACE is inherited from a parent
-   * directory. Present only when code is `acl_present` on Windows
+   * directory. Present only when code is "acl_present" on Windows
    * exact-replace pre-mutation failures.
    */
   aclFailureInherited?: boolean
   /**
-   * ACL failure detail: identifies which path failed ACL validation
-   * (`source` or `destination`). Present only when code is `acl_present` on
-   * Windows exact-replace pre-mutation failures.
+   * ACL failure detail: identifies which path failed ACL validation ("source" or "destination").
+   * Present only when code is "acl_present" on Windows exact-replace pre-mutation failures.
    */
   aclFailureSide?: string
 }

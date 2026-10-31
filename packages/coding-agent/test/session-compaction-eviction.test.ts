@@ -1399,20 +1399,14 @@ describe("SessionManager compacted cold-spill eviction", () => {
 		try {
 			const session = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, root));
 
-			// Create a tool result with details containing dotted keys that should remain compatible
-			const dotted_payload = Array.from({ length: 500 }, (_, i) => ({
-				index: i,
-				data: `legacy-dotted-${i}`,
-			}));
+			// String payloads are restored through the marker's path keys (not a refPath sentinel), so a
+			// dotted key only resolves if the reader walks with the encoding the marker was written in.
 			const legacyDetails = {
-				"a.b": dotted_payload, // Dotted key
-				"a\\b": Array.from({ length: 500 }, (_, i) => ({
-					index: i,
-					data: `legacy-escaped-${i}`,
-				})), // Backslash key
-				regular: { nested: dotted_payload },
+				"a.b": `legacy-dotted-${"x".repeat(2048)}`,
+				regular: { nested: `legacy-nested-${"y".repeat(2048)}` },
+				// A sentinel-shaped value makes cold-spill descend per key instead of spilling details whole.
+				raw: { __gjcResidentBlob: true, kind: "text" as const, ref: `blob:sha256:${"d".repeat(64)}` },
 			};
-
 			const toolId = session.appendMessage({
 				role: "toolResult",
 				toolCallId: "legacy-call",
@@ -1422,23 +1416,12 @@ describe("SessionManager compacted cold-spill eviction", () => {
 				isError: false,
 				timestamp: Date.now(),
 			});
-
-			const firstKeptEntryId = session.appendMessage({
-				role: "user",
-				content: "kept",
-				timestamp: Date.now(),
-			});
+			const firstKeptEntryId = session.appendMessage({ role: "user", content: "kept", timestamp: Date.now() });
 			const compactionEntryId = session.appendCompaction("summary", "short", firstKeptEntryId, 123);
-
-			// Evict and manually inject v0 marker (no pathEncoding field)
 			session.evictCompactedContent(firstKeptEntryId, compactionEntryId);
-			const evicted = session.getCanonicalEntryForTests(toolId) as SessionMessageEntry;
-			if (evicted.evictedContent) {
-				// Downgrade to v0 by removing pathEncoding field
-				const v0Marker = { ...evicted.evictedContent };
-				delete (v0Marker as any).pathEncoding;
-				evicted.evictedContent = v0Marker;
-			}
+			const marker = (session.getCanonicalEntryForTests(toolId) as SessionMessageEntry).evictedContent;
+			expect(marker?.pathEncoding).toBe("v1");
+			expect(Object.keys(marker?.payloads ?? {})).toContain("message.details.a\\.b");
 
 			await session.ensureOnDisk();
 			await session.rewriteEntries();
@@ -1447,17 +1430,21 @@ describe("SessionManager compacted cold-spill eviction", () => {
 			if (!sessionFile) throw new Error("Expected persisted session file");
 			await session.close();
 
-			// Reopen and verify legacy paths are still recovered
+			// Rewrite the persisted marker the way v0.19.2 wrote it: no pathEncoding, raw dot-joined keys.
+			const persisted = fs.readFileSync(sessionFile, "utf8");
+			const legacy = persisted
+				.replaceAll(',"pathEncoding":"v1"', "")
+				.replaceAll('"message.details.a\\\\.b"', '"message.details.a.b"');
+			expect(legacy).not.toBe(persisted);
+			expect(legacy).not.toContain("pathEncoding");
+			expect(legacy).toContain('"message.details.a.b"');
+			fs.writeFileSync(sessionFile, legacy);
+
 			reopened = await SessionManager.open(sessionFile);
 			const restored = reopened.getEntryForFidelity(toolId) as SessionMessageEntry;
-			const restoredDetails = (restored.message as { details?: unknown }).details as
-				| Record<string, unknown>
-				| undefined;
-
-			// Verify the dotted and escaped keys are recovered correctly
-			expect(restoredDetails?.["a.b"]).toEqual(legacyDetails["a.b"]);
-			expect(restoredDetails?.["a\\b"]).toEqual(legacyDetails["a\\b"]);
-			expect((restoredDetails?.regular as Record<string, unknown>)?.nested).toEqual(legacyDetails.regular.nested);
+			const restoredDetails = (restored.message as { details?: unknown }).details as Record<string, unknown>;
+			expect(restoredDetails["a.b"]).toBe(legacyDetails["a.b"]);
+			expect((restoredDetails.regular as Record<string, unknown>).nested).toBe(legacyDetails.regular.nested);
 		} finally {
 			await reopened?.close();
 			await fs.promises.rm(root, { recursive: true, force: true });

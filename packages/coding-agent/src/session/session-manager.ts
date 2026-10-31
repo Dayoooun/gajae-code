@@ -632,8 +632,8 @@ export interface EvictedContentMarker {
 	compactionEntryId: string;
 	firstKeptEntryId: string;
 	payloads: Record<string, ColdSpillRef>;
-	/** Path encoding version. v0 (omitted/undefined) uses legacy raw dot-join; v1 uses escaped paths. */
-	pathEncoding?: "v0" | "v1";
+	/** "v1": payload keys escape `\\` and `.` inside segments. Omitted: legacy raw dot-join (v0.19.2 and earlier). */
+	pathEncoding?: "v1";
 }
 
 export interface EvictCompactedContentResult {
@@ -6106,6 +6106,17 @@ function isColdSpillRef(value: unknown): value is ColdSpillRef {
 	);
 }
 
+function coldSpillLegacyPathJoin(base: string, segment: string | number): string {
+	return `${base}.${segment}`;
+}
+
+/** Own-property, shape-checked payload lookup: refPaths come from persisted, possibly hostile data. */
+function coldSpillMarkerRef(marker: EvictedContentMarker | undefined, path: string): ColdSpillRef | undefined {
+	if (!marker || !Object.hasOwn(marker.payloads, path)) return undefined;
+	const ref = marker.payloads[path];
+	return isColdSpillRef(ref) ? ref : undefined;
+}
+
 function coldSpillUnavailable(ref: ColdSpillRef): string {
 	return `[Cold-spill blob unavailable: ${ref.ref}; original ${ref.originalChars} chars unavailable]`;
 }
@@ -6133,52 +6144,23 @@ function rehydrateColdSpillValue(
 	basePath: string,
 	residentStores?: ResidentBlobStores,
 ): unknown {
-	// Try v1 encoding (escaped paths) first
-	let directRef: unknown;
-	if (marker && Object.hasOwn(marker.payloads, basePath)) {
-		directRef = marker.payloads[basePath];
-	}
-	// Fall back to v0 encoding (legacy raw dot-join) if marker lacks pathEncoding
-	if (!directRef && !marker?.pathEncoding && marker?.payloads) {
-		for (const [key, ref] of Object.entries(marker.payloads)) {
-			if (key === basePath) {
-				directRef = ref;
-				break;
-			}
-		}
-	}
-	if (isColdSpillRef(directRef)) return rehydrateColdSpillRef(directRef, blobStore, residentStores);
-
+	const directRef = coldSpillMarkerRef(marker, basePath);
+	if (directRef) return rehydrateColdSpillRef(directRef, blobStore, residentStores);
 	if (isColdSpillArgumentsSentinel(value) && typeof value.refPath === "string") {
-		// Safely look up the refPath without accessing inherited properties or prototype
-		let ref: unknown;
-		if (marker && Object.hasOwn(marker.payloads, value.refPath)) {
-			ref = marker.payloads[value.refPath];
-		}
-		// Fall back to v0 encoding if needed
-		if (!ref && !marker?.pathEncoding && marker?.payloads) {
-			for (const [key, refValue] of Object.entries(marker.payloads)) {
-				if (key === value.refPath) {
-					ref = refValue;
-					break;
-				}
-			}
-		}
-		if (isColdSpillRef(ref)) return rehydrateColdSpillRef(ref, blobStore, residentStores);
-		// Invalid ref or not found; return the sentinel unchanged
-		return value;
+		const ref = coldSpillMarkerRef(marker, value.refPath);
+		return ref ? rehydrateColdSpillRef(ref, blobStore, residentStores) : value;
 	}
+	// Markers written before path escaping (v0.19.2 and earlier) carry no pathEncoding and
+	// were keyed by a raw dot-join, so walk them with the same join they were written with.
+	const join = marker?.pathEncoding === "v1" ? coldSpillPathJoin : coldSpillLegacyPathJoin;
 	if (Array.isArray(value))
 		return value.map((item, index) =>
-			rehydrateColdSpillValue(item, marker, blobStore, coldSpillPathJoin(basePath, index), residentStores),
+			rehydrateColdSpillValue(item, marker, blobStore, join(basePath, index), residentStores),
 		);
 	if (!isRecord(value)) return value;
 	const entries = Object.entries(value).map(([key, child]) => {
 		if (key === "evictedContent") return [key, child] as const;
-		return [
-			key,
-			rehydrateColdSpillValue(child, marker, blobStore, coldSpillPathJoin(basePath, key), residentStores),
-		] as const;
+		return [key, rehydrateColdSpillValue(child, marker, blobStore, join(basePath, key), residentStores)] as const;
 	});
 	return Object.fromEntries(entries);
 }
@@ -20079,7 +20061,7 @@ export class SessionManager {
 			// HOWEVER: preserve details.usage (task tool only) which is read during session
 			// reopen to reconstruct usage statistics. Never cold-spill task tool usage.
 			const details = "details" in message ? message.details : undefined;
-			const isTaskTool = (message as any).role === "toolResult" && (message as any).toolName === "task";
+			const isTaskTool = message.role === "toolResult" && message.toolName === "task";
 			const nextDetails =
 				details === undefined
 					? details
