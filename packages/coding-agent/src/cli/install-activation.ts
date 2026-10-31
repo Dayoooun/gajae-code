@@ -29,27 +29,30 @@ export class InstallationAclPresentError extends Error {
 
 	constructor(
 		readonly targetPath: string,
+		readonly sourcePath: string,
 		detail: Pick<NativeExactUnlinkResult, "aclFailurePrincipal" | "aclFailureInherited" | "aclFailureSide">,
 	) {
 		const principal = detail.aclFailurePrincipal;
 		const inherited = detail.aclFailureInherited;
 		const side = detail.aclFailureSide;
-		const parent = path.win32.isAbsolute(targetPath) ? path.win32.dirname(targetPath) : path.dirname(targetPath);
+		// The native check validates the source before the destination; remediate the object it rejected.
+		const rejectedPath = side === "source" ? sourcePath : targetPath;
+		const parent = path.win32.isAbsolute(rejectedPath)
+			? path.win32.dirname(rejectedPath)
+			: path.dirname(rejectedPath);
 
 		let message = "acl_present";
 		if (principal && typeof inherited === "boolean") {
 			// Format principal for icacls: numeric SIDs need '*' prefix
 			const icaclsPrincipal = principal.startsWith("S-1-") ? `*${principal}` : `"${principal}"`;
-			// Determine which file to remediate based on which side failed validation
-			const fileToRemediate = side === "source" ? `${targetPath} (staged candidate)` : `${targetPath}`;
-			const sideLabel = side ? ` on the ${side} file` : "";
+			const sideLabel = side === "source" ? ` on the source file ${sourcePath}` : side ? ` on the ${side} file` : "";
 
 			if (inherited) {
 				// ACE inherited from parent: disable inheritance and remove from parent
 				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is inherited from a parent directory${sideLabel}. Run: icacls "${parent}" /inheritance:d && icacls "${parent}" /remove ${icaclsPrincipal} && gjc update`;
 			} else {
 				// ACE explicitly set on file: remove from the file itself
-				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is explicitly set${sideLabel}. Run: icacls "${fileToRemediate}" /remove ${icaclsPrincipal} && gjc update`;
+				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is explicitly set${sideLabel}. Run: icacls "${rejectedPath}" /remove ${icaclsPrincipal} && gjc update`;
 			}
 		}
 
@@ -520,7 +523,7 @@ export async function updateActivationRecordFile(
 		toNativeIdentity(expectedIdentity),
 	);
 	if (!replaced.ok) {
-		if (replaced.code === "acl_present") throw new InstallationAclPresentError(recordPath, replaced);
+		if (replaced.code === "acl_present") throw new InstallationAclPresentError(recordPath, tempPath, replaced);
 		throw new Error("activation_record_compare_and_swap_failed");
 	}
 	return source.identity;
