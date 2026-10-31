@@ -663,6 +663,12 @@ pub struct NativeExactUnlinkResult {
 	/// always absent on success, on non-Windows platforms, and after any
 	/// namespace mutation.
 	pub windows_error_code: Option<String>,
+	/// ACL failure details: offending principal (account name or SID string).
+	/// Present only when code is "acl_present" on Windows exact-replace pre-mutation failures.
+	pub acl_failure_principal: Option<String>,
+	/// ACL failure detail: whether the offending ACE is inherited from a parent directory.
+	/// Present only when code is "acl_present" on Windows exact-replace pre-mutation failures.
+	pub acl_failure_inherited: Option<bool>,
 }
 
 /// Bounded, path-free evidence for one publish operation.
@@ -858,6 +864,8 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
 		}
 	}
 
@@ -871,6 +879,8 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
 		}
 	}
 
@@ -884,6 +894,8 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
 		}
 	}
 
@@ -898,6 +910,8 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
 		}
 	}
 
@@ -916,6 +930,8 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
 		}
 	}
 
@@ -934,6 +950,8 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: Some(unknown_path),
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
 		}
 	}
 
@@ -953,6 +971,8 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
 		}
 	}
 
@@ -984,6 +1004,8 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
 		}
 	}
 
@@ -998,6 +1020,8 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: Some(unknown_path),
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
 		}
 	}
 
@@ -1012,6 +1036,8 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
 		}
 	}
 
@@ -1026,6 +1052,8 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
 		}
 	}
 
@@ -1040,6 +1068,8 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: Some(unknown_path),
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
 		}
 	}
 
@@ -1053,6 +1083,8 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
 		}
 	}
 
@@ -13347,6 +13379,8 @@ mod platform {
 						retained_placeholder_path: None,
 						retained_unknown_path: Some(destination_path.to_string_lossy().into_owned()),
 						windows_error_code: None,
+						acl_failure_principal: None,
+						acl_failure_inherited: None,
 					}
 				}
 			},
@@ -13574,6 +13608,8 @@ mod platform {
 					retained_placeholder_path: None,
 					retained_unknown_path: None,
 					windows_error_code: None,
+					acl_failure_principal: None,
+					acl_failure_inherited: None,
 				};
 			},
 		};
@@ -13791,6 +13827,8 @@ mod platform {
 					retained_placeholder_path: None,
 					retained_unknown_path: None,
 					windows_error_code: None,
+					acl_failure_principal: None,
+					acl_failure_inherited: None,
 				};
 			},
 		};
@@ -15282,6 +15320,8 @@ mod platform {
 							retained_placeholder_path: None,
 							retained_unknown_path: None,
 							windows_error_code: None,
+							acl_failure_principal: None,
+							acl_failure_inherited: None,
 						};
 					},
 				}
@@ -15296,6 +15336,8 @@ mod platform {
 					retained_placeholder_path: None,
 					retained_unknown_path: None,
 					windows_error_code: None,
+					acl_failure_principal: None,
+					acl_failure_inherited: None,
 				};
 			},
 		};

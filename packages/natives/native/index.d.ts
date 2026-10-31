@@ -2302,6 +2302,16 @@ export interface NativeExactUnlinkResult {
    * namespace mutation.
    */
   windowsErrorCode?: string
+  /**
+   * ACL failure details: offending principal (account name or SID string).
+   * Present only when code is "acl_present" on Windows exact-replace pre-mutation failures.
+   */
+  aclFailurePrincipal?: string
+  /**
+   * ACL failure detail: whether the offending ACE is inherited from a parent directory.
+   * Present only when code is "acl_present" on Windows exact-replace pre-mutation failures.
+   */
+  aclFailureInherited?: boolean
 }
 
 /** Dedicated result for an atomic no-replace namespace publication. */
