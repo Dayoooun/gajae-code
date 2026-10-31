@@ -664,10 +664,12 @@ pub struct NativeExactUnlinkResult {
 	/// namespace mutation.
 	pub windows_error_code: Option<String>,
 	/// ACL failure details: offending principal (account name or SID string).
-	/// Present only when code is "acl_present" on Windows exact-replace pre-mutation failures.
+	/// Present only when code is "acl_present" on Windows exact-replace
+	/// pre-mutation failures.
 	pub acl_failure_principal: Option<String>,
-	/// ACL failure detail: whether the offending ACE is inherited from a parent directory.
-	/// Present only when code is "acl_present" on Windows exact-replace pre-mutation failures.
+	/// ACL failure detail: whether the offending ACE is inherited from a parent
+	/// directory. Present only when code is "acl_present" on Windows
+	/// exact-replace pre-mutation failures.
 	pub acl_failure_inherited: Option<bool>,
 }
 
@@ -1098,14 +1100,16 @@ impl NativeExactUnlinkResult {
 	}
 
 	#[cfg(windows)]
-	/// Attach the offending ACL principal (DOMAIN\name or SID string) when code is "acl_present".
+	/// Attach the offending ACL principal (DOMAIN\name or SID string) when code
+	/// is "acl_present".
 	fn with_acl_failure_principal(mut self, principal: String) -> Self {
 		self.acl_failure_principal = Some(principal);
 		self
 	}
 
 	#[cfg(windows)]
-	/// Attach the inherited flag (true if ACE is inherited from parent) when code is "acl_present".
+	/// Attach the inherited flag (true if ACE is inherited from parent) when
+	/// code is "acl_present".
 	fn with_acl_failure_inherited(mut self, inherited: bool) -> Self {
 		self.acl_failure_inherited = Some(inherited);
 		self
@@ -11872,11 +11876,12 @@ mod platform {
 		Security::{
 			ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
 			AclSizeInformation, AddAccessAllowedAceEx,
-			Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo},
+			Authorization::{
+				ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+			},
 			DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
 			GetTokenInformation, INHERITED_ACE, InitializeAcl, IsValidSid, LookupAccountSidW,
-			OWNER_SECURITY_INFORMATION,
-			PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+			OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
 		},
 		Storage::FileSystem::{
 			BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
@@ -13005,7 +13010,12 @@ mod platform {
 		// SAFETY: sid is validated and live; null buffers request the required sizes.
 		unsafe {
 			LookupAccountSidW(
-				null(), sid, null_mut(), &mut name_length, null_mut(), &mut domain_length,
+				null(),
+				sid,
+				null_mut(),
+				&mut name_length,
+				null_mut(),
+				&mut domain_length,
 				&mut sid_use,
 			);
 		}
@@ -13015,14 +13025,23 @@ mod platform {
 			// SAFETY: both writable buffers have the capacities supplied to the API.
 			if unsafe {
 				LookupAccountSidW(
-					null(), sid, name.as_mut_ptr(), &mut name_length, domain.as_mut_ptr(),
-					&mut domain_length, &mut sid_use,
+					null(),
+					sid,
+					name.as_mut_ptr(),
+					&mut name_length,
+					domain.as_mut_ptr(),
+					&mut domain_length,
+					&mut sid_use,
 				)
 			} != 0
 			{
 				let name = String::from_utf16_lossy(&name[..name_length as usize]);
 				let domain = String::from_utf16_lossy(&domain[..domain_length as usize]);
-				return if domain.is_empty() { name } else { format!("{domain}\\{name}") };
+				return if domain.is_empty() {
+					name
+				} else {
+					format!("{domain}\\{name}")
+				};
 			}
 		}
 		let mut string_sid = null_mut();
@@ -13055,7 +13074,9 @@ mod platform {
 	/// mismatch, or any ACCESS_ALLOWED ACE that grants a write-capable right to
 	/// a principal other than the verified owner. Read/execute-only ACEs for
 	/// other principals are accepted.
-	fn verify_executable_ownership_no_shared_write(handle: HANDLE) -> Result<(), NativeExactUnlinkResult> {
+	fn verify_executable_ownership_no_shared_write(
+		handle: HANDLE,
+	) -> Result<(), NativeExactUnlinkResult> {
 		let sid = match current_user_sid() {
 			Ok(sid) => sid,
 			Err(()) => return Err(NativeExactUnlinkResult::failure("acl_unavailable")),
@@ -13180,7 +13201,8 @@ mod platform {
 					&sid,
 				);
 				if !safe {
-					acl_failure = Some((resolve_sid_to_principal(ace_sid), ace_header_has_inherited_flag(header)));
+					acl_failure =
+						Some((resolve_sid_to_principal(ace_sid), ace_header_has_inherited_flag(header)));
 					return Err("acl_present");
 				}
 			}
@@ -14751,9 +14773,15 @@ mod platform {
 
 		#[test]
 		fn inherited_flag_distinguishes_inheritance_from_audit_and_propagation_flags() {
-			for (flags, expected) in [(0, false), (0x0f, false), (0x80, false), (0x10, true), (0x9f, true)] {
+			for (flags, expected) in
+				[(0, false), (0x0f, false), (0x80, false), (0x10, true), (0x9f, true)]
+			{
 				assert_eq!(
-					ace_header_has_inherited_flag(ACE_HEADER { AceType: 0, AceFlags: flags, AceSize: 4 }),
+					ace_header_has_inherited_flag(ACE_HEADER {
+						AceType:  0,
+						AceFlags: flags,
+						AceSize:  4,
+					}),
 					expected,
 					"ACE flags {flags:#x}"
 				);
