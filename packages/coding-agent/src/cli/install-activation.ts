@@ -29,23 +29,27 @@ export class InstallationAclPresentError extends Error {
 
 	constructor(
 		readonly targetPath: string,
-		detail: Pick<NativeExactUnlinkResult, "aclFailurePrincipal" | "aclFailureInherited">,
+		detail: Pick<NativeExactUnlinkResult, "aclFailurePrincipal" | "aclFailureInherited" | "aclFailureSide">,
 	) {
 		const principal = detail.aclFailurePrincipal;
 		const inherited = detail.aclFailureInherited;
+		const side = detail.aclFailureSide;
 		const parent = path.win32.isAbsolute(targetPath) ? path.win32.dirname(targetPath) : path.dirname(targetPath);
 
 		let message = "acl_present";
 		if (principal && typeof inherited === "boolean") {
 			// Format principal for icacls: numeric SIDs need '*' prefix
 			const icaclsPrincipal = principal.startsWith("S-1-") ? `*${principal}` : `"${principal}"`;
+			// Determine which file to remediate based on which side failed validation
+			const fileToRemediate = side === "source" ? `${targetPath} (staged candidate)` : `${targetPath}`;
+			const sideLabel = side ? ` on the ${side} file` : "";
 
 			if (inherited) {
 				// ACE inherited from parent: disable inheritance and remove from parent
-				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is inherited from a parent directory. Run: icacls "${parent}" /inheritance:d && icacls "${parent}" /remove ${icaclsPrincipal} && gjc update`;
+				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is inherited from a parent directory${sideLabel}. Run: icacls "${parent}" /inheritance:d && icacls "${parent}" /remove ${icaclsPrincipal} && gjc update`;
 			} else {
 				// ACE explicitly set on file: remove from the file itself
-				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is explicitly set. Run: icacls "${targetPath}" /remove ${icaclsPrincipal} && gjc update`;
+				message = `acl_present during exact replacement of ${targetPath}: ACE for "${principal}" is explicitly set${sideLabel}. Run: icacls "${fileToRemediate}" /remove ${icaclsPrincipal} && gjc update`;
 			}
 		}
 
@@ -713,7 +717,11 @@ export async function reconcileActivationRecord(
 				record,
 				reason: result.code ?? "activation_promotion_failed",
 				...(result.code === "acl_present"
-					? { aclFailurePrincipal: result.aclFailurePrincipal, aclFailureInherited: result.aclFailureInherited }
+					? {
+							aclFailurePrincipal: result.aclFailurePrincipal,
+							aclFailureInherited: result.aclFailureInherited,
+							aclFailureSide: result.aclFailureSide,
+						}
 					: {}),
 				...(result.windowsErrorCode ? { windowsErrorCode: result.windowsErrorCode } : {}),
 				...(result.detachedPath !== undefined ? { detachedPath: result.detachedPath } : {}),

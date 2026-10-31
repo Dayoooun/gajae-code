@@ -101,4 +101,27 @@ describe("InstallationAclPresentError", () => {
 			String.raw`acl_present during exact replacement of C:\Program Files\GJC\gjc.exe: ACE for "CONTOSO\Domain Users" is explicitly set. Run: icacls "C:\Program Files\GJC\gjc.exe" /remove "CONTOSO\Domain Users" && gjc update`,
 		);
 	});
+
+	it("identifies source-side ACL failure with source indicator", () => {
+		const error = new InstallationAclPresentError(String.raw`C:\Users\Alice\.local\bin\gjc.exe`, {
+			aclFailurePrincipal: String.raw`BUILTIN\Users`,
+			aclFailureInherited: false,
+			aclFailureSide: "source",
+		});
+
+		expect(error.message).toContain("on the source file");
+		expect(error.message).toContain("staged candidate");
+		expect(error.code).toBe("acl_present");
+	});
+
+	it("identifies destination-side ACL failure with destination indicator", () => {
+		const error = new InstallationAclPresentError(String.raw`C:\Users\Alice\.local\bin\gjc.exe`, {
+			aclFailurePrincipal: String.raw`BUILTIN\Users`,
+			aclFailureInherited: false,
+			aclFailureSide: "destination",
+		});
+
+		expect(error.message).toContain("on the destination file");
+		expect(error.code).toBe("acl_present");
+	});
 });

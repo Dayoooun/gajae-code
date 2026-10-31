@@ -671,6 +671,9 @@ pub struct NativeExactUnlinkResult {
 	/// directory. Present only when code is "acl_present" on Windows
 	/// exact-replace pre-mutation failures.
 	pub acl_failure_inherited: Option<bool>,
+	/// ACL failure detail: identifies which path failed ACL validation ("source" or "destination").
+	/// Present only when code is "acl_present" on Windows exact-replace pre-mutation failures.
+	pub acl_failure_side: Option<String>,
 }
 
 /// Bounded, path-free evidence for one publish operation.
@@ -868,6 +871,7 @@ impl NativeExactUnlinkResult {
 			windows_error_code: None,
 			acl_failure_principal: None,
 			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -883,6 +887,7 @@ impl NativeExactUnlinkResult {
 			windows_error_code: None,
 			acl_failure_principal: None,
 			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -898,6 +903,7 @@ impl NativeExactUnlinkResult {
 			windows_error_code: None,
 			acl_failure_principal: None,
 			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -914,6 +920,7 @@ impl NativeExactUnlinkResult {
 			windows_error_code: None,
 			acl_failure_principal: None,
 			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -934,6 +941,7 @@ impl NativeExactUnlinkResult {
 			windows_error_code: None,
 			acl_failure_principal: None,
 			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -954,6 +962,7 @@ impl NativeExactUnlinkResult {
 			windows_error_code: None,
 			acl_failure_principal: None,
 			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -975,6 +984,7 @@ impl NativeExactUnlinkResult {
 			windows_error_code: None,
 			acl_failure_principal: None,
 			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -1008,6 +1018,7 @@ impl NativeExactUnlinkResult {
 			windows_error_code: None,
 			acl_failure_principal: None,
 			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -1024,6 +1035,7 @@ impl NativeExactUnlinkResult {
 			windows_error_code: None,
 			acl_failure_principal: None,
 			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -1040,6 +1052,7 @@ impl NativeExactUnlinkResult {
 			windows_error_code: None,
 			acl_failure_principal: None,
 			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -1056,6 +1069,7 @@ impl NativeExactUnlinkResult {
 			windows_error_code: None,
 			acl_failure_principal: None,
 			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -1072,6 +1086,7 @@ impl NativeExactUnlinkResult {
 			windows_error_code: None,
 			acl_failure_principal: None,
 			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -1087,6 +1102,7 @@ impl NativeExactUnlinkResult {
 			windows_error_code: None,
 			acl_failure_principal: None,
 			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -1112,6 +1128,14 @@ impl NativeExactUnlinkResult {
 	/// code is "acl_present".
 	fn with_acl_failure_inherited(mut self, inherited: bool) -> Self {
 		self.acl_failure_inherited = Some(inherited);
+		self
+	}
+
+	#[cfg(windows)]
+	/// Attach the failing side ("source" or "destination") when code is
+	/// "acl_present".
+	fn with_acl_failure_side(mut self, side: String) -> Self {
+		self.acl_failure_side = Some(side);
 		self
 	}
 }
@@ -13076,6 +13100,7 @@ mod platform {
 	/// other principals are accepted.
 	fn verify_executable_ownership_no_shared_write(
 		handle: HANDLE,
+		side: Option<&str>,
 	) -> Result<(), NativeExactUnlinkResult> {
 		let sid = match current_user_sid() {
 			Ok(sid) => sid,
@@ -13212,11 +13237,17 @@ mod platform {
 		// released exactly once after all reads have completed.
 		unsafe { LocalFree(descriptor) };
 		result.map_err(|code| {
-			let failure = NativeExactUnlinkResult::failure(code);
+			let mut failure = NativeExactUnlinkResult::failure(code);
 			match acl_failure {
-				Some((principal, inherited)) if !principal.is_empty() => failure
-					.with_acl_failure_principal(principal)
-					.with_acl_failure_inherited(inherited),
+				Some((principal, inherited)) if !principal.is_empty() => {
+					failure = failure
+						.with_acl_failure_principal(principal)
+						.with_acl_failure_inherited(inherited);
+					if let Some(s) = side {
+						failure = failure.with_acl_failure_side(s.to_owned());
+					}
+					failure
+				},
 				_ => failure,
 			}
 		})
@@ -13308,7 +13339,7 @@ mod platform {
 		if source_information.nNumberOfLinks != 1 {
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
 		}
-		if let Err(failure) = verify_executable_ownership_no_shared_write(source.target) {
+		if let Err(failure) = verify_executable_ownership_no_shared_write(source.target, Some("source")) {
 			return failure;
 		}
 		let Some(parent_handle) = source.parent() else {
@@ -13377,7 +13408,7 @@ mod platform {
 		if information.nNumberOfLinks != 1 {
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
 		}
-		if let Err(failure) = verify_executable_ownership_no_shared_write(destination.target) {
+		if let Err(failure) = verify_executable_ownership_no_shared_write(destination.target, Some("destination")) {
 			return failure;
 		}
 		match handles_same_object_checked(source.target, destination.target) {
